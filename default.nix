@@ -2,7 +2,7 @@
   lib,
   rustPlatform,
   pkg-config,
-  x264,
+  nasm,
   libyuv,
   libopus,
   libpulseaudio,
@@ -28,7 +28,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
-    rustPlatform.bindgenHook
+    nasm
     esbuild
     typescript
   ];
@@ -41,7 +41,6 @@ rustPlatform.buildRustPackage {
   '';
 
   buildInputs = [
-    x264
     libyuv
     libopus
     libpulseaudio

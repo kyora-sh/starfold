@@ -151,7 +151,7 @@ const hex2 = (x: number) => x.toString(16).padStart(2, '0');
 
 /** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
 function codecFromSps(d: Uint8Array): string | null {
-	for (let i = 0; i + 4 < d.length; i++) {
+	for (let i = 0; i + 6 < d.length; i++) {
 		if (
 			d[i] === 0 &&
 			d[i + 1] === 0 &&

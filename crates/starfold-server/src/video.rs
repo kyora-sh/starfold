@@ -1,12 +1,12 @@
-//! Video pipeline: damage-driven capture -> I420 -> x264 -> clients, with ack-based flow control.
+//! Video pipeline: damage-driven capture -> I420 -> H.264 -> clients, with ack-based flow control.
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoder, EncoderConfig, Planes};
+use crate::encoder::{self, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out};
 use bytes::Bytes;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone)]
 pub struct VideoConfig {
     pub display: Option<String>,
+    pub encoder: encoder::Backend,
     pub fps: u32,
     pub preset: String,
     pub threads: u32,
@@ -60,6 +61,8 @@ struct Pipeline {
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
     encode: std::thread::JoinHandle<()>,
+    /// A keyframe job is with the encoder; viewers' requests stay set until it lands.
+    idr_inflight: Arc<AtomicBool>,
 }
 
 /// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
@@ -82,8 +85,16 @@ pub fn spawn(
                 job_tx,
                 ret_rx,
                 encode,
+                idr_inflight,
             } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+            if let Err(e) = capture_loop(
+                &mut cap,
+                cfg.clone(),
+                hub.clone(),
+                job_tx,
+                ret_rx,
+                idr_inflight,
+            ) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -122,17 +133,26 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     hub.height.store(h, Ordering::Relaxed);
     hub.activity.reset(w, h);
     log::info!(
-        "capturing {}x{} @ {} fps, preset {} threads {}",
+        "capturing {}x{} @ {} fps, {} threads {}",
         w,
         h,
         cfg.fps,
-        cfg.preset,
+        cfg.encoder.name(),
         cfg.threads
     );
 
     let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
     let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
-    let layout = stripe_layout(h, cfg.stripes);
+    let layout = fit_stripes(cfg.encoder, w, h, cfg.stripes);
+    if layout.len() as u32 > cfg.stripes.clamp(1, 16) {
+        log::info!(
+            "{}x{} is too large for one {} picture: {} stripes",
+            w,
+            h,
+            cfg.encoder.name(),
+            layout.len()
+        );
+    }
     let mut stripes = Vec::new();
     for &(y, sh) in &layout {
         let fixed = if cfg.adaptive_threads {
@@ -141,13 +161,14 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             (cfg.threads / layout.len() as u32).max(1)
         };
         let ecfg = EncoderConfig {
+            backend: cfg.encoder,
             width: w,
             height: sh,
             fps: cfg.fps,
-            preset: cfg.preset.clone(),
             threads: fixed,
-            crf: cfg.crf,
-            max_kbps: cfg.max_kbps,
+            rate: RateConfig::new(cfg.crf, cfg.max_kbps, cfg.fps),
+            best_quality: cfg.crf.min(cfg.paintover_crf),
+            preset: cfg.preset.clone(),
         };
         let max_threads = if cfg.adaptive_threads {
             (cfg.threads / layout.len() as u32).max(1)
@@ -157,7 +178,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         stripes.push(Stripe {
             y: y as usize,
             h: sh as usize,
-            enc: Encoder::new(&ecfg)?,
+            enc: encoder::open(&ecfg)?,
             cfg: ecfg,
             max_threads,
             applied_kbps: 0,
@@ -167,9 +188,11 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
     let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    let idr_inflight = Arc::new(AtomicBool::new(false));
+    let idr2 = idr_inflight.clone();
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, idr2, crf, po_crf))
         .unwrap();
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
@@ -178,6 +201,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         job_tx,
         ret_rx,
         encode,
+        idr_inflight,
     })
 }
 
@@ -462,6 +486,7 @@ fn capture_loop(
     hub: Arc<Hub>,
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    idr_inflight: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool: Vec<Option<Box<I420>>> = vec![
@@ -527,9 +552,10 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
-        let want_key = clients
-            .iter()
-            .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
+        let want_key = !idr_inflight.load(Ordering::Acquire)
+            && clients
+                .iter()
+                .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
         if !had_clients {
             had_clients = true;
             // Our shm copy may be stale: re-grab everything once.
@@ -674,9 +700,7 @@ fn capture_loop(
             false
         };
         if want_key {
-            for c in &clients {
-                c.needs_keyframe.store(false, Ordering::Relaxed);
-            }
+            idr_inflight.store(true, Ordering::Release);
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
         }
@@ -730,6 +754,18 @@ fn capture_loop(
     }
 }
 
+/// Stripes for `n` (more if a picture would be too large for the encoder).
+fn fit_stripes(backend: encoder::Backend, width: u32, height: u32, n: u32) -> Vec<(u32, u32)> {
+    let mut n = n.clamp(1, 16);
+    loop {
+        let layout = stripe_layout(height, n);
+        if n >= 16 || layout.iter().all(|&(_, h)| backend.fits(width, h)) {
+            return layout;
+        }
+        n += 1;
+    }
+}
+
 /// Split the screen into horizontal stripes, each an independent H.264 stream.
 /// x264 pays ~9 ms of CPU per 2560x1600 frame even when nothing changed, and sliced
 /// threading triples that; independent single-threaded stripes are encoded in
@@ -750,7 +786,7 @@ fn stripe_layout(height: u32, n: u32) -> Vec<(u32, u32)> {
 struct Stripe {
     y: usize,
     h: usize,
-    enc: Encoder,
+    enc: Box<dyn VideoEncoder>,
     cfg: EncoderConfig,
     /// Sliced threads to fan out to under sustained heavy motion (1 = never).
     max_threads: u32,
@@ -883,33 +919,41 @@ fn stripe_worker(
     };
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
-        if job.force_idr {
+        let rate = if job.force_idr {
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc
-                .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
             s.applied_kbps = 0;
+            Some(RateConfig {
+                quality: job.crf,
+                max_kbps: boost,
+                buf_kbit: boost / s.cfg.fps.max(1) * 8,
+            })
         } else {
             let moved = s.applied_kbps == 0
                 || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
-            if job.crf != s.applied_crf || moved {
-                s.enc.set_rate(job.crf, job.cap);
+            (job.crf != s.applied_crf || moved).then(|| {
                 s.applied_crf = job.crf;
                 s.applied_kbps = job.cap;
+                RateConfig::new(job.crf, job.cap, s.cfg.fps)
+            })
+        };
+        if let Some(r) = rate {
+            if let Err(e) = s.enc.set_rate(r) {
+                log::warn!("stripe {i}: {e}");
             }
         }
         let suv = buf.stride_uv();
-        let planes = Planes {
+        let frame = FrameView {
+            width: buf.width as u32,
+            height: s.h as u32,
             y: &buf.y[s.y * buf.width..],
             u: &buf.u[(s.y / 2) * suv..],
             v: &buf.v[(s.y / 2) * suv..],
             stride_y: buf.width,
             stride_uv: suv,
         };
-        let mut out = Vec::with_capacity(64 << 10);
-        out.resize(HDR, 0);
-        // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
+        // Nonzero on unchanged macroblocks of this stripe (x264's X264_MBINFO_CONSTANT).
         let mut info = job.mb_dirty.as_ref().map(|d| {
             let rows = s.h.div_ceil(16);
             let start = (s.y / 16) * job.mb_cols;
@@ -920,13 +964,30 @@ fn stripe_worker(
         });
         let te = Instant::now();
         let r = s.enc.encode(
-            &planes,
-            job.ts,
-            job.force_idr,
-            None,
-            info.as_deref_mut(),
-            &mut out,
+            &frame,
+            EncodeOptions {
+                pts_ms: job.ts,
+                force_keyframe: job.force_idr,
+                static_mbs: info.as_deref_mut(),
+            },
         );
+        let out = r.map(|aus| {
+            let mut out = Vec::with_capacity(HDR + aus.iter().map(|a| a.data.len()).sum::<usize>());
+            out.resize(HDR, 0);
+            let key = aus.first().is_some_and(|a| a.keyframe);
+            for au in aus {
+                if let Some(c) = &au.config {
+                    log::info!(
+                        "stripe {i}: {} {}x{}",
+                        c.codec_string,
+                        c.display.0,
+                        c.display.1
+                    );
+                }
+                out.extend_from_slice(&au.data);
+            }
+            (key, out)
+        });
         if debug {
             let cpu_now = thread_cpu_us();
             log::info!(
@@ -934,7 +995,7 @@ fn stripe_worker(
                 s.y,
                 te.elapsed().as_micros(),
                 cpu_now,
-                out.len()
+                out.as_ref().map_or(0, |o| o.1.len())
             );
         }
         if s.max_threads > 1 {
@@ -945,7 +1006,7 @@ fn stripe_worker(
                     m.iter().filter(|&&c| c == 0).count() as f64
                 });
             if let Some(t) = gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads) {
-                match Encoder::new(&EncoderConfig {
+                match encoder::open(&EncoderConfig {
                     threads: t,
                     ..s.cfg.clone()
                 }) {
@@ -965,11 +1026,11 @@ fn stripe_worker(
                 }
             }
         }
-        let res = match r {
-            Ok(key) if out.len() > HDR => Some((key, out)),
+        let res = match out {
+            Ok((key, out)) if out.len() > HDR => Some((key, out)),
             Ok(_) => None,
             Err(e) => {
-                log::error!("{e}");
+                log::error!("stripe {i}: {e}");
                 None
             }
         };
@@ -984,6 +1045,7 @@ fn encode_loop(
     rx: mpsc::Receiver<Job>,
     ret: mpsc::Sender<(usize, Box<I420>)>,
     hub: Arc<Hub>,
+    idr_inflight: Arc<AtomicBool>,
     crf: f32,
     po_crf: f32,
 ) {
@@ -1075,11 +1137,22 @@ fn encode_loop(
             .enumerate()
             .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
             .collect();
+        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
+        if job.force_idr {
+            // Requests stay set (and are retried) until every stripe really sent an IDR.
+            if all_key {
+                for c in hub.video_clients() {
+                    c.needs_keyframe.store(false, Ordering::Relaxed);
+                }
+            } else {
+                log::warn!("keyframe request produced no IDR on every stripe; retrying");
+            }
+            idr_inflight.store(false, Ordering::Release);
+        }
         if parts.is_empty() {
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
-        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
         let total: usize = parts.iter().map(|p| p.2.len()).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);

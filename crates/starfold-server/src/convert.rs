@@ -143,7 +143,7 @@ pub fn convert_nv12_band(
         for r in a..b {
             std::ptr::copy_nonoverlapping(sy.get().add(r * stride_y), yp.get().add(r * w), w);
         }
-        for r in a / 2..b / 2 {
+        for r in a / 2..b.div_ceil(2) {
             let src = std::slice::from_raw_parts(suv_src.get().add(r * stride_uv), cw * 2);
             let u = std::slice::from_raw_parts_mut(up.get().add(r * suv), cw);
             let v = std::slice::from_raw_parts_mut(vp.get().add(r * suv), cw);
