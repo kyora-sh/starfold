@@ -48,14 +48,14 @@ pub fn index_html(title: &str) -> Bytes {
             c => escaped.push(c),
         }
     }
-    Bytes::from(include_str!("../web/index.html").replace("{{title}}", &escaped))
+    Bytes::from(include_str!("../../../packages/web/index.html").replace("{{title}}", &escaped))
 }
 
 /// The page's icon (--favicon): that file's bytes and content type, or voxl's own icon.
 pub fn favicon(path: Option<&str>) -> Result<(Bytes, &'static str), String> {
     let Some(path) = path else {
         return Ok((
-            Bytes::from_static(include_bytes!("../web/favicon.ico")),
+            Bytes::from_static(include_bytes!("../../../packages/web/favicon.ico")),
             "image/x-icon",
         ));
     };
@@ -110,7 +110,7 @@ macro_rules! asset {
                     (header::CONTENT_TYPE, $ctype),
                     (header::CACHE_CONTROL, "no-cache"),
                 ],
-                include_bytes!(concat!("../web/", $name)).as_slice(),
+                include_bytes!(concat!("../../../packages/web/", $name)).as_slice(),
             )
         })
     };

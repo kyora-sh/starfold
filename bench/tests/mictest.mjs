@@ -14,7 +14,7 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/voxl');
+const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
 const pa = process.env.PULSEAUDIO || '/run/current-system/sw';
 const port = process.env.VOXL_PORT || '6907';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'voxl-mic-'));

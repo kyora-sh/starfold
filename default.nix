@@ -11,7 +11,7 @@
   typescript,
 }:
 rustPlatform.buildRustPackage {
-  pname = "voxl";
+  pname = "starfold";
   version = "0.3.2";
 
   src = lib.fileset.toSource {
@@ -19,9 +19,8 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ./Cargo.toml
       ./Cargo.lock
-      ./build.rs
-      ./src
-      ./web
+      ./crates
+      ./packages/web
     ];
   };
 
@@ -34,11 +33,11 @@ rustPlatform.buildRustPackage {
     typescript
   ];
 
-  # build.rs bundles web/src with esbuild; type-check it first.
+  # build.rs bundles packages/web/src with esbuild; type-check it first.
   preBuild = ''
-    tsc -p web
-    tsc -p web/tsconfig.worker.json
-    tsc -p web/tsconfig.worklet.json
+    tsc -p packages/web
+    tsc -p packages/web/tsconfig.worker.json
+    tsc -p packages/web/tsconfig.worklet.json
   '';
 
   buildInputs = [
@@ -52,7 +51,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Low-latency X11 desktop streaming server (H.264 over WebSocket) for the Computer preview";
     license = lib.licenses.mit;
-    mainProgram = "voxl";
+    mainProgram = "starfold";
     platforms = ["x86_64-linux"];
   };
 }

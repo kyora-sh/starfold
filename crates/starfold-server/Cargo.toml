@@ -1,0 +1,107 @@
+[package]
+name = "starfold-server"
+version = "0.3.2"
+edition = "2021"
+license = "MIT"
+description = "Low-latency desktop streaming for the browser: an X11 display, a Mac's screen or a Windows desktop as H.264 over a WebSocket"
+repository = "https://github.com/kyora-sh/starfold"
+readme = "../../README.md"
+publish = false
+# Lets programs that embed starfold read DEP_STARFOLD_RPATH (see build.rs).
+links = "starfold"
+keywords = ["remote-desktop", "streaming", "x11", "h264", "websocket"]
+categories = ["command-line-utilities", "multimedia::video"]
+
+# The server, as a library for programs that embed it.
+[lib]
+name = "starfold"
+path = "src/lib.rs"
+
+[[bin]]
+name = "starfold"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+	"rt-multi-thread",
+	"macros",
+	"net",
+	"sync",
+	"time",
+	"signal",
+	"fs",
+	"io-util",
+] }
+axum = { version = "0.8", features = ["ws"] }
+libc = "0.2"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+futures-util = { version = "0.3", default-features = false, features = [
+	"sink",
+] }
+png = "0.18"
+base64 = "0.22"
+getrandom = "0.3"
+zip = { version = "7", default-features = false, features = [
+	"deflate-flate2-zlib-rs",
+] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs", "poll", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = [
+	"shm",
+	"damage",
+	"xfixes",
+	"xtest",
+	"shape",
+	"xinput",
+	"randr",
+	"allow-unsafe-code",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+	"Win32_Devices_FunctionDiscovery",
+	"Win32_Foundation",
+	"Win32_Graphics_Direct3D",
+	"Win32_Graphics_Direct3D11",
+	"Win32_Graphics_Dxgi",
+	"Win32_Graphics_Dxgi_Common",
+	"Win32_Graphics_Gdi",
+	"Win32_Media_Audio",
+	"Win32_Security",
+	"Win32_System_Com",
+	"Win32_System_Com_StructuredStorage",
+	"Win32_System_DataExchange",
+	"Win32_System_Memory",
+	"Win32_System_Ole",
+	"Win32_System_StationsAndDesktops",
+	"Win32_System_Threading",
+	"Win32_System_Variant",
+	"Win32_UI_HiDpi",
+	"Win32_UI_Input_KeyboardAndMouse",
+	"Win32_UI_Shell_PropertiesSystem",
+	"Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.61"
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+vcpkg = "0.2"

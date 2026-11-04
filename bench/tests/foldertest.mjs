@@ -12,7 +12,7 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/voxl');
+const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
 const port = process.env.VOXL_PORT || '6906';
 const base = `http://127.0.0.1:${port}`;
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voxl-folders-'));

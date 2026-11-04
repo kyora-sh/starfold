@@ -12,7 +12,7 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/voxl');
+const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
 const DISPLAY = process.env.RESIZE_DISPLAY || ':8';
 const port = process.env.VOXL_PORT || '6908';
 const log = '/tmp/voxl-resizedyn.log';

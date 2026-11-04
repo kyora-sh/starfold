@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # (Re)start voxl on the benchmark display, port 6902. Extra args are passed through.
 cd "$(dirname "$(readlink -f "$0")")"
-BIN=${VOXL_BIN:-../../target/release/voxl}
+BIN=${VOXL_BIN:-../../target/release/starfold}
 ./killpat.sh "--port=6902" >/dev/null 2>&1
 sleep 1
 DISPLAY=${BENCH_DISPLAY:-:2} RUST_LOG=${RUST_LOG:-info} setsid nohup "$BIN" --port=6902 --framerate=60 --preset=ultrafast --max-kbps=30000 --audio-enabled=false --enable-basic-auth=false "$@" > /tmp/voxl-bench.log 2>&1 < /dev/null &
