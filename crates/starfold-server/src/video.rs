@@ -187,12 +187,12 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    let (crf, po_crf, uncapped) = (cfg.crf, cfg.paintover_crf, cfg.max_kbps == 0);
     let idr_inflight = Arc::new(AtomicBool::new(false));
     let idr2 = idr_inflight.clone();
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, idr2, crf, po_crf))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, idr2, crf, po_crf, uncapped))
         .unwrap();
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
@@ -1047,6 +1047,7 @@ fn stripe_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
@@ -1055,6 +1056,8 @@ fn encode_loop(
     idr_inflight: Arc<AtomicBool>,
     crf: f32,
     po_crf: f32,
+    // --max-kbps 0: the controller's floor still applies after congestion; don't pass it on.
+    uncapped: bool,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
@@ -1097,7 +1100,7 @@ fn encode_loop(
         let want_crf = if job.paintover { po_crf } else { crf };
         // Each stripe may use up to twice its area share of the budget; the delay-based
         // controller reins the total in if several stripes move at once.
-        let share = if target == 0 {
+        let share = if uncapped || target == 0 {
             0
         } else {
             ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
