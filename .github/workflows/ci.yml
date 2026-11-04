@@ -42,11 +42,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # x264, libyuv, Opus and PulseAudio for linking, libclang for bindgen, esbuild for build.rs.
+      # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for bindgen, esbuild for build.rs.
       - name: Native libraries
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libyuv-dev libopus-dev libpulse-dev libclang-dev esbuild
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev libclang-dev esbuild
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
