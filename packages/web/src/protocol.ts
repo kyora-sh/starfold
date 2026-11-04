@@ -7,6 +7,8 @@
 export const Bin = {
 	/** Server: H.264 stripe update (16-byte header, then Annex-B). */
 	Video: 0x01,
+	/** Server, protocol 2: a stripe update of the negotiated codec (20-byte header with the epoch). */
+	VideoV2: 0x05,
 	/** Server: Opus desktop audio. */
 	Audio: 0x02,
 	/** Server: cursor image (RGBA). */
@@ -45,11 +47,55 @@ export interface Hello {
 	readOnly?: boolean;
 	/** Dynamic resolution: desktop pixels per CSS pixel of the viewer's window. */
 	resize?: { scale: number };
+	/** 2: the server negotiates codecs (absent from older servers). */
+	protocol?: number;
+	/** Generation of `videoOffers`, echoed in the capability hello. */
+	offer?: number;
+	videoOffers?: VideoOffer[];
 }
+
+/** What a decoder is configured with for one stripe. */
+export interface DecoderConfig {
+	codec: string;
+	codedWidth: number;
+	codedHeight: number;
+}
+
+export interface StripeConfig {
+	i: number;
+	y: number;
+	h: number;
+	config: DecoderConfig;
+}
+
+/** A codec the server can stream now, with every stripe's configuration. */
+export interface VideoOffer {
+	codec: 'h264' | 'hevc' | 'av1';
+	format: string;
+	stripes: StripeConfig[];
+}
+
+/** One configuration the decoder accepted, exactly as tested. */
+export interface DecodeEntry extends DecoderConfig {
+	implementation: 'webcodecs' | 'dav1d-wasm';
+	hardwareAcceleration?: HardwareAcceleration;
+}
+
+/** Protocol 2: the configuration of everything sent in `epoch` (or that none decodes here). */
+export type CodecMessage =
+	| ({
+			t: 'codec';
+			epoch: number;
+			w: number;
+			h: number;
+			error?: undefined;
+	  } & VideoOffer)
+	| { t: 'codec'; epoch: number; error: string };
 
 /** JSON text messages from the server. */
 export type ServerMessage =
 	| Hello
+	| CodecMessage
 	| { t: 'ping'; s: number }
 	| { t: 'clip'; d: string }
 	| { t: 'mic'; on: boolean }
@@ -74,6 +120,18 @@ export const cmd = {
 	pong: (sent: number) => `po,${sent}`,
 } as const;
 
+/** Protocol 2 messages to the server (JSON; acks and keyframe requests carry the epoch). */
+export const msg = {
+	hello: (offer: number | undefined, decode: DecodeEntry[]) =>
+		JSON.stringify({ t: 'hello', v: 2, offer, decode }),
+	ready: (epoch: number) => JSON.stringify({ t: 'codec-ready', epoch }),
+	error: (epoch: number, reason: string) =>
+		JSON.stringify({ t: 'codec-error', epoch, reason }),
+	ack: (epoch: number, frame: number) =>
+		JSON.stringify({ t: 'ack', epoch, frame }),
+	keyframe: (epoch: number) => JSON.stringify({ t: 'keyframe', epoch }),
+} as const;
+
 /** Header of a video message (after the type byte). */
 export interface VideoHeader {
 	key: boolean;
@@ -83,6 +141,8 @@ export interface VideoHeader {
 	stripe: number;
 	/** Stripe updates that make up this frame. */
 	parts: number;
+	/** Protocol 2 only. */
+	epoch?: number;
 }
 
 export function parseVideoHeader(b: Uint8Array): VideoHeader {
@@ -94,9 +154,11 @@ export function parseVideoHeader(b: Uint8Array): VideoHeader {
 		pipe: u32(6),
 		stripe: b[10],
 		parts: b[12],
+		epoch: b[0] === Bin.VideoV2 ? u32(16) : undefined,
 	};
 }
 export const VIDEO_HEADER_BYTES = 16;
+export const VIDEO_V2_HEADER_BYTES = 20;
 
 // ---- page <-> worker ----
 

@@ -1,0 +1,314 @@
+//! Codec negotiation (protocol 2): the server offers the codecs its eligible encoders
+//! produce, each viewer answers with the exact decoder configurations it tested, and
+//! every viewer is routed to an encoder cohort.
+//!
+//! At most two cohorts run at once: the H.264 one (legacy viewers, recording, and v2
+//! viewers that decode nothing better) and one "best" cohort. A viewer whose best
+//! choice would need a third joins the closest cohort it can decode.
+
+use crate::encoder::caps::{Acceleration, Registry};
+use crate::encoder::{Backend, BitstreamFormat, Codec, StreamConfig};
+use serde::{Deserialize, Serialize};
+
+pub const PROTOCOL: u32 = 2;
+/// The most decoder configurations one capability hello may list.
+pub const MAX_DECODE_ENTRIES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Candidate {
+    pub codec: Codec,
+    pub backend: Backend,
+    pub hardware: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Implementation {
+    #[serde(rename = "webcodecs")]
+    WebCodecs,
+    #[serde(rename = "dav1d-wasm")]
+    Dav1dWasm,
+}
+
+/// One configuration the viewer's decoder accepted, exactly as it was tested.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecodeCap {
+    pub codec: String,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub implementation: Implementation,
+    #[serde(default)]
+    pub hardware_acceleration: Option<String>,
+}
+
+/// What a viewer decodes the stream with: a cohort's encoder and the viewer's decoder.
+/// Legacy viewers have no implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Choice {
+    pub cand: Candidate,
+    pub implementation: Option<Implementation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecoderConfig {
+    pub codec: String,
+    pub coded_width: u32,
+    pub coded_height: u32,
+}
+
+impl DecoderConfig {
+    pub fn of(c: &StreamConfig) -> Self {
+        DecoderConfig {
+            codec: c.codec_string.clone(),
+            coded_width: c.coded.0,
+            coded_height: c.coded.1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StripeOffer {
+    pub i: usize,
+    pub y: u32,
+    pub h: u32,
+    pub config: DecoderConfig,
+}
+
+/// A codec the server can stream right now, with the configuration of every stripe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Offer {
+    pub codec: Codec,
+    pub format: &'static str,
+    pub stripes: Vec<StripeOffer>,
+    #[serde(skip)]
+    pub cand: Candidate,
+}
+
+pub fn format_name(f: BitstreamFormat) -> &'static str {
+    match f {
+        BitstreamFormat::AnnexB => "annexb",
+        BitstreamFormat::Av1LowOverhead => "av1-low-overhead",
+    }
+}
+
+impl Offer {
+    /// Whether the viewer's tested configurations cover every stripe with `imp`.
+    fn decodable(&self, caps: &[DecodeCap], imp: Implementation) -> bool {
+        if imp == Implementation::Dav1dWasm && self.codec != Codec::Av1 {
+            return false;
+        }
+        self.stripes.iter().all(|s| {
+            caps.iter().any(|c| {
+                c.implementation == imp
+                    && c.codec == s.config.codec
+                    && c.coded_width == s.config.coded_width
+                    && c.coded_height == s.config.coded_height
+            })
+        })
+    }
+
+    /// The server's `codec` message announcing this configuration to a viewer.
+    pub fn announce(&self, epoch: u32, w: u32, h: u32) -> String {
+        serde_json::json!({
+            "t": "codec",
+            "epoch": epoch,
+            "codec": self.codec,
+            "format": self.format,
+            "w": w,
+            "h": h,
+            "stripes": self.stripes,
+        })
+        .to_string()
+    }
+}
+
+/// The server's answer when nothing it offers decodes on the viewer.
+pub fn no_codec(epoch: u32) -> String {
+    serde_json::json!({"t": "codec", "epoch": epoch, "error": "no-common-codec"}).to_string()
+}
+
+fn codec_rank(c: Codec) -> u8 {
+    match c {
+        Codec::Av1 => 0,
+        Codec::Hevc => 1,
+        Codec::H264 => 2,
+    }
+}
+
+/// The encoders a stream may use, best first: eligible AV1, then HEVC (hardware before
+/// software), then the configured H.264 backend (`--encoder`, OpenH264 by default),
+/// which also serves legacy viewers and recording.
+pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
+    let mut v: Vec<Candidate> = Vec::new();
+    for codec in [Codec::Av1, Codec::Hevc] {
+        for e in reg.eligible(codec) {
+            let c = Candidate {
+                codec,
+                backend: e.backend,
+                hardware: e.acceleration == Acceleration::Hardware,
+            };
+            if !v
+                .iter()
+                .any(|x| x.codec == c.codec && x.backend == c.backend)
+            {
+                v.push(c);
+            }
+        }
+    }
+    v.sort_by_key(|c| (codec_rank(c.codec), !c.hardware));
+    v.push(Candidate {
+        codec: Codec::H264,
+        backend: h264,
+        hardware: reg
+            .eligible(Codec::H264)
+            .any(|e| e.backend == h264 && e.acceleration == Acceleration::Hardware),
+    });
+    v
+}
+
+/// A viewer's choices, best first: every offer it decodes with WebCodecs in the
+/// server's order, then AV1 through dav1d-wasm, which is only ever a last resort.
+pub fn preferences(caps: &[DecodeCap], rejected: &[Choice], offers: &[Offer]) -> Vec<Choice> {
+    let mut v = Vec::new();
+    for imp in [Implementation::WebCodecs, Implementation::Dav1dWasm] {
+        for o in offers {
+            let c = Choice {
+                cand: o.cand,
+                implementation: Some(imp),
+            };
+            if o.decodable(caps, imp) && !rejected.contains(&c) && !v.contains(&c) {
+                v.push(c);
+            }
+        }
+    }
+    v
+}
+
+pub struct Viewer<'a> {
+    pub id: u64,
+    pub legacy: bool,
+    pub caps: &'a [DecodeCap],
+    pub rejected: &'a [Choice],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// The non-H.264 cohort, if any viewer gets it.
+    pub best: Option<Candidate>,
+    /// Each viewer's choice; None: nothing the server can stream decodes there.
+    pub picks: Vec<(u64, Option<Choice>)>,
+}
+
+/// Routes `viewers` (in the order they joined) to at most two cohorts. The current best
+/// cohort stays while it is still some viewer's first choice, so viewers aren't moved
+/// back and forth as others come and go; otherwise the earliest viewer whose first
+/// choice is better than H.264 decides it.
+pub fn plan(
+    viewers: &[Viewer<'_>],
+    offers: &[Offer],
+    h264: Candidate,
+    current: Option<Candidate>,
+) -> Plan {
+    let prefs: Vec<Vec<Choice>> = viewers
+        .iter()
+        .map(|v| {
+            if v.legacy {
+                Vec::new()
+            } else {
+                preferences(v.caps, v.rejected, offers)
+            }
+        })
+        .collect();
+    let firsts = || {
+        prefs
+            .iter()
+            .filter_map(|p| p.first())
+            .map(|c| c.cand)
+            .filter(|c| c.codec != Codec::H264)
+    };
+    let best = current
+        .filter(|b| firsts().any(|c| c == *b))
+        .or_else(|| firsts().next());
+    let picks = viewers
+        .iter()
+        .zip(&prefs)
+        .map(|(v, p)| {
+            let pick = if v.legacy {
+                Some(Choice {
+                    cand: h264,
+                    implementation: None,
+                })
+            } else {
+                p.iter()
+                    .find(|c| c.cand == h264 || Some(c.cand) == best)
+                    .copied()
+            };
+            (v.id, pick)
+        })
+        .collect::<Vec<_>>();
+    Plan { best, picks }
+}
+
+/// Text messages of protocol 2 from the client (the CSV commands stay as they are).
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(tag = "t")]
+pub enum ClientMsg {
+    #[serde(rename = "hello")]
+    Hello {
+        v: u32,
+        /// The `offer` generation of the server hello these configurations answer.
+        #[serde(default)]
+        offer: Option<u64>,
+        #[serde(default)]
+        decode: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "codec-ready")]
+    Ready { epoch: u32 },
+    #[serde(rename = "codec-error")]
+    Error {
+        epoch: u32,
+        #[serde(default)]
+        reason: String,
+    },
+    #[serde(rename = "ack")]
+    Ack { epoch: u32, frame: u32 },
+    #[serde(rename = "keyframe")]
+    Keyframe { epoch: u32 },
+}
+
+impl ClientMsg {
+    pub fn parse(t: &str) -> Option<ClientMsg> {
+        serde_json::from_str(t).ok()
+    }
+}
+
+/// The entries of a capability hello this server understands; others are skipped.
+pub fn decode_caps(entries: &[serde_json::Value]) -> Vec<DecodeCap> {
+    entries
+        .iter()
+        .take(MAX_DECODE_ENTRIES)
+        .filter_map(|e| serde_json::from_value(e.clone()).ok())
+        .collect()
+}
+
+/// Video message type bytes: protocol 1 and protocol 2 (with the epoch).
+pub const VIDEO_V1: u8 = 0x01;
+pub const VIDEO_V2: u8 = 0x05;
+/// Header bytes of each.
+pub const HDR_V1: usize = 16;
+pub const HDR_V2: usize = 20;
+
+/// The protocol 2 form of a protocol 1 video message: the same header with the epoch
+/// appended, then the same payload.
+pub fn video_v2(v1: &[u8], epoch: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v1.len() + HDR_V2 - HDR_V1);
+    out.extend_from_slice(&v1[..HDR_V1]);
+    out[0] = VIDEO_V2;
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&v1[HDR_V1..]);
+    out
+}
+
+#[cfg(test)]
+mod tests;

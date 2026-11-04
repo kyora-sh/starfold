@@ -146,8 +146,9 @@ fn begin(
     }
     let (tx, rx) = mpsc::unbounded_channel();
     let client = r.hub.add_client(tx);
-    client.video.store(true, Ordering::Relaxed);
-    r.hub.wake();
+    // A protocol 1 viewer: the H.264 stream the MP4 writer takes.
+    client.set_video(true);
+    r.hub.replan();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
         let res = collect(&hub, &client, rx, stop, max).await;

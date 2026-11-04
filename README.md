@@ -3,8 +3,9 @@
 starfold is kyora's remote-desktop streaming, with codec negotiation between server and
 browser. It is a fork of [tembo/voxl](https://github.com/tembo/voxl) (MIT, see
 [NOTICE](NOTICE)); the rest of this README is voxl's and still says voxl where it means
-the server. The binary is `starfold`; flags, environment variables and the protocol are
-voxl's.
+the server. The binary is `starfold`; flags and environment variables are voxl's, and so
+is the protocol, which a protocol 2 client extends with codec negotiation (voxl's clients
+still get H.264 as before).
 
 # voxl
 
@@ -334,8 +335,7 @@ no CPU and power `/wait`. Wayland support is being worked on.
 
 **Does it use the GPU?** Not yet. starfold encodes H.264 on the CPU with OpenH264 (the
 CPU table above was measured with x264: 1.3–1.7 cores for a busy 2560x1600 desktop, X
-server included). Hardware
-encoding on macOS is in progress.
+server included). On macOS, a browser that decodes HEVC gets it from VideoToolbox.
 
 **What's the license?** The code is MIT, and the default build links OpenH264
 (BSD-2-Clause). A build with the `x264` feature links x264, which is GPL-2.0, so that

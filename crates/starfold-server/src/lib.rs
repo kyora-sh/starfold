@@ -26,6 +26,7 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+mod negotiate;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -257,7 +258,8 @@ async fn serve(a: HashMap<String, String>) {
     #[cfg(windows)]
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
-    if let Err(e) = video::spawn(vcfg, hub.clone(), screen) {
+    let candidates = negotiate::candidates(&encoders, encoder);
+    if let Err(e) = video::spawn(vcfg, hub.clone(), screen, candidates) {
         log::error!("video init failed: {e}");
         std::process::exit(1);
     }

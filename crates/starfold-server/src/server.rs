@@ -1,7 +1,8 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
-use crate::hub::{Client, Hub, Out};
+use crate::hub::{Client, Hub, Out, Phase, Proto};
 use crate::input::InputEvent;
+use crate::negotiate::ClientMsg;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
@@ -150,6 +151,15 @@ pub fn router(state: AppState) -> Router {
     let wait_routes = Router::new()
         .route("/wait", get(crate::wait::wait))
         .with_state(state.hub.clone());
+    // VOXL_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
+    // epoch (a codec switch, even to the same codec), for end-to-end tests.
+    let debug_routes: Router = if std::env::var_os("VOXL_TEST_HOOKS").is_some() {
+        Router::new()
+            .route("/debug/renegotiate", axum::routing::post(renegotiate))
+            .with_state(state.hub.clone())
+    } else {
+        Router::new()
+    };
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
@@ -167,6 +177,49 @@ pub fn router(state: AppState) -> Router {
         .merge(file_routes)
         .merge(record_routes)
         .merge(wait_routes)
+        .merge(debug_routes)
+}
+
+async fn renegotiate(State(hub): State<Arc<Hub>>) -> Response {
+    let mut n = 0;
+    for c in hub.clients.lock().iter() {
+        let mut r = c.route.lock();
+        if r.proto == Proto::V2 && r.cohort.is_some() {
+            r.detach();
+            n += 1;
+        }
+    }
+    hub.replan();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "renegotiated": n }).to_string(),
+    )
+        .into_response()
+}
+
+/// A client's protocol and codec, for /stats.
+fn route_stats(c: &Client) -> serde_json::Value {
+    let r = c.route.lock();
+    let protocol = match r.proto {
+        Proto::Unknown => serde_json::Value::Null,
+        Proto::Legacy => 1.into(),
+        Proto::V2 => 2.into(),
+    };
+    let phase = match r.phase {
+        Phase::Idle => "idle",
+        Phase::Announced(_) => "announced",
+        Phase::Ready => "ready",
+        Phase::NoCodec => "no-codec",
+    };
+    serde_json::json!({
+        "protocol": protocol,
+        "cohort": r.cohort,
+        "codec": r.choice.map(|c| c.cand.codec),
+        "backend": r.choice.map(|c| c.cand.backend),
+        "implementation": r.choice.and_then(|c| c.implementation),
+        "epoch": r.epoch,
+        "phase": phase,
+    })
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
@@ -179,7 +232,8 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|c| {
             let (n, age) = c.backlog();
             serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.delay.lock().queue_ms as u64, "delivered_kbps": (c.delivered.lock().rate_bps / 1000.0) as u64})
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.delay.lock().queue_ms as u64, "delivered_kbps": (c.delivered.lock().rate_bps / 1000.0) as u64,
+                "stream": route_stats(c)})
         })
         .collect();
     let body = serde_json::json!({
@@ -198,6 +252,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
+        "cohorts": &*s.hub.cohorts.lock(),
         "encoders": &*s.encoders,
     });
     (
@@ -306,7 +361,56 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
 /// microphone, resizing) and is dropped. The web client keeps the same list.
 const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
+/// Protocol 2's JSON messages. All of them are about watching (capabilities, decoder
+/// state, acks and keyframe requests), so read-only viewers send them too.
+fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
+    match m {
+        ClientMsg::Hello { v, offer, decode } if v >= crate::negotiate::PROTOCOL => {
+            let gen = s.hub.offer_gen.load(Ordering::Relaxed);
+            // It answers offers that have since changed; its answer to the new ones follows.
+            if offer.is_some_and(|o| o != gen) {
+                return;
+            }
+            c.caps_hello(crate::negotiate::decode_caps(&decode), gen);
+            s.hub.replan();
+        }
+        ClientMsg::Hello { .. } => {}
+        ClientMsg::Ready { epoch } => {
+            if c.codec_ready(epoch) {
+                s.hub.wake();
+            }
+        }
+        ClientMsg::Error { epoch, reason } => {
+            if let Some(ch) = c.codec_error(epoch) {
+                log::warn!(
+                    "client {}: {:?} from {} failed ({reason}); trying the next codec",
+                    c.id,
+                    ch.cand.codec,
+                    ch.cand.backend.name()
+                );
+                s.hub.replan();
+            }
+        }
+        ClientMsg::Ack { epoch, frame } => {
+            if c.ack(Some(epoch), frame) {
+                s.hub.wake();
+            }
+        }
+        ClientMsg::Keyframe { epoch } => {
+            if c.request_keyframe(Some(epoch)) {
+                s.hub.wake();
+            }
+        }
+    }
+}
+
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
+    if t.starts_with('{') {
+        if let Some(m) = ClientMsg::parse(t) {
+            handle_json(s, c, m);
+        }
+        return;
+    }
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
     // --read-only: accept only what watching needs, right where commands are applied,
     // so a client that ignores the hello flag cannot drive the desktop, whatever
@@ -323,8 +427,9 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
     match cmd {
         "a" => {
             if let Some(id) = num::<u32>(&mut it) {
-                c.on_ack(id);
-                s.hub.wake();
+                if c.ack(None, id) {
+                    s.hub.wake();
+                }
             }
         }
         "m" => {
@@ -363,14 +468,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             rest.to_string(),
         ))),
         "v" => {
-            let on = rest == "1";
-            c.video.store(on, Ordering::Relaxed);
-            if on {
-                c.inflight.lock().clear();
-                c.started.store(false, Ordering::Relaxed);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
-            }
-            s.hub.wake();
+            c.set_video(rest == "1");
+            s.hub.replan();
         }
         "au" => c.audio.store(rest == "1" && s.audio, Ordering::Relaxed),
         "mi" => {
@@ -400,9 +499,9 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             }
         }
         "kf" => {
-            c.started.store(false, Ordering::Relaxed);
-            c.needs_keyframe.store(true, Ordering::Relaxed);
-            s.hub.wake();
+            if c.request_keyframe(None) {
+                s.hub.wake();
+            }
         }
         "po" => {
             if let Some(sent) = num::<u64>(&mut it) {
@@ -444,17 +543,12 @@ mod tests {
         "po,1",
     ];
 
-    /// Sends every command to a server that has input, a microphone and resizing wired
-    /// up, and returns (input events, microphone messages, a resize was asked for).
-    fn drive(read_only: bool) -> (usize, usize, bool) {
-        let hub = Hub::new();
-        hub.width.store(1280, Ordering::Relaxed);
-        hub.height.store(800, Ordering::Relaxed);
-        *hub.resize_max.lock() = Some((2560, 1600));
-        let (input_tx, input_rx) = std::sync::mpsc::channel();
-        *hub.input.lock() = Some(input_tx);
-        let (mic_tx, mic_rx) = std::sync::mpsc::channel();
-        let s = AppState {
+    fn app(
+        hub: &Arc<Hub>,
+        read_only: bool,
+        mic: Option<std::sync::mpsc::Sender<crate::mic::MicMsg>>,
+    ) -> AppState {
+        AppState {
             hub: hub.clone(),
             audio: true,
             epoch: Instant::now(),
@@ -465,7 +559,7 @@ mod tests {
                 default_dir: String::new(),
                 max_upload_bytes: 0,
             }),
-            mic: Some(mic_tx),
+            mic,
             resize: true,
             read_only,
             recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
@@ -473,7 +567,20 @@ mod tests {
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
             encoders: Default::default(),
-        };
+        }
+    }
+
+    /// Sends every command to a server that has input, a microphone and resizing wired
+    /// up, and returns (input events, microphone messages, a resize was asked for).
+    fn drive(read_only: bool) -> (usize, usize, bool) {
+        let hub = Hub::new();
+        hub.width.store(1280, Ordering::Relaxed);
+        hub.height.store(800, Ordering::Relaxed);
+        *hub.resize_max.lock() = Some((2560, 1600));
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        *hub.input.lock() = Some(input_tx);
+        let (mic_tx, mic_rx) = std::sync::mpsc::channel();
+        let s = app(&hub, read_only, Some(mic_tx));
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
@@ -504,6 +611,55 @@ mod tests {
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    #[test]
+    fn protocol_is_told_by_the_first_message() {
+        let hub = Hub::new();
+        let s = app(&hub, true, None);
+        let mut rtts = Default::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let old = hub.add_client(tx);
+        handle_text(&s, &old, "v,1", &mut rtts);
+        assert_eq!(old.route.lock().proto, Proto::Legacy);
+        // Read-only viewers negotiate too: every protocol 2 message is about watching.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let new = hub.add_client(tx);
+        let caps = r#"{"t":"hello","v":2,"offer":0,"decode":[{"codec":"avc1.42c01f","codedWidth":640,"codedHeight":480,"implementation":"webcodecs"}]}"#;
+        handle_text(&s, &new, caps, &mut rtts);
+        handle_text(&s, &new, "v,1", &mut rtts);
+        let r = new.route.lock();
+        assert_eq!(r.proto, Proto::V2);
+        assert_eq!(r.caps.len(), 1);
+        drop(r);
+        assert!(new.video.load(Ordering::Relaxed));
+        // An answer to an older offer generation is ignored.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let late = hub.add_client(tx);
+        handle_text(
+            &s,
+            &late,
+            &caps.replace("\"offer\":0", "\"offer\":9"),
+            &mut rtts,
+        );
+        assert_eq!(late.route.lock().proto, Proto::Unknown);
+        // A v2 ack is ignored from a protocol 1 viewer, and `a,` from a protocol 2 one.
+        old.inflight.lock().push_back(crate::hub::Inflight {
+            id: 1,
+            sent: Instant::now(),
+            bytes: 1,
+        });
+        handle_text(&s, &old, r#"{"t":"ack","epoch":0,"frame":1}"#, &mut rtts);
+        assert_eq!(old.inflight.lock().len(), 1);
+        handle_text(&s, &old, "a,1", &mut rtts);
+        assert_eq!(old.inflight.lock().len(), 0);
+        new.inflight.lock().push_back(crate::hub::Inflight {
+            id: 1,
+            sent: Instant::now(),
+            bytes: 1,
+        });
+        handle_text(&s, &new, "a,1", &mut rtts);
+        assert_eq!(new.inflight.lock().len(), 1);
     }
 
     #[test]

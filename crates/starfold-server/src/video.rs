@@ -1,15 +1,28 @@
-//! Video pipeline: damage-driven capture -> I420 -> H.264 -> clients, with ack-based flow control.
+//! Video pipeline: damage-driven capture -> I420 -> encoder cohorts -> clients, with
+//! ack-based flow control per cohort.
+//!
+//! One capture feeds every cohort (negotiate.rs picks them). A cohort encodes the
+//! captures it has room for and catches up on the damage of those it skipped, so a
+//! slow viewer holds back only its own cohort.
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{self, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder};
+use crate::encoder::{
+    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, StreamConfig,
+    VideoEncoder,
+};
 use crate::hub::wait_any;
-use crate::hub::{Hub, Inflight, Out};
+use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto};
+use crate::negotiate::{self, Candidate, Choice, DecodeCap, DecoderConfig, Offer, StripeOffer};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone)]
 pub struct VideoConfig {
@@ -30,10 +43,14 @@ pub struct VideoConfig {
     pub adaptive_threads: bool,
 }
 
-struct Job {
-    buf: Box<I420>,
-    idx: usize,
-    force_idr: bool,
+/// Opens an encoder: `encoder::open`, or a fake in tests.
+pub type Open =
+    Arc<dyn Fn(&EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> + Send + Sync>;
+
+/// One capture as the cohorts get it: the whole current picture and what changed in it.
+#[derive(Clone)]
+struct Frame {
+    buf: Arc<I420>,
     paintover: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
@@ -43,6 +60,11 @@ struct Job {
     mb_dirty: Option<Arc<Vec<u8>>>,
     captured_at: Instant,
     marker_ms: i64,
+}
+
+struct Job {
+    frame: Frame,
+    force_idr: bool,
 }
 
 fn union(a: Option<Band>, b: Band) -> Band {
@@ -55,46 +77,775 @@ fn union(a: Option<Band>, b: Band) -> Band {
     }
 }
 
+fn union_opt(a: Option<Band>, b: Option<Band>) -> Option<Band> {
+    match (a, b) {
+        (a, None) => a,
+        (a, Some(b)) => Some(union(a, b)),
+    }
+}
+
+fn or_maps(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter().zip(b).map(|(x, y)| x | y).collect()
+}
+
+/// What a cohort skipped while it had no room, encoded with its next frame.
+struct Skipped {
+    band: Option<Band>,
+    /// None: analyse everything.
+    mb: Option<Vec<u8>>,
+}
+
+fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
+    match prev {
+        None => Skipped {
+            band: f.band,
+            mb: f.mb_dirty.as_ref().map(|m| m.to_vec()),
+        },
+        Some(p) => Skipped {
+            band: union_opt(p.band, f.band),
+            mb: match (p.mb, &f.mb_dirty) {
+                (Some(a), Some(b)) => Some(or_maps(&a, b)),
+                _ => None,
+            },
+        },
+    }
+}
+
+fn catch_up(s: Skipped, mut f: Frame) -> Frame {
+    f.band = union_opt(s.band, f.band);
+    f.mb_dirty = match (s.mb, f.mb_dirty) {
+        (Some(a), Some(b)) => Some(Arc::new(or_maps(&a, &b))),
+        _ => None,
+    };
+    f
+}
+
+/// Concurrent encoder cohorts per stream: the best codec and H.264.
+const MAX_COHORTS: usize = 2;
+/// One buffer being filled, and per cohort one encoding and one queued.
+const MAX_BUFS: usize = 1 + 2 * MAX_COHORTS;
+/// How long a viewer has to configure its decoders for a `codec` message.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often viewers are rerouted when nothing asked for it (for READY_TIMEOUT).
+const TICK: Duration = Duration::from_millis(250);
+
+/// Capture buffers, shared with the encoders while they read them. A buffer is free
+/// when only the pool holds it; each remembers the rows that changed since it was last
+/// converted.
+struct Pool {
+    bufs: Vec<(Arc<I420>, Option<Band>)>,
+    w: usize,
+    h: usize,
+    full: Band,
+}
+
+impl Pool {
+    fn new(w: usize, h: usize, full: Band) -> Self {
+        Pool {
+            bufs: (0..2)
+                .map(|_| (Arc::new(I420::new(w, h)), Some(full)))
+                .collect(),
+            w,
+            h,
+            full,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        for b in &mut self.bufs {
+            b.1 = Some(self.full);
+        }
+    }
+
+    fn free(&mut self) -> Option<usize> {
+        if let Some(i) = self
+            .bufs
+            .iter_mut()
+            .position(|b| Arc::get_mut(&mut b.0).is_some())
+        {
+            return Some(i);
+        }
+        (self.bufs.len() < MAX_BUFS).then(|| {
+            self.bufs
+                .push((Arc::new(I420::new(self.w, self.h)), Some(self.full)));
+            self.bufs.len() - 1
+        })
+    }
+
+    /// Brings free buffer `i` up to date (the rows it missed plus `band`) with `convert`
+    /// and hands it out.
+    fn fill(
+        &mut self,
+        i: usize,
+        band: Option<Band>,
+        convert: impl FnOnce(&mut I420, Band),
+    ) -> Arc<I420> {
+        let todo = union_opt(self.bufs[i].1.take(), band);
+        if let Some(b) = band {
+            for (j, x) in self.bufs.iter_mut().enumerate() {
+                if j != i {
+                    x.1 = Some(union(x.1, b));
+                }
+            }
+        }
+        if let Some(t) = todo {
+            match Arc::get_mut(&mut self.bufs[i].0) {
+                Some(buf) => convert(buf, t),
+                // Not free after all: convert it next time.
+                None => self.bufs[i].1 = Some(t),
+            }
+        }
+        self.bufs[i].0.clone()
+    }
+}
+
+/// What a cohort's encode thread shares with the capture thread.
+struct Shared {
+    id: u64,
+    cand: Candidate,
+    /// The configuration announced to viewers; the encode thread updates it when the
+    /// stream's own parameter sets change.
+    offer: Mutex<Offer>,
+    /// Jobs queued or being encoded.
+    busy: AtomicUsize,
+    /// A keyframe job is with the encoder; viewers' requests stay set until it lands.
+    idr_inflight: AtomicBool,
+    /// Adaptive bitrate cap (kbit/s).
+    target: AtomicU32,
+    w: u32,
+    h: u32,
+}
+
+impl Shared {
+    /// The stripes' streams told their parameters (on their first frame or when they
+    /// changed). Where they differ from what was announced, the cohort's protocol 2
+    /// viewers get a new epoch and the frames again once ready for it.
+    fn reconfigure(&self, hub: &Hub, configs: &[Option<StreamConfig>]) {
+        let offer = {
+            let mut o = self.offer.lock();
+            let mut changed = false;
+            for (s, c) in o.stripes.iter_mut().zip(configs) {
+                if let Some(c) = c {
+                    let d = DecoderConfig::of(c);
+                    if s.config != d {
+                        log::info!(
+                            "cohort {}: stripe {} is now {} {}x{}",
+                            self.id,
+                            s.i,
+                            d.codec,
+                            d.coded_width,
+                            d.coded_height
+                        );
+                        s.config = d;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return;
+            }
+            o.clone()
+        };
+        let clients = hub.clients.lock().clone();
+        for c in clients {
+            let mut r = c.route.lock();
+            if r.cohort != Some(self.id) || r.proto != Proto::V2 {
+                continue;
+            }
+            r.epoch = r.epoch.wrapping_add(1);
+            r.phase = Phase::Announced(Instant::now());
+            c.inflight.lock().clear();
+            c.started.store(false, Ordering::Relaxed);
+            c.needs_keyframe.store(false, Ordering::Relaxed);
+            c.send(Out::Text(offer.announce(r.epoch, self.w, self.h)));
+        }
+    }
+}
+
+/// One encoder per stripe for one candidate, on its own thread.
+struct Cohort {
+    shared: Arc<Shared>,
+    tx: Option<mpsc::SyncSender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    rc: RateCtl,
+    skipped: Option<Skipped>,
+    /// Had viewers at the last frame.
+    active: bool,
+}
+
+impl Drop for Cohort {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A cohort's viewers that get frames now, and whether one is waiting for a keyframe.
+struct View {
+    clients: Vec<Arc<Client>>,
+    want_key: bool,
+}
+
+fn encoder_config(
+    cfg: &VideoConfig,
+    cand: Candidate,
+    width: u32,
+    height: u32,
+    stripes: usize,
+) -> EncoderConfig {
+    EncoderConfig {
+        backend: cand.backend,
+        codec: cand.codec,
+        width,
+        height,
+        fps: cfg.fps,
+        threads: if cfg.adaptive_threads {
+            1
+        } else {
+            (cfg.threads / stripes as u32).max(1)
+        },
+        rate: RateConfig::new(cfg.crf, cfg.max_kbps, cfg.fps),
+        best_quality: cfg.crf,
+        preset: cfg.preset.clone(),
+    }
+}
+
+/// The configuration a stream from `ecfg` starts with, read from its first IDR.
+fn sample(open: &Open, ecfg: &EncoderConfig) -> Result<StreamConfig, String> {
+    let mut enc = open(ecfg)?;
+    let (w, h) = (ecfg.width as usize, ecfg.height as usize);
+    let (y, uv) = (
+        vec![128u8; w * h],
+        vec![128u8; w.div_ceil(2) * h.div_ceil(2)],
+    );
+    let frame = FrameView {
+        width: ecfg.width,
+        height: ecfg.height,
+        y: &y,
+        u: &uv,
+        v: &uv,
+        stride_y: w,
+        stride_uv: w.div_ceil(2),
+    };
+    let mut aus = enc.encode(
+        &frame,
+        EncodeOptions {
+            force_keyframe: true,
+            ..Default::default()
+        },
+    )?;
+    aus.extend(enc.drain()?);
+    aus.into_iter()
+        .find_map(|a| a.config)
+        .ok_or_else(|| "its first picture carried no stream configuration".into())
+}
+
+/// What `cand` streams at `w`x`h`: its stripes and their decoder configurations.
+fn make_offer(
+    cfg: &VideoConfig,
+    open: &Open,
+    cand: Candidate,
+    w: u32,
+    h: u32,
+) -> Result<Offer, String> {
+    // Hardware sessions are scarce: one picture unless it is too large for one.
+    let want = if cand.hardware && cand.codec != Codec::H264 {
+        1
+    } else {
+        cfg.stripes
+    };
+    let layout = fit_stripes(cand.backend, w, h, want);
+    if layout.len() as u32 > want.clamp(1, 16) {
+        log::info!(
+            "{}x{} is too large for one {} picture: {} stripes",
+            w,
+            h,
+            cand.backend.name(),
+            layout.len()
+        );
+    }
+    let mut seen: Vec<(u32, StreamConfig)> = Vec::new();
+    let mut stripes = Vec::new();
+    for (i, &(y, sh)) in layout.iter().enumerate() {
+        let sc = match seen.iter().find(|(h, _)| *h == sh) {
+            Some((_, c)) => c.clone(),
+            None => {
+                let c = sample(open, &encoder_config(cfg, cand, w, sh, layout.len()))?;
+                seen.push((sh, c.clone()));
+                c
+            }
+        };
+        stripes.push(StripeOffer {
+            i,
+            y,
+            h: sh,
+            config: DecoderConfig::of(&sc),
+        });
+    }
+    let format = seen
+        .first()
+        .map(|(_, c)| negotiate::format_name(c.format))
+        .ok_or("nothing to encode")?;
+    Ok(Offer {
+        codec: cand.codec,
+        format,
+        stripes,
+        cand,
+    })
+}
+
+/// A viewer as one routing pass sees it.
+struct Snap {
+    client: Arc<Client>,
+    legacy: bool,
+    caps: Vec<DecodeCap>,
+    rejected: Vec<Choice>,
+}
+
+/// Routes viewers to cohorts and feeds the cohorts; owned by the capture thread, which
+/// makes it the one place configurations change.
+struct Engine {
+    hub: Arc<Hub>,
+    cfg: VideoConfig,
+    w: u32,
+    h: u32,
+    h264: Candidate,
+    offers: Vec<Offer>,
+    /// Candidates whose encoders failed to open at this size.
+    failed: Vec<Candidate>,
+    cohorts: Vec<Cohort>,
+    best: Option<Candidate>,
+    open: Open,
+    last_tick: Instant,
+}
+
+impl Engine {
+    /// Offers every candidate that encodes at `w`x`h`, opens the H.264 cohort, and gives
+    /// connected clients the new geometry and offers.
+    fn new(
+        cfg: VideoConfig,
+        hub: Arc<Hub>,
+        w: u32,
+        h: u32,
+        cands: &[Candidate],
+        open: Open,
+    ) -> Result<Engine, String> {
+        let h264 = *cands
+            .iter()
+            .find(|c| c.codec == Codec::H264)
+            .ok_or("no H.264 encoder")?;
+        let mut offers = Vec::new();
+        for &c in cands {
+            match make_offer(&cfg, &open, c, w, h) {
+                Ok(o) => {
+                    log::info!(
+                        "offering {:?} from {}: {}",
+                        c.codec,
+                        c.backend.name(),
+                        o.stripes
+                            .iter()
+                            .map(|s| format!(
+                                "{} {}x{}",
+                                s.config.codec, s.config.coded_width, s.config.coded_height
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    offers.push(o)
+                }
+                Err(e) if c == h264 => return Err(e),
+                Err(e) => log::warn!(
+                    "{:?} from {} is not offered at {w}x{h}: {e}",
+                    c.codec,
+                    c.backend.name()
+                ),
+            }
+        }
+        let mut eng = Engine {
+            hub: hub.clone(),
+            cfg,
+            w,
+            h,
+            h264,
+            offers,
+            failed: Vec::new(),
+            cohorts: Vec::new(),
+            best: None,
+            open,
+            last_tick: Instant::now(),
+        };
+        let c = eng.open_cohort(h264)?;
+        *hub.stripes.lock() = c
+            .shared
+            .offer
+            .lock()
+            .stripes
+            .iter()
+            .map(|s| (s.y, s.h))
+            .collect();
+        eng.cohorts.push(c);
+        *hub.offers.lock() = eng.offers.clone();
+        hub.offer_gen.fetch_add(1, Ordering::Relaxed);
+        eng.publish();
+        // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
+        hub.restart_clients();
+        Ok(eng)
+    }
+
+    fn open_cohort(&self, cand: Candidate) -> Result<Cohort, String> {
+        let offer = self
+            .offers
+            .iter()
+            .find(|o| o.cand == cand)
+            .ok_or("not offered")?
+            .clone();
+        let n = offer.stripes.len();
+        let mut stripes = Vec::new();
+        for s in &offer.stripes {
+            let ecfg = encoder_config(&self.cfg, cand, self.w, s.h, n);
+            stripes.push(Stripe {
+                y: s.y as usize,
+                h: s.h as usize,
+                enc: (self.open)(&ecfg)?,
+                cfg: ecfg,
+                max_threads: if self.cfg.adaptive_threads {
+                    (self.cfg.threads / n as u32).max(1)
+                } else {
+                    1
+                },
+                applied_kbps: None,
+                applied_crf: -1.0,
+                open: self.open.clone(),
+            });
+        }
+        let rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
+        let shared = Arc::new(Shared {
+            id: self.hub.next_cohort.fetch_add(1, Ordering::Relaxed),
+            cand,
+            offer: Mutex::new(offer),
+            busy: AtomicUsize::new(0),
+            idr_inflight: AtomicBool::new(false),
+            target: AtomicU32::new(rc.target as u32),
+            w: self.w,
+            h: self.h,
+        });
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let (hub, sh) = (self.hub.clone(), shared.clone());
+        let (crf, po_crf, uncapped) =
+            (self.cfg.crf, self.cfg.paintover_crf, self.cfg.max_kbps == 0);
+        let thread = std::thread::Builder::new()
+            .name(format!("encode-{}", shared.id))
+            .spawn(move || encode_loop(stripes, rx, hub, sh, crf, po_crf, uncapped))
+            .map_err(|e| e.to_string())?;
+        log::info!(
+            "cohort {}: {:?} from {}, {} stripe(s) at {}x{}",
+            shared.id,
+            cand.codec,
+            cand.backend.name(),
+            n,
+            self.w,
+            self.h
+        );
+        Ok(Cohort {
+            shared,
+            tx: Some(tx),
+            thread: Some(thread),
+            rc,
+            skipped: None,
+            active: false,
+        })
+    }
+
+    /// Routes the viewers again when one asked for it (or a codec-ready is overdue):
+    /// opens the best cohort the plan wants, falls back to the next candidate if its
+    /// encoders fail to open, and closes cohorts nobody uses.
+    fn replan(&mut self) {
+        let due = self.last_tick.elapsed() >= TICK;
+        if !self.hub.replan.swap(false, Ordering::AcqRel) && !due {
+            return;
+        }
+        if due {
+            self.last_tick = Instant::now();
+            self.expire();
+        }
+        let gen = self.hub.offer_gen.load(Ordering::Relaxed);
+        loop {
+            let clients = self.hub.video_clients();
+            let snaps: Vec<Snap> = clients
+                .into_iter()
+                .filter_map(|c| {
+                    let r = c.route.lock();
+                    let (legacy, caps, rejected) = match r.proto {
+                        Proto::Legacy => (true, Vec::new(), Vec::new()),
+                        Proto::V2 if r.caps_gen == gen => {
+                            (false, r.caps.clone(), r.rejected.clone())
+                        }
+                        _ => return None,
+                    };
+                    drop(r);
+                    Some(Snap {
+                        client: c,
+                        legacy,
+                        caps,
+                        rejected,
+                    })
+                })
+                .collect();
+            let offers: Vec<Offer> = self
+                .offers
+                .iter()
+                .filter(|o| !self.failed.contains(&o.cand))
+                .cloned()
+                .collect();
+            let viewers: Vec<negotiate::Viewer> = snaps
+                .iter()
+                .map(|s| negotiate::Viewer {
+                    id: s.client.id,
+                    legacy: s.legacy,
+                    caps: &s.caps,
+                    rejected: &s.rejected,
+                })
+                .collect();
+            let plan = negotiate::plan(&viewers, &offers, self.h264, self.best);
+            if let Some(b) = plan.best {
+                if !self.cohorts.iter().any(|c| c.shared.cand == b) {
+                    match self.open_cohort(b) {
+                        Ok(c) => self.cohorts.push(c),
+                        Err(e) => {
+                            log::warn!(
+                                "{:?} from {} failed to open: {e}; trying the next codec",
+                                b.codec,
+                                b.backend.name()
+                            );
+                            self.failed.push(b);
+                            continue;
+                        }
+                    }
+                }
+            }
+            self.best = plan.best;
+            let clients: Vec<Arc<Client>> = snaps.into_iter().map(|s| s.client).collect();
+            self.apply(&clients, &plan.picks);
+            break;
+        }
+        let (h264, best) = (self.h264, self.best);
+        self.cohorts
+            .retain(|c| c.shared.cand == h264 || Some(c.shared.cand) == best);
+        self.publish();
+    }
+
+    /// Moves each viewer to its pick. A protocol 2 viewer gets a new epoch and the
+    /// `codec` message, and the cohort's frames once it is ready for them.
+    fn apply(&self, clients: &[Arc<Client>], picks: &[(u64, Option<Choice>)]) {
+        let offers: Vec<(u64, Candidate, Offer)> = self
+            .cohorts
+            .iter()
+            .map(|c| (c.shared.id, c.shared.cand, c.shared.offer.lock().clone()))
+            .collect();
+        for (c, (_, pick)) in clients.iter().zip(picks) {
+            let mut r = c.route.lock();
+            let target = pick.and_then(|p| {
+                offers
+                    .iter()
+                    .find(|o| o.1 == p.cand)
+                    .map(|o| (p, o.0, &o.2))
+            });
+            let Some((p, id, offer)) = target else {
+                if r.proto == Proto::V2 && r.phase != Phase::NoCodec {
+                    r.epoch = r.epoch.wrapping_add(1);
+                    r.detach();
+                    r.phase = Phase::NoCodec;
+                    c.send(Out::Text(negotiate::no_codec(r.epoch)));
+                    log::info!("client {}: no codec in common", c.id);
+                }
+                continue;
+            };
+            if r.cohort == Some(id) && r.choice == Some(p) {
+                continue;
+            }
+            r.cohort = Some(id);
+            r.choice = Some(p);
+            c.inflight.lock().clear();
+            c.started.store(false, Ordering::Relaxed);
+            if r.proto == Proto::V2 {
+                r.epoch = r.epoch.wrapping_add(1);
+                r.phase = Phase::Announced(Instant::now());
+                c.needs_keyframe.store(false, Ordering::Relaxed);
+                c.send(Out::Text(offer.announce(r.epoch, self.w, self.h)));
+                log::info!(
+                    "client {}: {:?} from {} (epoch {}, {:?})",
+                    c.id,
+                    p.cand.codec,
+                    p.cand.backend.name(),
+                    r.epoch,
+                    p.implementation
+                );
+            } else {
+                r.phase = Phase::Ready;
+                c.needs_keyframe.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A viewer that hasn't confirmed its `codec` in time is moved to its next choice.
+    fn expire(&self) {
+        for c in self.hub.video_clients() {
+            let mut r = c.route.lock();
+            if let (Phase::Announced(t), Some(ch)) = (r.phase, r.choice) {
+                if t.elapsed() >= READY_TIMEOUT {
+                    log::warn!(
+                        "client {}: no codec-ready for epoch {} in {} s; trying the next codec",
+                        c.id,
+                        r.epoch,
+                        READY_TIMEOUT.as_secs()
+                    );
+                    if !r.rejected.contains(&ch) {
+                        r.rejected.push(ch);
+                    }
+                    r.detach();
+                }
+            }
+        }
+    }
+
+    /// The cohorts as /stats shows them.
+    fn publish(&self) {
+        let v = self
+            .cohorts
+            .iter()
+            .map(|c| {
+                let s = &c.shared;
+                serde_json::json!({
+                    "id": s.id,
+                    "codec": s.cand.codec,
+                    "backend": s.cand.backend,
+                    "hardware": s.cand.hardware,
+                    "viewers": self.hub.cohort_clients(s.id).len(),
+                    "target_kbps": s.target.load(Ordering::Relaxed),
+                    "stripes": s.offer.lock().stripes,
+                })
+            })
+            .collect();
+        *self.hub.cohorts.lock() = serde_json::Value::Array(v);
+    }
+
+    fn views(&self) -> Vec<View> {
+        self.cohorts
+            .iter()
+            .map(|c| {
+                let clients = self.hub.cohort_clients(c.shared.id);
+                let want_key = !c.shared.idr_inflight.load(Ordering::Acquire)
+                    && clients
+                        .iter()
+                        .any(|x| x.needs_keyframe.load(Ordering::Relaxed));
+                View { clients, want_key }
+            })
+            .collect()
+    }
+
+    /// Each cohort's bitrate from its own viewers; a cohort that lost them all starts over.
+    fn update_rates(&mut self, views: &[View]) {
+        let mut shown = 0;
+        for (c, v) in self.cohorts.iter_mut().zip(views) {
+            if v.clients.is_empty() {
+                if c.active {
+                    c.rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
+                }
+                c.active = false;
+                c.skipped = None;
+            } else {
+                c.active = true;
+                c.rc.update(&v.clients);
+            }
+            c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
+            if c.active {
+                shown = shown.max(c.rc.target as u32);
+            }
+        }
+        if shown == 0 {
+            shown = self.cohorts.first().map_or(0, |c| c.rc.target as u32);
+        }
+        self.hub.target_kbps.store(shown, Ordering::Relaxed);
+    }
+
+    /// Which cohorts take the next capture: those with viewers, room in their queue, and
+    /// either a keyframe owed or their viewers keeping up.
+    fn takes(&self, views: &[View], interval_ms: f64) -> Vec<bool> {
+        self.cohorts
+            .iter()
+            .zip(views)
+            .map(|(c, v)| {
+                !v.clients.is_empty()
+                    && c.shared.busy.load(Ordering::Acquire) < 2
+                    && (v.want_key || flow_ok(&v.clients, interval_ms))
+            })
+            .collect()
+    }
+
+    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) {
+        for ((c, v), &take) in self.cohorts.iter_mut().zip(views).zip(takes) {
+            if v.clients.is_empty() {
+                continue;
+            }
+            if !take {
+                c.skipped = Some(skip(c.skipped.take(), f));
+                continue;
+            }
+            let frame = match c.skipped.take() {
+                Some(s) => catch_up(s, f.clone()),
+                None => f.clone(),
+            };
+            let Some(tx) = c.tx.as_ref() else { continue };
+            let force = v.want_key;
+            if force {
+                c.shared.idr_inflight.store(true, Ordering::Release);
+            }
+            c.shared.busy.fetch_add(1, Ordering::AcqRel);
+            if let Err(e) = tx.try_send(Job {
+                frame,
+                force_idr: force,
+            }) {
+                c.shared.busy.fetch_sub(1, Ordering::AcqRel);
+                if force {
+                    c.shared.idr_inflight.store(false, Ordering::Release);
+                }
+                let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
+                c.skipped = Some(skip(None, &j.frame));
+            }
+        }
+    }
+}
+
 /// One capture/encode setup for the current screen size.
 struct Pipeline {
     cap: Capturer,
-    job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
-    encode: std::thread::JoinHandle<()>,
-    /// A keyframe job is with the encoder; viewers' requests stay set until it lands.
-    idr_inflight: Arc<AtomicBool>,
+    engine: Engine,
 }
 
 /// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
-/// ends the capture loop: the encoder drains, the screen is resized and the pipeline
+/// ends the capture loop: the encoders drain, the screen is resized and the pipeline
 /// is rebuilt at the new size, and clients get the new geometry and a keyframe.
 pub fn spawn(
     cfg: VideoConfig,
     hub: Arc<Hub>,
     mut screen: Option<crate::screen::Screen>,
+    cands: Vec<Candidate>,
 ) -> Result<(), String> {
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
-    let mut p = build(&cfg, &hub)?;
+    let open: Open = Arc::new(|c: &EncoderConfig| encoder::open(c));
+    let mut p = build(&cfg, &hub, &cands, &open)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
             let Pipeline {
                 mut cap,
-                job_tx,
-                ret_rx,
-                encode,
-                idr_inflight,
+                mut engine,
             } = p;
-            if let Err(e) = capture_loop(
-                &mut cap,
-                cfg.clone(),
-                hub.clone(),
-                job_tx,
-                ret_rx,
-                idr_inflight,
-            ) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), &mut engine) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -107,14 +858,14 @@ pub fn spawn(
                 }
             }
             drop(cap);
-            let _ = encode.join();
+            drop(engine);
             let req = hub.resize_req.lock().take();
             if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
                 if let Err(e) = s.resize(w, h) {
                     log::warn!("resize to {w}x{h} failed: {e}");
                 }
             }
-            p = match build(&cfg, &hub) {
+            p = match build(&cfg, &hub, &cands, &open) {
                 Ok(p) => p,
                 Err(e) => {
                     log::error!("video restart failed: {e}");
@@ -126,7 +877,12 @@ pub fn spawn(
     Ok(())
 }
 
-fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
+fn build(
+    cfg: &VideoConfig,
+    hub: &Arc<Hub>,
+    cands: &[Candidate],
+    open: &Open,
+) -> Result<Pipeline, String> {
     let cap = Capturer::new(cfg.display.as_deref())?;
     let (w, h) = (cap.width, cap.height);
     hub.width.store(w, Ordering::Relaxed);
@@ -140,74 +896,12 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         cfg.encoder.name(),
         cfg.threads
     );
-
-    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-    let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
-    let layout = fit_stripes(cfg.encoder, w, h, cfg.stripes);
-    if layout.len() as u32 > cfg.stripes.clamp(1, 16) {
-        log::info!(
-            "{}x{} is too large for one {} picture: {} stripes",
-            w,
-            h,
-            cfg.encoder.name(),
-            layout.len()
-        );
-    }
-    let mut stripes = Vec::new();
-    for &(y, sh) in &layout {
-        let fixed = if cfg.adaptive_threads {
-            1
-        } else {
-            (cfg.threads / layout.len() as u32).max(1)
-        };
-        let ecfg = EncoderConfig {
-            backend: cfg.encoder,
-            codec: encoder::Codec::H264,
-            width: w,
-            height: sh,
-            fps: cfg.fps,
-            threads: fixed,
-            rate: RateConfig::new(cfg.crf, cfg.max_kbps, cfg.fps),
-            best_quality: cfg.crf,
-            preset: cfg.preset.clone(),
-        };
-        let max_threads = if cfg.adaptive_threads {
-            (cfg.threads / layout.len() as u32).max(1)
-        } else {
-            1
-        };
-        stripes.push(Stripe {
-            y: y as usize,
-            h: sh as usize,
-            enc: encoder::open(&ecfg)?,
-            cfg: ecfg,
-            max_threads,
-            applied_kbps: None,
-            applied_crf: -1.0,
-        });
-    }
-    *hub.stripes.lock() = layout;
-    let hub2 = hub.clone();
-    let (crf, po_crf, uncapped) = (cfg.crf, cfg.paintover_crf, cfg.max_kbps == 0);
-    let idr_inflight = Arc::new(AtomicBool::new(false));
-    let idr2 = idr_inflight.clone();
-    let encode = std::thread::Builder::new()
-        .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, idr2, crf, po_crf, uncapped))
-        .unwrap();
-    // New geometry (and a keyframe) for clients already connected; no-op at startup.
-    hub.restart_clients();
-    Ok(Pipeline {
-        cap,
-        job_tx,
-        ret_rx,
-        encode,
-        idr_inflight,
-    })
+    let engine = Engine::new(cfg.clone(), hub.clone(), w, h, cands, open.clone())?;
+    Ok(Pipeline { cap, engine })
 }
 
-fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    for c in hub.video_clients() {
+fn flow_ok(clients: &[Arc<Client>], interval_ms: f64) -> bool {
+    for c in clients {
         let (n, age) = c.backlog();
         if n == 0 {
             continue;
@@ -275,7 +969,7 @@ impl RateCtl {
         }
     }
 
-    fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
+    fn update(&mut self, clients: &[Arc<Client>]) {
         if self.last_eval.elapsed() < Duration::from_millis(100) {
             return;
         }
@@ -367,7 +1061,6 @@ impl RateCtl {
                 self.last_inc = now;
             }
         }
-        hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
 
@@ -485,17 +1178,10 @@ fn capture_loop(
     cap: &mut Capturer,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
-    idr_inflight: Arc<AtomicBool>,
+    eng: &mut Engine,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
-    let mut pool: Vec<Option<Box<I420>>> = vec![
-        Some(Box::new(I420::new(w, h))),
-        Some(Box::new(I420::new(w, h))),
-    ];
-    let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
-    let mut next_idx = 0usize;
+    let mut pool = Pool::new(w, h, cap.full());
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     // Allow slight early capture so source jitter doesn't alias into dropped frames.
     let min_interval = interval.mul_f64(0.85);
@@ -503,8 +1189,6 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
     let mut last_motion = Instant::now();
     let mut paintover_left = 0u32;
-    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
-    hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -539,29 +1223,20 @@ fn capture_loop(
                 let _ = tx.send(shot.clone());
             }
         }
-        while let Ok((i, b)) = ret_rx.try_recv() {
-            pool[i] = Some(b);
-        }
-        let clients = hub.video_clients();
-        if clients.is_empty() {
-            if had_clients {
-                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
-                hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
-            }
+        eng.replan();
+        let views = eng.views();
+        eng.update_rates(&views);
+        if views.iter().all(|v| v.clients.is_empty()) {
             had_clients = false;
             wait_any(&[cap.fd(), hub.waker.waitable()], 500);
             continue;
         }
-        rc.update(&hub, &clients);
-        let want_key = !idr_inflight.load(Ordering::Acquire)
-            && clients
-                .iter()
-                .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
+        let want_key = views.iter().any(|v| v.want_key);
         if !had_clients {
             had_clients = true;
             // Our shm copy may be stale: re-grab everything once.
             cap.grab(cap.full())?;
-            pending = [Some(cap.full()), Some(cap.full())];
+            pool.invalidate();
             cap.damaged = true;
             full_next = true;
         }
@@ -597,21 +1272,17 @@ fn capture_loop(
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, interval_ms) {
+        let takes = eng.takes(&views, interval_ms);
+        if !takes.iter().any(|&t| t) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
         }
-        // Need a free buffer (the encoder may still hold the other).
-        if pool[next_idx].is_none() {
-            match ret_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok((i, b)) => pool[i] = Some(b),
-                Err(_) => continue,
-            }
-            if pool[next_idx].is_none() {
-                continue;
-            }
-        }
+        // Need a free buffer (the encoders may still hold the others).
+        let Some(idx) = pool.free() else {
+            wait_any(&[hub.waker.waitable()], 50);
+            continue;
+        };
 
         let t0 = Instant::now();
         let origin = cap.damaged_at.unwrap_or(t0);
@@ -664,19 +1335,9 @@ fn capture_loop(
         } else {
             None
         };
-        let idx = next_idx;
-        let mut buf = pool[idx].take().unwrap();
-        let todo = match (pending[idx], band) {
-            (p, Some(b)) => Some(union(p, b)),
-            (p, None) => p,
-        };
-        if let Some(b) = band {
-            pending[1 - idx] = Some(union(pending[1 - idx], b));
-        }
-        pending[idx] = None;
-        if let Some(t) = todo {
-            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
-        }
+        let buf = pool.fill(idx, band, |b, t| {
+            cap.convert(b, t.y0 as usize, t.y1 as usize, cfg.convert_threads)
+        });
         let t2 = Instant::now();
         hub.stats
             .grab_us
@@ -701,7 +1362,6 @@ fn capture_loop(
             false
         };
         if want_key {
-            idr_inflight.store(true, Ordering::Release);
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
         }
@@ -735,23 +1395,19 @@ fn capture_loop(
             mb_dirty.take().map(Arc::new)
         };
         last_capture = t0;
-        next_idx = 1 - idx;
-        if job_tx
-            .send(Job {
+        eng.dispatch(
+            &Frame {
                 buf,
-                idx,
-                force_idr: want_key,
                 paintover,
                 paintover_final: frame_paintover && paintover_left == 0,
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
                 marker_ms,
-            })
-            .is_err()
-        {
-            return Err("encoder gone".into());
-        }
+            },
+            &views,
+            &takes,
+        );
     }
 }
 
@@ -794,22 +1450,14 @@ struct Stripe {
     /// The cap last applied (None: apply the next one).
     applied_kbps: Option<u32>,
     applied_crf: f32,
+    open: Open,
 }
 
-const HDR: usize = 16;
-
-struct SendPtr<T>(*const T);
-unsafe impl<T> Send for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for SendPtr<T> {}
+const HDR: usize = negotiate::HDR_V1;
 
 struct StripeJob {
-    /// Valid until the worker replies: the encode loop waits for every stripe.
-    buf: SendPtr<I420>,
+    /// The encode loop keeps its own reference until every stripe has replied.
+    buf: Arc<I420>,
     ts: i64,
     force_idr: bool,
     crf: f32,
@@ -818,7 +1466,7 @@ struct StripeJob {
     mb_cols: usize,
 }
 
-type StripeResult = (usize, Option<(bool, Vec<u8>)>);
+type StripeResult = (usize, Option<(bool, Vec<u8>)>, Option<StreamConfig>);
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
 /// small updates is even slower), so a stripe encodes single-threaded and only fans out
@@ -920,7 +1568,7 @@ fn stripe_worker(
         predicted_ms: 0.0,
     };
     while let Ok(job) = rx.recv() {
-        let buf = unsafe { &*job.buf.0 };
+        let buf = &*job.buf;
         let rate = if job.force_idr {
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
@@ -979,18 +1627,20 @@ fn stripe_worker(
                 static_mbs: info.as_deref_mut(),
             },
         );
+        let mut config = None;
         let out = r.map(|aus| {
             let mut out = Vec::with_capacity(HDR + aus.iter().map(|a| a.data.len()).sum::<usize>());
             out.resize(HDR, 0);
             let key = aus.first().is_some_and(|a| a.keyframe);
             for au in aus {
-                if let Some(c) = &au.config {
+                if let Some(c) = au.config {
                     log::info!(
                         "stripe {i}: {} {}x{}",
                         c.codec_string,
                         c.display.0,
                         c.display.1
                     );
+                    config = Some(c);
                 }
                 out.extend_from_slice(&au.data);
             }
@@ -1014,7 +1664,7 @@ fn stripe_worker(
                     m.iter().filter(|&&c| c == 0).count() as f64
                 });
             if let Some(t) = gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads) {
-                match encoder::open(&EncoderConfig {
+                match (s.open)(&EncoderConfig {
                     threads: t,
                     ..s.cfg.clone()
                 }) {
@@ -1042,25 +1692,25 @@ fn stripe_worker(
                 None
             }
         };
-        if done.send((i, res)).is_err() {
+        // Done with the picture before saying so: the capture thread reuses it then.
+        drop(job);
+        if done.send((i, res, config)).is_err() {
             return;
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::Sender<(usize, Box<I420>)>,
     hub: Arc<Hub>,
-    idr_inflight: Arc<AtomicBool>,
+    sh: Arc<Shared>,
     crf: f32,
     po_crf: f32,
     // --max-kbps 0: the controller's floor still applies after congestion; don't pass it on.
     uncapped: bool,
 ) {
-    let epoch = Instant::now();
+    let start = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
     let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
@@ -1075,18 +1725,30 @@ fn encode_loop(
             let (tx, rx) = mpsc::channel();
             let done = done_tx.clone();
             let h = std::thread::Builder::new()
-                .name(format!("enc-{i}"))
+                .name(format!("enc-{}-{i}", sh.id))
                 .spawn(move || stripe_worker(i, s, rx, done, debug_stripes))
                 .unwrap();
             (tx, h)
         })
         .collect();
-    while let Ok(job) = rx.recv() {
+    // Lets the capture thread queue the next job, once this one is sent.
+    let finish = |force_idr: bool| {
+        if force_idr {
+            sh.idr_inflight.store(false, Ordering::Release);
+        }
+        sh.busy.fetch_sub(1, Ordering::AcqRel);
+        hub.wake();
+    };
+    while let Ok(Job {
+        frame: job,
+        force_idr,
+    }) = rx.recv()
+    {
         let t0 = Instant::now();
         let selected: Vec<bool> = stripes
             .iter()
             .map(|&(y, h, touched)| {
-                job.force_idr
+                force_idr
                     || (job.paintover && touched)
                     || job
                         .band
@@ -1094,10 +1756,11 @@ fn encode_loop(
             })
             .collect();
         if !selected.iter().any(|&x| x) {
-            let _ = ret.send((job.idx, job.buf));
+            drop(job);
+            finish(force_idr);
             continue;
         }
-        let target = hub.target_kbps.load(Ordering::Relaxed);
+        let target = sh.target.load(Ordering::Relaxed);
         let want_crf = if job.paintover { po_crf } else { crf };
         // Each stripe may use up to twice its area share of the budget; the delay-based
         // controller reins the total in if several stripes move at once.
@@ -1106,9 +1769,8 @@ fn encode_loop(
         } else {
             ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
         };
-        let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
+        let ts = job.captured_at.duration_since(start).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
-        let buf_ptr = SendPtr(&*job.buf as *const I420);
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
@@ -1118,9 +1780,9 @@ fn encode_loop(
                     share
                 };
                 let _ = workers[i].0.send(StripeJob {
-                    buf: buf_ptr,
+                    buf: job.buf.clone(),
                     ts,
-                    force_idr: job.force_idr,
+                    force_idr,
                     crf: want_crf,
                     cap,
                     mb_dirty: job.mb_dirty.clone(),
@@ -1130,20 +1792,28 @@ fn encode_loop(
             }
         }
         let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
+        let mut configs: Vec<Option<StreamConfig>> = (0..n).map(|_| None).collect();
         for _ in 0..pending {
-            if let Ok((i, r)) = done_rx.recv() {
+            if let Ok((i, r, c)) = done_rx.recv() {
                 results[i] = r;
+                configs[i] = c;
             }
         }
-        let _ = ret.send((job.idx, job.buf));
+        let Frame {
+            buf,
+            paintover,
+            paintover_final,
+            band,
+            captured_at,
+            marker_ms,
+            ..
+        } = job;
+        drop(buf);
         for (y, h, touched) in stripes.iter_mut() {
-            if job.paintover_final {
+            if paintover_final {
                 *touched = false;
             }
-            if job
-                .band
-                .is_some_and(|b| (b.y0 as usize) < *y + *h && (b.y1 as usize) > *y)
-            {
+            if band.is_some_and(|b| (b.y0 as usize) < *y + *h && (b.y1 as usize) > *y) {
                 *touched = true;
             }
         }
@@ -1153,18 +1823,15 @@ fn encode_loop(
             .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
             .collect();
         let all_key = parts.len() == n && parts.iter().all(|p| p.1);
-        if job.force_idr {
+        if force_idr && !all_key {
             // Requests stay set (and are retried) until every stripe really sent an IDR.
-            if all_key {
-                for c in hub.video_clients() {
-                    c.needs_keyframe.store(false, Ordering::Relaxed);
-                }
-            } else {
-                log::warn!("keyframe request produced no IDR on every stripe; retrying");
-            }
-            idr_inflight.store(false, Ordering::Release);
+            log::warn!("keyframe request produced no IDR on every stripe; retrying");
+        }
+        if configs.iter().any(Option::is_some) {
+            sh.reconfigure(&hub, &configs);
         }
         if parts.is_empty() {
+            finish(force_idr);
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
@@ -1177,8 +1844,8 @@ fn encode_loop(
         }
         frame_id = frame_id.wrapping_add(1);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
-        let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
-        if job.marker_ms >= 0 {
+        let mut pipe = (captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
+        if marker_ms >= 0 {
             // Debug: wall-clock send time instead of pipeline latency.
             pipe = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1190,8 +1857,8 @@ fn encode_loop(
             .into_iter()
             .map(|(i, key, mut out)| {
                 // type, flags, frame id, pipe, stripe, stripe count, parts in frame, reserved, y
-                out[0] = 0x01;
-                out[1] = (key as u8) | if job.paintover { 2 } else { 0 };
+                out[0] = negotiate::VIDEO_V1;
+                out[1] = (key as u8) | if paintover { 2 } else { 0 };
                 out[2..6].copy_from_slice(&frame_id.to_be_bytes());
                 out[6..10].copy_from_slice(&pipe.to_be_bytes());
                 out[10] = i as u8;
@@ -1202,43 +1869,81 @@ fn encode_loop(
                 Bytes::from(out)
             })
             .collect();
-        let now = Instant::now();
-        for c in hub.video_clients() {
-            if !c.started.load(Ordering::Relaxed) {
-                if !all_key {
-                    continue;
-                }
-                c.started.store(true, Ordering::Relaxed);
-                c.inflight.lock().clear();
-            }
-            {
-                let mut q = c.inflight.lock();
-                if q.len() > 600 {
-                    log::warn!("client {} hopelessly behind; dropping", c.id);
-                    drop(q);
-                    c.send(Out::Text("{\"t\":\"close\"}".into()));
-                    continue;
-                }
-                q.push_back(Inflight {
-                    id: frame_id,
-                    sent: now,
-                    bytes: total,
-                });
-            }
-            for m in &msgs {
-                c.send(Out::Bin(m.clone()));
-            }
-        }
-        hub.stats.send_lat_us.fetch_add(
-            job.captured_at.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
-        if job.marker_ms >= 0 {
+        deliver(&hub, sh.id, frame_id, all_key, total, &msgs);
+        finish(force_idr);
+        hub.stats
+            .send_lat_us
+            .fetch_add(captured_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if marker_ms >= 0 {
             log::info!(
                 "marker sent age {} ms (encode {} us)",
-                marker_age(job.marker_ms),
+                marker_age(marker_ms),
                 enc_us
             );
+        }
+    }
+}
+
+/// Sends one encoded frame to cohort `cohort`'s viewers that get frames: protocol 1
+/// clients as is, protocol 2 clients in the epoch they confirmed. A viewer that has
+/// started over sees nothing until a frame that is a keyframe on every stripe.
+fn deliver(hub: &Hub, cohort: u64, frame_id: u32, all_key: bool, bytes: usize, msgs: &[Bytes]) {
+    let now = Instant::now();
+    let mut v2: Vec<(u32, Vec<Bytes>)> = Vec::new();
+    for c in hub.video_clients() {
+        let r = c.route.lock();
+        if r.cohort != Some(cohort) {
+            continue;
+        }
+        let epoch = match (r.proto, r.phase) {
+            (Proto::Legacy, _) => None,
+            (Proto::V2, Phase::Ready) => Some(r.epoch),
+            _ => continue,
+        };
+        if !c.started.load(Ordering::Relaxed) {
+            if !all_key {
+                continue;
+            }
+            c.started.store(true, Ordering::Relaxed);
+            c.inflight.lock().clear();
+        }
+        if all_key {
+            c.needs_keyframe.store(false, Ordering::Relaxed);
+        }
+        {
+            let mut q = c.inflight.lock();
+            if q.len() > 600 {
+                log::warn!("client {} hopelessly behind; dropping", c.id);
+                drop(q);
+                c.send(Out::Text("{\"t\":\"close\"}".into()));
+                continue;
+            }
+            q.push_back(Inflight {
+                id: frame_id,
+                sent: now,
+                bytes,
+            });
+        }
+        let Some(e) = epoch else {
+            for m in msgs {
+                c.send(Out::Bin(m.clone()));
+            }
+            continue;
+        };
+        let i = match v2.iter().position(|(x, _)| *x == e) {
+            Some(i) => i,
+            None => {
+                v2.push((
+                    e,
+                    msgs.iter()
+                        .map(|m| Bytes::from(negotiate::video_v2(m, e)))
+                        .collect(),
+                ));
+                v2.len() - 1
+            }
+        };
+        for m in &v2[i].1 {
+            c.send(Out::Bin(m.clone()));
         }
     }
 }
