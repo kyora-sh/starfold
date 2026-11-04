@@ -17,6 +17,8 @@ use std::sync::Arc;
 const PUBLIC: &[&str] = &[
     "/client.js",
     "/worker.js",
+    "/dav1d.js",
+    "/dav1d.wasm",
     "/audio.js",
     "/mic.js",
     "/favicon.ico",
@@ -192,6 +194,7 @@ mod tests {
         for uri in [
             "/client.js",
             "/worker.js?token=x",
+            "/dav1d.wasm",
             "/inter.woff2",
             "/healthz",
         ] {

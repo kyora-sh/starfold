@@ -9,6 +9,7 @@
 		"fmt:check": "oxfmt --check .",
 		"lint": "oxlint",
 		"typecheck": "bun run --filter '*' typecheck",
+		"test": "bun run --filter '*' test",
 		"check": "bun run fmt:check && bun run lint && bun run typecheck"
 	},
 	"devDependencies": {

@@ -30,7 +30,7 @@ try {
 	b = await chromium.launch({ executablePath: process.env.CHROMIUM || 'chromium', args: ['--no-sandbox'] });
 	const p = await b.newPage({ viewport: { width: 1280, height: 800 } });
 	await p.goto(`http://127.0.0.1:${port}/`);
-	const videoSize = () => p.evaluate(() => { const v = document.querySelector('video.stripe'); return v ? [v.videoWidth, v.videoHeight] : null; });
+	const videoSize = async () => { const c = (await (await fetch(`http://127.0.0.1:${port}/stats`)).json()).cohorts?.[0]?.stripes[0]?.config; return c ? [c.codedWidth, c.codedHeight] : null; };
 	const settle = async (want) => {
 		for (let i = 0; i < 40; i++) { const [w, h] = xsize(); const v = await videoSize(); if (w === want[0] && h === want[1] && v && v[0] === want[0]) return; await sleep(150); }
 	};

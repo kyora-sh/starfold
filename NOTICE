@@ -5,3 +5,7 @@ starfold is a fork of voxl (https://github.com/tembo/voxl), imported at upstream
 eba3b7ced9f60e885bb7b3a96a12e3ccb347fdcd. voxl is licensed under the MIT License; its
 original copyright and permission notice is retained unchanged in LICENSE and applies
 to this fork.
+
+packages/web/dav1d/dav1d.wasm, which the server embeds, contains dav1d (BSD-2-Clause, see
+packages/web/dav1d/COPYING-dav1d) and wasi-libc (MIT, with parts under BSD-2-Clause and
+CC0; see packages/web/dav1d/COPYING-wasi-libc).

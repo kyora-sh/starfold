@@ -20,7 +20,7 @@ env:
 
 jobs:
   web:
-    name: Web (oxfmt, oxlint, tsc)
+    name: Web (oxfmt, oxlint, tsc, bun test)
     runs-on: kyora-8x16
     timeout-minutes: 15
     steps:
@@ -35,6 +35,8 @@ jobs:
         run: bun run lint
       - name: Type-check
         run: bun run typecheck
+      - name: Unit tests
+        run: bun run test
 
   python:
     name: Python (ruff, pytest)

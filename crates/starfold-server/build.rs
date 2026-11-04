@@ -129,6 +129,7 @@ fn bundle_web(out: &std::path::Path) {
         .args([
             "client=src/client/main.ts",
             "worker=src/worker.ts",
+            "dav1d=src/dav1d/index.ts",
             "audio=src/worklets/audio.ts",
             "mic=src/worklets/mic.ts",
             "--bundle",
