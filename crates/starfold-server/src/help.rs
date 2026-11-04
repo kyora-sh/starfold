@@ -28,10 +28,12 @@ Video:
   --crf                         base quality (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
                                 (default 30000, 2000)
-  --encoder                     openh264, videotoolbox (macOS hardware), or
-                                x264 in a build with the x264 feature
-                                (default openh264); /stats shows what the
-                                startup probe found
+  --encoder                     auto: each codec from its hardware encoder,
+                                H.264 from OpenH264 where there is none
+                                (default); or the H.264 encoder: openh264,
+                                videotoolbox (macOS hardware), or x264 in a
+                                build with the x264 feature; /stats shows
+                                what the startup probe found
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
   --experimental-hw-probes      experimental: also probe VA-API, NVENC and

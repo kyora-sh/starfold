@@ -88,6 +88,9 @@ export type CodecMessage =
 			epoch: number;
 			w: number;
 			h: number;
+			/** The server's encoder for this codec, and whether it is hardware. */
+			backend?: string;
+			hardware?: boolean;
 			error?: undefined;
 	  } & VideoOffer)
 	| { t: 'codec'; epoch: number; error: string };
@@ -175,6 +178,8 @@ export interface Stats {
 	decodeMs: number;
 	pipeMs: number;
 	codec: string | null;
+	/** Protocol 2: the server's encoder, e.g. `videotoolbox (hw)`. */
+	encoder: string | null;
 	stripes: number;
 	dropped: number;
 	queue: number;

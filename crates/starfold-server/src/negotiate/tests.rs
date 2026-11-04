@@ -140,9 +140,96 @@ fn candidates_rank_codecs_then_hardware() {
             (Codec::H264, Backend::OpenH264),
         ]
     );
-    let vt = candidates(&r, Backend::VideoToolbox);
-    assert_eq!(vt.last().unwrap().backend, Backend::VideoToolbox);
-    assert!(vt.last().unwrap().hardware);
+    let vt: Vec<(Backend, bool)> = candidates(&r, Backend::VideoToolbox)
+        .iter()
+        .filter(|c| c.codec == Codec::H264)
+        .map(|c| (c.backend, c.hardware))
+        .collect();
+    assert_eq!(
+        vt,
+        vec![(Backend::VideoToolbox, true), (Backend::OpenH264, false)],
+        "a hardware H.264 encoder falls back to OpenH264"
+    );
+}
+
+#[test]
+fn auto_selection() {
+    let sw = || cap(Codec::H264, Backend::OpenH264, false);
+    let vt = || cap(Codec::H264, Backend::VideoToolbox, true);
+    let auto = |caps: Vec<EncoderCapability>| h264_backend(&reg(caps), Selection::Auto);
+    assert_eq!(auto(vec![sw(), vt()]), Ok(Backend::VideoToolbox));
+    let mut discovered = vt();
+    discovered.status = ProbeStatus::Discovered;
+    let mut disabled = cap(Codec::H264, Backend::Vaapi, true);
+    disabled.status = ProbeStatus::Disabled;
+    disabled.implemented = false;
+    let mut experimental = cap(Codec::H264, Backend::Nvenc, true);
+    experimental.implemented = false;
+    let mut no_idr = cap(Codec::H264, Backend::MediaFoundation, true);
+    no_idr.keyframe_control = None;
+    assert_eq!(
+        auto(vec![discovered, disabled, experimental, no_idr, sw()]),
+        Ok(Backend::OpenH264)
+    );
+    assert_eq!(auto(vec![sw()]), Ok(Backend::OpenH264));
+    assert!(auto(vec![]).is_err(), "no OpenH264 either");
+    let pinned = |b, caps| h264_backend(&reg(caps), Selection::Pinned(b));
+    assert_eq!(
+        pinned(Backend::OpenH264, vec![sw(), vt()]),
+        Ok(Backend::OpenH264)
+    );
+    assert_eq!(
+        pinned(Backend::VideoToolbox, vec![sw(), vt()]),
+        Ok(Backend::VideoToolbox)
+    );
+    let mut lost = vt();
+    lost.status = ProbeStatus::Unavailable("no session".into());
+    let e = pinned(Backend::VideoToolbox, vec![sw(), lost]).unwrap_err();
+    assert!(
+        e.contains("videotoolbox") && e.contains("no session"),
+        "{e}"
+    );
+    let e = pinned(Backend::VideoToolbox, vec![sw()]).unwrap_err();
+    assert!(e.contains("no videotoolbox H264 encoder"), "{e}");
+    let r = reg(vec![sw(), vt()]);
+    let h: Vec<Backend> = candidates(&r, Backend::OpenH264)
+        .iter()
+        .map(|c| c.backend)
+        .collect();
+    assert_eq!(h, vec![Backend::OpenH264], "pinned OpenH264 stays software");
+}
+
+#[test]
+fn chosen_is_each_codecs_first_candidate() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, Backend::VideoToolbox, true),
+        cap(Codec::Hevc, Backend::Vaapi, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+    ]);
+    let c: Vec<(Codec, Backend)> = chosen(&candidates(&r, Backend::VideoToolbox))
+        .iter()
+        .map(|c| (c.codec, c.backend))
+        .collect();
+    assert_eq!(
+        c,
+        vec![
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::VideoToolbox)
+        ]
+    );
+}
+
+#[test]
+fn selection_parse() {
+    assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
+    assert_eq!(
+        Selection::parse("openh264"),
+        Ok(Selection::Pinned(Backend::OpenH264))
+    );
+    assert!(Selection::parse("vaapi").is_err());
+    assert!(Selection::parse("h265").unwrap_err().contains("auto"));
+    assert_eq!(Selection::Auto.name(), "auto");
 }
 
 #[test]
@@ -449,7 +536,7 @@ fn server_messages() {
     let m: serde_json::Value = serde_json::from_str(&o.announce(7, 2560, 1600)).unwrap();
     assert_eq!(
         m,
-        serde_json::json!({"t":"codec","epoch":7,"codec":"hevc","format":"annexb","w":2560,"h":1600,
+        serde_json::json!({"t":"codec","epoch":7,"codec":"hevc","backend":"videotoolbox","hardware":true,"format":"annexb","w":2560,"h":1600,
             "stripes":[{"i":0,"y":0,"h":1600,"config":{"codec":"hvc1.1.6.L153.B0","codedWidth":2560,"codedHeight":1600}}]})
     );
     let offers = serde_json::to_value(vec![o]).unwrap();
@@ -471,4 +558,31 @@ fn video_v2_layout() {
     assert_eq!(&v2[1..HDR_V1], &v1[1..HDR_V1]);
     assert_eq!(&v2[HDR_V1..HDR_V2], &[1, 2, 3, 4]);
     assert_eq!(&v2[HDR_V2..], &v1[HDR_V1..]);
+}
+
+/// What `--encoder auto` picks on this host: VideoToolbox H.264 and HEVC on the
+/// kyora-macos runner, OpenH264 alone where no hardware encoder is default-safe yet.
+#[test]
+fn auto_on_this_host() {
+    use crate::encoder::caps::{host_providers, PROBE_TIMEOUT};
+    let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let h264 = h264_backend(&reg, Selection::Auto).unwrap();
+    let got: Vec<(Codec, Backend, bool)> = chosen(&candidates(&reg, h264))
+        .iter()
+        .map(|c| (c.codec, c.backend, c.hardware))
+        .collect();
+    println!("--encoder auto: {got:?}");
+    if cfg!(target_os = "macos") {
+        if std::env::var_os("STARFOLD_EXPECT_HW").is_some() {
+            assert_eq!(
+                got,
+                vec![
+                    (Codec::Hevc, Backend::VideoToolbox, true),
+                    (Codec::H264, Backend::VideoToolbox, true)
+                ]
+            );
+        }
+    } else {
+        assert_eq!(got, vec![(Codec::H264, Backend::OpenH264, false)]);
+    }
 }

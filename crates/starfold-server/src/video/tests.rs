@@ -12,6 +12,11 @@ const H264: Candidate = Candidate {
     backend: Backend::OpenH264,
     hardware: false,
 };
+const H264_HW: Candidate = Candidate {
+    codec: Codec::H264,
+    backend: Backend::VideoToolbox,
+    hardware: true,
+};
 const HEVC: Candidate = Candidate {
     codec: Codec::Hevc,
     backend: Backend::VideoToolbox,
@@ -139,12 +144,39 @@ struct Opts {
     h264_reopen_heals: bool,
     /// Keyframes requested from the first H.264 stripe's encoder.
     h264_keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
+    /// Hardware H.264 cohorts fail to open (the offer's sample encode still works).
+    h264_hw_fails: bool,
+    /// Hardware H.264 cohorts' encoders fail from their 3rd picture on, and so do
+    /// reopened ones.
+    h264_hw_breaks: bool,
 }
 
 fn fakes(o: Opts) -> Open {
     let opened = Arc::new(AtomicUsize::new(0));
     let h264_opened = Arc::new(AtomicUsize::new(0));
+    let hw_opened = Arc::new(AtomicUsize::new(0));
     Arc::new(move |c: &EncoderConfig| {
+        if c.codec == Codec::H264 && c.backend == Backend::VideoToolbox {
+            let earlier = hw_opened.fetch_add(1, Ordering::Relaxed);
+            if o.h264_hw_fails && earlier > 0 {
+                return Err(EncodeError("no session".into()));
+            }
+            return Ok(Box::new(Fake {
+                codec: c.codec,
+                coded: (c.width, c.height),
+                n: 0,
+                relevel: None,
+                fail_from: (o.h264_hw_breaks && earlier > 0).then_some(if earlier == 1 {
+                    3
+                } else {
+                    1
+                }),
+                fail_at: None,
+                gate: None,
+                keys: None,
+                kbps: 0,
+            }) as Box<dyn VideoEncoder>);
+        }
         let hevc = c.codec == Codec::Hevc;
         let earlier = if hevc {
             opened.fetch_add(1, Ordering::Relaxed)
@@ -187,7 +219,7 @@ fn fakes(o: Opts) -> Open {
 fn config() -> VideoConfig {
     VideoConfig {
         display: None,
-        encoder: Backend::OpenH264,
+        selection: encoder::Selection::Auto,
         fps: 30,
         preset: "ultrafast".into(),
         threads: 1,
@@ -757,6 +789,113 @@ fn an_encoder_that_keeps_failing_falls_back() {
     assert_eq!(route_codec(&c), Some(Codec::H264));
     assert!(eng.failed.contains(&HEVC));
     assert!(eng.cohorts.iter().all(|k| k.shared.cand != HEVC));
+}
+
+/// `c`'s messages, with every frame in them acked.
+fn acked(c: &Client, rx: &mut UnboundedReceiver<Out>) -> Vec<Msg> {
+    let m = drain(rx);
+    for v in videos(&m) {
+        c.ack(v.3, v.2);
+    }
+    m
+}
+
+#[test]
+fn a_hardware_h264_encoder_that_keeps_failing_falls_back_to_openh264() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264_HW, H264],
+        Opts {
+            h264_hw_breaks: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(eng.h264, H264_HW);
+    assert_eq!(hub.encoder.lock()["chosen"][0]["backend"], "videotoolbox");
+    let (l, mut rl) = client(&hub);
+    let (n, mut rn) = client(&hub);
+    join_legacy(&hub, &l);
+    join_v2(&hub, &n, &[Codec::H264]);
+    push(&mut eng);
+    acked(&l, &mut rl);
+    let m = acked(&n, &mut rn);
+    assert_eq!(codec_msgs(&m)[0]["backend"], "videotoolbox");
+    ready(&n, &m);
+    let mut m = Vec::new();
+    for _ in 0..(3 + FAIL_AFTER) {
+        push(&mut eng);
+        acked(&l, &mut rl);
+        m.extend(acked(&n, &mut rn));
+    }
+    assert_eq!(eng.h264, H264);
+    assert!(eng.failed.contains(&H264_HW));
+    assert!(eng.cohorts.iter().all(|k| k.shared.cand != H264_HW));
+    assert_eq!(hub.encoder.lock()["mode"], "auto");
+    assert_eq!(hub.encoder.lock()["chosen"][0]["backend"], "openh264");
+    let cm = codec_msgs(&m);
+    assert_eq!(cm.len(), 1, "{m:?}");
+    assert_eq!(cm[0]["codec"], "h264");
+    assert_eq!(cm[0]["backend"], "openh264");
+    assert_eq!(cm[0]["hardware"], false);
+    ready(&n, &m);
+    assert_eq!(cohort_of(&l), cohort_of(&n));
+    let (mut vl, mut vn) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        push(&mut eng);
+        vl.extend(videos(&acked(&l, &mut rl)));
+        vn.extend(videos(&acked(&n, &mut rn)));
+    }
+    assert!(!vl.is_empty(), "the legacy viewer gets OpenH264 frames");
+    assert!(vl.iter().all(|f| f.0 == negotiate::VIDEO_V1));
+    assert!(
+        !vn.is_empty() && vn[0].1,
+        "the v2 viewer starts with a keyframe"
+    );
+}
+
+#[test]
+fn a_hardware_h264_encoder_that_fails_to_open_falls_back() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264_HW, H264],
+        Opts {
+            h264_hw_fails: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(eng.h264, H264);
+    assert_eq!(eng.failed, vec![H264_HW]);
+    let (l, mut rl) = client(&hub);
+    join_legacy(&hub, &l);
+    push(&mut eng);
+    assert!(!videos(&drain(&mut rl)).is_empty());
+    assert_eq!(hub.encoder.lock()["chosen"][0]["backend"], "openh264");
+}
+
+#[test]
+fn the_last_h264_encoder_stays() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264_HW],
+        Opts {
+            h264_hw_breaks: true,
+            ..Default::default()
+        },
+    );
+    let (l, mut rl) = client(&hub);
+    join_legacy(&hub, &l);
+    for _ in 0..(3 + FAIL_AFTER) {
+        push(&mut eng);
+        acked(&l, &mut rl);
+    }
+    assert!(eng.cohorts[0].shared.degraded());
+    assert_eq!(eng.h264, H264_HW);
+    assert!(eng.failed.is_empty());
+    assert_eq!(eng.cohorts.len(), 1);
+    assert!(cohort_of(&l).is_some());
 }
 
 const HEVC_SW: Candidate = Candidate {

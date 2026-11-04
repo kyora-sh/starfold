@@ -180,7 +180,8 @@ function main() {
 					statsEl.style.display = 'block';
 					statsEl.textContent =
 						`${m.fps.toFixed(1)} fps  ${(m.kbps / 1000).toFixed(2)} Mbps\n` +
-						`decode ${m.decodeMs.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms\n${m.codec || ''} q=${m.queue}`;
+						`decode ${m.decodeMs.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms\n` +
+						`${m.codec || ''} ${m.encoder || ''} q=${m.queue}`;
 				}
 				break;
 			case 'log':
