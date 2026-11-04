@@ -234,8 +234,6 @@ pub struct VideoToolbox {
     hevc_sps: Option<Vec<u8>>,
     pts: i64,
     bps: i64,
-    /// Opened with low-latency rate control (no lookahead, one IDR then P frames).
-    low_latency: bool,
     /// A frame's output was lost: the next one has to be an IDR.
     resync: bool,
 }
@@ -268,19 +266,16 @@ impl VideoToolbox {
             Codec::Av1 => return Err(EncodeError("no VideoToolbox AV1 encoder".into())),
         };
         let ty = codec_type(cfg.codec);
-        // Low-latency rate control (one IDR, then P frames only) where the encoder has it.
-        let (session, low_latency) = match Session::open(ty, cfg.width, cfg.height, true) {
-            Ok(s) => (s, true),
-            Err(_) => (
-                Session::open(ty, cfg.width, cfg.height, false).map_err(|r| {
-                    EncodeError(format!(
-                        "no hardware VideoToolbox {:?} encoder for {}x{} ({r})",
-                        cfg.codec, cfg.width, cfg.height
-                    ))
-                })?,
-                false,
-            ),
-        };
+        // Low-latency rate control: no lookahead or reordering, one IDR then P frames.
+        let session = Session::open(ty, cfg.width, cfg.height, true).map_err(|r| {
+            EncodeError(format!(
+                "no low-latency hardware VideoToolbox {:?} encoder for {}x{}: {}",
+                cfg.codec,
+                cfg.width,
+                cfg.height,
+                session_error(r)
+            ))
+        })?;
         let s = &session;
         unsafe {
             s.require(
@@ -317,14 +312,6 @@ impl VideoToolbox {
             if let Err(r) = s.set(kVTCompressionPropertyKey_ExpectedFrameRate, fps.0) {
                 log::debug!("VideoToolbox ignores the expected frame rate ({r})");
             }
-            if !low_latency {
-                let n = number(kCFNumberSInt32Type, i32::MAX)?;
-                s.require(
-                    kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                    n.0,
-                    "turning periodic keyframes off",
-                )?;
-            }
         }
         let mut me = VideoToolbox {
             session,
@@ -335,7 +322,6 @@ impl VideoToolbox {
             hevc_sps: None,
             pts: -1,
             bps: 0,
-            low_latency,
             resync: false,
         };
         me.set_bps(bps(cfg.rate.max_kbps))?;
@@ -754,8 +740,6 @@ fn encoder_list() -> Result<Vec<Listed>, OSStatus> {
 /// What VideoToolbox says the probe's sample session ran on.
 struct Sampled {
     encoder_id: Option<String>,
-    /// Known to encode without lookahead or reordering.
-    low_latency: bool,
 }
 
 /// Opens the codec's hardware encoder and, where this build has one, encodes a few
@@ -769,7 +753,6 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
         }
         return Ok(Sampled {
             encoder_id: s.encoder_id(),
-            low_latency: false,
         });
     }
     let mut enc = VideoToolbox::new(&EncoderConfig {
@@ -816,7 +799,6 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
     }
     Ok(Sampled {
         encoder_id: enc.session.encoder_id(),
-        low_latency: enc.low_latency,
     })
 }
 
@@ -872,9 +854,7 @@ impl caps::ProbeProvider for Probe {
                         c.device_id = id;
                     }
                     if Backend::VideoToolbox.implements(codec) {
-                        // Without low-latency rate control the encoder may still look
-                        // ahead: unknown, so not eligible.
-                        c.low_latency = v.low_latency.then_some(true);
+                        c.low_latency = Some(true);
                         c.keyframe_control = Some(true);
                     }
                     c.status = ProbeStatus::Verified;

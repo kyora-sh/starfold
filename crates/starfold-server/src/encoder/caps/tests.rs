@@ -347,6 +347,13 @@ fn vaapi_encode_entrypoints_only() {
         [ProfileCapability::new("main", 10, Chroma::Yuv420)]
     );
     assert_eq!(av1_10[0].status, ProbeStatus::ProbeOnly, "10-bit only");
+    let av1_unknown = caps("/dev/dri/renderD129", &[ep(32, 6, None)]);
+    assert!(
+        av1_unknown[0].profiles.is_empty(),
+        "depth unknown, not 8-bit"
+    );
+    assert_eq!(av1_unknown[0].status, ProbeStatus::Discovered);
+    assert!(!av1_unknown[0].eligible());
     let only444 = caps("/dev/dri/renderD129", &[ep(26, 6, Some(4))]);
     assert_eq!(only444[0].status, ProbeStatus::ProbeOnly);
     assert_eq!(only444[0].limits.pixel_formats, None);

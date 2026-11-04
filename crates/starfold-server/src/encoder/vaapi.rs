@@ -88,14 +88,16 @@ pub fn caps(node: &str, entrypoints: &[Entrypoint]) -> Vec<EncoderCapability> {
             }
         };
         let c = &mut out[i];
-        // AV1's main profile is 8- and 10-bit; the RT formats, when known, say which.
+        // AV1's main profile is 8- and 10-bit; only the RT formats say which, so without
+        // them its depth stays unknown.
         let profs = match e.rt_format {
-            Some(f) if e.profile == 32 => [(RT_FORMAT_YUV420, 8), (RT_FORMAT_YUV420_10, 10)]
+            _ if e.profile != 32 => vec![prof],
+            Some(f) => [(RT_FORMAT_YUV420, 8), (RT_FORMAT_YUV420_10, 10)]
                 .into_iter()
                 .filter(|&(bit, _)| f & bit != 0)
                 .map(|(_, depth)| ProfileCapability::new("main", depth, Chroma::Yuv420))
                 .collect(),
-            _ => vec![prof],
+            None => Vec::new(),
         };
         for p in profs {
             if !c.profiles.contains(&p) {
@@ -127,7 +129,7 @@ pub fn caps(node: &str, entrypoints: &[Entrypoint]) -> Vec<EncoderCapability> {
         if c.limits.pixel_formats.as_ref().is_some_and(Vec::is_empty) {
             c.limits.pixel_formats = None;
         }
-        if !c.profiles.iter().any(ProfileCapability::baseline) {
+        if !c.profiles.is_empty() && !c.profiles.iter().any(ProfileCapability::baseline) {
             c.status = ProbeStatus::ProbeOnly;
         }
     }
