@@ -3,9 +3,13 @@
 Needs Linux with Xvfb and xterm, and STARFOLD_BIN pointing at a built `starfold` binary:
 
     STARFOLD_BIN=target/release/starfold uv run pytest -m integration
+
+The encoder fallback test also needs ffprobe and a binary built with `--features x264`
+(STARFOLD_X264=1): x264 is the only other H.264 encoder a machine without a hardware one has.
 """
 
 import contextlib
+import json
 import os
 import secrets
 import select
@@ -59,9 +63,14 @@ def _stop(proc: subprocess.Popen) -> None:
 
 
 @pytest.fixture
-def desktop(tmp_path):
+def server_args():
+    return []
+
+
+@pytest.fixture
+def desktop(tmp_path, server_args):
     marker = secrets.token_hex(8)
-    env = {**os.environ, "STARFOLD_TEST_RUN": marker}
+    env = {**os.environ, "STARFOLD_TEST_RUN": marker, "VOXL_TEST_HOOKS": "1"}
     procs: list[subprocess.Popen] = []
 
     def start(args, **kw):
@@ -95,6 +104,7 @@ def desktop(tmp_path):
                 "--addr=127.0.0.1",
                 "--audio-enabled=false",
                 f"--files-root={files}",
+                *server_args,
             ]
         )
         sf = Starfold(f"http://127.0.0.1:{port}", password=password, timeout=15)
@@ -167,5 +177,80 @@ def test_files_and_recording(desktop):
     rec = sf.record_start()
     sf.type_text("echo recording\n")
     sf.wait(idle_ms=300)
-    clip = sf.record_stop(rec)
-    assert clip[4:8] == b"ftyp"
+    clips = sf.record_stop(rec)
+    assert len(clips) == 1
+    assert clips[0][4:8] == b"ftyp"
+    assert clips.end_reason == "stopped"
+
+
+def _probe(path: Path) -> dict:
+    """Decodes every frame of the MP4; returns its video stream."""
+    r = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,profile,width,height,nb_read_frames",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stderr == "", r.stderr
+    return json.loads(r.stdout)["streams"][0]
+
+
+def _avcc(mp4: bytes) -> bytes:
+    """The MP4's SPS and PPS as its track stores them."""
+    at = mp4.index(b"avcC")
+    return mp4[at + 4 : at + int.from_bytes(mp4[at - 4 : at], "big") - 4]
+
+
+def _activity(sf: Starfold, text: str) -> None:
+    r = sf.type_text(text)
+    assert sf.wait(change=True, since=r.seq, timeout_ms=5000).changed
+    sf.wait(idle_ms=300)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("STARFOLD_X264") or not shutil.which("ffprobe"),
+    reason="set STARFOLD_X264 (a binary with x264) and install ffprobe to run",
+)
+@pytest.mark.parametrize("server_args", [["--encoder=x264"]])
+def test_encoder_fallback_rolls_the_recording(desktop):
+    sf, cwd, _ = desktop
+    sf.click(100, 100)
+    rec = sf.record_start()
+    _activity(sf, "echo before\n")
+
+    assert sf._http.post("/debug/fail-h264").status_code == 204
+    deadline = time.monotonic() + 15
+    while True:
+        chosen = sf._http.get("/stats").json()["encoder"]["chosen"]
+        if any(c["codec"] == "h264" and c["backend"] == "openh264" for c in chosen):
+            break
+        assert time.monotonic() < deadline, f"no fallback: {chosen}"
+        time.sleep(0.1)
+    _activity(sf, "echo after\n")
+
+    clips = sf.record_stop(rec)
+    assert len(clips) == 2
+    assert clips.end_reason == "stopped"
+    streams = []
+    for i, clip in enumerate(clips):
+        path = cwd / f"segment-{i + 1}.mp4"
+        path.write_bytes(clip)
+        streams.append(_probe(path))
+    for s in streams:
+        assert s["codec_name"] == "h264"
+        assert (s["width"], s["height"]) == (1280, 800)
+        assert int(s["nb_read_frames"]) >= 1
+    assert _avcc(clips[0]) != _avcc(clips[1])

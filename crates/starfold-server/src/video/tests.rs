@@ -859,6 +859,27 @@ fn a_hardware_h264_encoder_that_keeps_failing_falls_back_to_openh264() {
     );
 }
 
+#[test]
+fn the_test_hook_fails_the_h264_encoder() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264_HW, H264], Opts::default());
+    let (l, mut rl) = client(&hub);
+    join_legacy(&hub, &l);
+    push(&mut eng);
+    assert!(videos(&acked(&l, &mut rl))[0].1);
+    assert_eq!(eng.h264, H264_HW);
+    let before = cohort_of(&l);
+    hub.fail_h264.store(true, Ordering::Release);
+    hub.replan();
+    push(&mut eng);
+    assert_eq!(eng.h264, H264);
+    assert_ne!(cohort_of(&l), before);
+    assert!(
+        videos(&acked(&l, &mut rl))[0].1,
+        "the new encoder starts with a keyframe"
+    );
+}
+
 /// Answers the current offers with WebCodecs support for `backend`'s, and turns video on.
 fn join_v2_from(hub: &Hub, c: &Client, backend: Backend) {
     let caps = hub

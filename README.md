@@ -188,6 +188,14 @@ A recording is the H.264 voxl already sends to viewers, saved as MP4 without enc
 it again, so it costs no extra CPU. It doesn't include the cursor (viewers draw it), and
 a resize ends it.
 
+If another encoder takes over mid-recording (a hardware encoder failing over to OpenH264,
+say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
+`/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
+`manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
+`end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets` or
+`closed`). Without it you get the first MP4, with `x-voxl-segments` and
+`x-voxl-record-end` headers when there were more.
+
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
 after every action and hope it was long enough:
 

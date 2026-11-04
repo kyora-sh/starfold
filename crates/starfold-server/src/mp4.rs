@@ -10,6 +10,8 @@ pub struct Frame {
 }
 
 const TIMESCALE: u32 = 1000;
+/// The least a recording's last frame lasts (ms).
+pub const LAST_FRAME_MS: u64 = 17;
 
 /// NAL units of an Annex-B stream (start codes removed).
 pub fn nals(data: &[u8]) -> Vec<&[u8]> {
@@ -97,7 +99,7 @@ pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<V
         let next = frames
             .get(i + 1)
             .map(|n| n.ms)
-            .unwrap_or(end_ms.max(f.ms + 17));
+            .unwrap_or(end_ms.max(f.ms + LAST_FRAME_MS));
         durations.push(next.saturating_sub(f.ms).max(1) as u32);
         if f.key {
             sync.push(i as u32 + 1);

@@ -719,6 +719,9 @@ impl Engine {
                 self.failed.push(sh.cand);
             }
         }
+        if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
+            self.failed.push(self.h264);
+        }
         if self.failed.contains(&self.h264) {
             self.replace_h264();
         }
