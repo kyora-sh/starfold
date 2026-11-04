@@ -283,9 +283,7 @@ async function configure(c: number, m: Extract<CodecMessage, { w: number }>) {
 		return;
 	}
 	configs = list;
-	encoder = m.backend
-		? `${m.backend} (${m.hardware ? 'hw' : 'sw'})`
-		: null;
+	encoder = m.backend ? `${m.backend} (${m.hardware ? 'hw' : 'sw'})` : null;
 	setLayout(
 		m.w,
 		m.h,
