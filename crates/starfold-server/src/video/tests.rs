@@ -55,6 +55,9 @@ struct Fake {
     /// Only this encode fails.
     fail_at: Option<usize>,
     gate: Option<Arc<Gate>>,
+    /// Counts this encoder's requested keyframes: (all, at the keyframe budget).
+    keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
+    kbps: u32,
 }
 
 fn codec_string(c: Codec, level: u32) -> String {
@@ -66,7 +69,8 @@ fn codec_string(c: Codec, level: u32) -> String {
 }
 
 impl VideoEncoder for Fake {
-    fn set_rate(&mut self, _: RateConfig) -> Result<(), EncodeError> {
+    fn set_rate(&mut self, r: RateConfig) -> Result<(), EncodeError> {
+        self.kbps = r.max_kbps;
         Ok(())
     }
 
@@ -79,6 +83,12 @@ impl VideoEncoder for Fake {
             g.wait();
         }
         self.n += 1;
+        if let (Some(k), true) = (&self.keys, opts.force_keyframe) {
+            k.0.fetch_add(1, Ordering::Relaxed);
+            if self.kbps >= 16_000 {
+                k.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if self.fail_from.is_some_and(|f| self.n >= f) || self.fail_at == Some(self.n) {
             return Err(EncodeError("session lost".into()));
         }
@@ -116,16 +126,24 @@ struct Opts {
     hevc_fails: bool,
     /// The HEVC stream changes level on its 3rd picture.
     hevc_relevel: bool,
-    /// HEVC cohorts' encoders fail from their 3rd picture on.
+    /// HEVC cohorts' encoders fail from their 3rd picture on, and so do reopened ones.
     hevc_breaks: bool,
-    /// The second HEVC stripe's encoder fails from its 2nd picture on.
+    /// The second HEVC stripe's encoder fails from its 2nd picture on, and so do
+    /// reopened ones.
     hevc_second_stripe_breaks: bool,
     /// The first HEVC cohort encoder fails its 2nd picture only.
     hevc_fails_once: bool,
+    /// The second H.264 stripe's session fails every picture, and so does every one
+    /// opened after it (or, with `h264_reopen_heals`, only that first one).
+    h264_second_stripe_dead: bool,
+    h264_reopen_heals: bool,
+    /// Keyframes requested from the first H.264 stripe's encoder.
+    h264_keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
 }
 
 fn fakes(o: Opts) -> Open {
     let opened = Arc::new(AtomicUsize::new(0));
+    let h264_opened = Arc::new(AtomicUsize::new(0));
     Arc::new(move |c: &EncoderConfig| {
         let hevc = c.codec == Codec::Hevc;
         let earlier = if hevc {
@@ -133,6 +151,13 @@ fn fakes(o: Opts) -> Open {
         } else {
             0
         };
+        // The sample's is 0, the cohort's stripes 1 and 2, reopened ones after.
+        let h264 = if hevc {
+            0
+        } else {
+            h264_opened.fetch_add(1, Ordering::Relaxed)
+        };
+        let dead = o.h264_second_stripe_dead && (h264 == 2 || (h264 > 2 && !o.h264_reopen_heals));
         if o.hevc_fails && earlier > 0 {
             return Err(EncodeError("no session".into()));
         }
@@ -141,15 +166,20 @@ fn fakes(o: Opts) -> Open {
             coded: (c.width, c.height),
             n: 0,
             relevel: (hevc && o.hevc_relevel).then_some(3),
+            // A broken backend: the sessions reopened after a failure fail at once.
             fail_from: if hevc && o.hevc_breaks && earlier > 0 {
-                Some(3)
-            } else if hevc && o.hevc_second_stripe_breaks && earlier == 2 {
-                Some(2)
+                Some(if earlier == 1 { 3 } else { 1 })
+            } else if hevc && o.hevc_second_stripe_breaks && earlier >= 2 {
+                Some(if earlier == 2 { 2 } else { 1 })
+            } else if dead {
+                Some(1)
             } else {
                 None
             },
             fail_at: (hevc && o.hevc_fails_once && earlier == 1).then_some(2),
             gate: o.gate.clone().filter(|_| hevc),
+            keys: o.h264_keys.clone().filter(|_| !hevc && h264 == 1),
+            kbps: 0,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -799,6 +829,106 @@ fn a_failed_update_is_redone() {
         Some(Codec::Hevc),
         "one failure is not a fallback"
     );
+}
+
+fn two_stripes() -> VideoConfig {
+    VideoConfig {
+        stripes: 2,
+        ..config()
+    }
+}
+
+#[test]
+fn a_dead_h264_stripe_gets_a_keyframe_a_second_at_most() {
+    let keys = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        h264_keys: Some(keys.clone()),
+        ..Default::default()
+    };
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], fakes(o)).unwrap();
+    let (c, _rx) = client(&hub);
+    join_legacy(&hub, &c);
+    // An idle desktop: nothing changes for 2.5 s.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(2500) {
+        push_band(&mut eng, W, H, None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (all, boosted) = (
+        keys.0.load(Ordering::Relaxed),
+        keys.1.load(Ordering::Relaxed),
+    );
+    // FAIL_AFTER quick ones at the keyframe budget, then about one a second without it.
+    assert_eq!(
+        boosted as u32, FAIL_AFTER,
+        "{all} keyframes, {boosted} boosted"
+    );
+    assert!(
+        (FAIL_AFTER as usize + 1..=FAIL_AFTER as usize + 4).contains(&all),
+        "{all} keyframes in 2.5 s"
+    );
+    assert!(eng.cohorts[0].shared.degraded());
+}
+
+#[test]
+fn a_degraded_cohorts_keyframes_wait_for_flow_control() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        ..Default::default()
+    };
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], fakes(o)).unwrap();
+    let (c, _rx) = client(&hub);
+    join_legacy(&hub, &c);
+    for _ in 0..FAIL_AFTER {
+        push_band(&mut eng, W, H, None);
+    }
+    assert!(eng.cohorts[0].shared.degraded());
+    *eng.cohorts[0].shared.last_key.lock() = Instant::now() - RETRY_EVERY;
+    for id in 0..40 {
+        c.inflight.lock().push_back(crate::hub::Inflight {
+            id,
+            sent: Instant::now(),
+            bytes: 1,
+        });
+    }
+    let views = eng.views();
+    assert!(views[0].want_key);
+    assert_eq!(
+        eng.takes(&views, 33.0),
+        vec![false],
+        "a viewer that is behind"
+    );
+    c.inflight.lock().clear();
+    assert_eq!(eng.takes(&eng.views(), 33.0), vec![true]);
+}
+
+#[test]
+fn a_failed_session_is_reopened() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        h264_reopen_heals: true,
+        ..Default::default()
+    };
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    assert!(
+        videos(&drain(&mut rx)).is_empty(),
+        "the bottom stripe failed"
+    );
+    push_band(&mut eng, W, H, None);
+    let v = videos(&drain(&mut rx));
+    assert_eq!(v.len(), 2, "both stripes of one frame");
+    assert!(
+        v.iter().all(|f| f.1 && f.2 == v[0].2),
+        "a keyframe on every stripe, the bottom one from its new session: {v:?}"
+    );
+    assert!(!eng.cohorts[0].shared.degraded());
 }
 
 #[test]

@@ -65,6 +65,8 @@ struct Frame {
 struct Job {
     frame: Frame,
     force_idr: bool,
+    /// The keyframe gets the keyframe budget (not while the cohort is degraded).
+    boost: bool,
 }
 
 fn union(a: Option<Band>, b: Band) -> Band {
@@ -215,14 +217,24 @@ struct Shared {
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
     failures: AtomicU32,
+    /// When the capture thread last sent this cohort a keyframe job.
+    last_key: Mutex<Instant>,
     w: u32,
     h: u32,
 }
 
 /// Consecutive failed encodes after which a cohort's viewers move to their next codec.
 const FAIL_AFTER: u32 = 3;
+/// How often a cohort past FAIL_AFTER (H.264, which has nothing to fall back to) gets
+/// a keyframe; those wait for flow control and get no keyframe boost.
+const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 impl Shared {
+    /// A stripe keeps failing: keyframes are no longer a way to recover quickly.
+    fn degraded(&self) -> bool {
+        self.failures.load(Ordering::Acquire) >= FAIL_AFTER
+    }
+
     /// The stripes' streams told their parameters (on their first frame or when they
     /// changed). Where they differ from what was announced, the cohort's protocol 2
     /// viewers get a new epoch and the frames again once ready for it.
@@ -577,6 +589,7 @@ impl Engine {
             idr_inflight: AtomicBool::new(false),
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
+            last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             w: self.w,
             h: self.h,
         });
@@ -805,7 +818,9 @@ impl Engine {
             .iter()
             .map(|c| {
                 let clients = self.hub.cohort_clients(c.shared.id);
-                let want_key = !c.shared.idr_inflight.load(Ordering::Acquire)
+                let sh = &c.shared;
+                let want_key = !sh.idr_inflight.load(Ordering::Acquire)
+                    && (!sh.degraded() || sh.last_key.lock().elapsed() >= RETRY_EVERY)
                     && clients
                         .iter()
                         .any(|x| x.needs_keyframe.load(Ordering::Relaxed));
@@ -848,7 +863,7 @@ impl Engine {
             .map(|(c, v)| {
                 !v.clients.is_empty()
                     && c.shared.busy.load(Ordering::Acquire) < 2
-                    && (v.want_key || flow_ok(&v.clients, interval_ms))
+                    && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, interval_ms))
             })
             .collect()
     }
@@ -879,11 +894,13 @@ impl Engine {
             let force = v.want_key;
             if force {
                 c.shared.idr_inflight.store(true, Ordering::Release);
+                *c.shared.last_key.lock() = Instant::now();
             }
             c.shared.busy.fetch_add(1, Ordering::AcqRel);
             if let Err(e) = tx.try_send(Job {
                 frame,
                 force_idr: force,
+                boost: force && !c.shared.degraded(),
             }) {
                 c.shared.busy.fetch_sub(1, Ordering::AcqRel);
                 if force {
@@ -1543,6 +1560,7 @@ struct StripeJob {
     buf: Arc<I420>,
     ts: i64,
     force_idr: bool,
+    boost: bool,
     crf: f32,
     cap: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
@@ -1658,7 +1676,7 @@ fn stripe_worker(
     };
     while let Ok(job) = rx.recv() {
         let buf = &*job.buf;
-        let rate = if job.force_idr {
+        let rate = if job.force_idr && job.boost {
             s.applied_kbps = None;
             Some(keyframe_rate(job.crf, job.cap, s.cfg.fps))
         } else {
@@ -1767,6 +1785,22 @@ fn stripe_worker(
             Ok(_) => None,
             Err(e) => {
                 log::error!("stripe {i}: {e}");
+                // A session that failed may stay broken: the next picture gets a fresh
+                // one (which starts with an IDR).
+                match (s.open)(&EncoderConfig {
+                    threads: if s.max_threads > 1 {
+                        gov.threads
+                    } else {
+                        s.cfg.threads
+                    },
+                    ..s.cfg.clone()
+                }) {
+                    Ok(e) => {
+                        s.enc = e;
+                        s.applied_kbps = None;
+                    }
+                    Err(e) => log::error!("stripe {i}: encoder reopen failed: {e}"),
+                }
                 None
             }
         };
@@ -1828,6 +1862,7 @@ fn encode_loop(
     while let Ok(Job {
         frame: job,
         force_idr,
+        boost,
     }) = rx.recv()
     {
         let t0 = Instant::now();
@@ -1865,6 +1900,7 @@ fn encode_loop(
                     buf: job.buf.clone(),
                     ts,
                     force_idr,
+                    boost,
                     crf: want_crf,
                     cap,
                     mb_dirty: job.mb_dirty.clone(),
@@ -1887,8 +1923,9 @@ fn encode_loop(
         let worst = fails.iter().copied().max().unwrap_or(0);
         sh.failures.store(worst, Ordering::Release);
         if failed {
-            // What failed is redone as a keyframe (also counting towards FAIL_AFTER),
-            // so a lost update can't leave a still screen stale.
+            // What failed is redone as a keyframe (counting towards FAIL_AFTER), so a
+            // lost update can't leave a still screen stale; past FAIL_AFTER the capture
+            // thread admits those keyframes only now and then (Shared::degraded).
             for c in hub.cohort_clients(sh.id) {
                 c.needs_keyframe.store(true, Ordering::Relaxed);
             }
