@@ -31,30 +31,48 @@ for s in $sets; do
       arms+=("openh264|cpu_per_stream|BACKEND=openh264 CODEC=h264")
       run_set a "$rounds" "${arms[@]}" ;;
     b)
-      for c in h264 hevc; do
-        for r in 640x360 1280x720 1920x1080; do
-          for f in 30 60 120; do
-            arms+=("$c-${r}-f$f|cpu_per_stream|BACKEND=videotoolbox CODEC=$c W=${r%x*} H=${r#*x} FPS=$f $best")
+      for cfg in "base:" "off:VT_LL=0 VT_RT=0"; do
+        for c in h264 hevc; do
+          for r in 640x360 1280x720 1920x1080; do
+            for f in 30 60 120; do
+              arms+=("${cfg%%:*}-$c-${r}-f$f|cpu_per_stream|BACKEND=videotoolbox CODEC=$c W=${r%x*} H=${r#*x} FPS=$f ${cfg#*:}")
+            done
           done
         done
       done
       run_set b "$rounds" "${arms[@]}" ;;
     p)
-      for c in h264 hevc; do
-        arms+=("$c-free|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 $best")
-        arms+=("$c-pace33|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=33 $best")
-        arms+=("$c-pace37|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=37 $best")
-        arms+=("$c-pipe|vt_pipeline|CODEC=$c $best")
+      for cfg in "base:" "off:VT_LL=0 VT_RT=0"; do
+        for c in h264 hevc; do
+          n=${cfg%%:*}-$c; e=${cfg#*:}
+          arms+=("$n-free|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 $e")
+          arms+=("$n-pace33|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=33 $e")
+          arms+=("$n-pace37|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=37 $e")
+          arms+=("$n-pipe|vt_pipeline|CODEC=$c $e")
+        done
       done
       run_set p "$rounds" "${arms[@]}" ;;
-    c)
-      for c in h264 hevc; do
-        arms+=("$c-base|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=90")
-        arms+=("$c-llrc-off|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=90 VT_LL=0")
-        arms+=("$c-rt-off|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=90 VT_RT=0")
-        arms+=("$c-llrc-rt-off|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=90 VT_LL=0 VT_RT=0")
+    r)
+      for cfg in "base:" "off:VT_LL=0 VT_RT=0"; do
+        for c in h264 hevc; do
+          for k in 2000 8000 30000; do
+            arms+=("${cfg%%:*}-$c-k$k|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=240 KBPS=$k ${cfg#*:}")
+          done
+        done
       done
-      run_set c "$rounds" "${arms[@]}" ;;
+      run_set r "$rounds" "${arms[@]}" ;;
+    l)
+      for load in 0 2 6; do
+        for ((i = 0; i < rounds; i++)); do
+          pids=()
+          for ((y = 0; y < load; y++)); do yes > /dev/null & pids+=($!); done
+          for c in h264 hevc; do
+            run_set l 1 "$c-load$load|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150"
+          done
+          [ ${#pids[@]} -eq 0 ] || kill "${pids[@]}"
+          wait 2> /dev/null
+        done
+      done ;;
   esac
 done
 echo SETS_DONE

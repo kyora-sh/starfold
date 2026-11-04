@@ -749,6 +749,7 @@ fn cpu_per_stream() {
     };
     let (w, h, fps) = (env("W", 1920), env("H", 1080), env("FPS", 30) as u32);
     let pace_ms = env("PACE_MS", 0) as u64;
+    let cap_kbps = env("KBPS", 30_000) as u32;
     let cols = w.div_ceil(16);
     let mbs = cols * h.div_ceil(16);
     let cpu = || unsafe {
@@ -758,7 +759,7 @@ fn cpu_per_stream() {
             + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 / 1e6
     };
     for workload in ["typing", "scrolling", "video"] {
-        let mut cfg = config(backend, w as u32, h as u32, 30_000);
+        let mut cfg = config(backend, w as u32, h as u32, cap_kbps);
         cfg.codec = codec;
         cfg.fps = fps;
         cfg.threads = threads as u32;
@@ -766,6 +767,7 @@ fn cpu_per_stream() {
         let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
         let (mut bytes, mut lat, mut cpu_s) = (0usize, Vec::new(), 0.0);
+        let mut keys = 0usize;
         let start = std::time::Instant::now();
         for f in 0..frames {
             let mut dirty = vec![0u8; mbs];
@@ -819,6 +821,7 @@ fn cpu_per_stream() {
                 lat.push(dt);
                 cpu_s += dc;
                 bytes += aus.iter().map(|a| a.data.len()).sum::<usize>();
+                keys += aus.iter().filter(|a| a.keyframe).count();
             }
             if pace_ms > 0 {
                 let next = start + std::time::Duration::from_millis(pace_ms * (f as u64 + 1));
@@ -832,7 +835,7 @@ fn cpu_per_stream() {
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench backend={} codec={codec:?} workload={workload} w={w} h={h} fps={fps} pace_ms={pace_ms} threads={threads} wall_fps={wall_fps:.1} cpu_s_per_s={:.4} kbps={:.0} p05_ms={:.2} p25_ms={:.2} p50_ms={:.2} p75_ms={:.2} p95_ms={:.2} max_ms={:.2}",
+            "bench backend={} codec={codec:?} workload={workload} w={w} h={h} fps={fps} pace_ms={pace_ms} cap_kbps={cap_kbps} keys={keys} threads={threads} wall_fps={wall_fps:.1} cpu_s_per_s={:.4} kbps={:.0} p05_ms={:.2} p25_ms={:.2} p50_ms={:.2} p75_ms={:.2} p95_ms={:.2} max_ms={:.2}",
             backend.name(),
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
