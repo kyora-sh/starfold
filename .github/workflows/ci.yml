@@ -200,3 +200,8 @@ jobs:
       # What the startup probe finds on this host's hardware encoders.
       - name: Encoder probe
         run: cargo test --locked --lib videotoolbox_probe -- --nocapture
+      # A viewer that decodes HEVC gets VideoToolbox HEVC.
+      - name: HEVC negotiation
+        env:
+          STARFOLD_EXPECT_HEVC: '1'
+        run: cargo test --locked --lib videotoolbox_hevc_negotiated -- --nocapture

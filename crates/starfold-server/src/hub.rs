@@ -1,5 +1,6 @@
 //! Shared state between media producers (video/audio/cursor/clipboard) and websocket clients.
 
+use crate::negotiate::{Choice, DecodeCap, Offer};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -19,6 +20,61 @@ pub struct Inflight {
     pub bytes: usize,
 }
 
+/// The protocol a client speaks: unknown until it sends `v,0|1` (protocol 1) or a
+/// capability hello (protocol 2) first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Proto {
+    #[default]
+    Unknown,
+    Legacy,
+    V2,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    /// On no cohort.
+    #[default]
+    Idle,
+    /// Sent a `codec` message; waiting for codec-ready.
+    Announced(Instant),
+    /// Gets the cohort's frames.
+    Ready,
+    /// Told that nothing the server streams decodes there.
+    NoCodec,
+}
+
+/// Which cohort's frames a client gets, under which epoch. Changed only with the lock
+/// held, and frames are sent with it held, so nothing of an old configuration is
+/// queued after the message that replaces it.
+#[derive(Default)]
+pub struct Route {
+    pub proto: Proto,
+    /// Protocol 2: the decoder configurations of the client's last capability hello,
+    /// and the offer generation they answer.
+    pub caps: Vec<DecodeCap>,
+    pub caps_gen: u64,
+    pub cohort: Option<u64>,
+    pub choice: Option<Choice>,
+    /// Protocol 2: the configuration generation, one per `codec` message.
+    pub epoch: u32,
+    pub phase: Phase,
+    /// Choices that failed on this client (codec-error or no codec-ready in time).
+    pub rejected: Vec<Choice>,
+}
+
+impl Route {
+    /// Takes the client off its cohort: nothing more is sent to it until it is routed again.
+    pub fn detach(&mut self) {
+        self.cohort = None;
+        self.choice = None;
+        self.phase = Phase::Idle;
+    }
+
+    fn current(&self, epoch: u32) -> bool {
+        self.proto == Proto::V2 && self.cohort.is_some() && self.epoch == epoch
+    }
+}
+
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::UnboundedSender<Out>,
@@ -33,6 +89,7 @@ pub struct Client {
     /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
     pub delay: Mutex<DelayEst>,
+    pub route: Mutex<Route>,
 }
 
 /// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
@@ -92,6 +149,94 @@ impl Client {
             d.bytes = 0;
             d.window_start = Instant::now();
         }
+    }
+
+    /// `v,0|1`. A client that sends it before any capability hello speaks protocol 1.
+    pub fn set_video(&self, on: bool) {
+        let mut r = self.route.lock();
+        if r.proto == Proto::Unknown {
+            r.proto = Proto::Legacy;
+        }
+        self.video.store(on, Ordering::Relaxed);
+        if r.proto == Proto::V2 {
+            // Turned back on, it gets a new epoch (its worker reset its decoders).
+            r.detach();
+        }
+        if on {
+            self.inflight.lock().clear();
+            self.started.store(false, Ordering::Relaxed);
+            self.needs_keyframe
+                .store(r.proto == Proto::Legacy, Ordering::Relaxed);
+        }
+    }
+
+    /// A capability hello answering offer generation `gen`: the client speaks protocol 2
+    /// from now on and is negotiated afresh.
+    pub fn caps_hello(&self, caps: Vec<DecodeCap>, gen: u64) {
+        let mut r = self.route.lock();
+        r.proto = Proto::V2;
+        r.caps = caps;
+        r.caps_gen = gen;
+        r.rejected.clear();
+        r.detach();
+        self.started.store(false, Ordering::Relaxed);
+        self.needs_keyframe.store(false, Ordering::Relaxed);
+    }
+
+    /// codec-ready for `epoch`: false unless it is the epoch announced last.
+    pub fn codec_ready(&self, epoch: u32) -> bool {
+        let mut r = self.route.lock();
+        if !r.current(epoch) || !matches!(r.phase, Phase::Announced(_)) {
+            return false;
+        }
+        r.phase = Phase::Ready;
+        self.inflight.lock().clear();
+        self.started.store(false, Ordering::Relaxed);
+        self.needs_keyframe.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// codec-error for `epoch`: the choice is never tried on this client again. Returns
+    /// it, or None for a stale epoch.
+    pub fn codec_error(&self, epoch: u32) -> Option<Choice> {
+        let mut r = self.route.lock();
+        if !r.current(epoch) {
+            return None;
+        }
+        let c = r.choice?;
+        if !r.rejected.contains(&c) {
+            r.rejected.push(c);
+        }
+        r.detach();
+        Some(c)
+    }
+
+    /// An ack: `a,<frame>` (protocol 1, `epoch` None) or one for `epoch`. Acks for an
+    /// older configuration, or in the other protocol, are dropped.
+    pub fn ack(&self, epoch: Option<u32>, frame: u32) -> bool {
+        let r = self.route.lock();
+        let ok = match epoch {
+            None => r.proto == Proto::Legacy,
+            Some(e) => r.current(e) && r.phase == Phase::Ready,
+        };
+        if ok {
+            self.on_ack(frame);
+        }
+        ok
+    }
+
+    /// A keyframe request (`kf`, or one for `epoch`), on the same terms as `ack`.
+    pub fn request_keyframe(&self, epoch: Option<u32>) -> bool {
+        let r = self.route.lock();
+        let ok = match epoch {
+            None => r.proto == Proto::Legacy,
+            Some(e) => r.current(e) && r.phase == Phase::Ready,
+        };
+        if ok {
+            self.started.store(false, Ordering::Relaxed);
+            self.needs_keyframe.store(true, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Frames in flight and age of the oldest unacknowledged one.
@@ -260,6 +405,15 @@ pub struct Hub {
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
     /// When each part of the screen last changed (`/wait`).
     pub activity: crate::wait::Activity,
+    /// What the server can stream at the current size (`videoOffers` in the hello), and
+    /// its generation: capability hellos for an older one are ignored.
+    pub offers: Mutex<Vec<Offer>>,
+    pub offer_gen: AtomicU64,
+    /// Viewers changed: the video thread routes them again.
+    pub replan: AtomicBool,
+    pub next_cohort: AtomicU64,
+    /// The running encoder cohorts, for /stats.
+    pub cohorts: Mutex<serde_json::Value>,
 }
 
 impl Hub {
@@ -281,6 +435,11 @@ impl Hub {
             hello_extra: Mutex::new(serde_json::Map::new()),
             snapshots: Mutex::new(Vec::new()),
             activity: Default::default(),
+            offers: Mutex::new(Vec::new()),
+            offer_gen: AtomicU64::new(0),
+            replan: AtomicBool::new(false),
+            next_cohort: AtomicU64::new(1),
+            cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
         })
     }
 
@@ -290,6 +449,12 @@ impl Hub {
 
     pub fn drain_wake(&self) {
         self.waker.drain();
+    }
+
+    /// Asks the video thread to route viewers again.
+    pub fn replan(&self) {
+        self.replan.store(true, Ordering::Release);
+        self.wake();
     }
 
     pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>) -> Arc<Client> {
@@ -312,6 +477,7 @@ impl Hub {
                 base_at: Instant::now(),
                 queue_ms: 0.0,
             }),
+            route: Mutex::new(Route::default()),
         });
         self.clients.lock().push(c.clone());
         c
@@ -319,7 +485,7 @@ impl Hub {
 
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().retain(|c| c.id != id);
-        self.wake();
+        self.replan();
     }
 
     pub fn video_clients(&self) -> Vec<Arc<Client>> {
@@ -331,26 +497,49 @@ impl Hub {
             .collect()
     }
 
-    /// The `hello` message: current geometry plus the server's settings.
+    /// The `hello` message: current geometry plus the server's settings, and for
+    /// protocol 2 clients the codecs on offer. `stripes` is the H.264 stream's layout.
     pub fn hello(&self) -> String {
         let mut m = self.hello_extra.lock().clone();
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
         m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
         m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
+        m.insert("protocol".into(), crate::negotiate::PROTOCOL.into());
+        m.insert(
+            "offer".into(),
+            self.offer_gen.load(Ordering::Relaxed).into(),
+        );
+        m.insert("videoOffers".into(), serde_json::json!(*self.offers.lock()));
         serde_json::Value::Object(m).to_string()
     }
 
+    /// Video clients on cohort `id` that get its frames.
+    pub fn cohort_clients(&self, id: u64) -> Vec<Arc<Client>> {
+        self.video_clients()
+            .into_iter()
+            .filter(|c| {
+                let r = c.route.lock();
+                r.cohort == Some(id) && (r.proto == Proto::Legacy || r.phase == Phase::Ready)
+            })
+            .collect()
+    }
+
     /// After the stream restarts (new size): every client needs the new geometry and
-    /// a keyframe, and acks for the old stream's frames no longer apply.
+    /// a keyframe, acks for the old stream's frames no longer apply, and protocol 2
+    /// clients answer the new offers before they are routed again.
     pub fn restart_clients(&self) {
         let hello = self.hello();
         for c in self.clients.lock().iter() {
+            let mut r = c.route.lock();
+            r.detach();
             c.inflight.lock().clear();
             c.started.store(false, Ordering::Relaxed);
-            c.needs_keyframe.store(true, Ordering::Relaxed);
+            c.needs_keyframe
+                .store(r.proto != Proto::V2, Ordering::Relaxed);
             c.send(Out::Text(hello.clone()));
         }
+        self.replan();
     }
 
     pub fn broadcast(&self, m: impl Fn() -> Out) {

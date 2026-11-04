@@ -144,6 +144,15 @@ function main() {
 				resize.setup(m.resize);
 				statusEl.style.display = 'none';
 				break;
+			case 'codec':
+				// Protocol 2: this epoch's size and stripes.
+				if (m.error === undefined) {
+					app.desk.w = m.w;
+					app.desk.h = m.h;
+					video.build(m.stripes.map((s): [number, number] => [s.y, s.h]));
+					video.layout();
+				}
+				break;
 			case 'status':
 				if (m.s === 'closed') {
 					mic.stop();

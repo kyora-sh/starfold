@@ -1,15 +1,32 @@
-// Owns the WebSocket, decodes H.264 with WebCodecs and paints straight onto an
+// Owns the WebSocket, decodes the video with WebCodecs and paints straight onto an
 // OffscreenCanvas the moment each frame is decoded (no rAF queueing), or hands the
 // frames to the page when it presents them through <video>.
-import { Bin, cmd, parseVideoHeader, VIDEO_HEADER_BYTES } from './protocol';
+//
+// A protocol 2 server offers codecs in its hello: the worker tests each offered
+// decoder configuration, tells the server which it decodes, and configures its
+// decoders from the server's `codec` message of each epoch. An older server gets
+// protocol 1: H.264, configured from each keyframe's SPS.
+import {
+	Bin,
+	cmd,
+	msg,
+	parseVideoHeader,
+	VIDEO_HEADER_BYTES,
+	VIDEO_V2_HEADER_BYTES,
+} from './protocol';
 import type {
+	CodecMessage,
+	DecodeEntry,
+	DecoderConfig,
 	FromWorker,
+	Hello,
 	PcmChunk,
 	ServerMessage,
 	Stats,
 	Stripe,
 	StripeFrame,
 	ToWorker,
+	VideoOffer,
 } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -25,6 +42,22 @@ let audioPort: MessagePort | null = null;
 let audioTs = 0;
 let wantVideo = true;
 let wantAudio = false;
+/** 0 until the server's hello says which protocol it speaks. */
+let proto = 0;
+/** `v,` waits for the capability hello, so the server doesn't take this for an old client. */
+let videoSent = false;
+let helloSeq = 0;
+/** One per socket: async work started on an earlier connection is dropped. */
+let conn = 0;
+/** Protocol 2: the epoch announced last, and whether the decoders are set up for it. */
+let epoch = 0;
+let ready = false;
+/** Protocol 2: each stripe's decoder configuration in this epoch. */
+let configs: VideoDecoderConfig[] = [];
+/** The acceleration preference each tested configuration was accepted with. */
+const accepted = new Map<string, HardwareAcceleration>();
+/** Decoder errors in this epoch; a codec that keeps failing is reported. */
+let errors: number[] = [];
 
 // The screen arrives as independent H.264 stripes, one decoder each. A frame is a
 // set of stripe updates sharing an id; frames are presented whole and in order.
@@ -67,14 +100,18 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
 function connect() {
 	const sock = new WebSocket(url);
 	ws = sock;
+	conn++;
 	sock.binaryType = 'arraybuffer';
 	sock.addEventListener('open', () => {
 		post({ t: 'status', s: 'open' });
-		send(cmd.video(wantVideo));
 		send(cmd.audio(wantAudio));
 	});
 	sock.addEventListener('close', () => {
 		post({ t: 'status', s: 'closed' });
+		proto = 0;
+		videoSent = false;
+		epoch = 0;
+		ready = false;
 		resetDecoder();
 		setTimeout(connect, 1000);
 	});
@@ -83,6 +120,7 @@ function connect() {
 		const b = new Uint8Array(e.data);
 		switch (b[0]) {
 			case Bin.Video:
+			case Bin.VideoV2:
 				onVideo(b);
 				break;
 			case Bin.Audio:
@@ -115,16 +153,139 @@ function onText(s: string) {
 		} catch {}
 		return;
 	}
-	if (m.t === 'hello' && canvas) {
-		if (canvas.width !== m.w || canvas.height !== m.h) {
-			canvas.width = m.w;
-			canvas.height = m.h;
-		}
-		ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
-		width = m.w;
-		resetDecoder();
+	if (m.t === 'codec') {
+		onCodec(m);
+		return;
 	}
+	if (m.t === 'hello') onHello(m);
+	post(m);
+}
+
+function setLayout(w: number, h: number, list: Stripe[]) {
+	if (!canvas) return;
+	if (canvas.width !== w || canvas.height !== h) {
+		canvas.width = w;
+		canvas.height = h;
+	}
+	ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+	layout = list;
+	width = w;
+}
+
+function sendVideo() {
+	if (videoSent) return;
+	videoSent = true;
+	send(cmd.video(wantVideo));
+}
+
+function onHello(m: Hello) {
+	if (m.protocol !== 2 || !Array.isArray(m.videoOffers)) {
+		proto = 1;
+		setLayout(m.w, m.h, m.stripes && m.stripes.length ? m.stripes : [[0, m.h]]);
+		resetDecoder();
+		sendVideo();
+		return;
+	}
+	// Each hello (the first, and one per new screen size) is answered with what decodes
+	// at its sizes; the last picture stays up until the server's next `codec`.
+	proto = 2;
+	void answer(conn, ++helloSeq, m.offer, m.videoOffers);
+}
+
+async function answer(
+	c: number,
+	seq: number,
+	offer: number | undefined,
+	offers: VideoOffer[]
+) {
+	const decode = await probe(offers);
+	if (c !== conn || seq !== helloSeq || proto !== 2) return;
+	send(msg.hello(offer, decode));
+	sendVideo();
+}
+
+const configKey = (c: DecoderConfig) =>
+	`${c.codec}/${c.codedWidth}x${c.codedHeight}`;
+
+function decoderConfig(
+	c: DecoderConfig,
+	hardwareAcceleration: HardwareAcceleration
+): VideoDecoderConfig {
+	return {
+		codec: c.codec,
+		codedWidth: c.codedWidth,
+		codedHeight: c.codedHeight,
+		optimizeForLatency: true,
+		hardwareAcceleration,
+	};
+}
+
+async function supported(c: VideoDecoderConfig): Promise<boolean> {
+	try {
+		return !!(await VideoDecoder.isConfigSupported(c)).supported;
+	} catch {
+		return false;
+	}
+}
+
+/** Every offered configuration this browser decodes, hardware preferred. */
+async function probe(offers: VideoOffer[]): Promise<DecodeEntry[]> {
+	const all = new Map<string, DecoderConfig>();
+	for (const o of offers)
+		for (const s of o.stripes) all.set(configKey(s.config), s.config);
+	const found = await Promise.all([...all].map(([k, c]) => test(k, c)));
+	return found.filter((e): e is DecodeEntry => e !== null);
+}
+
+async function test(k: string, c: DecoderConfig): Promise<DecodeEntry | null> {
+	const hw: HardwareAcceleration | null = (await supported(
+		decoderConfig(c, 'prefer-hardware')
+	))
+		? 'prefer-hardware'
+		: (await supported(decoderConfig(c, 'no-preference')))
+			? 'no-preference'
+			: null;
+	if (!hw) return null;
+	accepted.set(k, hw);
+	return { ...c, implementation: 'webcodecs', hardwareAcceleration: hw };
+}
+
+/** A new epoch: everything of the old one is dropped, and once every stripe's
+ * decoder configuration checks out the server is told it can send. */
+function onCodec(m: CodecMessage) {
+	if (proto !== 2 || m.epoch <= epoch) return;
+	epoch = m.epoch;
+	ready = false;
+	errors = [];
+	resetDecoder();
+	if (m.error !== undefined) {
+		post({ t: 'log', s: `no video: ${m.error}` });
+		return;
+	}
+	void configure(conn, m);
+}
+
+async function configure(c: number, m: Extract<CodecMessage, { w: number }>) {
+	const list = m.stripes.map((s) =>
+		decoderConfig(
+			s.config,
+			accepted.get(configKey(s.config)) ?? 'no-preference'
+		)
+	);
+	const ok = await Promise.all(list.map(supported));
+	if (c !== conn || m.epoch !== epoch) return;
+	if (!ok.every(Boolean)) {
+		send(msg.error(m.epoch, 'unsupported'));
+		return;
+	}
+	configs = list;
+	setLayout(
+		m.w,
+		m.h,
+		m.stripes.map((s): Stripe => [s.y, s.h])
+	);
+	ready = true;
+	send(msg.ready(m.epoch));
 	post(m);
 }
 
@@ -145,7 +306,7 @@ function requestKeyframe() {
 	const now = performance.now();
 	if (now - kfRequested > 500) {
 		kfRequested = now;
-		send(cmd.keyframe);
+		send(proto === 2 ? msg.keyframe(epoch) : cmd.keyframe);
 	}
 }
 
@@ -206,10 +367,15 @@ function fitStripe(frame: VideoFrame, i: number): VideoFrame {
 	}
 }
 
-function makeDecoder(i: number, codec: string): VideoDecoder {
+function makeDecoder(i: number, config: VideoDecoderConfig): VideoDecoder {
 	const sd = stripeState(i);
+	const e = epoch;
 	const dec = new VideoDecoder({
 		output: (decoded) => {
+			if (stripes[i] !== sd) {
+				decoded.close();
+				return;
+			}
 			const frame = fitStripe(decoded, i);
 			const id = sd.ids.get(frame.timestamp);
 			sd.ids.delete(frame.timestamp);
@@ -221,17 +387,26 @@ function makeDecoder(i: number, codec: string): VideoDecoder {
 			f.got.push({ i, y: layout[i] ? layout[i][0] : 0, frame });
 			flush();
 		},
-		error: (e) => {
-			post({ t: 'log', s: `stripe ${i} decoder error: ${e.message}` });
+		error: (err) => {
+			post({ t: 'log', s: `stripe ${i} decoder error: ${err.message}` });
+			if (stripes[i] !== sd) return;
+			if (proto === 2 && e === epoch && ready) {
+				const now = performance.now();
+				errors = errors.filter((t) => now - t < 10000);
+				errors.push(now);
+				if (errors.length >= 3) {
+					// It keeps failing here: the server moves on to its next codec.
+					ready = false;
+					resetDecoder();
+					send(msg.error(e, 'decode-error'));
+					return;
+				}
+			}
 			resetDecoder();
 			requestKeyframe();
 		},
 	});
-	dec.configure({
-		codec,
-		optimizeForLatency: true,
-		hardwareAcceleration: 'no-preference',
-	});
+	dec.configure(config);
 	return dec;
 }
 
@@ -256,7 +431,7 @@ function flush() {
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id));
+		send(proto === 2 ? msg.ack(epoch, id) : cmd.ack(id));
 		st.frames++;
 		st.decodeMs += performance.now() - f.t0;
 	}
@@ -264,7 +439,11 @@ function flush() {
 
 function onVideo(b: Uint8Array) {
 	const h = parseVideoHeader(b);
-	const data = b.subarray(VIDEO_HEADER_BYTES);
+	const v2 = h.epoch !== undefined;
+	// Another protocol's, another epoch's, or before the decoders are set up.
+	if (v2 !== (proto === 2)) return;
+	if (v2 && (!ready || h.epoch !== epoch || !configs[h.stripe])) return;
+	const data = b.subarray(v2 ? VIDEO_V2_HEADER_BYTES : VIDEO_HEADER_BYTES);
 	st.bytes += b.length;
 	let f = frames.get(h.frame);
 	if (!f) {
@@ -282,7 +461,14 @@ function onVideo(b: Uint8Array) {
 		return;
 	}
 	if (h.key) {
-		const codec = codecFromSps(data) || 'avc1.640034';
+		const config: VideoDecoderConfig = v2
+			? configs[h.stripe]
+			: {
+					codec: codecFromSps(data) || 'avc1.640034',
+					optimizeForLatency: true,
+					hardwareAcceleration: 'no-preference',
+				};
+		const codec = config.codec;
 		if (!sd.dec || sd.dec.state === 'closed' || codec !== sd.codec) {
 			if (sd.dec && sd.dec.state !== 'closed') {
 				try {
@@ -292,7 +478,7 @@ function onVideo(b: Uint8Array) {
 			sd.codec = codec;
 			sd.ids.clear();
 			try {
-				sd.dec = makeDecoder(h.stripe, codec);
+				sd.dec = makeDecoder(h.stripe, config);
 			} catch (e) {
 				post({ t: 'log', s: 'configure failed ' + e });
 				f.need--;
@@ -401,8 +587,12 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'video':
 			if (wantVideo !== m.on) {
 				wantVideo = m.on;
-				if (m.on) resetDecoder();
-				send(cmd.video(m.on));
+				if (m.on) {
+					resetDecoder();
+					// Protocol 2: the server announces a new epoch.
+					if (proto === 2) ready = false;
+				}
+				if (videoSent) send(cmd.video(m.on));
 			}
 			break;
 		case 'audioPort':
