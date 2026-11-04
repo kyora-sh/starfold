@@ -12,6 +12,7 @@ fn backends() -> Vec<Backend> {
 fn config(backend: Backend, width: u32, height: u32, max_kbps: u32) -> EncoderConfig {
     EncoderConfig {
         backend,
+        codec: Codec::H264,
         width,
         height,
         fps: 30,
@@ -458,6 +459,139 @@ fn unknown_encoder_names() {
         .contains("--features x264"));
     #[cfg(feature = "x264")]
     assert_eq!(Backend::parse("x264"), Ok(Backend::X264));
+    #[cfg(target_os = "macos")]
+    assert_eq!(Backend::parse("videotoolbox"), Ok(Backend::VideoToolbox));
+    #[cfg(not(target_os = "macos"))]
+    assert!(Backend::parse("videotoolbox")
+        .unwrap_err()
+        .contains("macOS"));
+    assert!(Backend::parse("nvenc")
+        .unwrap_err()
+        .contains("no encoder yet"));
+}
+
+#[test]
+fn backends_without_the_codec_refuse_to_open() {
+    let mut cfg = config(Backend::OpenH264, 64, 64, 1000);
+    cfg.codec = Codec::Hevc;
+    assert!(open(&cfg).is_err());
+    cfg.backend = Backend::Nvenc;
+    cfg.codec = Codec::H264;
+    assert!(open(&cfg).is_err());
+}
+
+/// What the startup probe finds on this Mac (printed for the PR, `--nocapture`).
+#[cfg(target_os = "macos")]
+#[test]
+fn videotoolbox_probe() {
+    use super::caps::{host_providers, Registry, PROBE_TIMEOUT};
+    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    println!("{}", serde_json::to_string_pretty(&r).unwrap());
+    for codec in [Codec::H264, Codec::Hevc] {
+        let c = r.check(Backend::VideoToolbox, codec).unwrap();
+        assert_eq!(c.acceleration, super::caps::Acceleration::Hardware);
+    }
+    let av1 = r
+        .encoders
+        .iter()
+        .find(|c| c.backend == Backend::VideoToolbox && c.codec == Codec::Av1)
+        .expect("AV1 is probed, not assumed");
+    assert!(!av1.eligible());
+}
+
+#[cfg(target_os = "macos")]
+fn vt(codec: Codec, w: u32, h: u32, kbps: u32) -> Box<dyn VideoEncoder> {
+    let mut cfg = config(Backend::VideoToolbox, w, h, kbps);
+    cfg.codec = codec;
+    open(&cfg).unwrap()
+}
+
+/// ~60 frames of text, scrolling and motion through the hardware encoder: one access
+/// unit per frame, IDRs exactly where asked with their parameter sets first, and a
+/// bitrate change without reopening.
+#[cfg(target_os = "macos")]
+#[test]
+fn videotoolbox_encodes_h264_and_hevc() {
+    use super::hevc;
+    for codec in [Codec::H264, Codec::Hevc] {
+        let (w, h) = (1280, 720);
+        let mut enc = vt(codec, w as u32, h as u32, 8000);
+        let mut p = Picture::new(w, h);
+        let mut aus = Vec::new();
+        for f in 0..60usize {
+            match f / 20 {
+                0 => p.texture(f as u32 + 1, 100 + f * 12, 200, 112 + f * 12, 222, 0),
+                1 => p.texture(0, 200, 60, 1000, 660, f * 8),
+                _ => p.video(f),
+            }
+            if f == 40 {
+                enc.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
+            }
+            let got = encode_one(&mut *enc, &p, f as i64 * 33, f == 30);
+            assert_eq!(got.len(), 1, "{codec:?} frame {f}");
+            aus.extend(got);
+        }
+        aus.extend(enc.drain().unwrap());
+        assert_eq!(aus.len(), 60, "{codec:?}");
+        for (f, au) in aus.iter().enumerate() {
+            let want_key = f == 0 || f == 30;
+            assert_eq!(au.keyframe, want_key, "{codec:?} frame {f}");
+            assert_eq!(au.pts_ms, f as i64 * 33, "{codec:?} frame {f}");
+            assert_eq!(au.config.is_some(), f == 0, "{codec:?} frame {f}");
+            let t: Vec<u8> = nal_units(&au.data)
+                .map(|n| match codec {
+                    Codec::H264 => nal_type(n),
+                    _ => hevc::nal_type(n),
+                })
+                .collect();
+            let params: &[u8] = match codec {
+                Codec::H264 => &[NAL_SPS, NAL_PPS],
+                _ => &[hevc::NAL_VPS, hevc::NAL_SPS, hevc::NAL_PPS],
+            };
+            let first_slice = t
+                .iter()
+                .position(|&x| match codec {
+                    Codec::H264 => matches!(x, 1 | NAL_IDR),
+                    _ => hevc::is_slice(x),
+                })
+                .expect("a slice");
+            for ps in params {
+                let at = t.iter().position(|x| x == ps);
+                assert_eq!(
+                    at.is_some_and(|i| i < first_slice),
+                    want_key,
+                    "{codec:?} frame {f}: {t:?}"
+                );
+            }
+        }
+        let c = aus[0].config.as_ref().unwrap();
+        assert_eq!(c.coded, (w as u32, h as u32));
+        match codec {
+            Codec::H264 => {
+                assert!(c.codec_string.starts_with("avc1.64"), "{}", c.codec_string);
+                let sps = sps_of(&aus[0]);
+                assert_eq!(sps.profile, 100);
+                assert_eq!(sps.display, (w as u32, h as u32));
+                assert_eq!(sps.color, Some((false, 1, 13, 6)));
+                assert_eq!(decode_all(&aus).len(), aus.len());
+                assert_eq!(decode_all(&aus[30..]).len(), aus.len() - 30);
+            }
+            _ => assert!(c.codec_string.starts_with("hvc1.1."), "{}", c.codec_string),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn videotoolbox_pads_small_and_odd_sizes() {
+    for codec in [Codec::H264, Codec::Hevc] {
+        for (w, h) in [(64, 64), (333, 77), (2, 2), (1920, 1080)] {
+            let mut enc = vt(codec, w as u32, h as u32, 4000);
+            let au = encode_one(&mut *enc, &Picture::new(w, h), 0, false).remove(0);
+            assert!(au.keyframe, "{codec:?} {w}x{h}");
+            assert_eq!(au.config.unwrap().display, (w as u32, h as u32));
+        }
+    }
 }
 
 /// Writes the default encoder's typing, scrolling and video streams to `$STREAM_DIR`

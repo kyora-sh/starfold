@@ -153,16 +153,32 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    if encoder == encoder::Backend::OpenH264 {
+    if encoder.name() != "x264" {
         for flag in ["preset", "paintover-crf"]
             .iter()
             .filter(|f| a.contains_key(**f))
         {
-            log::warn!("--{flag} is an x264 setting; OpenH264 ignores it");
+            log::warn!("--{flag} is an x264 setting; {} ignores it", encoder.name());
         }
         if a.contains_key("crf") {
-            log::warn!("--crf with OpenH264 is its lowest QP; bitrate follows --max-kbps");
+            if encoder == encoder::Backend::OpenH264 {
+                log::warn!("--crf with OpenH264 is its lowest QP; bitrate follows --max-kbps");
+            } else {
+                log::warn!("--crf is an x264 setting; {} ignores it", encoder.name());
+            }
         }
+    }
+    let encoders = std::sync::Arc::new(encoder::caps::Registry::probe(
+        encoder::caps::host_providers(
+            truthy(a.get("encoder-probe"), true),
+            truthy(a.get("experimental-hw-probes"), false),
+        ),
+        encoder::caps::PROBE_TIMEOUT,
+    ));
+    encoders.log();
+    if let Err(e) = encoders.check(encoder, encoder::Codec::H264) {
+        log::error!("--encoder {}: {e}", encoder.name());
+        std::process::exit(2);
     }
     let vcfg = video::VideoConfig {
         display: display.clone(),
@@ -380,6 +396,7 @@ async fn serve(a: HashMap<String, String>) {
         ),
         favicon,
         favicon_type,
+        encoders,
     };
     // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
     // besides IP addresses, localhost and its own page (see access.rs).
