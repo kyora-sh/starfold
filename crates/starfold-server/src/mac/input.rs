@@ -113,44 +113,59 @@ fn layout_map() -> HashMap<char, (u16, bool, bool)> {
         }
         let layout = CFDataGetBytePtr(data);
         let kbd = LMGetKbdType() as u32;
-        // Plain keys first, then Shift, Option, Shift+Option; the main block before
-        // the keypad, so digits come from the number row.
-        let keys: Vec<u16> = (0..65).chain(93..128).chain(65..93).collect();
-        for mods in [0, UC_SHIFT, UC_OPTION, UC_SHIFT | UC_OPTION] {
-            for &kc in &keys {
-                let mut dead = 0u32;
-                let mut buf = [0u16; 4];
-                let mut len = 0usize;
-                let st = UCKeyTranslate(
-                    layout,
-                    kc,
-                    kUCKeyActionDown,
-                    mods,
-                    kbd,
-                    0,
-                    &mut dead,
-                    buf.len(),
-                    &mut len,
-                    buf.as_mut_ptr(),
-                );
-                // Dead keys (accents that wait for the next key) are typed as text instead.
-                if st != 0 || dead != 0 || len == 0 {
-                    continue;
-                }
-                let mut it = char::decode_utf16(buf[..len].iter().copied());
-                if let (Some(Ok(c)), None) = (it.next(), it.next()) {
-                    if !c.is_control() {
-                        map.entry(c)
-                            .or_insert((kc, mods & UC_SHIFT != 0, mods & UC_OPTION != 0));
-                    }
-                }
+        map = char_map(|kc, mods| {
+            let mut dead = 0u32;
+            let mut buf = [0u16; 4];
+            let mut len = 0usize;
+            let st = UCKeyTranslate(
+                layout,
+                kc,
+                kUCKeyActionDown,
+                mods,
+                kbd,
+                0,
+                &mut dead,
+                buf.len(),
+                &mut len,
+                buf.as_mut_ptr(),
+            );
+            // Dead keys (accents that wait for the next key) are typed as text instead.
+            if st != 0 || dead != 0 || len == 0 {
+                return None;
             }
-        }
+            let mut it = char::decode_utf16(buf[..len].iter().copied());
+            match (it.next(), it.next()) {
+                (Some(Ok(c)), None) if !c.is_control() => Some(c),
+                _ => None,
+            }
+        });
         CFRelease(src);
         true
     });
     if !ok {
         log::warn!("keyboard layout unavailable; typing characters as text");
+    }
+    map
+}
+
+/// Builds the character map from `translate(key, modifiers)`. The main block comes first
+/// with plain keys, then Shift, Option, Shift+Option, so '*' is Shift-8 rather than the
+/// keypad's '*' (the server drops the viewer's Shift, and Cmd-Shift-8 must stay that
+/// shortcut); keypad keys only add characters the main block can't type.
+fn char_map(translate: impl Fn(u16, u32) -> Option<char>) -> HashMap<char, (u16, bool, bool)> {
+    // 95 is the JIS keypad comma.
+    let main: Vec<u16> = (0..65).chain(93..95).chain(96..128).collect();
+    let keypad: Vec<u16> = (65..93).chain(95..96).collect();
+    let mut map = HashMap::new();
+    for keys in [main, keypad] {
+        for mods in [0, UC_SHIFT, UC_OPTION, UC_SHIFT | UC_OPTION] {
+            for &kc in &keys {
+                if let Some(c) = translate(kc, mods) {
+                    map.entry(c)
+                        .or_insert((kc, mods & UC_SHIFT != 0, mods & UC_OPTION != 0));
+                }
+            }
+        }
     }
     map
 }
@@ -492,4 +507,82 @@ pub fn spawn(
         })
         .unwrap();
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The US layout's keys these tests look at; the keypad ignores Shift.
+    fn us(kc: u16, mods: u32) -> Option<char> {
+        let (plain, shifted) = match kc {
+            0 => ('a', 'A'),
+            11 => ('b', 'B'),
+            18 => ('1', '!'),
+            19 => ('2', '@'),
+            20 => ('3', '#'),
+            21 => ('4', '$'),
+            23 => ('5', '%'),
+            22 => ('6', '^'),
+            26 => ('7', '&'),
+            28 => ('8', '*'),
+            25 => ('9', '('),
+            29 => ('0', ')'),
+            24 => ('=', '+'),
+            27 => ('-', '_'),
+            44 => ('/', '?'),
+            47 => ('.', '>'),
+            65 => ('.', '.'),
+            67 => ('*', '*'),
+            69 => ('+', '+'),
+            75 => ('/', '/'),
+            78 => ('-', '-'),
+            81 => ('=', '='),
+            82..=89 => {
+                let d = char::from_digit((kc - 82) as u32, 10)?;
+                (d, d)
+            }
+            91 => ('8', '8'),
+            92 => ('9', '9'),
+            _ => return None,
+        };
+        if mods & UC_OPTION != 0 {
+            return None;
+        }
+        Some(if mods & UC_SHIFT != 0 { shifted } else { plain })
+    }
+
+    #[test]
+    fn shifted_main_keys_win_over_the_keypad() {
+        let m = char_map(us);
+        assert_eq!(m[&'*'], (28, true, false));
+        assert_eq!(m[&'+'], (24, true, false));
+        for (c, kc) in [('/', 44), ('-', 27), ('=', 24), ('.', 47)] {
+            assert_eq!(m[&c], (kc, false, false), "{c}");
+        }
+    }
+
+    #[test]
+    fn digits_and_letters_come_from_the_main_block() {
+        let m = char_map(us);
+        for (c, kc) in "1234567890"
+            .chars()
+            .zip([18, 19, 20, 21, 23, 22, 26, 28, 25, 29])
+        {
+            assert_eq!(m[&c], (kc, false, false), "{c}");
+        }
+        assert_eq!(m[&'a'], (0, false, false));
+        assert_eq!(m[&'A'], (0, true, false));
+        assert_eq!(m[&'!'], (18, true, false));
+    }
+
+    #[test]
+    fn keypad_types_what_the_main_block_cannot() {
+        // A keypad decimal key that types ',' (as on many European layouts).
+        let m = char_map(|kc, mods| if kc == 65 { Some(',') } else { us(kc, mods) });
+        assert_eq!(m[&','], (65, false, false));
+        // The JIS keypad comma key is keypad too.
+        let m = char_map(|kc, mods| if kc == 95 { Some('*') } else { us(kc, mods) });
+        assert_eq!(m[&'*'], (28, true, false));
+    }
 }
