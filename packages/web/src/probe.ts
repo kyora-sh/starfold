@@ -1,6 +1,7 @@
 // What this browser decodes of the server's offers: WebCodecs, hardware preferred, and
 // dav1d-wasm for AV1 only when the browser has no hardware-backed WebCodecs decoder for
-// AV1, HEVC or H.264 and none of its own for AV1.
+// AV1, HEVC or H.264 and WebCodecs decodes none of the offers. The server ranks every
+// WebCodecs choice above dav1d-wasm, so it is only fetched when it would be picked.
 import type {
 	DecodeEntry,
 	DecoderConfig,
@@ -79,7 +80,7 @@ export async function probe(
 		(t) => t.av1 && !t.hw && env.dav1dDecodes(t.c.codec)
 	);
 	const noHardware =
-		!tested.some((t) => t.hw === 'prefer-hardware') &&
+		decode.length === 0 &&
 		wasm.length > 0 &&
 		!(await hardwareElsewhere(wasm[0].c, env));
 	if (noHardware && (await env.dav1d()))

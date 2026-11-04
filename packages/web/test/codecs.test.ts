@@ -186,6 +186,12 @@ describe('av01', () => {
 			av1Codec(Uint8Array.from([0x12, 0x00, 0x32, 0x01, 0x00]))
 		).toBeNull();
 		expect(av1Codec(Uint8Array.from([0x0a, 0x02, 0x00, 0x00]))).toBeNull();
+		expect(av1Codec(Uint8Array.from([0x0a, 0x80]))).toBeNull();
+		expect(
+			av1Codec(
+				Uint8Array.from([0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+			)
+		).toBeNull();
 	});
 });
 

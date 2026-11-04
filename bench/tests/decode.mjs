@@ -144,6 +144,8 @@ const tus = ivfFrames(path.join(HERE, 'fixtures/av1-640x360.ivf'));
 const stub = { caps: null, ready: 0, acks: 0, lastAck: -1, keyRequests: 0, errors: [], sent: 0, corrupt: false, epochs: 0 };
 // An OBU with its forbidden bit set: dav1d refuses it.
 const BAD_TU = Buffer.from([0x8a, 0x01, 0x00]);
+// Padding OBUs after the frame, which dav1d may keep buffered into the next call.
+const PAD = Buffer.from([0x7a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
 function serveStub() {
 	const server = http.createServer(async (req, res) => {
 		try {
@@ -159,8 +161,7 @@ function serveStub() {
 		const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
 		sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
 		const stripes = [0, 1].map((i) => ({ i, y: i * 360, h: 360, config: { codec: AV1, codedWidth: 640, codedHeight: 360 } }));
-		const h264 = stripes.map((s) => ({ ...s, config: { ...s.config, codec: 'avc1.42c01e' } }));
-		wsSend(sock, JSON.stringify({ t: 'hello', w: 640, h: 720, stripes: [[0, 360], [360, 360]], os: 'linux', audio: false, protocol: 2, offer: 1, videoOffers: [{ codec: 'av1', format: 'av1-low-overhead', stripes }, { codec: 'h264', format: 'annexb', stripes: h264 }] }));
+		wsSend(sock, JSON.stringify({ t: 'hello', w: 640, h: 720, stripes: [[0, 360], [360, 360]], os: 'linux', audio: false, protocol: 2, offer: 1, videoOffers: [{ codec: 'av1', format: 'av1-low-overhead', stripes }] }));
 		let epoch = 0;
 		let timer = null;
 		let id = 0;
@@ -179,7 +180,7 @@ function serveStub() {
 				h[12] = 2;
 				h.writeUInt16BE(s * 360, 14);
 				h.writeUInt32BE(epoch, 16);
-				wsSend(sock, Buffer.concat([h, stub.corrupt && key ? BAD_TU : tus[tu % tus.length]]));
+				wsSend(sock, Buffer.concat([h, stub.corrupt && key ? BAD_TU : key ? tus[tu % tus.length] : Buffer.concat([tus[tu % tus.length], PAD])]));
 			}
 			stub.sent++;
 			tu++;

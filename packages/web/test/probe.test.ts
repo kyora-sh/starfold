@@ -61,18 +61,38 @@ describe('probe', () => {
 		});
 	});
 
-	test('dav1d-wasm is offered for AV1 only when nothing decodes with hardware', async () => {
-		const { e, loads } = env([], ['avc1']);
+	test('dav1d-wasm is offered for AV1 only when nothing decodes through WebCodecs', async () => {
+		const { e, loads } = env([], []);
 		const r = await probe([AV1, H264], e);
 		expect(r.decode.map((d) => [d.codec, d.implementation])).toEqual([
-			['avc1.42c028', 'webcodecs'],
 			['av01.0.08M.08', 'dav1d-wasm'],
 		]);
-		expect(r.decode[1].hardwareAcceleration).toBeUndefined();
+		expect(r.decode[0].hardwareAcceleration).toBeUndefined();
 		expect(r.accepted.get('av01.0.08M.08/1920x1080')?.implementation).toBe(
 			'dav1d-wasm'
 		);
 		expect(loads()).toBe(1);
+	});
+
+	test('software WebCodecs H.264 outranks dav1d-wasm, which is then not even fetched', async () => {
+		const { e, loads } = env([], ['avc1']);
+		const r = await probe([AV1, H264], e);
+		expect(r.decode.map((d) => d.implementation)).toEqual(['webcodecs']);
+		expect(loads()).toBe(0);
+	});
+
+	test('WebCodecs AV1 at one size rules dav1d-wasm out at another', async () => {
+		const small = offer('av1', 'av01.0.04M.08', 640, 360);
+		const e: ProbeEnv = {
+			supported: async (c) =>
+				c.hardwareAcceleration === 'no-preference' && c.codedWidth === 640,
+			dav1d: async () => true,
+			dav1dDecodes,
+		};
+		const r = await probe([AV1, small], e);
+		expect(r.decode.map((d) => [d.codec, d.implementation])).toEqual([
+			['av01.0.04M.08', 'webcodecs'],
+		]);
 	});
 
 	test('any hardware WebCodecs decoder rules dav1d-wasm out, and it is not even loaded', async () => {
@@ -88,10 +108,10 @@ describe('probe', () => {
 	});
 
 	test('hardware for a codec the server did not offer rules dav1d-wasm out too', async () => {
-		const { e, asked, loads } = env(['hvc1'], ['avc1']);
+		const { e, asked, loads } = env(['hvc1'], []);
 		const r = await probe([AV1, H264], e);
 		expect(asked).toContain('hvc1.1.6.L120.90:prefer-hardware');
-		expect(r.decode.map((d) => d.implementation)).toEqual(['webcodecs']);
+		expect(r.decode).toEqual([]);
 		expect(loads()).toBe(0);
 	});
 
@@ -106,9 +126,9 @@ describe('probe', () => {
 	});
 
 	test('dav1d-wasm is advertised only once it initialized', async () => {
-		const { e, loads } = env([], ['avc1'], false);
+		const { e, loads } = env([], [], false);
 		const r = await probe([AV1, H264], e);
-		expect(r.decode.map((d) => d.implementation)).toEqual(['webcodecs']);
+		expect(r.decode).toEqual([]);
 		expect(r.accepted.has('av01.0.08M.08/1920x1080')).toBe(false);
 		expect(loads()).toBe(1);
 	});
@@ -123,14 +143,11 @@ describe('probe', () => {
 	test('the test hook: no hardware decoders, and no WebCodecs AV1', async () => {
 		const { e, asked } = env(['av01', 'avc1'], ['av01', 'avc1']);
 		e.noHardware = true;
-		const r = await probe([AV1, H264], e);
+		const r = await probe([AV1], e);
 		expect(
 			r.decode.map((d) => [d.codec, d.implementation, d.hardwareAcceleration])
-		).toEqual([
-			['avc1.42c028', 'webcodecs', 'no-preference'],
-			['av01.0.08M.08', 'dav1d-wasm', undefined],
-		]);
-		expect(asked).toEqual(['avc1.42c028:no-preference']);
+		).toEqual([['av01.0.08M.08', 'dav1d-wasm', undefined]]);
+		expect(asked).toEqual([]);
 	});
 
 	test('each distinct configuration is tested once', async () => {

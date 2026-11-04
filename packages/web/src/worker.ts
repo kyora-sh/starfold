@@ -423,7 +423,10 @@ function present(id: number, parts: Part<Picture>[], t0: number) {
 		const out: StripeFrame[] = parts.map((g) => ({
 			i: g.i,
 			y: g.y,
-			frame: g.pic.take!(),
+			frame: g.pic.take!(
+				width || Infinity,
+				layout[g.i] ? layout[g.i][1] : Infinity
+			),
 		}));
 		post(
 			{ t: 'frames', parts: out },

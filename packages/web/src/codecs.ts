@@ -121,10 +121,9 @@ export function sequenceHeader(d: Uint8Array): Uint8Array | null {
 const dec2 = (x: number) => String(x).padStart(2, '0');
 
 export function av1Codec(d: Uint8Array): string | null {
-	const sh = sequenceHeader(d);
-	if (!sh) return null;
 	try {
-		return av1FromSequenceHeader(sh);
+		const sh = sequenceHeader(d);
+		return sh ? av1FromSequenceHeader(sh) : null;
 	} catch {
 		return null;
 	}

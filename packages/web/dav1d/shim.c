@@ -87,6 +87,7 @@ Picture *sf_decode(Dav1dContext *c, uint8_t *buf, uint32_t len, int *err) {
 		return NULL;
 	}
 	Picture *out = NULL;
+	int stalls = 0;
 	while (data.sz) {
 		int r = dav1d_send_data(c, &data);
 		if (r < 0 && r != DAV1D_ERR(EAGAIN)) {
@@ -102,7 +103,7 @@ Picture *sf_decode(Dav1dContext *c, uint8_t *buf, uint32_t len, int *err) {
 				free(out);
 			}
 			out = p;
-		} else if (r == DAV1D_ERR(EAGAIN)) {
+		} else if (r == DAV1D_ERR(EAGAIN) && ++stalls > 4) {
 			*err = r;
 			break;
 		}
