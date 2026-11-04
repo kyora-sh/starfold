@@ -65,13 +65,25 @@ try {
 		if (/\[voxl\]/.test(t)) console.log('[page]', t);
 	});
 	p.on('pageerror', (e) => errors.push(String(e)));
-	await p.goto(`${base}/?stats`);
+	await p.goto(`${base}/?stats`, { waitUntil: 'commit' });
+	await p.waitForFunction(() => window.starfoldFirstFrame !== undefined, null, { timeout: 20000 });
+	// Frames the page presented (decoded frames written to its <video> stripes, or the
+	// worker's own count when it paints the canvas), and the worker's latest report.
+	const presented = () =>
+		p.evaluate(() => {
+			const v = [...document.querySelectorAll('video.stripe')];
+			return v.length ? v.reduce((n, x) => n + x.getVideoPlaybackQuality().totalVideoFrames, 0) : null;
+		});
 	const report = () => p.evaluate(() => window.voxlStats || {});
-	const decoding = async (what) => {
-		await sleep(3500);
+	const decoding = async (what, width) => {
+		await sleep(1500);
+		const n0 = await presented();
+		await sleep(2000);
+		const n1 = await presented();
 		const r = await report();
-		const frames = Math.round(r.fps * 2);
-		check(frames >= 20 && r.dropped === 0, `${what}: ${r.fps?.toFixed(1)} fps, ${r.dropped} dropped`);
+		const vw = await p.evaluate(() => document.querySelector('video.stripe')?.videoWidth ?? null);
+		const frames = n0 === null ? Math.round(r.fps * 2) : n1 - n0;
+		check(frames >= 20 && r.dropped === 0 && (!width || vw === null || vw === width), `${what}: ${frames} frames decoded in 2 s, ${r.fps?.toFixed(1)} fps, ${r.dropped} dropped, video ${vw ?? 'canvas'} wide`);
 		return r;
 	};
 	const ready = (after) => until(async () => {
@@ -88,7 +100,7 @@ try {
 		return v && v.stream.phase === 'ready' && coded && coded.codedWidth === 1920 ? { v, coded } : null;
 	}, 20000);
 	check(!!v1 && v1.v.stream.codec === 'h264', `negotiated ${v1 ? `${v1.v.stream.codec} ${v1.coded.codec} ${v1.coded.codedWidth}x${v1.coded.codedHeight} epoch ${v1.v.stream.epoch}` : 'nothing'}`);
-	const r1 = await decoding('after negotiation');
+	const r1 = await decoding('after negotiation', 1920);
 	check(r1.codec === v1?.coded.codec, `worker decoders configured with ${r1.codec}`);
 	const enc = (await stats()).encoder;
 	const h264 = enc?.chosen?.find((c) => c.codec === 'h264');
@@ -107,7 +119,7 @@ try {
 		return k > k0 ? k : null;
 	}, 5000);
 	check(!!k1, `keyframe on the switch (${k0} -> ${k1})`);
-	await decoding('after the switch');
+	await decoding('after the switch', 1920);
 
 	// 3) A resize goes through the same transition: new offers, a new epoch at the new size.
 	const e2 = v2 ? v2.stream.epoch : e1;
@@ -119,7 +131,7 @@ try {
 		return v && v.stream.phase === 'ready' && v.stream.epoch > e2 && coded?.codedWidth === 1440 ? { v, coded } : null;
 	}, 20000);
 	check(!!v3, `resize: epoch ${e2} -> ${v3?.v.stream.epoch} at ${v3 ? `${v3.coded.codedWidth}x${v3.coded.codedHeight}` : '?'}`);
-	await decoding('after the resize');
+	await decoding('after the resize', 1440);
 
 	// 4) A protocol 1 client (as the old worker: `v,1` first, codec from the SPS, `a,<id>`
 	// acks) beside it, decoding with WebCodecs.
@@ -170,7 +182,7 @@ try {
 		return r;
 	}, `ws://127.0.0.1:${port}/ws`);
 	check(legacy.frames >= 30 && legacy.keys >= 1 && legacy.errors.length === 0 && legacy.v2 === 0 && legacy.codecMsgs === 0, `protocol 1 client: ${JSON.stringify(legacy)}`);
-	await decoding('the protocol 2 viewer while the protocol 1 client watched');
+	await decoding('the protocol 2 viewer while the protocol 1 client watched', 1440);
 
 	check(errors.length === 0, `no decoder errors in the page (${errors.length}${errors.length ? ': ' + errors.join(' | ') : ''})`);
 } catch (e) {

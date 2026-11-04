@@ -12,6 +12,8 @@ export interface Picture {
 		h: number
 	): void;
 	close(): void;
+	/** Hands over the VideoFrame behind the picture, if it has one; closing it is then the taker's. */
+	take?(): VideoFrame;
 }
 
 export interface DecoderSink {
@@ -30,7 +32,12 @@ export interface StripeDecoder {
 }
 
 class FramePicture implements Picture {
+	private taken = false;
 	constructor(private readonly frame: VideoFrame) {}
+	take(): VideoFrame {
+		this.taken = true;
+		return this.frame;
+	}
 	get timestamp() {
 		return this.frame.timestamp;
 	}
@@ -45,7 +52,7 @@ class FramePicture implements Picture {
 		ctx.drawImage(this.frame, 0, 0, sw, sh, 0, y, sw, sh);
 	}
 	close() {
-		this.frame.close();
+		if (!this.taken) this.frame.close();
 	}
 }
 

@@ -263,7 +263,11 @@ try {
 				for (const e of l.getEntries()) window.longTasks.push(Math.round(e.duration));
 			}).observe({ type: 'longtask' });
 		});
-		await p.goto(url);
+		// Readiness is the page's first painted frame; the load event must still come.
+		await p.goto(url, { waitUntil: 'commit' });
+		await p.waitForFunction(() => window.starfoldFirstFrame !== undefined, null, { timeout: 20000 });
+		const loaded = await p.waitForFunction(() => document.readyState === 'complete', null, { timeout: 5000 }).then(() => true, () => false);
+		check(loaded, `${url}: first frame painted, then the load event`);
 		return { ctx, p, errors, requests };
 	};
 	const report = (p) => p.evaluate(() => window.voxlStats || {});
@@ -284,6 +288,8 @@ try {
 			return r.implementation && r.fps >= 15 ? r : null;
 		}, 20000);
 		check(!!r0 && r0.implementation === 'webcodecs' && /^avc1\./.test(r0.codec), `H.264: ${r0 ? `${r0.codec} via ${r0.implementation} (${r0.hw}), ${r0.fps.toFixed(1)} fps` : 'nothing decoded'}`);
+		const shown = await p.evaluate(() => [...document.querySelectorAll('video.stripe')].map((v) => [v.style.display, v.getVideoPlaybackQuality().totalVideoFrames]));
+		check(shown.length === 1 && shown[0][0] === '' && shown[0][1] > 0, `H.264 presented through <video> by default: ${JSON.stringify(shown)}`);
 		const r = await steady(p, 'H.264');
 		check(r.fps >= 15 && r.dropped === 0, `H.264 steady: ${r.fps?.toFixed(1)} fps, decode p50 ${r.decodeP50?.toFixed(1)} p95 ${r.decodeP95?.toFixed(1)} ms, ${r.dropped} dropped`);
 		check(!requests.some((u) => /dav1d/.test(u)), `dav1d assets not fetched on the default path (${requests.filter((u) => /\.(js|wasm)$/.test(u)).join(' ')})`);
@@ -295,6 +301,8 @@ try {
 	server = await serveStub();
 	{
 		const { ctx, p, errors, requests } = await open(`http://127.0.0.1:${stubPort}/?stats&nohwdecode`);
+		const surface = await p.evaluate(() => ({ videos: document.querySelectorAll('video.stripe').length, canvas: document.getElementById('screen').style.display }));
+		check(surface.videos === 0 && surface.canvas === '', `dav1d-wasm pictures on the canvas, no <video> stripes: ${JSON.stringify(surface)}`);
 		await until(() => stub.acks > 30, 20000);
 		const caps = stub.caps || [];
 		check(caps.some((c) => c.codec === AV1 && c.implementation === 'dav1d-wasm' && !('hardwareAcceleration' in c)) && !caps.some((c) => c.codec === AV1 && c.implementation === 'webcodecs') && !caps.some((c) => c.hardwareAcceleration === 'prefer-hardware'), `capability hello: ${JSON.stringify(caps)}`);

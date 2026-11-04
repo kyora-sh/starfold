@@ -180,6 +180,12 @@ export function isCurrent(
 
 // ---- page <-> worker ----
 
+export interface StripeFrame {
+	i: number;
+	y: number;
+	frame: VideoFrame;
+}
+
 export interface Stats {
 	t: 'stats';
 	fps: number;
@@ -202,6 +208,11 @@ export interface Stats {
 
 /** Worker -> page. Server messages other than ping and close are forwarded as is. */
 export type FromWorker =
+	| { t: 'frames'; parts: StripeFrame[] }
+	/** Where the worker presents from now on; dav1d-wasm pictures go to the canvas. */
+	| { t: 'surface'; s: 'video' | 'canvas' }
+	/** The worker painted its first frame onto the canvas. */
+	| { t: 'painted' }
 	| { t: 'status'; s: 'open' | 'closed' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
@@ -211,7 +222,7 @@ export type FromWorker =
 
 /** Page -> worker. */
 export type ToWorker =
-	| { t: 'init'; canvas: OffscreenCanvas; url: string }
+	| { t: 'init'; canvas: OffscreenCanvas; url: string; presentToMain: boolean }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }

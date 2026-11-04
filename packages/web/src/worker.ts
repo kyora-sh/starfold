@@ -1,6 +1,6 @@
-// Owns the WebSocket, decodes the video and paints straight onto the page's
-// OffscreenCanvas the moment each frame is complete (no rAF queueing), so the main
-// thread never touches video.
+// Owns the WebSocket and decodes the video. Complete frames go to the page's <video>
+// stripes (MediaStreamTrackGenerator, where the browser has it), or are painted straight
+// onto its OffscreenCanvas the moment they are complete; dav1d-wasm pictures always are.
 //
 // A protocol 2 server offers codecs in its hello: the worker tests each offered
 // decoder configuration, tells the server which it decodes, and configures its
@@ -27,6 +27,7 @@ import {
 } from './protocol';
 import type {
 	CodecMessage,
+	StripeFrame,
 	FromWorker,
 	Hello,
 	Implementation,
@@ -51,6 +52,9 @@ const MAX_PENDING = 32;
 /** Chunks a stripe decoder may hold before it is taken as falling behind. */
 const MAX_QUEUED = 16;
 
+let presentToMain = false;
+let surface: 'video' | 'canvas' | null = null;
+let painted = false;
 let ws: WebSocket | null = null;
 let url = '';
 let canvas: OffscreenCanvas | null = null;
@@ -407,11 +411,35 @@ function makeDecoder(i: number, p: StripePlan): StripeDecoder {
 	return new WebCodecsDecoder(p.config, sink);
 }
 
+function setSurface(s: 'video' | 'canvas') {
+	if (s === surface) return;
+	surface = s;
+	post({ t: 'surface', s });
+}
+
 function present(id: number, parts: Part<Picture>[], t0: number) {
-	for (const g of parts) {
-		const h = layout[g.i] ? layout[g.i][1] : Infinity;
-		if (ctx && !noDraw) g.pic.draw(ctx, g.y, width || Infinity, h);
-		g.pic.close();
+	if (presentToMain && parts.length && parts.every((g) => g.pic.take)) {
+		setSurface('video');
+		const out: StripeFrame[] = parts.map((g) => ({
+			i: g.i,
+			y: g.y,
+			frame: g.pic.take!(),
+		}));
+		post(
+			{ t: 'frames', parts: out },
+			out.map((g) => g.frame)
+		);
+	} else if (parts.length) {
+		setSurface('canvas');
+		for (const g of parts) {
+			const h = layout[g.i] ? layout[g.i][1] : Infinity;
+			if (ctx && !noDraw) g.pic.draw(ctx, g.y, width || Infinity, h);
+			g.pic.close();
+		}
+		if (!painted) {
+			painted = true;
+			post({ t: 'painted' });
+		}
 	}
 	send(proto === 2 ? msg.ack(epoch, id) : cmd.ack(id));
 	const ms = performance.now() - t0;
@@ -585,6 +613,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'init':
 			canvas = m.canvas;
 			url = m.url;
+			presentToMain = m.presentToMain;
 			ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 			connect();
 			break;

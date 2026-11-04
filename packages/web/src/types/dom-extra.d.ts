@@ -1,5 +1,14 @@
 // Browser APIs voxl uses that TypeScript's DOM library doesn't include yet.
 
+// Insertable streams for video (Chromium): write VideoFrames into a MediaStreamTrack.
+interface MediaStreamTrackGenerator extends MediaStreamTrack {
+	readonly writable: WritableStream<VideoFrame>;
+}
+declare var MediaStreamTrackGenerator: {
+	prototype: MediaStreamTrackGenerator;
+	new (init: { kind: 'video' | 'audio' }): MediaStreamTrackGenerator;
+};
+
 // Keyboard Lock (Chromium): capture reserved shortcuts in fullscreen.
 interface Keyboard {
 	lock(keyCodes?: string[]): Promise<void>;
@@ -13,4 +22,6 @@ interface Navigator {
 interface Window {
 	fps: number;
 	voxlStats: unknown;
+	/** performance.now() when the first frame was painted (`starfold:firstframe`). */
+	starfoldFirstFrame?: number;
 }

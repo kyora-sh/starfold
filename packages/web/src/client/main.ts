@@ -81,7 +81,18 @@ function main() {
 	};
 
 	const cursor = createCursor(app);
-	const video = createVideo(app, cursor.apply);
+	// ?present=canvas: the worker paints every frame onto the canvas instead.
+	const useVideo =
+		params.get('present') !== 'canvas' &&
+		typeof MediaStreamTrackGenerator !== 'undefined';
+	let firstFrame = false;
+	const onFirstPaint = () => {
+		if (firstFrame) return;
+		firstFrame = true;
+		window.starfoldFirstFrame = performance.now();
+		window.dispatchEvent(new Event('starfold:firstframe'));
+	};
+	const video = createVideo(app, canvas, useVideo, cursor.apply, onFirstPaint);
 	const clipboard = createClipboard(app);
 	const audio = createAudio(app);
 	// Browsers only allow audio and clipboard writes after a user gesture.
@@ -97,7 +108,10 @@ function main() {
 	const resize = createResize(app);
 
 	const offscreen = canvas.transferControlToOffscreen();
-	post({ t: 'init', canvas: offscreen, url: wsUrl.href }, [offscreen]);
+	post(
+		{ t: 'init', canvas: offscreen, url: wsUrl.href, presentToMain: useVideo },
+		[offscreen]
+	);
 
 	// Stop video when nobody can see it.
 	let videoOn: boolean | null = null;
@@ -122,12 +136,22 @@ function main() {
 	worker.addEventListener('message', (e: MessageEvent<FromWorker>) => {
 		const m = e.data;
 		switch (m.t) {
+			case 'frames':
+				video.present(m.parts);
+				break;
+			case 'surface':
+				video.setSurface(m.s);
+				break;
+			case 'painted':
+				requestAnimationFrame(onFirstPaint);
+				break;
 			case 'hello':
 				app.desk.w = m.w;
 				app.desk.h = m.h;
 				app.remoteMac = m.os === 'macos';
 				app.readOnly = !!m.readOnly;
 				app.tools.classList.toggle('read-only', app.readOnly);
+				video.build(m.stripes && m.stripes.length ? m.stripes : [[0, m.h]]);
 				video.layout();
 				files.setup(m.files);
 				mic.setup(!!m.mic && !app.readOnly);
@@ -139,6 +163,7 @@ function main() {
 				if (m.error === undefined) {
 					app.desk.w = m.w;
 					app.desk.h = m.h;
+					video.build(m.stripes.map((s): [number, number] => [s.y, s.h]));
 					video.layout();
 					statusEl.style.display = 'none';
 				} else {
