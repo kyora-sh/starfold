@@ -4,6 +4,7 @@ import type { App } from './app';
 
 interface StripeOut {
 	video: HTMLVideoElement;
+	gen: MediaStreamTrackGenerator;
 	writer: WritableStreamDefaultWriter<VideoFrame>;
 	writing: boolean;
 	next: VideoFrame | null;
@@ -42,18 +43,45 @@ export function createVideo(
 	app: App,
 	canvas: HTMLCanvasElement,
 	useVideo: boolean,
-	onLayout: () => void
+	onLayout: () => void,
+	onFirstPaint: () => void
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
-	if (useVideo) canvas.style.display = 'none';
+	/** Waiting for the first presented frame of a stripe <video> (re-armed if it is removed first). */
+	let armed = false;
+	let painted = false;
+	/** Where the worker presents: <video> stripes, or the canvas (always for dav1d-wasm). */
+	let surface: 'video' | 'canvas' = useVideo ? 'video' : 'canvas';
+	const show = () => {
+		canvas.style.display = surface === 'canvas' ? '' : 'none';
+		for (const o of outs)
+			o.video.style.display = surface === 'video' ? '' : 'none';
+	};
+	show();
+
+	/** Drops the stripes. A <video> without data delays the page's load event until it has
+	 * some, even once removed, so each source is detached first. */
+	function clear() {
+		for (const o of outs) {
+			o.video.srcObject = null;
+			o.gen.stop();
+			o.next?.close();
+			o.next = null;
+			o.video.remove();
+		}
+		outs = [];
+		armed = false;
+	}
 
 	function build(list: Stripe[]) {
 		stripes = list;
-		for (const o of outs) o.video.remove();
-		outs = [];
-		if (!useVideo) return;
-		for (const [y, h] of list) {
+		clear();
+	}
+
+	/** The stripes' <video>s, made with their first frames so none ever waits for data. */
+	function open() {
+		for (const [y, h] of stripes) {
 			const gen = new MediaStreamTrackGenerator({ kind: 'video' });
 			const video = document.createElement('video');
 			video.className = 'stripe';
@@ -68,6 +96,7 @@ export function createVideo(
 			video.play().catch(() => {});
 			outs.push({
 				video,
+				gen,
 				writer: gen.writable.getWriter(),
 				writing: false,
 				next: null,
@@ -76,11 +105,33 @@ export function createVideo(
 	}
 
 	function present(parts: StripeFrame[]) {
+		if (!useVideo) {
+			for (const p of parts) p.frame.close();
+			return;
+		}
+		if (!outs.length) open();
+		if (!painted && !armed && outs[0] && parts.length) {
+			armed = true;
+			const v = outs[0].video;
+			const done = () => {
+				if (!v.isConnected) return;
+				painted = true;
+				onFirstPaint();
+			};
+			if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(done);
+			else requestAnimationFrame(done);
+		}
 		for (const p of parts) {
 			const o = outs[p.i];
 			if (o) write(o, p.frame);
 			else p.frame.close();
 		}
+	}
+
+	function setSurface(s: 'video' | 'canvas') {
+		surface = useVideo ? s : 'canvas';
+		if (surface === 'canvas') clear();
+		show();
 	}
 
 	function layout() {
@@ -102,5 +153,5 @@ export function createVideo(
 		onLayout();
 	}
 
-	return { build, present, layout };
+	return { build, present, layout, setSurface };
 }

@@ -94,7 +94,8 @@ cargo install --locked --path crates/starfold-server
 ```
 
 Run it against an X display, then open the link it prints (`?stats` adds an FPS
-overlay):
+overlay, `?present=canvas` paints into a canvas instead of `<video>`; a page embedding
+it can wait for the `starfold:firstframe` event on `window` rather than `load`):
 
 ```sh
 DISPLAY=:1 ./target/release/starfold --port=6901

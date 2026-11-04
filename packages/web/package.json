@@ -3,7 +3,8 @@
 	"private": true,
 	"description": "The browser client the server embeds; build.rs bundles src/ with esbuild.",
 	"scripts": {
-		"typecheck": "tsc -p . && tsc -p tsconfig.worker.json && tsc -p tsconfig.worklet.json"
+		"typecheck": "tsc -p . && tsc -p tsconfig.worker.json && tsc -p tsconfig.worklet.json",
+		"test": "bun test"
 	},
 	"devDependencies": {
 		"typescript": "5.8.2"

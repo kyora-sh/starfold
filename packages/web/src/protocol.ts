@@ -75,9 +75,11 @@ export interface VideoOffer {
 	stripes: StripeConfig[];
 }
 
+export type Implementation = 'webcodecs' | 'dav1d-wasm';
+
 /** One configuration the decoder accepted, exactly as tested. */
 export interface DecodeEntry extends DecoderConfig {
-	implementation: 'webcodecs' | 'dav1d-wasm';
+	implementation: Implementation;
 	hardwareAcceleration?: HardwareAcceleration;
 }
 
@@ -163,6 +165,19 @@ export function parseVideoHeader(b: Uint8Array): VideoHeader {
 export const VIDEO_HEADER_BYTES = 16;
 export const VIDEO_V2_HEADER_BYTES = 20;
 
+/** Whether a video message is for what the decoders are set up for: protocol 1 before
+ * and without a protocol 2 hello, else this epoch once its decoders are ready. */
+export function isCurrent(
+	h: VideoHeader,
+	proto: number,
+	epoch: number,
+	ready: boolean
+): boolean {
+	const v2 = h.epoch !== undefined;
+	if (v2 !== (proto === 2)) return false;
+	return !v2 || (ready && h.epoch === epoch);
+}
+
 // ---- page <-> worker ----
 
 export interface StripeFrame {
@@ -175,9 +190,15 @@ export interface Stats {
 	t: 'stats';
 	fps: number;
 	kbps: number;
+	/** Time from a frame's first stripe arriving to its presentation, mean and percentiles. */
 	decodeMs: number;
+	decodeP50: number;
+	decodeP95: number;
 	pipeMs: number;
 	codec: string | null;
+	implementation: Implementation | null;
+	/** The acceleration preference WebCodecs accepted: a hint, not proof of hardware. */
+	hw: HardwareAcceleration | null;
 	/** Protocol 2: the server's encoder, e.g. `videotoolbox (hw)`. */
 	encoder: string | null;
 	stripes: number;
@@ -188,6 +209,10 @@ export interface Stats {
 /** Worker -> page. Server messages other than ping and close are forwarded as is. */
 export type FromWorker =
 	| { t: 'frames'; parts: StripeFrame[] }
+	/** Where the worker presents from now on; dav1d-wasm pictures go to the canvas. */
+	| { t: 'surface'; s: 'video' | 'canvas' }
+	/** The worker painted its first frame onto the canvas. */
+	| { t: 'painted' }
 	| { t: 'status'; s: 'open' | 'closed' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }

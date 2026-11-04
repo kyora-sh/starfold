@@ -22,4 +22,6 @@ interface Navigator {
 interface Window {
 	fps: number;
 	voxlStats: unknown;
+	/** performance.now() when the first frame was painted (`starfold:firstframe`). */
+	starfoldFirstFrame?: number;
 }

@@ -65,7 +65,8 @@ try {
 		if (/\[voxl\]/.test(t)) console.log('[page]', t);
 	});
 	p.on('pageerror', (e) => errors.push(String(e)));
-	await p.goto(`${base}/?stats`);
+	await p.goto(`${base}/?stats`, { waitUntil: 'commit' });
+	await p.waitForFunction(() => window.starfoldFirstFrame !== undefined, null, { timeout: 20000 });
 	// Frames the page presented (decoded frames written to its <video> stripes, or the
 	// worker's own count when it paints the canvas), and the worker's latest report.
 	const presented = () =>

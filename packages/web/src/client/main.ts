@@ -43,9 +43,9 @@ function main() {
 			'voxl needs HTTPS or localhost: browsers only decode video on secure pages. Serve it over HTTPS, or forward the port and open localhost.';
 		return;
 	}
-	if (!('VideoDecoder' in window) || !canvas.transferControlToOffscreen) {
-		statusEl.textContent =
-			'This browser lacks WebCodecs/OffscreenCanvas support.';
+	// Which codecs decode is the worker's to find out; it needs OffscreenCanvas.
+	if (!canvas.transferControlToOffscreen) {
+		statusEl.textContent = 'This browser lacks OffscreenCanvas support.';
 		return;
 	}
 
@@ -81,10 +81,18 @@ function main() {
 	};
 
 	const cursor = createCursor(app);
+	// ?present=canvas: the worker paints every frame onto the canvas instead.
 	const useVideo =
 		params.get('present') !== 'canvas' &&
 		typeof MediaStreamTrackGenerator !== 'undefined';
-	const video = createVideo(app, canvas, useVideo, cursor.apply);
+	let firstFrame = false;
+	const onFirstPaint = () => {
+		if (firstFrame) return;
+		firstFrame = true;
+		window.starfoldFirstFrame = performance.now();
+		window.dispatchEvent(new Event('starfold:firstframe'));
+	};
+	const video = createVideo(app, canvas, useVideo, cursor.apply, onFirstPaint);
 	const clipboard = createClipboard(app);
 	const audio = createAudio(app);
 	// Browsers only allow audio and clipboard writes after a user gesture.
@@ -131,6 +139,12 @@ function main() {
 			case 'frames':
 				video.present(m.parts);
 				break;
+			case 'surface':
+				video.setSurface(m.s);
+				break;
+			case 'painted':
+				requestAnimationFrame(onFirstPaint);
+				break;
 			case 'hello':
 				app.desk.w = m.w;
 				app.desk.h = m.h;
@@ -145,12 +159,16 @@ function main() {
 				statusEl.style.display = 'none';
 				break;
 			case 'codec':
-				// Protocol 2: this epoch's size and stripes.
+				// Protocol 2: this epoch's size, or that nothing the server sends decodes here.
 				if (m.error === undefined) {
 					app.desk.w = m.w;
 					app.desk.h = m.h;
 					video.build(m.stripes.map((s): [number, number] => [s.y, s.h]));
 					video.layout();
+					statusEl.style.display = 'none';
+				} else {
+					statusEl.style.display = '';
+					statusEl.textContent = `This browser decodes none of the server's video codecs (${m.error}).`;
 				}
 				break;
 			case 'status':
@@ -178,9 +196,13 @@ function main() {
 				window.voxlStats = m;
 				if (params.has('stats')) {
 					statsEl.style.display = 'block';
-					statsEl.textContent =
-						`${m.fps.toFixed(1)} fps  ${(m.kbps / 1000).toFixed(2)} Mbps\n` +
-						`decode ${m.decodeMs.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms\n${m.codec || ''} ${m.encoder || ''} q=${m.queue}`;
+					statsEl.textContent = [
+						`${m.fps.toFixed(1)} fps  ${(m.kbps / 1000).toFixed(2)} Mbps`,
+						`decode p50 ${m.decodeP50.toFixed(1)} p95 ${m.decodeP95.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms`,
+						`${m.codec || ''} ${m.implementation || ''}${m.hw ? ` (${m.hw})` : ''}`,
+						`${m.encoder || ''}`,
+						`dropped ${m.dropped}  q=${m.queue}`,
+					].join('\n');
 				}
 				break;
 			case 'log':

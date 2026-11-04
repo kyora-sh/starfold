@@ -134,6 +134,18 @@ macro_rules! bundled {
     };
 }
 
+/// dav1d-wasm (packages/web/dav1d), fetched only by workers that decode AV1 with it.
+async fn dav1d_wasm() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/wasm"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_bytes!("../../../packages/web/dav1d/dav1d.wasm").as_slice(),
+    )
+        .into_response()
+}
+
 pub fn router(state: AppState) -> Router {
     use crate::files;
     let file_routes = Router::new()
@@ -165,6 +177,8 @@ pub fn router(state: AppState) -> Router {
         .route("/index.html", get(index))
         .route("/client.js", bundled!("client.js"))
         .route("/worker.js", bundled!("worker.js"))
+        .route("/dav1d.js", bundled!("dav1d.js"))
+        .route("/dav1d.wasm", get(dav1d_wasm))
         .route("/audio.js", bundled!("audio.js"))
         .route("/mic.js", bundled!("mic.js"))
         .route("/favicon.ico", get(favicon_route))
@@ -523,6 +537,16 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dav1d_wasm_is_served_as_wasm() {
+        let r = dav1d_wasm().await;
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/wasm");
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..4], b"\0asm");
+    }
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
