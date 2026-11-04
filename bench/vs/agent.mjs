@@ -1,16 +1,17 @@
 // VM side: one Xvfb, then per run one streamer and one source, each in its own process group, and
-// a control port on loopback. Usage: node agent.mjs <starfold> <source> <novnc web dir> <password file> <max seconds>
+// a control port on loopback. Usage: node agent.mjs <starfold> <source> <novnc web dir> <password file> <max seconds> <lan|wan> <shaper.py>
 import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import http from 'http';
-import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WIDTH, X11VNC_ARGS } from './config.mjs';
-const [bin, source, web, pwFile, maxS] = process.argv.slice(2);
+import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS } from './config.mjs';
+const [bin, source, web, pwFile, maxS, link, shaper] = process.argv.slice(2);
 const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock';
 const pw = fs.readFileSync(pwFile, 'utf8').trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const group = (c, a, o = {}) => spawn(c, a, { detached: true, stdio: 'ignore', ...o, env: { ...process.env, DISPLAY, ...o.env } });
 const xvfb = group('Xvfb', [DISPLAY, '-screen', '0', `${WIDTH}x${HEIGHT}x24`, '-dpi', '96', '-shmem', '-ac', '-nolisten', 'tcp', '-noreset']);
 await sleep(1000);
+const shapers = link === 'wan' ? [STARFOLD_PORT, NOVNC_PORT].map((p) => group('python3', [shaper, p + WAN.portOffset, `127.0.0.1:${p}`, WAN.mbps, WAN.rttMs, WAN.queueBytes].map(String))) : [];
 let run = [], src = null;
 const kill = async (procs) => {
 	for (const c of procs) { try { process.kill(-c.pid, 'SIGTERM'); } catch {} }
@@ -77,9 +78,11 @@ function bytes(port) {
 	}
 	return out;
 }
+/** Connections x11vnc has accepted on its socket: exactly the VNC viewers. */
+const vncViewers = () => fs.readFileSync('/proc/net/unix', 'latin1').split('\n').filter((l) => { const f = l.trim().split(/\s+/); return f[7] === SOCK && f[5] === '03'; }).length;
 const quit = async () => {
 	await stop();
-	await kill([xvfb]);
+	await kill([xvfb, ...shapers]);
 	process.exit(0);
 };
 http.createServer(async (req, res) => {
@@ -89,6 +92,7 @@ http.createServer(async (req, res) => {
 		else if (u.pathname === '/stop') { await stop(); res.end('ok'); }
 		else if (u.pathname === '/cpu') res.end(JSON.stringify({ server: run.reduce((n, c) => n + cpu(c.pid), 0), x: cpu(xvfb.pid), source: cpu(src?.pid) }));
 		else if (u.pathname === '/bytes') res.end(JSON.stringify(bytes(Number(u.searchParams.get('port')))));
+		else if (u.pathname === '/vnc-viewers') res.end(String(vncViewers()));
 		else if (u.pathname === '/quit') { res.end('bye'); quit(); }
 		else res.end('ok');
 	} catch (e) {

@@ -18,6 +18,8 @@
 #include <poll.h>
 #include <signal.h>
 #define CELL 16
+#define STRIP_W (20 * CELL)
+#define STRIP_H (3 * CELL)
 #define LOOP 30
 static int W, H;
 static Display *d;
@@ -182,9 +184,14 @@ int main(int argc, char **argv) {
 		}
 		if (scroll) {
 			off = (off + 20) % (ph - H);
-			XCopyArea(d, p, w, g, 0, off, W, H, 0, 0);
+			XCopyArea(d, p, w, g, 0, off + STRIP_H, W, H - STRIP_H, 0, STRIP_H);
+			XCopyArea(d, p, w, g, STRIP_W, off, W - STRIP_W, STRIP_H, STRIP_W, 0);
 		} else
-			XShmPutImage(d, w, g, img, 0, (n % LOOP) * H, 0, 0, W, H, False);
+		{
+			int top = (n % LOOP) * H;
+			XShmPutImage(d, w, g, img, 0, top + STRIP_H, 0, STRIP_H, W, H - STRIP_H, False);
+			XShmPutImage(d, w, g, img, STRIP_W, top, STRIP_W, 0, W - STRIP_W, STRIP_H, False);
+		}
 		draw_frame(n);
 		draw_tag();
 		XSync(d, False);

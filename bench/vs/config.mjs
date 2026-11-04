@@ -10,6 +10,8 @@ export const X11VNC_ARGS = [
 export const STARFOLD_ARGS = ['--audio-enabled=false', '--enable-basic-auth=true', '--framerate=30', '--encoder=auto'];
 export const WIDTH = 1920, HEIGHT = 1080, FPS = 30;
 export const STARFOLD_PORT = 6930, NOVNC_PORT = 6932, CTL_PORT = 6940;
+// The shaped link: bench/shaper.py in front of each port at +1000, the queue bounded at 2x BDP.
+export const WAN = { rttMs: 50, mbps: 20, queueBytes: 250000, portOffset: 1000 };
 export const ARMS = {
 	novnc: { kind: 'novnc', profile: 'high' },
 	'novnc-low': { kind: 'novnc', profile: 'low', wanOnly: true },

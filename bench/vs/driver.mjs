@@ -3,7 +3,7 @@
 // runs alongside. Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, KEYS, OUT, BUDGET_S.
 import { createRequire } from 'module';
 import fs from 'fs';
-import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WIDTH, WORKLOADS } from './config.mjs';
+import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
 const link = process.env.LINK || 'lan', rounds = Number(process.env.ROUNDS || 5), win = Number(process.env.WIN || 10);
@@ -34,19 +34,20 @@ function chromeCpu() {
 	}
 	return j / 100;
 }
-const portOf = (arm) => (ARMS[arm].kind === 'novnc' ? NOVNC_PORT : STARFOLD_PORT);
+const offset = link === 'wan' ? WAN.portOffset : 0;
+const portOf = (arm) => (ARMS[arm].kind === 'novnc' ? NOVNC_PORT : STARFOLD_PORT) + offset;
 const urlOf = (arm) => {
 	const a = ARMS[arm];
-	if (a.kind === 'starfold') return `http://127.0.0.1:${STARFOLD_PORT}/?token=${token}${a.query}`;
+	if (a.kind === 'starfold') return `http://127.0.0.1:${portOf(arm)}/?token=${token}${a.query}`;
 	const { quality, compression } = NOVNC_PROFILES[a.profile];
-	return `http://127.0.0.1:${NOVNC_PORT}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
+	return `http://127.0.0.1:${portOf(arm)}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
 };
 async function viewers(arm) {
 	if (ARMS[arm].kind === 'starfold') {
 		const r = await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } });
 		return ((await r.json()).clients || []).length;
 	}
-	return Object.keys(await ctlJson(`/bytes?port=${NOVNC_PORT}`)).length;
+	return Number(await ctl('/vnc-viewers'));
 }
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
 function reader({ cell, w, h, readback }) {
@@ -120,8 +121,8 @@ async function typeKeys(p, wl, until) {
 	return sent;
 }
 /** Each key's first visible frame: tags appear in order, so a tag only answers its own key. */
-function answer(keys, tags, swaps) {
-	const i2p = [], i2s = [];
+function answer(keys, tags) {
+	const i2p = [];
 	let at = 0, missing = 0;
 	for (const [t, key] of keys) {
 		const v = key.charCodeAt(0) - 97;
@@ -130,10 +131,8 @@ function answer(keys, tags, swaps) {
 		if (i === tags.length) { missing++; continue; }
 		at = i + 1;
 		i2p.push(tags[i][0] - t);
-		const s = swaps.find((x) => x >= tags[i][0]);
-		if (s !== undefined) i2s.push(s - t);
 	}
-	return { i2p, i2s, missing };
+	return { i2p, missing };
 }
 async function run(arm, wl, readback = true) {
 	await ctl(`/start?arm=${arm}&wl=${wl}`);
@@ -183,7 +182,7 @@ async function run(arm, wl, readback = true) {
 		const iv = f.slice(1).map((x, i) => x[0] - f[i][0]);
 		const lat = f.map((x) => x[2]);
 		const span = f.length > 1 ? ((f.at(-1)[1] - f[0][1] + 4096) % 4096) + 1 : 0;
-		const { i2p, i2s, missing } = answer(r.keys, r.tags, swaps);
+		const { i2p, missing } = answer(r.keys, r.tags);
 		const acked = Object.keys(b1).filter((k) => k in b0).map((k) => b1[k] - b0[k]);
 		const frames = wl === 'typing' || !readback ? {} : {
 			fps: f.length / dt, ivP50: pct(iv, 0.5), ivP95: pct(iv, 0.95), ivP99: pct(iv, 0.99), ivMax: Math.max(...iv), jitter: stddev(iv),
@@ -193,10 +192,10 @@ async function run(arm, wl, readback = true) {
 		return {
 			...frames,
 			keys: r.keys.length, keysSeen: i2p.length, keysMissing: missing,
-			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p), i2sP50: pct(i2s, 0.5), i2sP95: pct(i2s, 0.95),
+			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p),
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
 			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, browserCpu: ((c1 - c0) / dt) * 100,
-			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95),
+			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
 			rafHz: r.ticks / dt, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,
 		};
