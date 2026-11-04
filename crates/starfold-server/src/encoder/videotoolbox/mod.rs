@@ -201,10 +201,12 @@ impl Session {
         (r == 0 && !v.is_null()).then(|| Cf(v))
     }
 
-    fn hardware(&self) -> bool {
+    /// Whether the session says it runs on hardware; paravirtualized encoders (a macOS
+    /// guest's) don't say, and the session was created requiring hardware anyway.
+    fn software(&self) -> bool {
         self.copy(unsafe { kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder })
             .and_then(|v| unsafe { get_bool(v.0) })
-            == Some(true)
+            == Some(false)
     }
 
     fn encoder_id(&self) -> Option<String> {
@@ -335,7 +337,7 @@ impl VideoToolbox {
         if r != 0 {
             return Err(err("preparing to encode", r));
         }
-        if !me.session.hardware() {
+        if me.session.software() {
             return Err(EncodeError(
                 "VideoToolbox opened a software encoder, not the hardware one".into(),
             ));
@@ -728,7 +730,7 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
     let (w, h) = (640, 360);
     if !Backend::VideoToolbox.implements(codec) {
         let s = Session::open(codec_type(codec), w, h, false).map_err(session_error)?;
-        if !s.hardware() {
+        if s.software() {
             return Err("the session is not on the hardware encoder".into());
         }
         return Ok(Sampled {
