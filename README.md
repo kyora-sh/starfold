@@ -16,7 +16,7 @@ folder transfer and dynamic resolution.
 ## Quick start
 
 ```sh
-cargo install --locked --path crates/starfold-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
+cargo install --locked --path crates/starfold-server   # needs nasm, libyuv, Opus, PulseAudio and esbuild (see Usage)
 DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
@@ -76,8 +76,9 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 
 ## Usage
 
-Build (needs Rust, pkg-config, clang, x264, libyuv, libopus, libpulse and esbuild;
-`nix-shell` provides them all):
+Build (needs Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild;
+`nix-shell` provides them all). The H.264 encoder is OpenH264, built from source; x264
+is optional (`cargo build --features x264`, then `--encoder x264`; needs x264 and clang):
 
 ```sh
 nix-shell
@@ -113,8 +114,9 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 | `--basic-auth-password`                                        | `VOXL_PASSWORD`, else made up      | the password                                                                                                      |
 | `--basic-auth-user`                                            | any                                | the user name a browser's sign-in has to give                                                                     |
 | `--framerate`                                                  | `60`                               | max frames per second (`60-60` style ranges accepted)                                                             |
+| `--encoder`                                                    | `openh264`                         | H.264 encoder: `openh264`, or `x264` in a build with the `x264` feature                                           |
 | `--preset`                                                     | `ultrafast`                        | x264 preset                                                                                                       |
-| `--encoder-threads`                                            | `min(4, ncpu/4)`                   | x264 sliced threads                                                                                               |
+| `--encoder-threads`                                            | `min(4, ncpu/4)`                   | sliced encoder threads                                                                                            |
 | `--crf`                                                        | `24`                               | base quality                                                                                                      |
 | `--max-kbps` / `--video-bitrate`                               | `30000`                            | adaptive bitrate ceiling                                                                                          |
 | `--min-kbps`                                                   | `2000`                             | adaptive bitrate floor                                                                                            |
@@ -222,7 +224,7 @@ voxl also streams a Mac's own screen, with every feature of the Linux version
 (ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
 
 ```sh
-brew install x264 opus pkgconf esbuild
+brew install opus pkgconf esbuild
 cargo build --release
 ./target/release/starfold --port=6901
 ```
@@ -248,11 +250,10 @@ rounded-corner flags don't apply.
 
 voxl also streams a Windows desktop (Windows 10 or later), with every feature of the
 Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
-WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), LLVM (for bindgen)
-and esbuild:
+WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
-vcpkg install x264 libyuv opus --triplet x64-windows-static-md
+vcpkg install libyuv opus --triplet x64-windows-static-md
 $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
 npm install -g esbuild
 cargo build --release
@@ -329,9 +330,11 @@ desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 let
 capture them without a permission prompt, with damage events that keep a still screen at
 no CPU and power `/wait`. Wayland support is being worked on.
 
-**Does it use the GPU?** Not yet. voxl encodes H.264 on the CPU with x264: 1.3–1.7 cores
-for a busy 2560x1600 desktop, X server included (see the CPU table above). Hardware
+**Does it use the GPU?** Not yet. starfold encodes H.264 on the CPU with OpenH264 (the
+CPU table above was measured with x264: 1.3–1.7 cores for a busy 2560x1600 desktop, X
+server included). Hardware
 encoding on macOS is in progress.
 
-**What's the license?** voxl's code is MIT. It links x264, which is GPL-2.0, so a voxl
+**What's the license?** The code is MIT, and the default build links OpenH264
+(BSD-2-Clause). A build with the `x264` feature links x264, which is GPL-2.0, so that
 binary, and anything that bundles one, is distributed under the GPL.

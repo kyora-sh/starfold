@@ -15,7 +15,7 @@ mod convert;
 mod corners;
 #[cfg(target_os = "linux")]
 mod desktop;
-mod encoder;
+pub mod encoder;
 mod files;
 mod help;
 mod hub;
@@ -142,15 +142,38 @@ async fn serve(a: HashMap<String, String>) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
+    let encoder = match a
+        .get("encoder")
+        .map_or(Ok(encoder::Backend::OpenH264), |e| {
+            encoder::Backend::parse(e)
+        }) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("--encoder: {e}");
+            std::process::exit(2);
+        }
+    };
+    if encoder == encoder::Backend::OpenH264 {
+        for flag in ["preset", "paintover-crf"]
+            .iter()
+            .filter(|f| a.contains_key(**f))
+        {
+            log::warn!("--{flag} is an x264 setting; OpenH264 ignores it");
+        }
+        if a.contains_key("crf") {
+            log::warn!("--crf with OpenH264 is its lowest QP; bitrate follows --max-kbps");
+        }
+    }
     let vcfg = video::VideoConfig {
         display: display.clone(),
+        encoder,
         fps: range_max(a.get("framerate"), 60.0) as u32,
         preset: a
             .get("preset")
             .cloned()
             .unwrap_or_else(|| "ultrafast".into()),
-        // Four sliced threads: lower latency than one, and x264's slicing overhead grows
-        // with thread count, so more threads only add CPU (measured on 2560x1600).
+        // Four sliced threads: lower latency than one, and the encoders' slicing overhead
+        // grows with thread count, so more threads only add CPU (x264, 2560x1600).
         threads: a
             .get("encoder-threads")
             .and_then(|v| v.parse().ok())

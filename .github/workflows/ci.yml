@@ -63,11 +63,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for bindgen, esbuild for build.rs.
+      # libyuv, Opus, PulseAudio and xcb for linking, nasm for OpenH264, esbuild for build.rs.
       - name: Native libraries
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev libclang-dev esbuild
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -88,6 +88,34 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  x264:
+    name: Rust with x264 (clippy, test)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # As above, plus x264 and libclang for its bindings.
+      - name: Native libraries
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        run: cargo clippy --features x264 --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --features x264 --locked
+
   windows:
     name: Windows (clippy, cross-compiled on Linux)
     runs-on: kyora-8x16
@@ -105,13 +133,13 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-x64-mingw-static-2026.10.16-x264-libyuv-opus-v1
-      - name: x264, libyuv and Opus (vcpkg)
+          key: vcpkg-x64-mingw-static-2026.10.16-libyuv-opus-v1
+      - name: libyuv and Opus (vcpkg)
         run: |
           mkdir -p .vcpkg-cache
           git clone --quiet --depth 1 --branch 2026.10.16 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
           "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          "$VCPKG_ROOT/vcpkg" install x264 libyuv opus --triplet "$VCPKGRS_TRIPLET"
+          "$VCPKG_ROOT/vcpkg" install libyuv opus --triplet "$VCPKGRS_TRIPLET"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -139,8 +167,22 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
-      # x264 and Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
-      - run: brew install x264 opus pkgconf esbuild
+      # The runner image may not have Homebrew yet.
+      - name: Homebrew
+        run: |
+          if ! command -v brew >/dev/null; then
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+          brew=$(command -v brew || echo /opt/homebrew/bin/brew)
+          prefix=$("$brew" --prefix)
+          {
+            echo "HOMEBREW_PREFIX=$prefix"
+            echo "HOMEBREW_CELLAR=$prefix/Cellar"
+            echo "HOMEBREW_REPOSITORY=$("$brew" --repository)"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
+      # Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
+      - run: brew install opus pkgconf esbuild
       - uses: actions/cache@v4
         with:
           path: |
