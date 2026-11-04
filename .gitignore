@@ -5,3 +5,5 @@ result
 node_modules
 __pycache__
 .venv
+.vcpkg
+.vcpkg-cache
