@@ -8,6 +8,7 @@ sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize; sw_vers -productVersion
 run_set() { # name rounds arm...   arm = label|test|env words
   local name=$1 n=$2; shift 2
   local arms=("$@") len=$#
+  local i k
   for ((i = 0; i < n; i++)); do
     for ((k = 0; k < len; k++)); do
       IFS='|' read -r label test envs <<< "${arms[$(((k + i) % len))]}"
