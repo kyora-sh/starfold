@@ -212,7 +212,8 @@ struct Shared {
     idr_inflight: AtomicBool,
     /// Adaptive bitrate cap (kbit/s).
     target: AtomicU32,
-    /// Consecutive jobs a stripe failed to encode; at FAIL_AFTER the cohort is given up.
+    /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
+    /// given up.
     failures: AtomicU32,
     w: u32,
     h: u32,
@@ -1800,6 +1801,8 @@ fn encode_loop(
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
         stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
+    // Consecutive failed encodes per stripe; a stripe not asked to encode hasn't recovered.
+    let mut fails = vec![0u32; n];
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
         .into_iter()
@@ -1876,14 +1879,22 @@ fn encode_loop(
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
+                fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
                 results[r.i] = r.out;
                 configs[r.i] = r.config;
             }
         }
-        if !failed {
-            sh.failures.store(0, Ordering::Release);
-        } else if sh.failures.fetch_add(1, Ordering::AcqRel) + 1 == FAIL_AFTER {
-            hub.replan();
+        let worst = fails.iter().copied().max().unwrap_or(0);
+        sh.failures.store(worst, Ordering::Release);
+        if failed {
+            // What failed is redone as a keyframe (also counting towards FAIL_AFTER),
+            // so a lost update can't leave a still screen stale.
+            for c in hub.cohort_clients(sh.id) {
+                c.needs_keyframe.store(true, Ordering::Relaxed);
+            }
+            if worst >= FAIL_AFTER {
+                hub.replan();
+            }
         }
         let Frame {
             buf,

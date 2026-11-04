@@ -52,6 +52,8 @@ struct Fake {
     relevel: Option<usize>,
     /// Every encode from this one on fails.
     fail_from: Option<usize>,
+    /// Only this encode fails.
+    fail_at: Option<usize>,
     gate: Option<Arc<Gate>>,
 }
 
@@ -77,7 +79,7 @@ impl VideoEncoder for Fake {
             g.wait();
         }
         self.n += 1;
-        if self.fail_from.is_some_and(|f| self.n >= f) {
+        if self.fail_from.is_some_and(|f| self.n >= f) || self.fail_at == Some(self.n) {
             return Err(EncodeError("session lost".into()));
         }
         let relevel = self.relevel == Some(self.n);
@@ -116,6 +118,10 @@ struct Opts {
     hevc_relevel: bool,
     /// HEVC cohorts' encoders fail from their 3rd picture on.
     hevc_breaks: bool,
+    /// The second HEVC stripe's encoder fails from its 2nd picture on.
+    hevc_second_stripe_breaks: bool,
+    /// The first HEVC cohort encoder fails its 2nd picture only.
+    hevc_fails_once: bool,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -135,7 +141,14 @@ fn fakes(o: Opts) -> Open {
             coded: (c.width, c.height),
             n: 0,
             relevel: (hevc && o.hevc_relevel).then_some(3),
-            fail_from: (hevc && o.hevc_breaks && earlier > 0).then_some(3),
+            fail_from: if hevc && o.hevc_breaks && earlier > 0 {
+                Some(3)
+            } else if hevc && o.hevc_second_stripe_breaks && earlier == 2 {
+                Some(2)
+            } else {
+                None
+            },
+            fail_at: (hevc && o.hevc_fails_once && earlier == 1).then_some(2),
             gate: o.gate.clone().filter(|_| hevc),
         }) as Box<dyn VideoEncoder>)
     })
@@ -208,15 +221,21 @@ fn whole(w: u32, h: u32) -> Frame {
     }
 }
 
-/// One capture of the whole screen, through the capture loop's steps; returns once
+/// One capture through the capture loop's steps, with `band` changed; returns once
 /// the cohorts are done with it.
-fn push_at(eng: &mut Engine, w: u32, h: u32) {
+fn push_band(eng: &mut Engine, w: u32, h: u32, band: Option<Band>) {
     eng.replan();
     let views = eng.views();
     eng.update_rates(&views);
     let takes = eng.takes(&views, 33.0);
-    eng.dispatch(&whole(w, h), &views, &takes);
+    let mut f = whole(w, h);
+    f.band = band;
+    eng.dispatch(&f, &views, &takes);
     settle(eng);
+}
+
+fn push_at(eng: &mut Engine, w: u32, h: u32) {
+    push_band(eng, w, h, Some(Band { y0: 0, y1: h }))
 }
 
 fn push(eng: &mut Engine) {
@@ -708,6 +727,78 @@ fn an_encoder_that_keeps_failing_falls_back() {
     assert_eq!(route_codec(&c), Some(Codec::H264));
     assert!(eng.failed.contains(&HEVC));
     assert!(eng.cohorts.iter().all(|k| k.shared.cand != HEVC));
+}
+
+const HEVC_SW: Candidate = Candidate {
+    codec: Codec::Hevc,
+    backend: Backend::VideoToolbox,
+    hardware: false,
+};
+
+#[test]
+fn a_failing_stripe_is_not_hidden_by_the_others() {
+    let hub = Hub::new();
+    let cfg = VideoConfig {
+        stripes: 2,
+        ..config()
+    };
+    let o = Opts {
+        hevc_second_stripe_breaks: true,
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[HEVC_SW, H264], fakes(o)).unwrap();
+    assert_eq!(eng.offers[0].stripes.len(), 2);
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    ready(&c, &drain(&mut rx));
+    push(&mut eng);
+    assert!(videos(&drain(&mut rx))[0].1, "both stripes start");
+    // The bottom stripe's session breaks; afterwards only the top one changes. Its
+    // successes don't clear the bottom one's failures, and each failure asks for a
+    // keyframe, which tries the bottom one again.
+    push(&mut eng);
+    let top = Some(Band { y0: 0, y1: H / 2 });
+    for _ in 0..=FAIL_AFTER {
+        push_band(&mut eng, W, H, top);
+    }
+    assert_eq!(route_codec(&c), Some(Codec::H264));
+    assert!(eng.failed.contains(&HEVC_SW));
+}
+
+#[test]
+fn a_failed_update_is_redone() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_fails_once: true,
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    ready(&c, &drain(&mut rx));
+    push(&mut eng);
+    push(&mut eng);
+    assert_eq!(
+        videos(&drain(&mut rx)).len(),
+        1,
+        "the second picture failed"
+    );
+    // Nothing else changes on screen, yet the cohort owes a keyframe.
+    assert!(eng.views().iter().any(|v| v.want_key));
+    push_band(&mut eng, W, H, None);
+    let v = videos(&drain(&mut rx));
+    assert_eq!(v.len(), 1);
+    assert!(v[0].1, "redone as a keyframe");
+    assert_eq!(
+        route_codec(&c),
+        Some(Codec::Hevc),
+        "one failure is not a fallback"
+    );
 }
 
 #[test]
