@@ -119,7 +119,7 @@ Files and recordings:
   -h, --help                    print this and exit
   -V, --version                 print the version and exit
 
-Agents and scripts can use GET /screenshot, /record and /wait; see
+Agents and scripts can use GET /screenshot, /record and /wait and POST /input; see
 https://github.com/tembo/voxl#for-agents-and-scripts
 ";
 

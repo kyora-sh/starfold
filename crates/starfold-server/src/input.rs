@@ -37,6 +37,8 @@ pub enum InputEvent {
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(crate::desktop::ClipContent),
     ReleaseAll,
+    /// Answered once every event sent before it has reached the desktop (POST /input).
+    Synced(tokio::sync::oneshot::Sender<()>),
     /// Undo keymap changes before exit.
     Shutdown,
 }
@@ -464,6 +466,10 @@ impl Injector {
                 if let Some(c) = &self.clipboard {
                     c.set_blocking(text);
                 }
+            }
+            InputEvent::Synced(done) => {
+                let _ = self.conn.flush();
+                let _ = done.send(());
             }
             InputEvent::Shutdown => {
                 self.handle(InputEvent::ReleaseAll);
