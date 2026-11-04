@@ -1,0 +1,99 @@
+// VM side: one Xvfb, then per run one streamer and one source, each in its own process group, and
+// a control port on loopback. Usage: node agent.mjs <starfold> <source> <novnc web dir> <password file> <max seconds>
+import { execSync, spawn } from 'child_process';
+import fs from 'fs';
+import http from 'http';
+import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WIDTH, X11VNC_ARGS } from './config.mjs';
+const [bin, source, web, pwFile, maxS] = process.argv.slice(2);
+const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock';
+const pw = fs.readFileSync(pwFile, 'utf8').trim();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const group = (c, a, o = {}) => spawn(c, a, { detached: true, stdio: 'ignore', ...o, env: { ...process.env, DISPLAY, ...o.env } });
+const xvfb = group('Xvfb', [DISPLAY, '-screen', '0', `${WIDTH}x${HEIGHT}x24`, '-dpi', '96', '-shmem', '-ac', '-nolisten', 'tcp', '-noreset']);
+await sleep(1000);
+let run = [], src = null;
+const kill = async (procs) => {
+	for (const c of procs) { try { process.kill(-c.pid, 'SIGTERM'); } catch {} }
+	await sleep(300);
+	for (const c of procs) { try { process.kill(-c.pid, 'SIGKILL'); } catch {} }
+};
+async function stop() {
+	await kill([...run, ...(src ? [src] : [])]);
+	run = [];
+	src = null;
+	fs.rmSync(SOCK, { force: true });
+}
+const listening = async (port) => {
+	for (let i = 0; i < 100; i++) {
+		const up = await fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false);
+		if (up) return;
+		await sleep(100);
+	}
+	throw new Error(`nothing on ${port}`);
+};
+async function start(arm, wl) {
+	await stop();
+	src = group(source, [wl, WIDTH, HEIGHT, FPS].map(String), { stdio: ['ignore', 'pipe', 'ignore'] });
+	await new Promise((res, rej) => {
+		const t = setTimeout(() => rej(new Error('source not ready')), 15000);
+		src.stdout.on('data', (b) => { if (String(b).includes('READY')) { clearTimeout(t); res(); } });
+		src.on('exit', (c) => rej(new Error(`source exited ${c}`)));
+	});
+	if (ARMS[arm].kind === 'novnc') {
+		run.push(group('x11vnc', ['-display', DISPLAY, ...X11VNC_ARGS, '-unixsock', SOCK]));
+		for (let i = 0; i < 100 && !fs.existsSync(SOCK); i++) await sleep(50);
+		if (!fs.existsSync(SOCK)) throw new Error('x11vnc did not open its socket');
+		run.push(group('websockify', ['--web', web, `--unix-target=${SOCK}`, `127.0.0.1:${NOVNC_PORT}`]));
+		await listening(NOVNC_PORT);
+	} else {
+		const log = fs.openSync('/tmp/vs-starfold.log', 'a');
+		run.push(group(bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...STARFOLD_ARGS], { env: { VOXL_PASSWORD: pw, RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
+		await listening(STARFOLD_PORT);
+	}
+}
+/** CPU seconds of a process group, every member and thread. */
+function cpu(pgid) {
+	if (!pgid) return 0;
+	let j = 0;
+	for (const d of fs.readdirSync('/proc')) {
+		if (!/^\d+$/.test(d)) continue;
+		try {
+			const t = fs.readFileSync(`/proc/${d}/stat`, 'latin1');
+			const f = t.slice(t.lastIndexOf(')') + 2).split(' ');
+			if (Number(f[2]) === pgid) j += Number(f[11]) + Number(f[12]);
+		} catch {}
+	}
+	return j / 100;
+}
+/** TCP payload acked by the peer per connection of a server port: the same count for every arm. */
+function bytes(port) {
+	const out = {};
+	let peer = null;
+	for (const l of execSync(`ss -tinH state established '( sport = :${port} )'`, { encoding: 'utf8' }).split('\n')) {
+		const c = l.match(/^\s*\d+\s+\d+\s+\S+:\d+\s+\S+:(\d+)/);
+		if (c) { peer = c[1]; out[peer] = 0; continue; }
+		const b = l.match(/bytes_acked:(\d+)/);
+		if (b && peer) out[peer] = Number(b[1]);
+	}
+	return out;
+}
+const quit = async () => {
+	await stop();
+	await kill([xvfb]);
+	process.exit(0);
+};
+http.createServer(async (req, res) => {
+	const u = new URL(req.url, 'http://x');
+	try {
+		if (u.pathname === '/start') { await start(u.searchParams.get('arm'), u.searchParams.get('wl')); res.end('ok'); }
+		else if (u.pathname === '/stop') { await stop(); res.end('ok'); }
+		else if (u.pathname === '/cpu') res.end(JSON.stringify({ server: run.reduce((n, c) => n + cpu(c.pid), 0), x: cpu(xvfb.pid), source: cpu(src?.pid) }));
+		else if (u.pathname === '/bytes') res.end(JSON.stringify(bytes(Number(u.searchParams.get('port')))));
+		else if (u.pathname === '/quit') { res.end('bye'); quit(); }
+		else res.end('ok');
+	} catch (e) {
+		res.statusCode = 500;
+		res.end(String(e));
+	}
+}).listen(CTL_PORT, '127.0.0.1', () => console.log('AGENT READY'));
+setTimeout(quit, Number(maxS) * 1000);
