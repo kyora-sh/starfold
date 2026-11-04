@@ -63,6 +63,28 @@ pub struct FrameView<'a> {
     pub stride_uv: usize,
 }
 
+impl FrameView<'_> {
+    /// Fails unless every plane holds the picture at its stride, and strides fit a C int.
+    pub fn check(&self) -> Result<(), EncodeError> {
+        let bad = || {
+            EncodeError(format!(
+                "I420 planes don't hold a {}x{} picture",
+                self.width, self.height
+            ))
+        };
+        let (w, h) = (self.width as usize, self.height as usize);
+        let plane = |len: usize, stride: usize, w: usize, h: usize| {
+            let need = (h.max(1) - 1).checked_mul(stride)?.checked_add(w)?;
+            (w > 0 && stride >= w && stride <= i32::MAX as usize && len >= need).then_some(())
+        };
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        plane(self.y.len(), self.stride_y, w, h)
+            .and_then(|_| plane(self.u.len(), self.stride_uv, cw, ch))
+            .and_then(|_| plane(self.v.len(), self.stride_uv, cw, ch))
+            .ok_or_else(bad)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RateConfig {
     /// x264's CRF; backends without one ignore it.
@@ -88,7 +110,8 @@ impl RateConfig {
 pub struct EncodeOptions<'a> {
     pub pts_ms: i64,
     pub force_keyframe: bool,
-    /// One byte per macroblock, nonzero where nothing changed since the last frame.
+    /// One byte per macroblock (row-major, `width.div_ceil(16)` per row), nonzero where
+    /// nothing changed since the last frame.
     pub static_mbs: Option<&'a mut [u8]>,
 }
 
@@ -189,7 +212,7 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub threads: u32,
     pub rate: RateConfig,
-    /// The best quality (lowest CRF) any frame will ask for; OpenH264's QP floor.
+    /// OpenH264's lowest QP: its bitrate mode otherwise spends the whole cap.
     pub best_quality: f32,
     /// x264's preset.
     pub preset: String,
@@ -289,6 +312,7 @@ impl VideoEncoder for Pad {
                 self.display.0, self.display.1, f.width, f.height
             )));
         }
+        f.check()?;
         let (w, h) = (f.width as usize, f.height as usize);
         let (pw, ph) = (self.coded.0 as usize, self.coded.1 as usize);
         let [y, u, v] = &mut self.planes;

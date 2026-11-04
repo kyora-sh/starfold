@@ -167,7 +167,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             fps: cfg.fps,
             threads: fixed,
             rate: RateConfig::new(cfg.crf, cfg.max_kbps, cfg.fps),
-            best_quality: cfg.crf.min(cfg.paintover_crf),
+            best_quality: cfg.crf,
             preset: cfg.preset.clone(),
         };
         let max_threads = if cfg.adaptive_threads {

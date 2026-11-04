@@ -150,6 +150,13 @@ impl VideoEncoder for X264 {
                 self.width, self.height, p.width, p.height
             )));
         }
+        p.check()?;
+        let mbs = p.width.div_ceil(16) as usize * p.height.div_ceil(16) as usize;
+        if opts.static_mbs.as_ref().is_some_and(|m| m.len() < mbs) {
+            return Err(EncodeError(format!(
+                "macroblock map has fewer than {mbs} entries"
+            )));
+        }
         unsafe {
             self.pic.img.plane[0] = p.y.as_ptr() as *mut u8;
             self.pic.img.plane[1] = p.u.as_ptr() as *mut u8;

@@ -1,5 +1,5 @@
 //! OpenH264 (BSD-2-Clause, compiled from source by openh264-sys2) through its C vtable:
-//! constrained Baseline, screen-content mode, bitrate rate control, IDR on request only.
+//! constrained Baseline, bitrate rate control, IDR on request only.
 
 use super::h264::ParamSets;
 use super::{
@@ -12,7 +12,8 @@ use std::ptr;
 
 /// Level 5.2's frame size, OpenH264's limit for one picture.
 pub const MAX_MBS: usize = 36864;
-/// OpenH264 clamps the frame rate it plans rate control for to this.
+/// OpenH264 clamps the frame rate it plans rate control for to this, so above it the
+/// bitrate is scaled down to keep the per-second budget.
 const MAX_FPS: u32 = 60;
 /// What an uncapped rate (`max_kbps` 0) becomes: level 5.2's bitrate.
 const UNCAPPED_BPS: c_int = 240_000_000;
@@ -22,6 +23,8 @@ pub struct OpenH264 {
     info: Box<sys::SFrameBSInfo>,
     params: ParamSets,
     bps: c_int,
+    /// Frames OpenH264 budgets per second over frames that arrive per second.
+    rate_scale: f64,
     pts: i64,
     width: u32,
     height: u32,
@@ -38,11 +41,11 @@ fn check(what: &str, r: c_int) -> Result<(), EncodeError> {
     }
 }
 
-fn bps(max_kbps: u32) -> c_int {
+fn bps(max_kbps: u32, scale: f64) -> c_int {
     if max_kbps == 0 {
         UNCAPPED_BPS
     } else {
-        (max_kbps as u64 * 1000).min(UNCAPPED_BPS as u64) as c_int
+        (max_kbps as f64 * 1000.0 * scale).clamp(1000.0, UNCAPPED_BPS as f64) as c_int
     }
 }
 
@@ -53,11 +56,13 @@ impl OpenH264 {
         if r != 0 || enc.is_null() {
             return Err(EncodeError(format!("WelsCreateSVCEncoder failed ({r})")));
         }
+        let rate_scale = (MAX_FPS as f64 / cfg.fps.max(1) as f64).min(1.0);
         let mut me = OpenH264 {
             enc,
             info: Box::default(),
             params: ParamSets::default(),
-            bps: bps(cfg.rate.max_kbps),
+            bps: bps(cfg.rate.max_kbps, rate_scale),
+            rate_scale,
             pts: -1,
             width: cfg.width,
             height: cfg.height,
@@ -71,7 +76,10 @@ impl OpenH264 {
         })?;
         let fps = cfg.fps.clamp(1, MAX_FPS) as f32;
         let threads = cfg.threads.clamp(1, 4) as u16;
-        p.iUsageType = sys::SCREEN_CONTENT_REAL_TIME;
+        // Not SCREEN_CONTENT_REAL_TIME: that mode forces scene-change detection on (an
+        // unrequested IDR per detected change, unless long-term references take them,
+        // which cost ~15x the CPU on scrolling).
+        p.iUsageType = sys::CAMERA_VIDEO_REAL_TIME;
         p.iPicWidth = cfg.width as c_int;
         p.iPicHeight = cfg.height as c_int;
         p.iRCMode = sys::RC_BITRATE_MODE;
@@ -91,9 +99,7 @@ impl OpenH264 {
         p.bEnableFrameSkip = false;
         p.iMinQp = (cfg.best_quality.round() as c_int).clamp(12, 51);
         p.iMaxQp = 51;
-        // Screen-content mode always detects scene changes, and without long-term
-        // references each one is an IDR. The WebSocket never loses a frame.
-        p.bEnableLongTermReference = true;
+        p.bEnableLongTermReference = false;
         p.iMultipleThreadIdc = threads;
         p.bUseLoadBalancing = false;
         p.iLoopFilterDisableIdc = 0;
@@ -102,7 +108,7 @@ impl OpenH264 {
         p.bEnableAdaptiveQuant = false;
         p.bEnableFrameCroppingFlag = true;
         p.bEnableSceneChangeDetect = false;
-        p.bIsLosslessLink = true;
+        p.bIsLosslessLink = false;
         let l = &mut p.sSpatialLayers[0];
         l.iVideoWidth = cfg.width as c_int;
         l.iVideoHeight = cfg.height as c_int;
@@ -167,7 +173,7 @@ impl OpenH264 {
 
 impl VideoEncoder for OpenH264 {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
-        let b = bps(rate.max_kbps);
+        let b = bps(rate.max_kbps, self.rate_scale);
         if b == self.bps {
             return Ok(());
         }
@@ -185,14 +191,7 @@ impl VideoEncoder for OpenH264 {
                 self.width, self.height, f.width, f.height
             )));
         }
-        let (w, h) = (f.width as usize, f.height as usize);
-        let ch = h.div_ceil(2);
-        if f.y.len() < (h - 1) * f.stride_y + w
-            || f.u.len() < (ch - 1) * f.stride_uv + w.div_ceil(2)
-            || f.v.len() < (ch - 1) * f.stride_uv + w.div_ceil(2)
-        {
-            return Err(EncodeError("I420 planes shorter than the picture".into()));
-        }
+        f.check()?;
         self.pts = opts.pts_ms.max(self.pts + 1);
         let src = sys::SSourcePicture {
             iColorFormat: sys::videoFormatI420,

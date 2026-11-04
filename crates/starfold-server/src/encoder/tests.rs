@@ -395,6 +395,39 @@ fn threads_slice_the_picture() {
 }
 
 #[test]
+fn short_or_wrapping_planes_are_rejected() {
+    for b in backends() {
+        let mut enc = open(&config(b, 64, 64, 4000)).unwrap();
+        let p = Picture::new(64, 64);
+        let mut v = p.view();
+        v.y = &p.y[..64 * 63];
+        assert!(enc.encode(&v, EncodeOptions::default()).is_err(), "{b:?}");
+        let mut v = p.view();
+        v.stride_y = usize::MAX / 63 + 1;
+        assert!(enc.encode(&v, EncodeOptions::default()).is_err(), "{b:?}");
+        let mut v = p.view();
+        v.stride_uv = 16;
+        assert!(enc.encode(&v, EncodeOptions::default()).is_err(), "{b:?}");
+        let mut odd = open(&config(b, 63, 63, 4000)).unwrap();
+        let q = Picture::new(63, 63);
+        let mut v = q.view();
+        v.v = &q.v[..10];
+        assert!(odd.encode(&v, EncodeOptions::default()).is_err(), "{b:?}");
+    }
+    #[cfg(feature = "x264")]
+    {
+        let mut enc = open(&config(Backend::X264, 64, 64, 4000)).unwrap();
+        let p = Picture::new(64, 64);
+        let mut map = vec![1u8; 15];
+        let opts = EncodeOptions {
+            static_mbs: Some(&mut map),
+            ..Default::default()
+        };
+        assert!(enc.encode(&p.view(), opts).is_err());
+    }
+}
+
+#[test]
 fn idr_missing_parameter_sets_gets_cached_ones() {
     let nal = |t: u8, body: &[u8]| [&[0, 0, 0, 1, t][..], body].concat();
     let mut ps = ParamSets::default();
@@ -436,7 +469,9 @@ fn dump_streams() {
     let dir = std::path::PathBuf::from(std::env::var("STREAM_DIR").expect("STREAM_DIR"));
     let (w, h) = (1280usize, 720usize);
     for workload in ["typing", "scrolling", "video"] {
-        let mut enc = open(&config(Backend::OpenH264, w as u32, h as u32, 30_000)).unwrap();
+        let mut cfg = config(Backend::OpenH264, w as u32, h as u32, 30_000);
+        cfg.best_quality = cfg.rate.quality;
+        let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
         let mut out = Vec::new();
         for f in 0..120 {
@@ -486,6 +521,7 @@ fn cpu_per_stream() {
         let mut cfg = config(backend, w as u32, h as u32, 30_000);
         cfg.fps = fps;
         cfg.threads = threads as u32;
+        cfg.best_quality = cfg.rate.quality;
         let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
         let (mut bytes, mut lat, mut cpu_s) = (0usize, Vec::new(), 0.0);

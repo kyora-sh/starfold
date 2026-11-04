@@ -153,14 +153,14 @@ async fn serve(a: HashMap<String, String>) {
         }
     };
     if encoder == encoder::Backend::OpenH264 {
-        for flag in ["preset", "crf", "paintover-crf"]
+        for flag in ["preset", "paintover-crf"]
             .iter()
             .filter(|f| a.contains_key(**f))
         {
-            log::warn!(
-                "--{flag} is an x264 setting: OpenH264 controls bitrate (--max-kbps), and the \
-                 lower of --crf and --paintover-crf only sets its lowest QP"
-            );
+            log::warn!("--{flag} is an x264 setting; OpenH264 ignores it");
+        }
+        if a.contains_key("crf") {
+            log::warn!("--crf with OpenH264 is its lowest QP; bitrate follows --max-kbps");
         }
     }
     let vcfg = video::VideoConfig {

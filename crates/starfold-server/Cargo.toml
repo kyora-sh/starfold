@@ -111,7 +111,9 @@ windows = { version = "0.61", features = [
 windows-core = "0.61"
 
 [dev-dependencies]
-openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }
+openh264 = { version = "=0.9.9", default-features = false, features = [
+	"source",
+] }
 
 [build-dependencies]
 bindgen = { version = "0.72", optional = true }
