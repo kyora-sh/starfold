@@ -42,11 +42,17 @@ jobs:
             gh pr create --base main --head sync/upstream --title 'chore: upstream sync (tembo/voxl)' --body-file "$RUNNER_TEMP/body.md"
           fi
       # Pushes and pull requests made with GITHUB_TOKEN start no workflows; a dispatch does.
+      # Also on an unchanged branch whose head has no CI run yet (a dispatch that failed).
       - name: Run CI on sync/upstream
-        if: steps.sync.outputs.status == 'pushed'
+        if: steps.sync.outputs.status == 'pushed' || steps.sync.outputs.status == 'unchanged'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run ci.yml --ref sync/upstream
+          HEAD_SHA: ${{ steps.sync.outputs.head }}
+        run: |
+          runs=$(gh run list --workflow ci.yml --commit "$HEAD_SHA" --json databaseId --jq length)
+          if [ "$runs" = 0 ]; then
+            gh workflow run ci.yml --ref sync/upstream
+          fi
       - name: Report a commit that needs a hand
         if: steps.sync.outputs.status == 'blocked'
         run: |

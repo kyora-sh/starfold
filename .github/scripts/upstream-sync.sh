@@ -6,8 +6,8 @@
 # cherry-picked in order. Stops at the first one that doesn't apply, bumps the marker to
 # the last one that did and force-pushes sync/upstream, unless the branch already has
 # that content or carries commits the bot didn't make. Writes the pull request body to
-# <body-file> and status=<up-to-date|human-edits|blocked|unchanged|pushed> to
-# $GITHUB_OUTPUT.
+# <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|pushed> plus, for
+# the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT.
 set -euo pipefail
 
 upstream_url=$1
@@ -61,9 +61,12 @@ if [ ${#commits[@]} -eq 0 ]; then
 	output status=up-to-date
 	exit 0
 fi
-if [ -n "$remote_branch" ] && git log --format=%ce "refs/remotes/origin/main..$remote_branch" | grep -qvxF "$bot_email"; then
-	output status=human-edits
-	exit 0
+if [ -n "$remote_branch" ]; then
+	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
+	if [ -n "$committers" ] && grep -qvxF "$bot_email" <<<"$committers"; then
+		output status=human-edits
+		exit 0
+	fi
 fi
 
 git checkout --quiet -B "$branch" refs/remotes/origin/main
@@ -128,8 +131,10 @@ if [ ${#picked[@]} -eq 0 ]; then
 fi
 if [ -n "$remote_branch" ] && git merge-base --is-ancestor refs/remotes/origin/main "$remote_branch" &&
 	[ "$(git rev-parse "$remote_branch^{tree}")" = "$(git rev-parse "HEAD^{tree}")" ]; then
+	output "head=$remote_branch"
 	output status=unchanged
 	exit 0
 fi
 git push --quiet --force-with-lease="refs/heads/$branch:$remote_branch" origin "HEAD:refs/heads/$branch"
+output "head=$(git rev-parse HEAD)"
 output status=pushed
