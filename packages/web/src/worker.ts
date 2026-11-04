@@ -47,6 +47,8 @@ let proto = 0;
 /** `v,` waits for the capability hello, so the server doesn't take this for an old client. */
 let videoSent = false;
 let helloSeq = 0;
+/** One per socket: async work started on an earlier connection is dropped. */
+let conn = 0;
 /** Protocol 2: the epoch announced last, and whether the decoders are set up for it. */
 let epoch = 0;
 let ready = false;
@@ -98,6 +100,7 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
 function connect() {
 	const sock = new WebSocket(url);
 	ws = sock;
+	conn++;
 	sock.binaryType = 'arraybuffer';
 	sock.addEventListener('open', () => {
 		post({ t: 'status', s: 'open' });
@@ -186,16 +189,17 @@ function onHello(m: Hello) {
 	// Each hello (the first, and one per new screen size) is answered with what decodes
 	// at its sizes; the last picture stays up until the server's next `codec`.
 	proto = 2;
-	void answer(++helloSeq, m.offer, m.videoOffers);
+	void answer(conn, ++helloSeq, m.offer, m.videoOffers);
 }
 
 async function answer(
+	c: number,
 	seq: number,
 	offer: number | undefined,
 	offers: VideoOffer[]
 ) {
 	const decode = await probe(offers);
-	if (seq !== helloSeq || proto !== 2) return;
+	if (c !== conn || seq !== helloSeq || proto !== 2) return;
 	send(msg.hello(offer, decode));
 	sendVideo();
 }
@@ -258,10 +262,10 @@ function onCodec(m: CodecMessage) {
 		post({ t: 'log', s: `no video: ${m.error}` });
 		return;
 	}
-	void configure(m);
+	void configure(conn, m);
 }
 
-async function configure(m: Extract<CodecMessage, { w: number }>) {
+async function configure(c: number, m: Extract<CodecMessage, { w: number }>) {
 	const list = m.stripes.map((s) =>
 		decoderConfig(
 			s.config,
@@ -269,7 +273,7 @@ async function configure(m: Extract<CodecMessage, { w: number }>) {
 		)
 	);
 	const ok = await Promise.all(list.map(supported));
-	if (m.epoch !== epoch) return;
+	if (c !== conn || m.epoch !== epoch) return;
 	if (!ok.every(Boolean)) {
 		send(msg.error(m.epoch, 'unsupported'));
 		return;

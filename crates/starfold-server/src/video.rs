@@ -212,9 +212,14 @@ struct Shared {
     idr_inflight: AtomicBool,
     /// Adaptive bitrate cap (kbit/s).
     target: AtomicU32,
+    /// Consecutive jobs a stripe failed to encode; at FAIL_AFTER the cohort is given up.
+    failures: AtomicU32,
     w: u32,
     h: u32,
 }
+
+/// Consecutive failed encodes after which a cohort's viewers move to their next codec.
+const FAIL_AFTER: u32 = 3;
 
 impl Shared {
     /// The stripes' streams told their parameters (on their first frame or when they
@@ -528,6 +533,7 @@ impl Engine {
             busy: AtomicUsize::new(0),
             idr_inflight: AtomicBool::new(false),
             target: AtomicU32::new(rc.target as u32),
+            failures: AtomicU32::new(0),
             w: self.w,
             h: self.h,
         });
@@ -569,6 +575,27 @@ impl Engine {
         if due {
             self.last_tick = Instant::now();
             self.expire();
+        }
+        // A cohort whose encoder keeps failing: its candidate is off until the next size.
+        // H.264 is the last resort and stays.
+        for c in &self.cohorts {
+            let sh = &c.shared;
+            if sh.cand != self.h264
+                && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
+                && !self.failed.contains(&sh.cand)
+            {
+                log::warn!(
+                    "{:?} from {} keeps failing to encode; trying the next codec",
+                    sh.cand.codec,
+                    sh.cand.backend.name()
+                );
+                self.failed.push(sh.cand);
+            }
+        }
+        let failed = self.failed.clone();
+        self.cohorts.retain(|c| !failed.contains(&c.shared.cand));
+        if self.best.is_some_and(|b| failed.contains(&b)) {
+            self.best = None;
         }
         let gen = self.hub.offer_gen.load(Ordering::Relaxed);
         loop {
@@ -639,20 +666,15 @@ impl Engine {
     /// Moves each viewer to its pick. A protocol 2 viewer gets a new epoch and the
     /// `codec` message, and the cohort's frames once it is ready for them.
     fn apply(&self, clients: &[Arc<Client>], picks: &[(u64, Option<Choice>)]) {
-        let offers: Vec<(u64, Candidate, Offer)> = self
-            .cohorts
-            .iter()
-            .map(|c| (c.shared.id, c.shared.cand, c.shared.offer.lock().clone()))
-            .collect();
         for (c, (_, pick)) in clients.iter().zip(picks) {
             let mut r = c.route.lock();
             let target = pick.and_then(|p| {
-                offers
+                self.cohorts
                     .iter()
-                    .find(|o| o.1 == p.cand)
-                    .map(|o| (p, o.0, &o.2))
+                    .find(|k| k.shared.cand == p.cand)
+                    .map(|k| (p, &k.shared))
             });
-            let Some((p, id, offer)) = target else {
+            let Some((p, sh)) = target else {
                 if r.proto == Proto::V2 && r.phase != Phase::NoCodec {
                     r.epoch = r.epoch.wrapping_add(1);
                     r.detach();
@@ -662,6 +684,7 @@ impl Engine {
                 }
                 continue;
             };
+            let id = sh.id;
             if r.cohort == Some(id) && r.choice == Some(p) {
                 continue;
             }
@@ -673,7 +696,10 @@ impl Engine {
                 r.epoch = r.epoch.wrapping_add(1);
                 r.phase = Phase::Announced(Instant::now());
                 c.needs_keyframe.store(false, Ordering::Relaxed);
-                c.send(Out::Text(offer.announce(r.epoch, self.w, self.h)));
+                // Read with the route held: a reconfigure that updates the offer after
+                // this finds the viewer attached and announces again.
+                let msg = sh.offer.lock().announce(r.epoch, self.w, self.h);
+                c.send(Out::Text(msg));
                 log::info!(
                     "client {}: {:?} from {} (epoch {}, {:?})",
                     c.id,
@@ -782,6 +808,15 @@ impl Engine {
                     && (v.want_key || flow_ok(&v.clients, interval_ms))
             })
             .collect()
+    }
+
+    /// Whether a cohort that skipped damage has room for it now: worth a capture even
+    /// when nothing else changed, or that cohort's viewers keep stale regions.
+    fn catch_up_due(&self, views: &[View], interval_ms: f64) -> bool {
+        self.cohorts
+            .iter()
+            .zip(self.takes(views, interval_ms))
+            .any(|(c, take)| take && c.skipped.is_some())
     }
 
     fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) {
@@ -1240,9 +1275,10 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        let paintover_due = paintover_left > 0
+        let mut paintover_due = paintover_left > 0
             && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
-        if !cap.damaged && !want_key && !paintover_due {
+        let catch_up = eng.catch_up_due(&views, interval_ms);
+        if !cap.damaged && !want_key && !paintover_due && !catch_up {
             let timeout = if paintover_left == 0 {
                 100
             } else {
@@ -1319,7 +1355,7 @@ fn capture_loop(
             _ => -1,
         };
         let is_motion = band.is_some();
-        if !is_motion && !want_key && !paintover_due {
+        if !is_motion && !want_key && !paintover_due && !catch_up {
             // Damage was empty after all.
             continue;
         }
@@ -1329,7 +1365,11 @@ fn capture_loop(
                 Some(m) => Some(m),
                 None => {
                     paintover_left = 0;
-                    continue;
+                    if !catch_up {
+                        continue;
+                    }
+                    paintover_due = false;
+                    None
                 }
             }
         } else {
@@ -1466,7 +1506,13 @@ struct StripeJob {
     mb_cols: usize,
 }
 
-type StripeResult = (usize, Option<(bool, Vec<u8>)>, Option<StreamConfig>);
+struct StripeResult {
+    i: usize,
+    /// Keyframe and the stripe's message (header space first); None: nothing to send.
+    out: Option<(bool, Vec<u8>)>,
+    config: Option<StreamConfig>,
+    failed: bool,
+}
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
 /// small updates is even slower), so a stripe encodes single-threaded and only fans out
@@ -1684,6 +1730,7 @@ fn stripe_worker(
                 }
             }
         }
+        let failed = out.is_err();
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
             Ok(_) => None,
@@ -1694,7 +1741,13 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
-        if done.send((i, res, config)).is_err() {
+        let r = StripeResult {
+            i,
+            out: res,
+            config,
+            failed,
+        };
+        if done.send(r).is_err() {
             return;
         }
     }
@@ -1793,11 +1846,18 @@ fn encode_loop(
         }
         let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
         let mut configs: Vec<Option<StreamConfig>> = (0..n).map(|_| None).collect();
+        let mut failed = false;
         for _ in 0..pending {
-            if let Ok((i, r, c)) = done_rx.recv() {
-                results[i] = r;
-                configs[i] = c;
+            if let Ok(r) = done_rx.recv() {
+                failed |= r.failed;
+                results[r.i] = r.out;
+                configs[r.i] = r.config;
             }
+        }
+        if !failed {
+            sh.failures.store(0, Ordering::Release);
+        } else if sh.failures.fetch_add(1, Ordering::AcqRel) + 1 == FAIL_AFTER {
+            hub.replan();
         }
         let Frame {
             buf,

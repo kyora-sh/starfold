@@ -50,6 +50,8 @@ struct Fake {
     coded: (u32, u32),
     n: usize,
     relevel: Option<usize>,
+    /// Every encode from this one on fails.
+    fail_from: Option<usize>,
     gate: Option<Arc<Gate>>,
 }
 
@@ -75,6 +77,9 @@ impl VideoEncoder for Fake {
             g.wait();
         }
         self.n += 1;
+        if self.fail_from.is_some_and(|f| self.n >= f) {
+            return Err(EncodeError("session lost".into()));
+        }
         let relevel = self.relevel == Some(self.n);
         let key = opts.force_keyframe || self.n == 1 || relevel;
         let level = if self.relevel.is_some_and(|r| self.n >= r) {
@@ -109,13 +114,20 @@ struct Opts {
     hevc_fails: bool,
     /// The HEVC stream changes level on its 3rd picture.
     hevc_relevel: bool,
+    /// HEVC cohorts' encoders fail from their 3rd picture on.
+    hevc_breaks: bool,
 }
 
 fn fakes(o: Opts) -> Open {
     let opened = Arc::new(AtomicUsize::new(0));
     Arc::new(move |c: &EncoderConfig| {
         let hevc = c.codec == Codec::Hevc;
-        if hevc && o.hevc_fails && opened.fetch_add(1, Ordering::Relaxed) > 0 {
+        let earlier = if hevc {
+            opened.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        if o.hevc_fails && earlier > 0 {
             return Err(EncodeError("no session".into()));
         }
         Ok(Box::new(Fake {
@@ -123,6 +135,7 @@ fn fakes(o: Opts) -> Open {
             coded: (c.width, c.height),
             n: 0,
             relevel: (hevc && o.hevc_relevel).then_some(3),
+            fail_from: (hevc && o.hevc_breaks && earlier > 0).then_some(3),
             gate: o.gate.clone().filter(|_| hevc),
         }) as Box<dyn VideoEncoder>)
     })
@@ -649,6 +662,67 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
         hevc.skipped.is_some(),
         "its cohort keeps the damage it skipped"
     );
+    // Once it catches up, the damage it skipped is due even if nothing else changes.
+    assert!(!eng.catch_up_due(&eng.views(), 33.0));
+    slow.inflight.lock().clear();
+    assert!(eng.catch_up_due(&eng.views(), 33.0));
+    let views = eng.views();
+    let takes = eng.takes(&views, 33.0);
+    let mut still = whole(W, H);
+    still.band = None;
+    eng.dispatch(&still, &views, &takes);
+    settle(&eng);
+    assert_eq!(
+        videos(&drain(&mut rs)).len(),
+        1,
+        "the skipped damage was sent"
+    );
+    let hevc = &eng.cohorts.iter().find(|k| k.shared.cand == HEVC).unwrap();
+    assert!(hevc.skipped.is_none());
+    assert!(!eng.catch_up_due(&eng.views(), 33.0));
+}
+
+#[test]
+fn an_encoder_that_keeps_failing_falls_back() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_breaks: true,
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    ready(&c, &drain(&mut rx));
+    for _ in 0..(2 + FAIL_AFTER) {
+        push(&mut eng);
+    }
+    push(&mut eng);
+    let m = drain(&mut rx);
+    let cm = codec_msgs(&m);
+    assert_eq!(cm.len(), 1, "{m:?}");
+    assert_eq!(cm[0]["codec"], "h264");
+    assert_eq!(route_codec(&c), Some(Codec::H264));
+    assert!(eng.failed.contains(&HEVC));
+    assert!(eng.cohorts.iter().all(|k| k.shared.cand != HEVC));
+}
+
+#[test]
+fn announcements_carry_the_cohorts_current_configuration() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    eng.cohorts[0].shared.offer.lock().stripes[0].config.codec = "avc1.42c034".into();
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::H264]);
+    push(&mut eng);
+    let m = drain(&mut rx);
+    assert_eq!(
+        codec_msgs(&m)[0]["stripes"][0]["config"]["codec"],
+        "avc1.42c034"
+    );
 }
 
 #[test]
@@ -775,19 +849,40 @@ fn videotoolbox_hevc_negotiated() {
         Backend::VideoToolbox
     );
     assert!(c.codec_ready(1));
+    // The first real picture may tell a configuration other than the sample's: that is
+    // announced as a new epoch, which a viewer confirms like the first.
     let mut got = Vec::new();
-    for _ in 0..5 {
+    let mut epoch = 1;
+    for _ in 0..20 {
         push_at(&mut eng, 1280, 720);
         while let Ok(m) = rx.try_recv() {
-            if let Out::Bin(b) = m {
-                got.push(b);
+            match m {
+                Out::Bin(b) => got.push(b),
+                Out::Text(t) => {
+                    let j: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if j["t"] == "codec" {
+                        println!("re-announced: {j}");
+                        assert_eq!(j["codec"], "hevc");
+                        epoch = j["epoch"].as_u64().unwrap() as u32;
+                        assert!(c.codec_ready(epoch));
+                    }
+                }
             }
         }
     }
-    assert!(!got.is_empty());
+    let got: Vec<_> = got
+        .into_iter()
+        .filter(|b| b[16..20] == epoch.to_be_bytes())
+        .collect();
+    assert!(
+        !got.is_empty(),
+        "no frames in epoch {epoch}: encoded {}, keyframes {}, route {:?}",
+        hub.stats.encoded.load(Ordering::Relaxed),
+        hub.stats.keyframes.load(Ordering::Relaxed),
+        c.route.lock().phase
+    );
     let first = &got[0];
     assert_eq!(first[0], negotiate::VIDEO_V2);
-    assert_eq!(&first[16..20], &1u32.to_be_bytes());
     assert_eq!(first[1] & 1, 1, "starts with a keyframe");
     let types = hevc_nal_types(&first[20..]);
     assert!(
