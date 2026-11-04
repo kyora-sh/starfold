@@ -186,12 +186,18 @@ function onHello(m: Hello) {
 	// Each hello (the first, and one per new screen size) is answered with what decodes
 	// at its sizes; the last picture stays up until the server's next `codec`.
 	proto = 2;
-	const seq = ++helloSeq;
-	void probe(m.videoOffers).then((decode) => {
-		if (seq !== helloSeq || proto !== 2) return;
-		send(msg.hello(m.offer, decode));
-		sendVideo();
-	});
+	void answer(++helloSeq, m.offer, m.videoOffers);
+}
+
+async function answer(
+	seq: number,
+	offer: number | undefined,
+	offers: VideoOffer[]
+) {
+	const decode = await probe(offers);
+	if (seq !== helloSeq || proto !== 2) return;
+	send(msg.hello(offer, decode));
+	sendVideo();
 }
 
 const configKey = (c: DecoderConfig) =>
@@ -220,26 +226,24 @@ async function supported(c: VideoDecoderConfig): Promise<boolean> {
 
 /** Every offered configuration this browser decodes, hardware preferred. */
 async function probe(offers: VideoOffer[]): Promise<DecodeEntry[]> {
-	const out: DecodeEntry[] = [];
-	const seen = new Set<string>();
+	const all = new Map<string, DecoderConfig>();
 	for (const o of offers)
-		for (const s of o.stripes) {
-			const k = configKey(s.config);
-			if (seen.has(k)) continue;
-			seen.add(k);
-			for (const hw of ['prefer-hardware', 'no-preference'] as const) {
-				if (await supported(decoderConfig(s.config, hw))) {
-					accepted.set(k, hw);
-					out.push({
-						...s.config,
-						implementation: 'webcodecs',
-						hardwareAcceleration: hw,
-					});
-					break;
-				}
-			}
-		}
-	return out;
+		for (const s of o.stripes) all.set(configKey(s.config), s.config);
+	const found = await Promise.all([...all].map(([k, c]) => test(k, c)));
+	return found.filter((e): e is DecodeEntry => e !== null);
+}
+
+async function test(k: string, c: DecoderConfig): Promise<DecodeEntry | null> {
+	const hw: HardwareAcceleration | null = (await supported(
+		decoderConfig(c, 'prefer-hardware')
+	))
+		? 'prefer-hardware'
+		: (await supported(decoderConfig(c, 'no-preference')))
+			? 'no-preference'
+			: null;
+	if (!hw) return null;
+	accepted.set(k, hw);
+	return { ...c, implementation: 'webcodecs', hardwareAcceleration: hw };
 }
 
 /** A new epoch: everything of the old one is dropped, and once every stripe's
@@ -254,29 +258,31 @@ function onCodec(m: CodecMessage) {
 		post({ t: 'log', s: `no video: ${m.error}` });
 		return;
 	}
-	const e = m.epoch;
+	void configure(m);
+}
+
+async function configure(m: Extract<CodecMessage, { w: number }>) {
 	const list = m.stripes.map((s) =>
 		decoderConfig(
 			s.config,
 			accepted.get(configKey(s.config)) ?? 'no-preference'
 		)
 	);
-	void Promise.all(list.map(supported)).then((ok) => {
-		if (e !== epoch) return;
-		if (!ok.every(Boolean)) {
-			send(msg.error(e, 'unsupported'));
-			return;
-		}
-		configs = list;
-		setLayout(
-			m.w,
-			m.h,
-			m.stripes.map((s): Stripe => [s.y, s.h])
-		);
-		ready = true;
-		send(msg.ready(e));
-		post(m);
-	});
+	const ok = await Promise.all(list.map(supported));
+	if (m.epoch !== epoch) return;
+	if (!ok.every(Boolean)) {
+		send(msg.error(m.epoch, 'unsupported'));
+		return;
+	}
+	configs = list;
+	setLayout(
+		m.w,
+		m.h,
+		m.stripes.map((s): Stripe => [s.y, s.h])
+	);
+	ready = true;
+	send(msg.ready(m.epoch));
+	post(m);
 }
 
 function resetDecoder() {
