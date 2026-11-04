@@ -113,39 +113,32 @@ fn layout_map() -> HashMap<char, (u16, bool, bool)> {
         }
         let layout = CFDataGetBytePtr(data);
         let kbd = LMGetKbdType() as u32;
-        // Plain keys first, then Shift, Option, Shift+Option; the main block before
-        // the keypad, so digits come from the number row.
-        let keys: Vec<u16> = (0..65).chain(93..128).chain(65..93).collect();
-        for mods in [0, UC_SHIFT, UC_OPTION, UC_SHIFT | UC_OPTION] {
-            for &kc in &keys {
-                let mut dead = 0u32;
-                let mut buf = [0u16; 4];
-                let mut len = 0usize;
-                let st = UCKeyTranslate(
-                    layout,
-                    kc,
-                    kUCKeyActionDown,
-                    mods,
-                    kbd,
-                    0,
-                    &mut dead,
-                    buf.len(),
-                    &mut len,
-                    buf.as_mut_ptr(),
-                );
-                // Dead keys (accents that wait for the next key) are typed as text instead.
-                if st != 0 || dead != 0 || len == 0 {
-                    continue;
-                }
-                let mut it = char::decode_utf16(buf[..len].iter().copied());
-                if let (Some(Ok(c)), None) = (it.next(), it.next()) {
-                    if !c.is_control() {
-                        map.entry(c)
-                            .or_insert((kc, mods & UC_SHIFT != 0, mods & UC_OPTION != 0));
-                    }
-                }
+        map = char_map(|kc, mods| {
+            let mut dead = 0u32;
+            let mut buf = [0u16; 4];
+            let mut len = 0usize;
+            let st = UCKeyTranslate(
+                layout,
+                kc,
+                kUCKeyActionDown,
+                mods,
+                kbd,
+                0,
+                &mut dead,
+                buf.len(),
+                &mut len,
+                buf.as_mut_ptr(),
+            );
+            // Dead keys (accents that wait for the next key) are typed as text instead.
+            if st != 0 || dead != 0 || len == 0 {
+                return None;
             }
-        }
+            let mut it = char::decode_utf16(buf[..len].iter().copied());
+            match (it.next(), it.next()) {
+                (Some(Ok(c)), None) if !c.is_control() => Some(c),
+                _ => None,
+            }
+        });
         CFRelease(src);
         true
     });
@@ -155,12 +148,58 @@ fn layout_map() -> HashMap<char, (u16, bool, bool)> {
     map
 }
 
+/// Builds the character map from `translate(key, modifiers)`. The main block comes first
+/// with plain keys, then Shift, Option, Shift+Option, so '*' is Shift-8 rather than the
+/// keypad's '*' (the server drops the viewer's Shift, and Cmd-Shift-8 must stay that
+/// shortcut); keypad keys only add characters the main block can't type.
+fn char_map(translate: impl Fn(u16, u32) -> Option<char>) -> HashMap<char, (u16, bool, bool)> {
+    // 95 is the JIS keypad comma.
+    let main: Vec<u16> = (0..65).chain(93..95).chain(96..128).collect();
+    let keypad: Vec<u16> = (65..93).chain(95..96).collect();
+    let mut map = HashMap::new();
+    for keys in [main, keypad] {
+        for mods in [0, UC_SHIFT, UC_OPTION, UC_SHIFT | UC_OPTION] {
+            for &kc in &keys {
+                if let Some(c) = translate(kc, mods) {
+                    map.entry(c)
+                        .or_insert((kc, mods & UC_SHIFT != 0, mods & UC_OPTION != 0));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The held modifiers a typed character drops, and the ones it adds. The character
+/// decides Shift and Option (the viewer's layout already applied them); Command and
+/// Control stay as held, for shortcuts. Alt held with a plain letter stays too
+/// (Option-letter shortcuts).
+fn char_mods(c: char, shift: bool, option: bool) -> (u64, u64) {
+    let mut strip = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
+    if option || !c.is_ascii_alphanumeric() {
+        strip |= kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK;
+    }
+    let mut add = 0;
+    if shift {
+        add |= kCGEventFlagMaskShift;
+    }
+    if option {
+        add |= kCGEventFlagMaskAlternate;
+    }
+    (strip, add)
+}
+
+/// The flags for a typed character's events, given the modifiers held at the time.
+fn with_mods(held: u64, (strip, add): (u64, u64)) -> u64 {
+    (held & !strip) | add
+}
+
 struct Injector {
     src: CGEventSourceRef,
     chars: HashMap<char, (u16, bool, bool)>,
     chars_at: Instant,
-    /// keysym -> (virtual key, extra flags it was pressed with).
-    pressed: HashMap<u32, (u16, u64)>,
+    /// keysym -> (virtual key, `char_mods` it was pressed with).
+    pressed: HashMap<u32, (u16, (u64, u64))>,
     /// Held modifier keysyms and their flags.
     mods: HashMap<u32, u64>,
     buttons: [bool; 16],
@@ -364,18 +403,18 @@ impl Injector {
             return;
         }
         if !down {
-            if let Some((kc, extra)) = self.pressed.remove(&keysym) {
-                self.key_event(kc, false, self.flags() | extra, false);
+            if let Some((kc, m)) = self.pressed.remove(&keysym) {
+                self.key_event(kc, false, with_mods(self.flags(), m), false);
             }
             return;
         }
-        if let Some(&(kc, extra)) = self.pressed.get(&keysym) {
+        if let Some(&(kc, m)) = self.pressed.get(&keysym) {
             // Autorepeat.
-            self.key_event(kc, true, self.flags() | extra, true);
+            self.key_event(kc, true, with_mods(self.flags(), m), true);
             return;
         }
         if let Some(kc) = named(keysym) {
-            self.pressed.insert(keysym, (kc, 0));
+            self.pressed.insert(keysym, (kc, (0, 0)));
             self.key_event(kc, true, self.flags(), false);
             return;
         }
@@ -395,36 +434,18 @@ impl Injector {
         }
         match self.chars.get(&c).copied() {
             Some((kc, shift, option)) => {
-                // The character decides Shift and Option (the viewer's layout already
-                // applied them); Command and Control stay as held, for shortcuts. Alt
-                // held with a plain letter stays too (Option-letter shortcuts).
-                let held = self.flags();
-                let keep_option = !option && c.is_ascii_alphanumeric();
-                let mut flags = held
-                    & !(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK);
-                if !keep_option {
-                    flags &=
-                        !(kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK);
-                }
-                let mut extra = 0;
-                if shift {
-                    extra |= kCGEventFlagMaskShift;
-                }
-                if option {
-                    extra |= kCGEventFlagMaskAlternate;
-                }
-                // Release uses the same flags, so remember them relative to `held`.
-                let flags = flags | extra;
-                self.pressed.insert(keysym, (kc, flags & !held));
-                self.key_event(kc, true, flags, false);
+                let m = char_mods(c, shift, option);
+                // Repeats and the release apply the same override to what is held then.
+                self.pressed.insert(keysym, (kc, m));
+                self.key_event(kc, true, with_mods(self.flags(), m), false);
             }
             None => self.type_text(c),
         }
     }
 
     fn release_all(&mut self) {
-        for (_, (kc, extra)) in std::mem::take(&mut self.pressed) {
-            self.key_event(kc, false, self.flags() | extra, false);
+        for (_, (kc, m)) in std::mem::take(&mut self.pressed) {
+            self.key_event(kc, false, with_mods(self.flags(), m), false);
         }
         for ks in self.mods.keys().copied().collect::<Vec<_>>() {
             self.key(ks, false);
@@ -492,4 +513,98 @@ pub fn spawn(
         })
         .unwrap();
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The US layout's keys these tests look at; the keypad ignores Shift.
+    fn us(kc: u16, mods: u32) -> Option<char> {
+        let (plain, shifted) = match kc {
+            0 => ('a', 'A'),
+            11 => ('b', 'B'),
+            18 => ('1', '!'),
+            19 => ('2', '@'),
+            20 => ('3', '#'),
+            21 => ('4', '$'),
+            23 => ('5', '%'),
+            22 => ('6', '^'),
+            26 => ('7', '&'),
+            28 => ('8', '*'),
+            25 => ('9', '('),
+            29 => ('0', ')'),
+            24 => ('=', '+'),
+            27 => ('-', '_'),
+            44 => ('/', '?'),
+            47 => ('.', '>'),
+            65 => ('.', '.'),
+            67 => ('*', '*'),
+            69 => ('+', '+'),
+            75 => ('/', '/'),
+            78 => ('-', '-'),
+            81 => ('=', '='),
+            82..=89 => {
+                let d = char::from_digit((kc - 82) as u32, 10)?;
+                (d, d)
+            }
+            91 => ('8', '8'),
+            92 => ('9', '9'),
+            _ => return None,
+        };
+        if mods & UC_OPTION != 0 {
+            return None;
+        }
+        Some(if mods & UC_SHIFT != 0 { shifted } else { plain })
+    }
+
+    #[test]
+    fn shifted_main_keys_win_over_the_keypad() {
+        let m = char_map(us);
+        assert_eq!(m[&'*'], (28, true, false));
+        assert_eq!(m[&'+'], (24, true, false));
+        for (c, kc) in [('/', 44), ('-', 27), ('=', 24), ('.', 47)] {
+            assert_eq!(m[&c], (kc, false, false), "{c}");
+        }
+    }
+
+    #[test]
+    fn digits_and_letters_come_from_the_main_block() {
+        let m = char_map(us);
+        for (c, kc) in "1234567890"
+            .chars()
+            .zip([18, 19, 20, 21, 23, 22, 26, 28, 25, 29])
+        {
+            assert_eq!(m[&c], (kc, false, false), "{c}");
+        }
+        assert_eq!(m[&'a'], (0, false, false));
+        assert_eq!(m[&'A'], (0, true, false));
+        assert_eq!(m[&'!'], (18, true, false));
+    }
+
+    #[test]
+    fn keypad_types_what_the_main_block_cannot() {
+        // A keypad decimal key that types ',' (as on many European layouts).
+        let m = char_map(|kc, mods| if kc == 65 { Some(',') } else { us(kc, mods) });
+        assert_eq!(m[&','], (65, false, false));
+        // The JIS keypad comma key is keypad too.
+        let m = char_map(|kc, mods| if kc == 95 { Some('*') } else { us(kc, mods) });
+        assert_eq!(m[&'*'], (28, true, false));
+    }
+
+    #[test]
+    fn the_character_decides_shift_and_option() {
+        let opt = kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK;
+        let shift = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+        let cmd = kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
+        // '*' typed with Option on the viewer's layout is Shift-8 here, on every repeat.
+        let star = char_mods('*', true, false);
+        assert_eq!(with_mods(opt, star), kCGEventFlagMaskShift);
+        assert_eq!(with_mods(cmd | shift, star), cmd | kCGEventFlagMaskShift);
+        assert_eq!(with_mods(shift, char_mods('8', false, false)), 0);
+        assert_eq!(
+            with_mods(cmd | opt, char_mods('a', false, false)),
+            cmd | opt
+        );
+    }
 }
