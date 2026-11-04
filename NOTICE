@@ -1,0 +1,7 @@
+starfold
+Copyright (c) Tembo and the starfold contributors
+
+starfold is a fork of voxl (https://github.com/tembo/voxl), imported at upstream commit
+eba3b7ced9f60e885bb7b3a96a12e3ccb347fdcd. voxl is licensed under the MIT License; its
+original copyright and permission notice is retained unchanged in LICENSE and applies
+to this fork.
