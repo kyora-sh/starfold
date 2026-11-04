@@ -81,6 +81,32 @@ describe('probe', () => {
 		expect(loads()).toBe(0);
 	});
 
+	test('an offer WebCodecs covers only in part does not rule dav1d-wasm out', async () => {
+		const two: VideoOffer = {
+			...H264,
+			stripes: [
+				H264.stripes[0],
+				{
+					i: 1,
+					y: 1080,
+					h: 1080,
+					config: { codec: 'avc1.640034', codedWidth: 1920, codedHeight: 1080 },
+				},
+			],
+		};
+		const e: ProbeEnv = {
+			supported: async (c) =>
+				c.hardwareAcceleration === 'no-preference' && c.codec === 'avc1.42c028',
+			dav1d: async () => true,
+			dav1dDecodes,
+		};
+		const r = await probe([AV1, two], e);
+		expect(r.decode.map((d) => [d.codec, d.implementation])).toEqual([
+			['avc1.42c028', 'webcodecs'],
+			['av01.0.08M.08', 'dav1d-wasm'],
+		]);
+	});
+
 	test('WebCodecs AV1 at one size rules dav1d-wasm out at another', async () => {
 		const small = offer('av1', 'av01.0.04M.08', 640, 360);
 		const e: ProbeEnv = {

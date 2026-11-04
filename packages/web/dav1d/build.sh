@@ -6,6 +6,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=${1:-$(mktemp -d)}
 mkdir -p "$work"
+work=$(cd "$work" && pwd)
 cd "$work"
 
 DAV1D=1.5.4
