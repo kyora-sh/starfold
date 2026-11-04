@@ -185,6 +185,7 @@ impl Va {
         let (mut major, mut minor) = (0, 0);
         let r = (self.initialize)(dpy, &mut major, &mut minor);
         if r != 0 {
+            (self.terminate)(dpy);
             return Err(format!("vaInitialize failed ({r})"));
         }
         let res = self.entrypoints(dpy).map(|e| (e, self.vendor_string(dpy)));
