@@ -25,6 +25,23 @@ const UNCAPPED_BPS: i64 = 100_000_000;
 /// How long one frame may take to come out.
 const OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub static STAGES: Mutex<Vec<[f64; 9]>> = Mutex::new(Vec::new());
+pub const STAGE_NAMES: [&str; 9] = [
+    "alloc", "lock", "copy", "unlock", "submit", "cb", "wake", "annexb", "total",
+];
+
+fn ms(a: Instant, b: Instant) -> f64 {
+    if b >= a {
+        (b - a).as_secs_f64() * 1e3
+    } else {
+        -(a - b).as_secs_f64() * 1e3
+    }
+}
+
+fn exp(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
 /// An owned CoreFoundation reference.
 struct Cf(CFTypeRef);
 
@@ -96,6 +113,7 @@ struct Encoded {
     dropped: bool,
     pts: i64,
     sample: Option<Cf>,
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -112,6 +130,7 @@ unsafe extern "C" fn on_output(
     flags: u32,
     sample: CMSampleBufferRef,
 ) {
+    let at = Instant::now();
     let out = &*(refcon as *const Output);
     let sample = (!sample.is_null()).then(|| Cf(CFRetain(sample)));
     out.queue.lock().push_back(Encoded {
@@ -119,6 +138,7 @@ unsafe extern "C" fn on_output(
         dropped: flags & kVTEncodeInfo_FrameDropped != 0,
         pts: frame as usize as i64,
         sample,
+        at,
     });
     out.ready.notify_all();
 }
@@ -236,6 +256,7 @@ pub struct VideoToolbox {
     bps: i64,
     /// A frame's output was lost: the next one has to be an IDR.
     resync: bool,
+    up: [f64; 4],
 }
 
 // The session is only ever driven from one thread at a time; its callback only touches
@@ -267,7 +288,8 @@ impl VideoToolbox {
         };
         let ty = codec_type(cfg.codec);
         // Low-latency rate control: no lookahead or reordering, one IDR then P frames.
-        let session = Session::open(ty, cfg.width, cfg.height, true).map_err(|r| {
+        let llrc = exp("VT_LL").as_deref() != Some("0");
+        let session = Session::open(ty, cfg.width, cfg.height, llrc).map_err(|r| {
             EncodeError(format!(
                 "no low-latency hardware VideoToolbox {:?} encoder for {}x{}: {}",
                 cfg.codec,
@@ -278,11 +300,13 @@ impl VideoToolbox {
         })?;
         let s = &session;
         unsafe {
-            s.require(
-                kVTCompressionPropertyKey_RealTime,
-                kCFBooleanTrue,
-                "real-time mode",
-            )?;
+            if exp("VT_RT").as_deref() != Some("0") {
+                s.require(
+                    kVTCompressionPropertyKey_RealTime,
+                    kCFBooleanTrue,
+                    "real-time mode",
+                )?;
+            }
             s.require(
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kCFBooleanFalse,
@@ -308,9 +332,27 @@ impl VideoToolbox {
                 kCVImageBufferYCbCrMatrix_ITU_R_601_4,
                 "setting the YCbCr matrix",
             )?;
-            let fps = number(kCFNumberDoubleType, cfg.fps.max(1) as f64)?;
-            if let Err(r) = s.set(kVTCompressionPropertyKey_ExpectedFrameRate, fps.0) {
-                log::debug!("VideoToolbox ignores the expected frame rate ({r})");
+            if exp("VT_NO_FPS").is_none() {
+                let fps = number(kCFNumberDoubleType, cfg.fps.max(1) as f64)?;
+                if let Err(r) = s.set(kVTCompressionPropertyKey_ExpectedFrameRate, fps.0) {
+                    log::debug!("VideoToolbox ignores the expected frame rate ({r})");
+                }
+            }
+            let mut mfdc = None;
+            if let Some(v) = exp("VT_MFDC") {
+                let n = number(kCFNumberSInt32Type, v.parse::<i32>().unwrap())?;
+                mfdc = Some(s.set(kVTCompressionPropertyKey_MaxFrameDelayCount, n.0));
+            }
+            if exp("VT_REPORT").is_some() {
+                let read = |k| s.copy(k).and_then(|v| get_i64(v.0));
+                println!(
+                    "vtcfg codec={:?} llrc={llrc} encoder_id={:?} mfdc_set={mfdc:?} mfdc_read={:?} fps_read={:?} realtime_read={:?}",
+                    cfg.codec,
+                    s.encoder_id(),
+                    read(kVTCompressionPropertyKey_MaxFrameDelayCount),
+                    read(kVTCompressionPropertyKey_ExpectedFrameRate),
+                    s.copy(kVTCompressionPropertyKey_RealTime).and_then(|v| get_bool(v.0)),
+                );
             }
         }
         let mut me = VideoToolbox {
@@ -323,6 +365,7 @@ impl VideoToolbox {
             pts: -1,
             bps: 0,
             resync: false,
+            up: [0.0; 4],
         };
         me.set_bps(bps(cfg.rate.max_kbps))?;
         let r = unsafe { VTCompressionSessionPrepareToEncodeFrames(me.session.s) };
@@ -349,7 +392,8 @@ impl VideoToolbox {
     }
 
     /// Copies an I420 picture into a pooled NV12 buffer.
-    fn upload(&self, f: &FrameView<'_>) -> Result<Cf, EncodeError> {
+    fn upload(&mut self, f: &FrameView<'_>) -> Result<Cf, EncodeError> {
+        let t0 = Instant::now();
         let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.session.s) };
         if pool.is_null() {
             return Err(EncodeError("VideoToolbox has no pixel buffer pool".into()));
@@ -361,11 +405,15 @@ impl VideoToolbox {
         }
         let pb = Cf(pb as CFTypeRef);
         let raw = pb.0 as CVPixelBufferRef;
+        let t1 = Instant::now();
         if unsafe { CVPixelBufferLockBaseAddress(raw, 0) } != 0 {
             return Err(EncodeError("can't lock the pixel buffer".into()));
         }
+        let t2 = Instant::now();
         let copied = unsafe { copy_nv12(raw, f) };
+        let t3 = Instant::now();
         unsafe { CVPixelBufferUnlockBaseAddress(raw, 0) };
+        self.up = [ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, Instant::now())];
         copied.map(|_| pb)
     }
 
@@ -599,6 +647,48 @@ unsafe fn copy_nv12(pb: CVPixelBufferRef, f: &FrameView<'_>) -> Result<(), Encod
     Ok(())
 }
 
+impl VideoToolbox {
+    pub fn submit(&mut self, f: &FrameView<'_>, pts_ms: i64, key: bool) -> Result<(), EncodeError> {
+        let pb = self.upload(f)?;
+        let props = key
+            .then(|| dict(unsafe { &[(kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue)] }))
+            .transpose()?;
+        let pts = CMTime {
+            value: pts_ms,
+            timescale: 1000,
+            flags: kCMTimeFlags_Valid,
+            epoch: 0,
+        };
+        let mut info = 0u32;
+        let r = unsafe {
+            VTCompressionSessionEncodeFrame(
+                self.session.s,
+                pb.0 as CVPixelBufferRef,
+                pts,
+                kCMTimeInvalid,
+                props.as_ref().map_or(ptr::null(), |p| p.0),
+                pts_ms as usize as *mut c_void,
+                &mut info,
+            )
+        };
+        if r != 0 {
+            return Err(err("submitting a frame", r));
+        }
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Vec<(i64, Instant, bool)> {
+        unsafe { VTCompressionSessionCompleteFrames(self.session.s, kCMTimeInvalid) };
+        self.session
+            .out
+            .queue
+            .lock()
+            .drain(..)
+            .map(|e| (e.pts, e.at, e.dropped || e.status != 0))
+            .collect()
+    }
+}
+
 impl VideoEncoder for VideoToolbox {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         let b = bps(rate.max_kbps);
@@ -620,6 +710,7 @@ impl VideoEncoder for VideoToolbox {
             )));
         }
         f.check()?;
+        let t_start = Instant::now();
         self.pts = opts.pts_ms.max(self.pts + 1);
         let pb = self.upload(f)?;
         let props = if opts.force_keyframe || self.resync {
@@ -636,6 +727,7 @@ impl VideoEncoder for VideoToolbox {
             epoch: 0,
         };
         let mut info = 0u32;
+        let t_submit = Instant::now();
         let r = unsafe {
             VTCompressionSessionEncodeFrame(
                 self.session.s,
@@ -647,6 +739,7 @@ impl VideoEncoder for VideoToolbox {
                 &mut info,
             )
         };
+        let t_returned = Instant::now();
         drop(pb);
         if r != 0 {
             return Err(err("submitting a frame", r));
@@ -661,6 +754,7 @@ impl VideoEncoder for VideoToolbox {
             }
         }
         let late = !q.iter().any(|e| e.pts == self.pts);
+        let t_woke = Instant::now();
         drop(q);
         if late {
             // Blocks until the frame is out, so it can't turn up in a later call.
@@ -689,10 +783,25 @@ impl VideoEncoder for VideoToolbox {
                 OUTPUT_TIMEOUT.as_millis()
             )));
         }
+        let t_cb = mine[0].at;
+        let t_collect = Instant::now();
         let aus = self.collect(mine);
+        let t_end = Instant::now();
         if aus.is_err() {
             self.resync = true;
         }
+        let u = self.up;
+        STAGES.lock().push([
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            ms(t_submit, t_returned),
+            ms(t_returned, t_cb),
+            ms(t_cb, t_woke),
+            ms(t_collect, t_end),
+            ms(t_start, t_end),
+        ]);
         aus
     }
 

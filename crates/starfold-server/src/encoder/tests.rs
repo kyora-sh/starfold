@@ -627,6 +627,107 @@ fn dump_streams() {
     }
 }
 
+/// Submits without waiting for each output: encoder throughput and per-frame latency
+/// with frames in flight, from 30 pre-rendered pictures.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn vt_pipeline() {
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let codec = match std::env::var("CODEC").as_deref() {
+        Ok("hevc") => Codec::Hevc,
+        _ => Codec::H264,
+    };
+    let (frames, w, h, fps) = (
+        env("FRAMES", 300),
+        env("W", 1920),
+        env("H", 1080),
+        env("FPS", 30),
+    );
+    for workload in ["typing", "scrolling", "video"] {
+        let mut cfg = config(Backend::VideoToolbox, w as u32, h as u32, 30_000);
+        cfg.codec = codec;
+        cfg.fps = fps as u32;
+        cfg.best_quality = cfg.rate.quality;
+        let mut enc = videotoolbox::VideoToolbox::new(&cfg).unwrap();
+        let mut p = Picture::new(w, h);
+        let pics: Vec<Picture> = (0..30)
+            .map(|f| {
+                match workload {
+                    "typing" => {
+                        let (x, y) = ((200 + (f % 120) * 12) * w / 1920, 300 * h / 1080);
+                        p.texture(f as u32 + 1, x, y, x + 12, y + 22, 0);
+                    }
+                    "scrolling" => p.texture(
+                        0,
+                        300 * w / 1920,
+                        90 * h / 1080,
+                        1500 * w / 1920,
+                        990 * h / 1080,
+                        f * 8,
+                    ),
+                    _ => p.video(f),
+                }
+                Picture {
+                    w,
+                    h,
+                    y: p.y.clone(),
+                    u: p.u.clone(),
+                    v: p.v.clone(),
+                }
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let mut sent = Vec::with_capacity(frames);
+        let mut calls = Vec::with_capacity(frames);
+        for f in 0..frames {
+            let t = std::time::Instant::now();
+            enc.submit(&pics[f % 30].view(), (f * 1000 / fps) as i64, f == 0)
+                .unwrap();
+            calls.push(t.elapsed().as_secs_f64() * 1e3);
+            sent.push(t);
+        }
+        let submit_wall = start.elapsed().as_secs_f64();
+        let mut got = enc.finish();
+        let total_wall = start.elapsed().as_secs_f64();
+        got.sort_by_key(|g| g.1);
+        let dropped = got.iter().filter(|g| g.2).count();
+        let live: Vec<_> = got.iter().filter(|g| !g.2).collect();
+        let mut gaps: Vec<f64> = live
+            .windows(2)
+            .skip(30)
+            .map(|a| (a[1].1 - a[0].1).as_secs_f64() * 1e3)
+            .collect();
+        let idx: std::collections::HashMap<i64, usize> =
+            (0..frames).map(|f| ((f * 1000 / fps) as i64, f)).collect();
+        let mut lat: Vec<f64> = live
+            .iter()
+            .skip(30)
+            .map(|g| (g.1 - sent[idx[&g.0]]).as_secs_f64() * 1e3)
+            .collect();
+        let q = |v: &mut Vec<f64>, x: f64| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[((v.len() - 1) as f64 * x).round() as usize]
+        };
+        println!(
+            "pipeline codec={codec:?} workload={workload} w={w} fps={fps} frames={frames} arrived={} dropped={dropped} submit_fps={:.1} output_fps={:.1} submit_p50_ms={:.2} gap_p50_ms={:.2} gap_p95_ms={:.2} lat_p50_ms={:.2} lat_p95_ms={:.2}",
+            got.len(),
+            frames as f64 / submit_wall,
+            live.len() as f64 / total_wall,
+            q(&mut calls, 0.5),
+            q(&mut gaps, 0.5),
+            q(&mut gaps, 0.95),
+            q(&mut lat, 0.5),
+            q(&mut lat, 0.95),
+        );
+    }
+}
+
 /// CPU per stream at 1080p30 for typing, scrolling and video-like content:
 /// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND=x264 with the
 /// x264 feature; FRAMES, THREADS). One line per workload, `bench` first.
@@ -642,7 +743,12 @@ fn cpu_per_stream() {
             .unwrap_or(d)
     };
     let (frames, threads) = (env("FRAMES", 300), env("THREADS", 1));
-    let (w, h, fps) = (1920usize, 1080usize, 30u32);
+    let codec = match std::env::var("CODEC").as_deref() {
+        Ok("hevc") => Codec::Hevc,
+        _ => Codec::H264,
+    };
+    let (w, h, fps) = (env("W", 1920), env("H", 1080), env("FPS", 30) as u32);
+    let pace_ms = env("PACE_MS", 0) as u64;
     let cols = w.div_ceil(16);
     let mbs = cols * h.div_ceil(16);
     let cpu = || unsafe {
@@ -653,12 +759,14 @@ fn cpu_per_stream() {
     };
     for workload in ["typing", "scrolling", "video"] {
         let mut cfg = config(backend, w as u32, h as u32, 30_000);
+        cfg.codec = codec;
         cfg.fps = fps;
         cfg.threads = threads as u32;
         cfg.best_quality = cfg.rate.quality;
         let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
         let (mut bytes, mut lat, mut cpu_s) = (0usize, Vec::new(), 0.0);
+        let start = std::time::Instant::now();
         for f in 0..frames {
             let mut dirty = vec![0u8; mbs];
             let mut mark = |x0: usize, y0: usize, x1: usize, y1: usize| {
@@ -668,13 +776,22 @@ fn cpu_per_stream() {
             };
             match workload {
                 "typing" => {
-                    let (x, y) = (200 + (f % 120) * 12, 300 + (f / 120) * 22);
+                    let (x, y) = (
+                        (200 + (f % 120) * 12) * w / 1920,
+                        (300 + (f / 120) * 22) * h / 1080,
+                    );
                     p.texture(f as u32 + 1, x, y, x + 12, y + 22, 0);
                     mark(x, y, x + 12, y + 22);
                 }
                 "scrolling" => {
-                    p.texture(0, 300, 90, 1500, 990, f * 8);
-                    mark(300, 90, 1500, 990);
+                    let (x0, y0, x1, y1) = (
+                        300 * w / 1920,
+                        90 * h / 1080,
+                        1500 * w / 1920,
+                        990 * h / 1080,
+                    );
+                    p.texture(0, x0, y0, x1, y1, f * 8);
+                    mark(x0, y0, x1, y1);
                 }
                 _ => {
                     p.video(f);
@@ -687,29 +804,59 @@ fn cpu_per_stream() {
                 .encode(
                     &p.view(),
                     EncodeOptions {
-                        pts_ms: f as i64 * 1000 / fps as i64,
+                        pts_ms: if pace_ms > 0 {
+                            f as i64 * pace_ms as i64
+                        } else {
+                            f as i64 * 1000 / fps as i64
+                        },
                         force_keyframe: f == 0,
                         static_mbs: Some(&mut hints),
                     },
                 )
                 .unwrap();
             let (dt, dc) = (t0.elapsed().as_secs_f64() * 1e3, cpu() - c0);
-            if f >= fps as usize {
+            if f >= 30 {
                 lat.push(dt);
                 cpu_s += dc;
                 bytes += aus.iter().map(|a| a.data.len()).sum::<usize>();
             }
+            if pace_ms > 0 {
+                let next = start + std::time::Duration::from_millis(pace_ms * (f as u64 + 1));
+                if let Some(d) = next.checked_duration_since(std::time::Instant::now()) {
+                    std::thread::sleep(d);
+                }
+            }
         }
+        let wall_fps = frames as f64 / start.elapsed().as_secs_f64();
         lat.sort_by(|a, b| a.total_cmp(b));
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench backend={} workload={workload} threads={threads} cpu_s_per_s={:.4} kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
+            "bench backend={} codec={codec:?} workload={workload} w={w} h={h} fps={fps} pace_ms={pace_ms} threads={threads} wall_fps={wall_fps:.1} cpu_s_per_s={:.4} kbps={:.0} p05_ms={:.2} p25_ms={:.2} p50_ms={:.2} p75_ms={:.2} p95_ms={:.2} max_ms={:.2}",
             backend.name(),
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
+            pct(0.05),
+            pct(0.25),
             pct(0.5),
-            pct(0.95)
+            pct(0.75),
+            pct(0.95),
+            pct(1.0),
         );
+        #[cfg(target_os = "macos")]
+        if backend == Backend::VideoToolbox {
+            let st: Vec<_> = std::mem::take(&mut *videotoolbox::STAGES.lock());
+            let st = &st[30.min(st.len())..];
+            let mut line = format!(
+                "stages codec={codec:?} workload={workload} w={w} fps={fps} pace_ms={pace_ms}"
+            );
+            for (i, name) in videotoolbox::STAGE_NAMES.iter().enumerate() {
+                let mut v: Vec<f64> = st.iter().map(|s| s[i]).collect();
+                v.sort_by(|a, b| a.total_cmp(b));
+                let q = |x: f64| v[((v.len() - 1) as f64 * x).round() as usize];
+                line += &format!(" {name}={:.3}/{:.3}", q(0.5), q(0.95));
+            }
+            println!("{line}");
+        }
     }
 }

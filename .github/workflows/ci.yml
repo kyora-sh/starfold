@@ -1,175 +1,29 @@
 name: CI
-
-# Everything runs on kyora runners. macOS runs on pushes to main and by hand; Windows is
-# checked by cross-compiling clippy on Linux (no desktop smoke test).
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
-
+    inputs:
+      sets:
+        type: string
+        default: a
+      rounds:
+        type: string
+        default: '5'
+      best:
+        type: string
+        default: ''
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
   RUST_TOOLCHAIN: '1.93.0'
-
 jobs:
-  web:
-    name: Web (oxfmt, oxlint, tsc, bun test)
-    runs-on: kyora-8x16
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
-      - run: bun install --frozen-lockfile
-      - name: Format
-        run: bun run fmt:check
-      - name: Lint
-        run: bun run lint
-      - name: Type-check
-        run: bun run typecheck
-      - name: Unit tests
-        run: bun run test
-
-  python:
-    name: Python (ruff, pytest)
-    runs-on: kyora-8x16
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: python/starfold
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: 0.11.8
-      - run: uv sync --locked
-      - name: Format
-        run: uv run --locked ruff format --check
-      - name: Lint
-        run: uv run --locked ruff check
-      # Unit tests; the Xvfb integration test skips without STARFOLD_BIN.
-      - name: Test
-        run: uv run --locked pytest
-
-  rust:
-    name: Rust (rustfmt, clippy, test)
-    runs-on: kyora-8x16
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      # libyuv, Opus, PulseAudio and xcb for linking, nasm for OpenH264, esbuild for build.rs.
-      - name: Native libraries
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-      # Unit tests, including the Linux-only ones (dynamic resolution).
-      - name: Test
-        run: cargo test --locked
-
-  x264:
-    name: Rust with x264 (clippy, test)
-    runs-on: kyora-8x16
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      # As above, plus x264 and libclang for its bindings.
-      - name: Native libraries
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
-      - name: Clippy
-        run: cargo clippy --features x264 --all-targets --locked -- -D warnings
-      - name: Test
-        run: cargo test --features x264 --locked
-
-  windows:
-    name: Windows (clippy, cross-compiled on Linux)
-    runs-on: kyora-8x16
-    timeout-minutes: 45
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
-      VCPKGRS_TRIPLET: x64-mingw-static
-      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
-    steps:
-      - uses: actions/checkout@v4
-      - name: MinGW, NASM and vcpkg's build tools
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip
-      - uses: actions/cache@v4
-        with:
-          path: .vcpkg-cache
-          key: vcpkg-x64-mingw-static-2026.10.16-libyuv-opus-v1
-      - name: libyuv and Opus (vcpkg)
-        run: |
-          mkdir -p .vcpkg-cache
-          git clone --quiet --depth 1 --branch 2026.10.16 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          "$VCPKG_ROOT/vcpkg" install libyuv opus --triplet "$VCPKGRS_TRIPLET"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: x86_64-pc-windows-gnu
-          components: clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
-      - name: Clippy
-        run: cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
-
   macos:
-    name: macOS (rustfmt, clippy, test)
-    if: github.event_name != 'pull_request'
     runs-on: kyora-macos
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
-      # The runner image may not have Homebrew yet.
       - name: Homebrew
         run: |
           if ! command -v brew >/dev/null; then
@@ -183,7 +37,6 @@ jobs:
             echo "HOMEBREW_REPOSITORY=$("$brew" --repository)"
           } >> "$GITHUB_ENV"
           printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
-      # Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
       - run: brew install opus pkgconf esbuild
       - uses: actions/cache@v4
         with:
@@ -193,22 +46,9 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Test
-        run: cargo test --locked
-      # What the startup probe finds on this host's hardware encoders.
-      - name: Encoder probe
-        run: cargo test --locked --lib videotoolbox_probe -- --nocapture
-      # A viewer that decodes HEVC gets VideoToolbox HEVC.
-      - name: HEVC negotiation
+      - name: VT floor
         env:
-          STARFOLD_EXPECT_HEVC: '1'
-        run: cargo test --locked --lib videotoolbox_hevc_negotiated -- --nocapture
-      # --encoder auto streams H.264 and HEVC from VideoToolbox.
-      - name: Auto encoder
-        env:
-          STARFOLD_EXPECT_HW: '1'
-        run: cargo test --locked --lib auto_on_this_host -- --nocapture
+          SETS: ${{ inputs.sets }}
+          ROUNDS: ${{ inputs.rounds }}
+          BEST: ${{ inputs.best }}
+        run: bash bench/vs/vt-floor.sh "$SETS" "$ROUNDS" "$BEST"

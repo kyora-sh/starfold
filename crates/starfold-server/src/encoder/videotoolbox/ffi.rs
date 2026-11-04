@@ -96,6 +96,7 @@ extern "C" {
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
     pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
     pub static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
     pub static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
     pub static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
