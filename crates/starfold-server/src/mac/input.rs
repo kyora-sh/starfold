@@ -170,12 +170,36 @@ fn char_map(translate: impl Fn(u16, u32) -> Option<char>) -> HashMap<char, (u16,
     map
 }
 
+/// The held modifiers a typed character drops, and the ones it adds. The character
+/// decides Shift and Option (the viewer's layout already applied them); Command and
+/// Control stay as held, for shortcuts. Alt held with a plain letter stays too
+/// (Option-letter shortcuts).
+fn char_mods(c: char, shift: bool, option: bool) -> (u64, u64) {
+    let mut strip = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
+    if option || !c.is_ascii_alphanumeric() {
+        strip |= kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK;
+    }
+    let mut add = 0;
+    if shift {
+        add |= kCGEventFlagMaskShift;
+    }
+    if option {
+        add |= kCGEventFlagMaskAlternate;
+    }
+    (strip, add)
+}
+
+/// The flags for a typed character's events, given the modifiers held at the time.
+fn with_mods(held: u64, (strip, add): (u64, u64)) -> u64 {
+    (held & !strip) | add
+}
+
 struct Injector {
     src: CGEventSourceRef,
     chars: HashMap<char, (u16, bool, bool)>,
     chars_at: Instant,
-    /// keysym -> (virtual key, extra flags it was pressed with).
-    pressed: HashMap<u32, (u16, u64)>,
+    /// keysym -> (virtual key, `char_mods` it was pressed with).
+    pressed: HashMap<u32, (u16, (u64, u64))>,
     /// Held modifier keysyms and their flags.
     mods: HashMap<u32, u64>,
     buttons: [bool; 16],
@@ -379,18 +403,18 @@ impl Injector {
             return;
         }
         if !down {
-            if let Some((kc, extra)) = self.pressed.remove(&keysym) {
-                self.key_event(kc, false, self.flags() | extra, false);
+            if let Some((kc, m)) = self.pressed.remove(&keysym) {
+                self.key_event(kc, false, with_mods(self.flags(), m), false);
             }
             return;
         }
-        if let Some(&(kc, extra)) = self.pressed.get(&keysym) {
+        if let Some(&(kc, m)) = self.pressed.get(&keysym) {
             // Autorepeat.
-            self.key_event(kc, true, self.flags() | extra, true);
+            self.key_event(kc, true, with_mods(self.flags(), m), true);
             return;
         }
         if let Some(kc) = named(keysym) {
-            self.pressed.insert(keysym, (kc, 0));
+            self.pressed.insert(keysym, (kc, (0, 0)));
             self.key_event(kc, true, self.flags(), false);
             return;
         }
@@ -410,36 +434,18 @@ impl Injector {
         }
         match self.chars.get(&c).copied() {
             Some((kc, shift, option)) => {
-                // The character decides Shift and Option (the viewer's layout already
-                // applied them); Command and Control stay as held, for shortcuts. Alt
-                // held with a plain letter stays too (Option-letter shortcuts).
-                let held = self.flags();
-                let keep_option = !option && c.is_ascii_alphanumeric();
-                let mut flags = held
-                    & !(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK);
-                if !keep_option {
-                    flags &=
-                        !(kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK);
-                }
-                let mut extra = 0;
-                if shift {
-                    extra |= kCGEventFlagMaskShift;
-                }
-                if option {
-                    extra |= kCGEventFlagMaskAlternate;
-                }
-                // Release uses the same flags, so remember them relative to `held`.
-                let flags = flags | extra;
-                self.pressed.insert(keysym, (kc, flags & !held));
-                self.key_event(kc, true, flags, false);
+                let m = char_mods(c, shift, option);
+                // Repeats and the release apply the same override to what is held then.
+                self.pressed.insert(keysym, (kc, m));
+                self.key_event(kc, true, with_mods(self.flags(), m), false);
             }
             None => self.type_text(c),
         }
     }
 
     fn release_all(&mut self) {
-        for (_, (kc, extra)) in std::mem::take(&mut self.pressed) {
-            self.key_event(kc, false, self.flags() | extra, false);
+        for (_, (kc, m)) in std::mem::take(&mut self.pressed) {
+            self.key_event(kc, false, with_mods(self.flags(), m), false);
         }
         for ks in self.mods.keys().copied().collect::<Vec<_>>() {
             self.key(ks, false);
@@ -584,5 +590,21 @@ mod tests {
         // The JIS keypad comma key is keypad too.
         let m = char_map(|kc, mods| if kc == 95 { Some('*') } else { us(kc, mods) });
         assert_eq!(m[&'*'], (28, true, false));
+    }
+
+    #[test]
+    fn the_character_decides_shift_and_option() {
+        let opt = kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK;
+        let shift = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+        let cmd = kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
+        // '*' typed with Option on the viewer's layout is Shift-8 here, on every repeat.
+        let star = char_mods('*', true, false);
+        assert_eq!(with_mods(opt, star), kCGEventFlagMaskShift);
+        assert_eq!(with_mods(cmd | shift, star), cmd | kCGEventFlagMaskShift);
+        assert_eq!(with_mods(shift, char_mods('8', false, false)), 0);
+        assert_eq!(
+            with_mods(cmd | opt, char_mods('a', false, false)),
+            cmd | opt
+        );
     }
 }
