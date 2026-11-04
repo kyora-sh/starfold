@@ -32,6 +32,8 @@ Video:
                                 x264 in a build with the x264 feature
                                 (default openh264); /stats shows what the
                                 startup probe found
+  --encoder-probe               probe the hardware encoders at startup
+                                (default true)
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             sliced threads (default min(4, cores/4))
   --adaptive-threads            encode on one thread, fanning out only under

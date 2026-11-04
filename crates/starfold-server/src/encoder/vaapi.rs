@@ -88,11 +88,15 @@ pub fn caps(node: &str, entrypoints: &[Entrypoint]) -> Vec<EncoderCapability> {
             }
         };
         let c = &mut out[i];
-        let mut profs = vec![prof];
-        // AV1's main profile is 8- and 10-bit; the RT formats say which.
-        if e.profile == 32 && e.rt_format.is_some_and(|f| f & RT_FORMAT_YUV420_10 != 0) {
-            profs.push(ProfileCapability::new("main", 10, Chroma::Yuv420));
-        }
+        // AV1's main profile is 8- and 10-bit; the RT formats, when known, say which.
+        let profs = match e.rt_format {
+            Some(f) if e.profile == 32 => [(RT_FORMAT_YUV420, 8), (RT_FORMAT_YUV420_10, 10)]
+                .into_iter()
+                .filter(|&(bit, _)| f & bit != 0)
+                .map(|(_, depth)| ProfileCapability::new("main", depth, Chroma::Yuv420))
+                .collect(),
+            _ => vec![prof],
+        };
         for p in profs {
             if !c.profiles.contains(&p) {
                 c.profiles.push(p);
@@ -186,17 +190,24 @@ impl Va {
         res
     }
 
+    /// A list libva fills up to the `max` it reported, which is what it is given room for.
     unsafe fn list(
-        n: c_int,
+        max: c_int,
         fill: impl FnOnce(*mut c_int, *mut c_int) -> VAStatus,
-    ) -> Result<Vec<c_int>, VAStatus> {
-        let mut v = vec![0; n.clamp(0, MAX_LIST) as usize];
+    ) -> Result<Vec<c_int>, String> {
+        if max > MAX_LIST {
+            return Err(format!("reports {max} list entries, more than {MAX_LIST}"));
+        }
+        if max <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut v = vec![0; max as usize];
         let mut got: c_int = 0;
         let r = fill(v.as_mut_ptr(), &mut got);
         if r != 0 {
-            return Err(r);
+            return Err(format!("failed ({r})"));
         }
-        v.truncate(got.clamp(0, v.len() as c_int) as usize);
+        v.truncate(got.clamp(0, max) as usize);
         Ok(v)
     }
 
@@ -204,8 +215,13 @@ impl Va {
         let profiles = Self::list((self.max_num_profiles)(dpy), |p, n| {
             (self.query_profiles)(dpy, p, n)
         })
-        .map_err(|r| format!("vaQueryConfigProfiles failed ({r})"))?;
+        .map_err(|e| format!("vaQueryConfigProfiles {e}"))?;
         let max_eps = (self.max_num_entrypoints)(dpy);
+        if max_eps > MAX_LIST {
+            return Err(format!(
+                "vaMaxNumEntrypoints reports {max_eps}, more than {MAX_LIST}"
+            ));
+        }
         let mut out = Vec::new();
         for p in profiles.into_iter().filter(|&p| profile(p).is_some()) {
             let Ok(eps) = Self::list(max_eps, |e, n| (self.query_entrypoints)(dpy, p, e, n)) else {

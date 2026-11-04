@@ -485,7 +485,7 @@ fn backends_without_the_codec_refuse_to_open() {
 #[test]
 fn videotoolbox_probe() {
     use super::caps::{host_providers, Registry, PROBE_TIMEOUT};
-    let r = Registry::probe(host_providers(), PROBE_TIMEOUT);
+    let r = Registry::probe(host_providers(true), PROBE_TIMEOUT);
     println!("{}", serde_json::to_string_pretty(&r).unwrap());
     for codec in [Codec::H264, Codec::Hevc] {
         let c = r.check(Backend::VideoToolbox, codec).unwrap();

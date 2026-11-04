@@ -164,7 +164,8 @@ impl EncoderCapability {
 }
 
 /// A probe finding that is no encoder: a missing library, a device that can't be
-/// opened, a probe that failed or hung.
+/// opened, a probe that failed or hung. A probe that crashes takes the process with it
+/// (panics abort): `--encoder-probe false` skips the hardware probes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Diagnostic {
     pub backend: Backend,
@@ -220,10 +221,7 @@ impl Registry {
             let spawned = std::thread::Builder::new()
                 .name(format!("probe-{}", p.backend().name()))
                 .spawn(move || {
-                    let b = p.backend();
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.probe()))
-                        .unwrap_or_else(|_| Probe::failed(b, "probe panicked"));
-                    let _ = sender.send((i, r));
+                    let _ = sender.send((i, p.probe()));
                 });
             if let Err(e) = spawned {
                 let _ = tx.send((
@@ -335,11 +333,15 @@ fn describe(c: &EncoderCapability) -> String {
     }
 }
 
-/// The providers for this platform and build.
-pub fn host_providers() -> Vec<Box<dyn ProbeProvider>> {
+/// The providers for this platform and build; `hardware` false keeps to the software
+/// encoders.
+pub fn host_providers(hardware: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(Backend::OpenH264))];
     #[cfg(feature = "x264")]
     v.push(Box::new(Software(Backend::X264)));
+    if !hardware {
+        return v;
+    }
     #[cfg(target_os = "macos")]
     v.push(Box::new(super::videotoolbox::Probe));
     #[cfg(target_os = "linux")]

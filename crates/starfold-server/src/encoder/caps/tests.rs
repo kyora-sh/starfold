@@ -6,7 +6,6 @@ struct Fake {
     caps: Vec<EncoderCapability>,
     diagnostics: Vec<(Option<&'static str>, &'static str)>,
     delay: Duration,
-    panics: bool,
 }
 
 impl Fake {
@@ -16,7 +15,6 @@ impl Fake {
             caps: Vec::new(),
             diagnostics: Vec::new(),
             delay: Duration::ZERO,
-            panics: false,
         }
     }
 }
@@ -28,7 +26,6 @@ impl ProbeProvider for Fake {
 
     fn probe(&self) -> Probe {
         std::thread::sleep(self.delay);
-        assert!(!self.panics, "driver crashed");
         let mut p = Probe {
             caps: self.caps.clone(),
             diagnostics: Vec::new(),
@@ -224,36 +221,32 @@ fn size_limits_are_not_independent() {
 }
 
 #[test]
-fn hung_or_crashing_probes_become_diagnostics() {
+fn hung_probes_become_diagnostics() {
     let mut slow = Fake::new(Backend::Nvenc);
     slow.delay = Duration::from_secs(3);
-    let mut crash = Fake::new(Backend::MediaFoundation);
-    crash.panics = true;
-    let v: Vec<Box<dyn ProbeProvider>> = vec![
-        Box::new(Software(Backend::OpenH264)),
-        Box::new(slow),
-        Box::new(crash),
-    ];
+    let v: Vec<Box<dyn ProbeProvider>> =
+        vec![Box::new(Software(Backend::OpenH264)), Box::new(slow)];
     let t = Instant::now();
     let r = Registry::probe(v, Duration::from_millis(500));
-    assert!(t.elapsed() < Duration::from_secs(5));
+    assert!(t.elapsed() < Duration::from_secs(2));
     openh264_left(&r);
-    let why = |b| {
-        r.diagnostics
-            .iter()
-            .find(|d| d.backend == b)
-            .map(|d| d.reason.clone())
-            .unwrap_or_default()
-    };
+    assert_eq!(r.diagnostics.len(), 1);
+    assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);
     assert!(
-        why(Backend::Nvenc).contains("did not finish"),
+        r.diagnostics[0].reason.contains("did not finish"),
         "{:?}",
         r.diagnostics
     );
+}
+
+#[test]
+fn software_only_probes_load_no_hardware_backend() {
+    let backends: Vec<Backend> = host_providers(false).iter().map(|p| p.backend()).collect();
     assert!(
-        why(Backend::MediaFoundation).contains("panicked"),
-        "{:?}",
-        r.diagnostics
+        backends
+            .iter()
+            .all(|b| b.name() == "openh264" || b.name() == "x264"),
+        "{backends:?}"
     );
 }
 
@@ -348,6 +341,12 @@ fn vaapi_encode_entrypoints_only() {
     let av1 = got.iter().find(|c| c.codec == Codec::Av1).unwrap();
     assert_eq!(av1.profiles.len(), 2);
     assert_eq!(av1.limits.max_width, None);
+    let av1_10 = caps("/dev/dri/renderD129", &[ep(32, 6, Some(0x100))]);
+    assert_eq!(
+        av1_10[0].profiles,
+        [ProfileCapability::new("main", 10, Chroma::Yuv420)]
+    );
+    assert_eq!(av1_10[0].status, ProbeStatus::ProbeOnly, "10-bit only");
     let only444 = caps("/dev/dri/renderD129", &[ep(26, 6, Some(4))]);
     assert_eq!(only444[0].status, ProbeStatus::ProbeOnly);
     assert_eq!(only444[0].limits.pixel_formats, None);

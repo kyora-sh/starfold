@@ -234,6 +234,10 @@ pub struct VideoToolbox {
     hevc_sps: Option<Vec<u8>>,
     pts: i64,
     bps: i64,
+    /// Opened with low-latency rate control (no lookahead, one IDR then P frames).
+    low_latency: bool,
+    /// A frame's output was lost: the next one has to be an IDR.
+    resync: bool,
 }
 
 // The session is only ever driven from one thread at a time; its callback only touches
@@ -331,6 +335,8 @@ impl VideoToolbox {
             hevc_sps: None,
             pts: -1,
             bps: 0,
+            low_latency,
+            resync: false,
         };
         me.set_bps(bps(cfg.rate.max_kbps))?;
         let r = unsafe { VTCompressionSessionPrepareToEncodeFrames(me.session.s) };
@@ -630,7 +636,7 @@ impl VideoEncoder for VideoToolbox {
         f.check()?;
         self.pts = opts.pts_ms.max(self.pts + 1);
         let pb = self.upload(f)?;
-        let props = if opts.force_keyframe {
+        let props = if opts.force_keyframe || self.resync {
             Some(dict(unsafe {
                 &[(kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue)]
             })?)
@@ -659,23 +665,49 @@ impl VideoEncoder for VideoToolbox {
         if r != 0 {
             return Err(err("submitting a frame", r));
         }
+        self.resync = false;
         let deadline = Instant::now() + OUTPUT_TIMEOUT;
         let out = &self.session.out;
         let mut q = out.queue.lock();
-        while !q.iter().any(|e| e.pts >= self.pts) {
+        while !q.iter().any(|e| e.pts == self.pts) {
             if out.ready.wait_until(&mut q, deadline).timed_out() {
                 break;
             }
         }
-        let items: Vec<Encoded> = q.drain(..).collect();
+        let late = !q.iter().any(|e| e.pts == self.pts);
         drop(q);
-        if items.is_empty() {
+        if late {
+            // Blocks until the frame is out, so it can't turn up in a later call.
+            let r = unsafe { VTCompressionSessionCompleteFrames(self.session.s, pts) };
+            if r != 0 {
+                log::warn!("VideoToolbox: completing a slow frame failed ({r})");
+            }
+        }
+        let items: Vec<Encoded> = out.queue.lock().drain(..).collect();
+        // One picture per call: anything else is from a frame already given up on, and
+        // what follows it can't be decoded without it.
+        let (mine, stale): (Vec<Encoded>, Vec<Encoded>) =
+            items.into_iter().partition(|e| e.pts == self.pts);
+        if !stale.is_empty() || mine.is_empty() {
+            self.resync = true;
+        }
+        if !stale.is_empty() {
+            log::warn!(
+                "VideoToolbox: dropped {} late frame(s); the next frame is an IDR",
+                stale.len()
+            );
+        }
+        if mine.is_empty() {
             return Err(EncodeError(format!(
-                "VideoToolbox returned nothing within {} ms",
+                "VideoToolbox returned no frame within {} ms",
                 OUTPUT_TIMEOUT.as_millis()
             )));
         }
-        self.collect(items)
+        let aus = self.collect(mine);
+        if aus.is_err() {
+            self.resync = true;
+        }
+        aus
     }
 
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
@@ -722,6 +754,8 @@ fn encoder_list() -> Result<Vec<Listed>, OSStatus> {
 /// What VideoToolbox says the probe's sample session ran on.
 struct Sampled {
     encoder_id: Option<String>,
+    /// Known to encode without lookahead or reordering.
+    low_latency: bool,
 }
 
 /// Opens the codec's hardware encoder and, where this build has one, encodes a few
@@ -735,6 +769,7 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
         }
         return Ok(Sampled {
             encoder_id: s.encoder_id(),
+            low_latency: false,
         });
     }
     let mut enc = VideoToolbox::new(&EncoderConfig {
@@ -781,6 +816,7 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
     }
     Ok(Sampled {
         encoder_id: enc.session.encoder_id(),
+        low_latency: enc.low_latency,
     })
 }
 
@@ -836,7 +872,9 @@ impl caps::ProbeProvider for Probe {
                         c.device_id = id;
                     }
                     if Backend::VideoToolbox.implements(codec) {
-                        c.low_latency = Some(true);
+                        // Without low-latency rate control the encoder may still look
+                        // ahead: unknown, so not eligible.
+                        c.low_latency = v.low_latency.then_some(true);
                         c.keyframe_control = Some(true);
                     }
                     c.status = ProbeStatus::Verified;
