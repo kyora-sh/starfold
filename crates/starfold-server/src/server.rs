@@ -32,6 +32,8 @@ pub struct AppState {
     /// The page's icon and its content type (--favicon).
     pub favicon: Bytes,
     pub favicon_type: &'static str,
+    /// The host's encoders, probed at startup.
+    pub encoders: Arc<crate::encoder::caps::Registry>,
 }
 
 /// The web client's page, titled `title` (--title): the browser tab, and the name of
@@ -196,6 +198,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
+        "encoders": &*s.encoders,
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -469,6 +472,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
+            encoders: Default::default(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);

@@ -28,8 +28,10 @@ Video:
   --crf                         base quality (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
                                 (default 30000, 2000)
-  --encoder                     openh264, or x264 in a build with the x264
-                                feature (default openh264)
+  --encoder                     openh264, videotoolbox (macOS hardware), or
+                                x264 in a build with the x264 feature
+                                (default openh264); /stats shows what the
+                                startup probe found
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             sliced threads (default min(4, cores/4))
   --adaptive-threads            encode on one thread, fanning out only under

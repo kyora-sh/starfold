@@ -1424,6 +1424,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "libc",
+ "libloading",
  "log",
  "nix",
  "objc2",

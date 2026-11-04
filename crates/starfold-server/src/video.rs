@@ -162,6 +162,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         };
         let ecfg = EncoderConfig {
             backend: cfg.encoder,
+            codec: encoder::Codec::H264,
             width: w,
             height: sh,
             fps: cfg.fps,

@@ -1,14 +1,27 @@
 //! The video encoder boundary: a backend turns I420 frames into access units, and
 //! callers only see the types here.
 
+pub mod caps;
 mod h264;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod hevc;
+#[cfg(windows)]
+mod mf;
+#[cfg(any(target_os = "linux", windows))]
+mod nvenc;
 mod openh264;
 #[cfg(test)]
 mod tests;
+#[cfg(target_os = "linux")]
+mod vaapi;
+#[cfg(target_os = "macos")]
+mod videotoolbox;
 #[cfg(feature = "x264")]
 mod x264;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Codec {
     H264,
     Hevc,
@@ -150,11 +163,16 @@ pub trait VideoEncoder: Send {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
     OpenH264,
     #[cfg(feature = "x264")]
     X264,
+    VideoToolbox,
+    Vaapi,
+    Nvenc,
+    MediaFoundation,
 }
 
 impl Backend {
@@ -165,9 +183,21 @@ impl Backend {
             "x264" => Ok(Backend::X264),
             #[cfg(not(feature = "x264"))]
             "x264" => Err("this build has no x264 (build with `--features x264`)".into()),
+            #[cfg(target_os = "macos")]
+            "videotoolbox" => Ok(Backend::VideoToolbox),
+            #[cfg(not(target_os = "macos"))]
+            "videotoolbox" => Err("videotoolbox is macOS-only".into()),
+            "vaapi" | "nvenc" | "mediafoundation" => {
+                Err(format!("{s} is probed (see /stats) but has no encoder yet"))
+            }
             _ => Err(format!(
-                "unknown encoder {s:?} (openh264{})",
-                if cfg!(feature = "x264") { ", x264" } else { "" }
+                "unknown encoder {s:?} (openh264{}{})",
+                if cfg!(feature = "x264") { ", x264" } else { "" },
+                if cfg!(target_os = "macos") {
+                    ", videotoolbox"
+                } else {
+                    ""
+                }
             )),
         }
     }
@@ -177,6 +207,23 @@ impl Backend {
             Backend::OpenH264 => "openh264",
             #[cfg(feature = "x264")]
             Backend::X264 => "x264",
+            Backend::VideoToolbox => "videotoolbox",
+            Backend::Vaapi => "vaapi",
+            Backend::Nvenc => "nvenc",
+            Backend::MediaFoundation => "mediafoundation",
+        }
+    }
+
+    /// Whether this build has an encoder for `codec` on this backend.
+    pub fn implements(self, codec: Codec) -> bool {
+        match self {
+            Backend::OpenH264 => codec == Codec::H264,
+            #[cfg(feature = "x264")]
+            Backend::X264 => codec == Codec::H264,
+            Backend::VideoToolbox => {
+                cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
+            }
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => false,
         }
     }
 
@@ -186,6 +233,9 @@ impl Backend {
             Backend::OpenH264 => Some(openh264::MAX_MBS),
             #[cfg(feature = "x264")]
             Backend::X264 => None,
+            // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
+            Backend::VideoToolbox => Some(openh264::MAX_MBS),
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
         }
     }
 
@@ -195,6 +245,8 @@ impl Backend {
             Backend::OpenH264 => 16,
             #[cfg(feature = "x264")]
             Backend::X264 => 2,
+            Backend::VideoToolbox => 64,
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
     }
 
@@ -207,6 +259,7 @@ impl Backend {
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
     pub backend: Backend,
+    pub codec: Codec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -221,6 +274,13 @@ pub struct EncoderConfig {
 /// Opens `cfg.backend`. Sizes it can't code (odd, or below its minimum) are coded
 /// larger, the last column and row repeated, and report the real size as `display`.
 pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    if !cfg.backend.implements(cfg.codec) {
+        return Err(EncodeError(format!(
+            "this build has no {} {:?} encoder",
+            cfg.backend.name(),
+            cfg.codec
+        )));
+    }
     if cfg.width == 0 || cfg.height == 0 {
         return Err(EncodeError(format!(
             "can't encode a {}x{} picture",
@@ -247,6 +307,9 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
+        #[cfg(target_os = "macos")]
+        Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
+        b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {
         return Ok(inner);

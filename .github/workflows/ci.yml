@@ -197,3 +197,6 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      # What the startup probe finds on this host's hardware encoders.
+      - name: Encoder probe
+        run: cargo test --locked --lib videotoolbox_probe -- --nocapture
