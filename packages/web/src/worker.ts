@@ -42,6 +42,7 @@ interface PendingFrame {
 	t0: number;
 }
 let layout: Stripe[] = [];
+let width = 0;
 const stripes: StripeState[] = [];
 const frames = new Map<number, PendingFrame>();
 /** Frame ids awaiting presentation, oldest first. */
@@ -121,6 +122,7 @@ function onText(s: string) {
 		}
 		ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
+		width = m.w;
 		resetDecoder();
 	}
 	post(m);
@@ -177,10 +179,38 @@ function stripeState(i: number): StripeState {
 	);
 }
 
+/** Encoders may code a stripe larger than it is (odd or tiny sizes); crop to it. */
+function fitStripe(frame: VideoFrame, i: number): VideoFrame {
+	const w = Math.min(
+		width || frame.displayWidth,
+		frame.visibleRect?.width ?? 0
+	);
+	const h = Math.min(
+		layout[i] ? layout[i][1] : frame.displayHeight,
+		frame.visibleRect?.height ?? 0
+	);
+	if (
+		!frame.visibleRect ||
+		(w === frame.displayWidth && h === frame.displayHeight)
+	)
+		return frame;
+	try {
+		const { x, y } = frame.visibleRect;
+		const c = new VideoFrame(frame, {
+			visibleRect: { x, y, width: w, height: h },
+		});
+		frame.close();
+		return c;
+	} catch {
+		return frame;
+	}
+}
+
 function makeDecoder(i: number, codec: string): VideoDecoder {
 	const sd = stripeState(i);
 	const dec = new VideoDecoder({
-		output: (frame) => {
+		output: (decoded) => {
+			const frame = fitStripe(decoded, i);
 			const id = sd.ids.get(frame.timestamp);
 			sd.ids.delete(frame.timestamp);
 			const f = id === undefined ? undefined : frames.get(id);

@@ -181,7 +181,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             enc: encoder::open(&ecfg)?,
             cfg: ecfg,
             max_threads,
-            applied_kbps: 0,
+            applied_kbps: None,
             applied_crf: -1.0,
         });
     }
@@ -790,7 +790,8 @@ struct Stripe {
     cfg: EncoderConfig,
     /// Sliced threads to fan out to under sustained heavy motion (1 = never).
     max_threads: u32,
-    applied_kbps: u32,
+    /// The cap last applied (None: apply the next one).
+    applied_kbps: Option<u32>,
     applied_crf: f32,
 }
 
@@ -922,19 +923,25 @@ fn stripe_worker(
         let rate = if job.force_idr {
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
-            let boost = job.cap.saturating_mul(4).max(16_000);
-            s.applied_kbps = 0;
+            // An uncapped stream (cap 0) stays uncapped.
+            let boost = if job.cap == 0 {
+                0
+            } else {
+                job.cap.saturating_mul(4).max(16_000)
+            };
+            s.applied_kbps = None;
             Some(RateConfig {
                 quality: job.crf,
                 max_kbps: boost,
                 buf_kbit: boost / s.cfg.fps.max(1) * 8,
             })
         } else {
-            let moved = s.applied_kbps == 0
-                || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
+            let moved = s
+                .applied_kbps
+                .is_none_or(|a| (job.cap as f64 - a as f64).abs() > a as f64 * 0.04);
             (job.crf != s.applied_crf || moved).then(|| {
                 s.applied_crf = job.crf;
-                s.applied_kbps = job.cap;
+                s.applied_kbps = Some(job.cap);
                 RateConfig::new(job.crf, job.cap, s.cfg.fps)
             })
         };
@@ -1017,7 +1024,7 @@ fn stripe_worker(
                         );
                         // A fresh encoder opens with an IDR on its next frame.
                         s.enc = e;
-                        s.applied_kbps = 0;
+                        s.applied_kbps = None;
                         gov.threads = t;
                         gov.heavy = 0;
                         gov.light_since = None;
@@ -1090,7 +1097,11 @@ fn encode_loop(
         let want_crf = if job.paintover { po_crf } else { crf };
         // Each stripe may use up to twice its area share of the budget; the delay-based
         // controller reins the total in if several stripes move at once.
-        let share = ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32;
+        let share = if target == 0 {
+            0
+        } else {
+            ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
+        };
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
