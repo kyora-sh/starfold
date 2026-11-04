@@ -143,14 +143,27 @@ async fn serve(a: HashMap<String, String>) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
-    let encoder = match a
-        .get("encoder")
-        .map_or(Ok(encoder::Backend::OpenH264), |e| {
-            encoder::Backend::parse(e)
-        }) {
+    let selection = match a.get("encoder").map_or(Ok(encoder::Selection::Auto), |e| {
+        encoder::Selection::parse(e)
+    }) {
         Ok(e) => e,
         Err(e) => {
             log::error!("--encoder: {e}");
+            std::process::exit(2);
+        }
+    };
+    let encoders = std::sync::Arc::new(encoder::caps::Registry::probe(
+        encoder::caps::host_providers(
+            truthy(a.get("encoder-probe"), true),
+            truthy(a.get("experimental-hw-probes"), false),
+        ),
+        encoder::caps::PROBE_TIMEOUT,
+    ));
+    encoders.log();
+    let encoder = match negotiate::h264_backend(&encoders, selection) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("--encoder {}: {e}", selection.name());
             std::process::exit(2);
         }
     };
@@ -169,21 +182,9 @@ async fn serve(a: HashMap<String, String>) {
             }
         }
     }
-    let encoders = std::sync::Arc::new(encoder::caps::Registry::probe(
-        encoder::caps::host_providers(
-            truthy(a.get("encoder-probe"), true),
-            truthy(a.get("experimental-hw-probes"), false),
-        ),
-        encoder::caps::PROBE_TIMEOUT,
-    ));
-    encoders.log();
-    if let Err(e) = encoders.check(encoder, encoder::Codec::H264) {
-        log::error!("--encoder {}: {e}", encoder.name());
-        std::process::exit(2);
-    }
     let vcfg = video::VideoConfig {
         display: display.clone(),
-        encoder,
+        selection,
         fps: range_max(a.get("framerate"), 60.0) as u32,
         preset: a
             .get("preset")
@@ -259,6 +260,15 @@ async fn serve(a: HashMap<String, String>) {
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let candidates = negotiate::candidates(&encoders, encoder);
+    for c in negotiate::chosen(&candidates) {
+        log::info!(
+            "--encoder {}: {:?} from {} ({})",
+            selection.name(),
+            c.codec,
+            c.backend.name(),
+            if c.hardware { "hardware" } else { "software" }
+        );
+    }
     if let Err(e) = video::spawn(vcfg, hub.clone(), screen, candidates) {
         log::error!("video init failed: {e}");
         std::process::exit(1);

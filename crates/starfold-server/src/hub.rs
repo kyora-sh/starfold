@@ -414,6 +414,8 @@ pub struct Hub {
     pub next_cohort: AtomicU64,
     /// The running encoder cohorts, for /stats.
     pub cohorts: Mutex<serde_json::Value>,
+    /// `--encoder` and the encoder each codec streams from, for /stats.
+    pub encoder: Mutex<serde_json::Value>,
 }
 
 impl Hub {
@@ -440,6 +442,7 @@ impl Hub {
             replan: AtomicBool::new(false),
             next_cohort: AtomicU64::new(1),
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
+            encoder: Mutex::new(serde_json::Value::Null),
         })
     }
 

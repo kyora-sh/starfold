@@ -3,11 +3,12 @@
 //! every viewer is routed to an encoder cohort.
 //!
 //! At most two cohorts run at once: the H.264 one (legacy viewers, recording, and v2
-//! viewers that decode nothing better) and one "best" cohort. A viewer whose best
-//! choice would need a third joins the closest cohort it can decode.
+//! viewers that decode nothing better) and one "best" cohort, which may be the other
+//! H.264 encoder for viewers that can't decode the first. A viewer whose best choice
+//! would need a third joins the closest cohort it can decode.
 
 use crate::encoder::caps::{Acceleration, Registry};
-use crate::encoder::{Backend, BitstreamFormat, Codec, StreamConfig};
+use crate::encoder::{Backend, BitstreamFormat, Codec, Selection, StreamConfig};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: u32 = 2;
@@ -114,6 +115,8 @@ impl Offer {
             "t": "codec",
             "epoch": epoch,
             "codec": self.codec,
+            "backend": self.cand.backend,
+            "hardware": self.cand.hardware,
             "format": self.format,
             "w": w,
             "h": h,
@@ -136,9 +139,22 @@ fn codec_rank(c: Codec) -> u8 {
     }
 }
 
+/// The H.264 backend `sel` stands for here: the pinned one, which must be eligible, or
+/// the first eligible hardware one, else OpenH264.
+pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
+    let b = match sel {
+        Selection::Pinned(b) => b,
+        Selection::Auto => reg
+            .eligible(Codec::H264)
+            .find(|e| e.acceleration == Acceleration::Hardware)
+            .map_or(Backend::OpenH264, |e| e.backend),
+    };
+    reg.check(b, Codec::H264).map(|_| b)
+}
+
 /// The encoders a stream may use, best first: eligible AV1, then HEVC (hardware before
-/// software), then the configured H.264 backend (`--encoder`, OpenH264 by default),
-/// which also serves legacy viewers and recording.
+/// software), then the H.264 backend (`h264_backend`), which also serves legacy viewers
+/// and recording, and OpenH264 for when a hardware one fails.
 pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
     for codec in [Codec::Av1, Codec::Hevc] {
@@ -157,13 +173,36 @@ pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
         }
     }
     v.sort_by_key(|c| (codec_rank(c.codec), !c.hardware));
+    let hardware = reg
+        .eligible(Codec::H264)
+        .any(|e| e.backend == h264 && e.acceleration == Acceleration::Hardware);
     v.push(Candidate {
         codec: Codec::H264,
         backend: h264,
-        hardware: reg
-            .eligible(Codec::H264)
-            .any(|e| e.backend == h264 && e.acceleration == Acceleration::Hardware),
+        hardware,
     });
+    if hardware
+        && reg
+            .eligible(Codec::H264)
+            .any(|e| e.backend == Backend::OpenH264)
+    {
+        v.push(Candidate {
+            codec: Codec::H264,
+            backend: Backend::OpenH264,
+            hardware: false,
+        });
+    }
+    v
+}
+
+/// Each codec's first candidate, as the startup log and /stats name it.
+pub fn chosen(cands: &[Candidate]) -> Vec<Candidate> {
+    let mut v: Vec<Candidate> = Vec::new();
+    for c in cands {
+        if !v.iter().any(|x| x.codec == c.codec) {
+            v.push(*c);
+        }
+    }
     v
 }
 
@@ -194,7 +233,7 @@ pub struct Viewer<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// The non-H.264 cohort, if any viewer gets it.
+    /// The cohort besides the H.264 one, if any viewer gets it.
     pub best: Option<Candidate>,
     /// Each viewer's choice; None: nothing the server can stream decodes there.
     pub picks: Vec<(u64, Option<Choice>)>,
@@ -203,7 +242,7 @@ pub struct Plan {
 /// Routes `viewers` (in the order they joined) to at most two cohorts. The current best
 /// cohort stays while it is still some viewer's first choice, so viewers aren't moved
 /// back and forth as others come and go; otherwise the earliest viewer whose first
-/// choice is better than H.264 decides it.
+/// choice is another cohort decides it.
 pub fn plan(
     viewers: &[Viewer<'_>],
     offers: &[Offer],
@@ -225,7 +264,7 @@ pub fn plan(
             .iter()
             .filter_map(|p| p.first())
             .map(|c| c.cand)
-            .filter(|c| c.codec != Codec::H264)
+            .filter(|c| *c != h264)
     };
     let best = current
         .filter(|b| firsts().any(|c| c == *b))

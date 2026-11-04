@@ -169,6 +169,7 @@ async fn collect(
     tokio::pin!(deadline);
     let mut frames: Vec<mp4::Frame> = Vec::new();
     let mut size = (0, 0);
+    let mut first: Option<Vec<Vec<u8>>> = None;
     loop {
         tokio::select! {
             _ = &mut stop => break,
@@ -179,6 +180,17 @@ async fn collect(
                     // Acknowledge at once, so the recorder never holds the stream back.
                     client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
                     hub.wake();
+                    let key = b[1] & 1 == 1;
+                    if key {
+                        let p = params(&b[16..]);
+                        match &first {
+                            None => first = Some(p),
+                            // Another encoder took over the stream (its frames may already
+                            // have been queued when this one was): it can't share the track.
+                            Some(f) if !p.is_empty() && *f != p => break,
+                            Some(_) => {}
+                        }
+                    }
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
                     }
@@ -188,7 +200,7 @@ async fn collect(
                     let ms = frames.last().map_or(ms, |l: &mp4::Frame| ms.max(l.ms + 1));
                     frames.push(mp4::Frame {
                         ms,
-                        key: b[1] & 1 == 1,
+                        key,
                         data: b.slice(16..),
                     });
                 }
@@ -202,6 +214,22 @@ async fn collect(
     tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// A keyframe's SPS and PPS, the level left out: an MP4 track keeps the first
+/// keyframe's, which still describe a stream that only changed level.
+fn params(d: &[u8]) -> Vec<Vec<u8>> {
+    mp4::nals(d)
+        .into_iter()
+        .filter(|n| matches!(n[0] & 0x1f, 7 | 8))
+        .map(|n| {
+            let mut v = n.to_vec();
+            if v[0] & 0x1f == 7 && v.len() > 3 {
+                v[3] = 0;
+            }
+            v
+        })
+        .collect()
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
@@ -296,5 +324,46 @@ mod tests {
         assert_eq!(record_len(0.0, max), None);
         assert_eq!(record_len(-1.0, max), None);
         assert_eq!(record_len(f64::NAN, max), None);
+    }
+
+    fn unit(key: Option<(u8, u8)>) -> Out {
+        let mut b = vec![0x01, key.is_some() as u8, 0, 0, 0, 1];
+        b.resize(16, 0);
+        match key {
+            Some((profile, level)) => b.extend_from_slice(&[
+                0, 0, 0, 1, 0x67, profile, 0, level, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1,
+                0x65, 0xaa,
+            ]),
+            None => b.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]),
+        }
+        Out::Bin(bytes::Bytes::from(b))
+    }
+
+    #[tokio::test]
+    async fn another_encoders_keyframe_ends_the_recording() {
+        let hub = Hub::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx.clone());
+        let (_keep, stop) = oneshot::channel();
+        for u in [
+            Some((100, 40)),
+            None,
+            Some((100, 41)),
+            None,
+            Some((66, 41)),
+            None,
+        ] {
+            tx.send(unit(u)).unwrap();
+        }
+        let mp4 = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect(&hub, &client, rx, stop, Duration::from_secs(30)),
+        )
+        .await
+        .expect("the recording ended")
+        .unwrap();
+        let stsz = mp4.windows(4).position(|w| w == b"stsz").unwrap();
+        let count = u32::from_be_bytes(mp4[stsz + 12..stsz + 16].try_into().unwrap());
+        assert_eq!(count, 4, "a new level continues, a new profile ends it");
     }
 }

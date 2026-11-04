@@ -54,6 +54,8 @@ let epoch = 0;
 let ready = false;
 /** Protocol 2: each stripe's decoder configuration in this epoch. */
 let configs: VideoDecoderConfig[] = [];
+/** Protocol 2: the server's encoder in this epoch. */
+let encoder: string | null = null;
 /** The acceleration preference each tested configuration was accepted with. */
 const accepted = new Map<string, HardwareAcceleration>();
 /** Decoder errors in this epoch; a codec that keeps failing is reported. */
@@ -112,6 +114,7 @@ function connect() {
 		videoSent = false;
 		epoch = 0;
 		ready = false;
+		encoder = null;
 		resetDecoder();
 		setTimeout(connect, 1000);
 	});
@@ -256,6 +259,7 @@ function onCodec(m: CodecMessage) {
 	if (proto !== 2 || m.epoch <= epoch) return;
 	epoch = m.epoch;
 	ready = false;
+	encoder = null;
 	errors = [];
 	resetDecoder();
 	if (m.error !== undefined) {
@@ -279,6 +283,7 @@ async function configure(c: number, m: Extract<CodecMessage, { w: number }>) {
 		return;
 	}
 	configs = list;
+	encoder = m.backend ? `${m.backend} (${m.hardware ? 'hw' : 'sw'})` : null;
 	setLayout(
 		m.w,
 		m.h,
@@ -556,6 +561,7 @@ setInterval(() => {
 		decodeMs: n ? st.decodeMs / n : 0,
 		pipeMs: n ? st.pipeMs / n : 0,
 		codec: stripes[0]?.codec ?? null,
+		encoder,
 		stripes: layout.length,
 		dropped: st.dropped,
 		queue: order.length,

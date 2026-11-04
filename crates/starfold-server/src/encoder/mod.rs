@@ -191,7 +191,7 @@ impl Backend {
                 Err(format!("{s} is probed (see /stats) but has no encoder yet"))
             }
             _ => Err(format!(
-                "unknown encoder {s:?} (openh264{}{})",
+                "unknown encoder {s:?} (auto, openh264{}{})",
                 if cfg!(feature = "x264") { ", x264" } else { "" },
                 if cfg!(target_os = "macos") {
                     ", videotoolbox"
@@ -253,6 +253,30 @@ impl Backend {
     pub fn fits(self, width: u32, height: u32) -> bool {
         let mbs = width.div_ceil(16) as usize * height.div_ceil(16) as usize;
         self.max_mbs().is_none_or(|m| mbs <= m)
+    }
+}
+
+/// `--encoder`: `auto` streams each codec from its eligible hardware encoder (H.264
+/// from OpenH264 where there is none); a backend name pins the H.264 one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    Auto,
+    Pinned(Backend),
+}
+
+impl Selection {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(Selection::Auto),
+            _ => Backend::parse(s).map(Selection::Pinned),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Selection::Auto => "auto",
+            Selection::Pinned(b) => b.name(),
+        }
     }
 }
 
