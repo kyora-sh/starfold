@@ -12,7 +12,7 @@ pub struct Frame {
 const TIMESCALE: u32 = 1000;
 
 /// NAL units of an Annex-B stream (start codes removed).
-fn nals(data: &[u8]) -> Vec<&[u8]> {
+pub fn nals(data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = None;
     let mut i = 0;
