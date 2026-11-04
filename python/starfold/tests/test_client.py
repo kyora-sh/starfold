@@ -138,7 +138,7 @@ def test_actions_batch_flattens_and_extends_timeout(sf, server):
     sf.actions([act.key("ctrl+l"), act.pause(20_000), act.drag(0, 0, 1, 1, steps=1), act.type_text("x")])
     body = server.last_json()
     assert [a["type"] for a in body] == ["key", "pause", "down", "pause", "move", "up", "type"]
-    assert server.seen[-1].extensions["timeout"]["read"] == pytest.approx(30 + 20.01)
+    assert server.seen[-1].extensions["timeout"]["read"] == pytest.approx(30 + 20.01 + 0.01)
 
 
 def test_half_a_position_is_refused():
@@ -214,6 +214,15 @@ def test_transport_errors_are_wrapped():
         c.screenshot()
     with Starfold(transport=httpx.MockTransport(refused)) as c, pytest.raises(StarfoldConnectionError):
         c.screenshot()
+
+
+def test_other_403s_on_input_are_not_read_only():
+    def handler(req):
+        return httpx.Response(403, text="host other.example is not allowed (--allowed-hosts)")
+
+    with Starfold(transport=httpx.MockTransport(handler)) as c, pytest.raises(ForbiddenError) as e:
+        c.click()
+    assert not isinstance(e.value, ReadOnlyError)
 
 
 def test_url_prefix_is_kept():

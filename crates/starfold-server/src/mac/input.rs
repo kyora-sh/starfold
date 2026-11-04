@@ -34,6 +34,8 @@ pub enum InputEvent {
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(super::desktop::ClipContent),
     ReleaseAll,
+    /// Answered once every event sent before it has reached the desktop (POST /input).
+    Synced(tokio::sync::oneshot::Sender<()>),
     /// Release everything before exit.
     Shutdown,
 }
@@ -334,6 +336,9 @@ impl Injector {
                 }
             }
             InputEvent::ReleaseAll | InputEvent::Shutdown => self.release_all(),
+            InputEvent::Synced(done) => {
+                let _ = done.send(());
+            }
         }
     }
 

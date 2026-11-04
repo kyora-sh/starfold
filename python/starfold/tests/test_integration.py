@@ -5,6 +5,7 @@ Needs Linux with Xvfb and xterm, and STARFOLD_BIN pointing at a built `starfold`
     STARFOLD_BIN=target/release/starfold uv run pytest -m integration
 """
 
+import contextlib
 import os
 import secrets
 import select
@@ -118,8 +119,15 @@ def desktop(tmp_path):
         for p in reversed(procs):
             _stop(p)
         left = _ours(marker)
-        for pid in left:
-            os.kill(pid, signal.SIGKILL)
+        for _ in range(50):
+            stragglers = _ours(marker)
+            if not stragglers:
+                break
+            for pid in stragglers:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            time.sleep(0.1)
+        assert not _ours(marker), f"processes survive SIGKILL: {_ours(marker)}"
         assert not left, f"processes left behind: {left}"
 
 

@@ -53,7 +53,8 @@ def _error(resp: httpx.Response) -> StarfoldError:
     if code == 401:
         return AuthError(message, code)
     if code == 403:
-        return (ReadOnlyError if resp.request.url.path.endswith("/input") else ForbiddenError)(message, code)
+        read_only = resp.request.url.path.endswith("/input") and "read-only" in message
+        return (ReadOnlyError if read_only else ForbiddenError)(message, code)
     if code == 404:
         return NotFoundError(message, code)
     return StarfoldError(f"{code}: {message}", code)
@@ -102,12 +103,14 @@ def _input(actions: Iterable[act.Action | list[act.Action]]) -> _Req[InputResult
     for a in actions:
         flat.extend(a if isinstance(a, list) else [a])
     paused = sum(a.get("ms", 0) for a in flat if a.get("type") == "pause") / 1000
+    # The answer comes once the input is done; a character the keymap lacks takes ~10 ms.
+    typing = sum(len(a.get("text", "")) for a in flat if a.get("type") == "type") / 100
     return _Req(
         "POST",
         "/input",
         lambda r: InputResult(seq=int(r.json()["seq"]), events=int(r.json()["events"])),
         json=flat,
-        extra_s=paused,
+        extra_s=paused + typing,
     )
 
 

@@ -13,13 +13,17 @@
 //!   `key_down` and `key_up` only press or only release. Keys are named (Enter, Tab,
 //!   Escape, BackSpace, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right,
 //!   Insert, Space, F1-F24, ctrl, shift, alt, altgr, super, ...) or a single character.
+//!   After modifiers, a letter's case follows Shift: `ctrl+T` is Ctrl+t, `ctrl+shift+t`
+//!   is Ctrl+Shift+T.
 //! - `{"type":"type","text":"hello\n"}`: types the text, newlines as Enter.
 //! - `{"type":"pause","ms":50}`: waits before the next action.
 //!
-//! The answer is `{"seq":n,"events":m}`: `seq` is the screen's change count from before
-//! the first event went out, so `/wait?change&since=n` returns once the actions changed
-//! the screen. A request runs to the end even if its client goes away, so it never
-//! leaves a key or button pressed halfway. A --read-only server refuses input with 403.
+//! The answer comes once every event has reached the desktop (a pause, too, starts once
+//! the events before it have): `{"seq":n,"events":m}`, where `seq` is the screen's change
+//! count from before the first event went out, so `/wait?change&since=n` returns once the
+//! actions changed the screen. A request runs to the end even if its client goes away, so
+//! it never leaves a key or button pressed halfway. A --read-only server refuses input
+//! with 403.
 
 use crate::input::InputEvent;
 use crate::server::AppState;
@@ -34,6 +38,7 @@ use std::time::Duration;
 const MAX_ACTIONS: usize = 1000;
 const MAX_TEXT: usize = 10_000;
 const MAX_CLICKS: u8 = 10;
+const MAX_KEYS: usize = 8;
 const MAX_PAUSE: Duration = Duration::from_secs(10);
 const MAX_TOTAL_PAUSE: Duration = Duration::from_secs(60);
 
@@ -200,18 +205,34 @@ fn keysym(name: &str) -> Result<u32, String> {
 
 /// "ctrl+shift+t" -> its keysyms in order. "+" and "ctrl++" name the plus key.
 fn combo(s: &str) -> Result<Vec<u32>, String> {
+    if s.split('+').count() > MAX_KEYS + 1 {
+        return Err(format!("at most {MAX_KEYS} keys together"));
+    }
     let (mods, last) = match s.strip_suffix("++") {
         Some(m) => (m, "+"),
         None if s == "+" => ("", "+"),
         None => s.rsplit_once('+').unwrap_or(("", s)),
     };
     let mods = mods.split('+').filter(|_| !mods.is_empty());
-    mods.chain([last])
+    let mut keys: Vec<u32> = mods
+        .chain([last])
         .map(|part| match part {
             "" => Err(format!("key {s:?} has an empty part")),
             part => keysym(part),
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if keys.len() > MAX_KEYS {
+        return Err(format!("at most {MAX_KEYS} keys together"));
+    }
+    // The input thread presses a letter's own level, lifting a held Shift for a
+    // lowercase one, so the letter has to match the modifiers.
+    if let [held @ .., k] = &mut keys[..] {
+        if !held.is_empty() && char::from_u32(*k).is_some_and(|c| c.is_ascii_alphabetic()) {
+            let shift = held.iter().any(|h| matches!(h, 0xffe1 | 0xffe2));
+            *k = if shift { *k & !0x20 } else { *k | 0x20 };
+        }
+    }
+    Ok(keys)
 }
 
 #[derive(Default)]
@@ -356,6 +377,13 @@ fn error(code: StatusCode, msg: &str) -> Response {
     reply(code, json!({ "error": msg }))
 }
 
+/// Once the input thread has injected everything sent so far.
+async fn synced(tx: &std::sync::mpsc::Sender<InputEvent>) -> Option<()> {
+    let (done, rx) = tokio::sync::oneshot::channel();
+    tx.send(InputEvent::Synced(done)).ok()?;
+    rx.await.ok()
+}
+
 pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if s.read_only {
         return error(
@@ -389,14 +417,16 @@ pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -
         for step in steps {
             match step {
                 Step::Event(e) => {
-                    if tx.send(e.event()).is_err() {
-                        return None;
-                    }
+                    tx.send(e.event()).ok()?;
                     events += 1;
                 }
-                Step::Pause(d) => tokio::time::sleep(d).await,
+                Step::Pause(d) => {
+                    synced(&tx).await?;
+                    tokio::time::sleep(d).await;
+                }
             }
         }
+        synced(&tx).await?;
         Some(events)
     });
     match run.await {
@@ -496,6 +526,9 @@ mod tests {
             assert_eq!(combo(name).unwrap(), [ks], "{name}");
         }
         assert_eq!(combo("ctrl++").unwrap(), [0xffe3, 0x2b]);
+        assert_eq!(combo("ctrl+shift+t").unwrap(), [0xffe3, 0xffe1, 0x54]);
+        assert_eq!(combo("ctrl+T").unwrap(), [0xffe3, 0x74]);
+        assert_eq!(combo("T").unwrap(), [0x54]);
         assert_eq!(combo("ctrl+plus").unwrap(), [0xffe3, 0x2b]);
     }
 
@@ -530,6 +563,10 @@ mod tests {
             (r#"{"type":"key","key":"hyper"}"#, "unknown key"),
             (r#"{"type":"key","key":"ctrl+"}"#, "empty part"),
             (r#"{"type":"key","key":""}"#, "empty part"),
+            (
+                r#"{"type":"key","key":"a+b+c+d+e+f+g+h+i"}"#,
+                "at most 8 keys",
+            ),
             (r#"{"type":"type","text":"a\u0007"}"#, "can't type"),
             (r#"{"type":"pause","ms":10001}"#, "pauses are at most"),
         ] {
@@ -542,14 +579,42 @@ mod tests {
         assert!(refused(&many).contains("1 to 1000"));
         let pauses = format!("[{}]", [r#"{"type":"pause","ms":10000}"#; 7].join(","));
         assert!(refused(&pauses).contains("per request"));
+        let chord = format!(r#"{{"type":"key","key":"{}a"}}"#, "a+".repeat(500_000));
+        assert!(refused(&chord).contains("at most 8 keys"));
         let text = format!(r#"{{"type":"type","text":"{}"}}"#, "a".repeat(10_001));
         assert!(refused(&text).contains("characters"));
     }
 
-    fn state(read_only: bool) -> (AppState, std::sync::mpsc::Receiver<InputEvent>) {
+    type Seen = Arc<parking_lot::Mutex<Vec<(Ev, std::time::Instant)>>>;
+
+    fn evs(seen: &Seen) -> Vec<Ev> {
+        seen.lock().iter().map(|&(e, _)| e).collect()
+    }
+
+    /// A server whose input thread records each event, `delay` apart, and answers syncs.
+    fn state(read_only: bool, delay: Duration) -> (AppState, Seen) {
         let hub = crate::hub::Hub::new();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
         *hub.input.lock() = Some(tx);
+        let seen = Seen::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for ev in rx {
+                std::thread::sleep(delay);
+                let e = match ev {
+                    InputEvent::Move { x, y } => Ev::Move(x, y),
+                    InputEvent::Button { button, down } => Ev::Button(button, down),
+                    InputEvent::Scroll { dx, dy } => Ev::Scroll(dx, dy),
+                    InputEvent::Key { keysym, down } => Ev::Key(keysym, down),
+                    InputEvent::Synced(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                    _ => unreachable!(),
+                };
+                log.lock().push((e, std::time::Instant::now()));
+            }
+        });
         let s = AppState {
             hub: hub.clone(),
             audio: false,
@@ -569,7 +634,7 @@ mod tests {
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
         };
-        (s, rx)
+        (s, seen)
     }
 
     async fn post(s: &AppState, content_type: &str, body: &str) -> (StatusCode, Value) {
@@ -587,41 +652,44 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_servers_refuse_input() {
-        let (s, rx) = state(true);
+        let (s, seen) = state(true, Duration::ZERO);
         let (code, body) = post(&s, "application/json", CLICK).await;
         assert_eq!(code, StatusCode::FORBIDDEN);
         assert!(body["error"].as_str().unwrap().contains("read-only"));
-        assert_eq!(rx.try_iter().count(), 0);
+        assert!(seen.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn input_reaches_the_input_thread_with_the_seq_before_it() {
-        let (s, rx) = state(false);
+    async fn answers_once_the_input_is_done_with_the_seq_before_it() {
+        let (s, seen) = state(false, Duration::from_millis(20));
         s.hub.activity.reset(64, 64);
         let seq = s.hub.activity.seq();
         let (code, body) = post(&s, "application/json; charset=utf-8", CLICK).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body, json!({ "seq": seq, "events": 3 }));
-        let got: Vec<_> = rx.try_iter().collect();
-        assert!(matches!(
-            got[..],
-            [
-                InputEvent::Move { x: 1, y: 2 },
-                InputEvent::Button {
-                    button: 1,
-                    down: true
-                },
-                InputEvent::Button {
-                    button: 1,
-                    down: false
-                }
-            ]
-        ));
+        assert_eq!(
+            evs(&seen),
+            [Ev::Move(1, 2), Ev::Button(1, true), Ev::Button(1, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pause_starts_once_the_events_before_it_are_done() {
+        let (s, seen) = state(false, Duration::from_millis(30));
+        let body = r#"[{"type":"type","text":"abc"},{"type":"pause","ms":50},{"type":"key","key":"Enter"}]"#;
+        let (code, _) = post(&s, "application/json", body).await;
+        assert_eq!(code, StatusCode::OK);
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 8);
+        // Without waiting for the typing, the pause would have run out while the input
+        // thread was still at it, and Enter would follow the last key 30 ms later.
+        let gap = seen[6].1 - seen[5].1;
+        assert!(gap >= Duration::from_millis(80), "{gap:?}");
     }
 
     #[tokio::test]
     async fn bad_requests_send_nothing() {
-        let (s, rx) = state(false);
+        let (s, seen) = state(false, Duration::ZERO);
         let (code, _) = post(&s, "text/plain", CLICK).await;
         assert_eq!(code, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let (code, body) = post(
@@ -632,7 +700,7 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().starts_with("action 1:"));
-        assert_eq!(rx.try_iter().count(), 0);
+        assert!(seen.lock().is_empty());
         *s.hub.input.lock() = None;
         let (code, _) = post(&s, "application/json", CLICK).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
