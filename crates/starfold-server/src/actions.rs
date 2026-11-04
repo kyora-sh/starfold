@@ -13,8 +13,9 @@
 //!   `key_down` and `key_up` only press or only release. Keys are named (Enter, Tab,
 //!   Escape, BackSpace, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right,
 //!   Insert, Space, F1-F24, ctrl, shift, alt, altgr, super, ...) or a single character.
-//!   After modifiers, a letter's case follows Shift: `ctrl+T` is Ctrl+t, `ctrl+shift+t`
-//!   is Ctrl+Shift+T.
+//!   After modifiers, a letter's case follows Shift (`ctrl+T` is Ctrl+t, `ctrl+shift+t`
+//!   is Ctrl+Shift+T), and with Shift a digit or punctuation key is its shifted symbol on
+//!   a US layout (`cmd+shift+4` is Cmd+$), which the desktop presses as Shift+4.
 //! - `{"type":"type","text":"hello\n"}`: types the text, newlines as Enter.
 //! - `{"type":"pause","ms":50}`: waits before the next action.
 //!
@@ -224,16 +225,29 @@ fn combo(s: &str) -> Result<Vec<u32>, String> {
     if keys.len() > MAX_KEYS {
         return Err(format!("at most {MAX_KEYS} keys together"));
     }
-    // The input thread presses a letter's own level, lifting a held Shift for a
-    // lowercase one, so the letter has to match the modifiers.
+    // The input threads press a character's own level, lifting a held Shift for an
+    // unshifted one (as the web client sends the character Shift made), so the
+    // character has to match the modifiers.
     if let [held @ .., k] = &mut keys[..] {
-        if !held.is_empty() && char::from_u32(*k).is_some_and(|c| c.is_ascii_alphabetic()) {
-            let shift = held.iter().any(|h| matches!(h, 0xffe1 | 0xffe2));
-            *k = if shift { *k & !0x20 } else { *k | 0x20 };
+        let shift = held.iter().any(|h| matches!(h, 0xffe1 | 0xffe2));
+        match char::from_u32(*k) {
+            Some(c) if !held.is_empty() && c.is_ascii_alphabetic() => {
+                *k = if shift { *k & !0x20 } else { *k | 0x20 };
+            }
+            Some(c) if shift => {
+                if let Some(i) = US_PLAIN.find(c) {
+                    *k = US_SHIFTED.as_bytes()[i] as u32;
+                }
+            }
+            _ => {}
         }
     }
     Ok(keys)
 }
+
+/// Digits and punctuation, and what Shift makes of each on a US layout.
+const US_PLAIN: &str = "1234567890-=[]\\;',./`";
+const US_SHIFTED: &str = "!@#$%^&*()_+{}|:\"<>?~";
 
 #[derive(Default)]
 struct Plan {
@@ -386,9 +400,9 @@ async fn synced(tx: &std::sync::mpsc::Sender<InputEvent>) -> Option<()> {
 
 pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if s.read_only {
-        return error(
+        return reply(
             StatusCode::FORBIDDEN,
-            "this server is read-only (--read-only): input is refused",
+            json!({ "error": "this server is read-only (--read-only): input is refused", "read_only": true }),
         );
     }
     // A JSON body also means a browser on another site can't send this without a CORS
@@ -529,6 +543,12 @@ mod tests {
         assert_eq!(combo("ctrl+shift+t").unwrap(), [0xffe3, 0xffe1, 0x54]);
         assert_eq!(combo("ctrl+T").unwrap(), [0xffe3, 0x74]);
         assert_eq!(combo("T").unwrap(), [0x54]);
+        assert_eq!(combo("cmd+shift+4").unwrap(), [0xffeb, 0xffe1, 0x24]);
+        assert_eq!(combo("shift+/").unwrap(), [0xffe1, 0x3f]);
+        assert_eq!(combo("shift+\\").unwrap(), [0xffe1, 0x7c]);
+        assert_eq!(combo("ctrl+4").unwrap(), [0xffe3, 0x34]);
+        assert_eq!(combo("shift+Tab").unwrap(), [0xffe1, 0xff09]);
+        assert_eq!(US_PLAIN.len(), US_SHIFTED.len());
         assert_eq!(combo("ctrl+plus").unwrap(), [0xffe3, 0x2b]);
     }
 
@@ -656,6 +676,7 @@ mod tests {
         let (code, body) = post(&s, "application/json", CLICK).await;
         assert_eq!(code, StatusCode::FORBIDDEN);
         assert!(body["error"].as_str().unwrap().contains("read-only"));
+        assert_eq!(body["read_only"], true);
         assert!(seen.lock().is_empty());
     }
 

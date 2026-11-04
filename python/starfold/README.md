@@ -39,7 +39,8 @@ Errors: `AuthError` (wrong or missing password), `ReadOnlyError` (the server run
 
 Keys for `key()` are a single character or a name (Enter, Tab, Escape, BackSpace, Delete,
 Home, End, PageUp, PageDown, Up, Down, Left, Right, F1-F24, ...), joined with `+` after
-modifiers (ctrl, shift, alt, altgr, super).
+modifiers (ctrl, shift, alt, altgr, super). With shift, a letter or a US-layout digit or
+punctuation key means the shifted key: `ctrl+shift+t`, `cmd+shift+4`.
 
 ## Tests
 

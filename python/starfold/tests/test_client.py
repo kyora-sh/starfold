@@ -41,7 +41,9 @@ class Server:
             return httpx.Response(200, json={"changed": "since" in q, "timed_out": False, "seq": 42, "waited_ms": 7})
         if path == "/input":
             if self.read_only:
-                return httpx.Response(403, json={"error": "this server is read-only (--read-only): input is refused"})
+                return httpx.Response(
+                    403, json={"error": "this server is read-only (--read-only): input is refused", "read_only": True}
+                )
             return httpx.Response(200, json={"seq": 40, "events": len(json.loads(req.content))})
         if path == "/record":
             return httpx.Response(200, content=b"mp4:" + q["seconds"].encode())
@@ -218,7 +220,7 @@ def test_transport_errors_are_wrapped():
 
 def test_other_403s_on_input_are_not_read_only():
     def handler(req):
-        return httpx.Response(403, text="host other.example is not allowed (--allowed-hosts)")
+        return httpx.Response(403, text="host read-only.example is not allowed (--allowed-hosts)")
 
     with Starfold(transport=httpx.MockTransport(handler)) as c, pytest.raises(ForbiddenError) as e:
         c.click()
@@ -230,7 +232,9 @@ def test_url_prefix_is_kept():
 
     def handler(req):
         paths.append(req.url.path)
-        return httpx.Response(403, json={"error": "this server is read-only (--read-only): input is refused"})
+        return httpx.Response(
+            403, json={"error": "this server is read-only (--read-only): input is refused", "read_only": True}
+        )
 
     with Starfold("http://proxy/desk/", transport=httpx.MockTransport(handler)) as c, pytest.raises(ReadOnlyError):
         c.key("a")

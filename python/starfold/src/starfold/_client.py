@@ -46,14 +46,16 @@ class _Req(Generic[T]):
 
 def _error(resp: httpx.Response) -> StarfoldError:
     try:
-        message = str(resp.json()["error"])
+        body = resp.json()
+        message = str(body["error"])
     except Exception:
+        body = None
         message = resp.text.strip() or resp.reason_phrase
     code = resp.status_code
     if code == 401:
         return AuthError(message, code)
     if code == 403:
-        read_only = resp.request.url.path.endswith("/input") and "read-only" in message
+        read_only = isinstance(body, dict) and body.get("read_only") is True
         return (ReadOnlyError if read_only else ForbiddenError)(message, code)
     if code == 404:
         return NotFoundError(message, code)
