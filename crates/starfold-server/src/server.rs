@@ -160,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/stats", get(stats))
         .route("/ws", get(ws_handler))
+        .route("/input", axum::routing::post(crate::actions::input))
         .with_state(state)
         .merge(file_routes)
         .merge(record_routes)
