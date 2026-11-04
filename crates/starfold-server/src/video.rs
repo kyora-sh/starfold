@@ -582,34 +582,44 @@ impl Engine {
     fn replace_h264(&mut self) {
         let old = self.h264;
         while let Some(n) = self.next_h264() {
-            match self.open_cohort(n) {
-                Ok(c) => {
-                    log::warn!(
-                        "H264 from {} failed; falling back to {}",
-                        old.backend.name(),
-                        n.backend.name()
-                    );
-                    let stripes: Vec<(u32, u32)> = c
-                        .shared
+            if !self.cohorts.iter().any(|c| c.shared.cand == n) {
+                match self.open_cohort(n) {
+                    Ok(c) => self.cohorts.push(c),
+                    Err(e) => {
+                        log::warn!("H264 from {} failed to open: {e}", n.backend.name());
+                        self.failed.push(n);
+                        continue;
+                    }
+                }
+            }
+            log::warn!(
+                "H264 from {} failed; falling back to {}",
+                old.backend.name(),
+                n.backend.name()
+            );
+            self.h264 = n;
+            if self.best == Some(n) {
+                self.best = None;
+            }
+            let stripes: Vec<(u32, u32)> = self
+                .cohorts
+                .iter()
+                .filter(|c| c.shared.cand == n)
+                .flat_map(|c| {
+                    c.shared
                         .offer
                         .lock()
                         .stripes
                         .iter()
                         .map(|s| (s.y, s.h))
-                        .collect();
-                    self.cohorts.push(c);
-                    self.h264 = n;
-                    if *self.hub.stripes.lock() != stripes {
-                        *self.hub.stripes.lock() = stripes;
-                        self.hub.restart_clients();
-                    }
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("H264 from {} failed to open: {e}", n.backend.name());
-                    self.failed.push(n);
-                }
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            if *self.hub.stripes.lock() != stripes {
+                *self.hub.stripes.lock() = stripes;
+                self.hub.restart_clients();
             }
+            return;
         }
         self.failed.retain(|c| *c != old);
     }

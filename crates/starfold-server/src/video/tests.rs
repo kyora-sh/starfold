@@ -52,6 +52,8 @@ impl Gate {
 /// its codec on its first unit and after `relevel` encodes a new level.
 struct Fake {
     codec: Codec,
+    /// Hardware H.264 streams High profile, OpenH264 Constrained Baseline.
+    high: bool,
     coded: (u32, u32),
     n: usize,
     relevel: Option<usize>,
@@ -65,8 +67,9 @@ struct Fake {
     kbps: u32,
 }
 
-fn codec_string(c: Codec, level: u32) -> String {
+fn codec_string(c: Codec, high: bool, level: u32) -> String {
     match c {
+        Codec::H264 if high => format!("avc1.6400{level:02x}"),
         Codec::H264 => format!("avc1.42c0{level:02x}"),
         Codec::Hevc => format!("hvc1.1.6.L{level}.B0"),
         Codec::Av1 => format!("av01.0.{level:02}M.08"),
@@ -110,7 +113,7 @@ impl VideoEncoder for Fake {
             data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, self.n as u8],
             config: (self.n == 1 || relevel).then(|| StreamConfig {
                 codec: self.codec,
-                codec_string: codec_string(self.codec, level),
+                codec_string: codec_string(self.codec, self.high, level),
                 coded: self.coded,
                 display: self.coded,
                 format: BitstreamFormat::AnnexB,
@@ -163,6 +166,7 @@ fn fakes(o: Opts) -> Open {
             }
             return Ok(Box::new(Fake {
                 codec: c.codec,
+                high: true,
                 coded: (c.width, c.height),
                 n: 0,
                 relevel: None,
@@ -195,6 +199,7 @@ fn fakes(o: Opts) -> Open {
         }
         Ok(Box::new(Fake {
             codec: c.codec,
+            high: false,
             coded: (c.width, c.height),
             n: 0,
             relevel: (hevc && o.hevc_relevel).then_some(3),
@@ -852,6 +857,72 @@ fn a_hardware_h264_encoder_that_keeps_failing_falls_back_to_openh264() {
         !vn.is_empty() && vn[0].1,
         "the v2 viewer starts with a keyframe"
     );
+}
+
+/// Answers the current offers with WebCodecs support for `backend`'s, and turns video on.
+fn join_v2_from(hub: &Hub, c: &Client, backend: Backend) {
+    let caps = hub
+        .offers
+        .lock()
+        .iter()
+        .filter(|o| o.cand.backend == backend)
+        .flat_map(|o| o.stripes.iter())
+        .map(|s| DecodeCap {
+            codec: s.config.codec.clone(),
+            coded_width: s.config.coded_width,
+            coded_height: s.config.coded_height,
+            implementation: Implementation::WebCodecs,
+            hardware_acceleration: Some("prefer-hardware".into()),
+        })
+        .collect();
+    c.caps_hello(caps, hub.offer_gen.load(Ordering::Relaxed));
+    c.set_video(true);
+    hub.replan();
+}
+
+#[test]
+fn a_viewer_that_cant_decode_hardware_h264_gets_openh264() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264_HW, H264],
+        Opts {
+            h264_hw_breaks: true,
+            ..Default::default()
+        },
+    );
+    let (l, mut rl) = client(&hub);
+    let (n, mut rn) = client(&hub);
+    join_legacy(&hub, &l);
+    join_v2_from(&hub, &n, Backend::OpenH264);
+    push(&mut eng);
+    acked(&l, &mut rl);
+    let m = acked(&n, &mut rn);
+    let cm = codec_msgs(&m);
+    assert_eq!(cm[0]["backend"], "openh264", "{m:?}");
+    assert_eq!(cm[0]["stripes"][0]["config"]["codec"], "avc1.42c01e");
+    ready(&n, &m);
+    assert_eq!(eng.cohorts.len(), 2);
+    assert_ne!(cohort_of(&l), cohort_of(&n));
+    let openh264 = cohort_of(&n);
+    // The hardware one fails: its viewers join the OpenH264 cohort already running.
+    for _ in 0..(3 + FAIL_AFTER) {
+        push(&mut eng);
+        acked(&l, &mut rl);
+        acked(&n, &mut rn);
+    }
+    assert_eq!(eng.h264, H264);
+    assert_eq!(eng.best, None);
+    assert_eq!(eng.cohorts.len(), 1);
+    assert_eq!(cohort_of(&l), openh264);
+    assert_eq!(cohort_of(&n), openh264);
+    let mut vl = Vec::new();
+    for _ in 0..3 {
+        push(&mut eng);
+        vl.extend(videos(&acked(&l, &mut rl)));
+        acked(&n, &mut rn);
+    }
+    assert!(!vl.is_empty());
 }
 
 #[test]

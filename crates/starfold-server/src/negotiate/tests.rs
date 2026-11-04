@@ -586,3 +586,65 @@ fn auto_on_this_host() {
         assert_eq!(got, vec![(Codec::H264, Backend::OpenH264, false)]);
     }
 }
+
+#[test]
+fn the_other_h264_encoder_serves_viewers_that_cant_decode_the_first() {
+    const VT264: Candidate = Candidate {
+        codec: Codec::H264,
+        backend: Backend::VideoToolbox,
+        hardware: true,
+    };
+    let offers = vec![
+        offer(HEVC, "hvc1.1.6.L153.B0", &[(0, 1600)], 2560),
+        offer(VT264, "avc1.640034", &[(0, 1600)], 2560),
+        offer(H264, "avc1.42c034", &[(0, 1600)], 2560),
+    ];
+    let baseline = [wc("avc1.42c034", 2560, 1600)];
+    let both = [wc("avc1.640034", 2560, 1600), wc("avc1.42c034", 2560, 1600)];
+    let rejected = [choice(VT264, Implementation::WebCodecs)];
+    let viewers = [
+        viewer(1, &both),
+        viewer(2, &baseline),
+        Viewer {
+            id: 3,
+            legacy: false,
+            caps: &both,
+            rejected: &rejected,
+        },
+        Viewer {
+            id: 4,
+            legacy: true,
+            caps: &[],
+            rejected: &[],
+        },
+    ];
+    let p = plan(&viewers, &offers, VT264, None);
+    assert_eq!(p.best, Some(H264));
+    let got: Vec<Option<Backend>> = p
+        .picks
+        .iter()
+        .map(|(_, c)| c.map(|c| c.cand.backend))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            Some(Backend::VideoToolbox),
+            Some(Backend::OpenH264),
+            Some(Backend::OpenH264),
+            Some(Backend::VideoToolbox)
+        ]
+    );
+    let first = [hevc(), wc("avc1.42c034", 2560, 1600)];
+    let p = plan(
+        &[viewer(5, &first), viewer(2, &baseline)],
+        &offers,
+        VT264,
+        None,
+    );
+    assert_eq!(
+        p.best,
+        Some(HEVC),
+        "the earliest viewer decides the second cohort"
+    );
+    assert_eq!(p.picks[1].1, None);
+}

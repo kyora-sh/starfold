@@ -3,8 +3,9 @@
 //! every viewer is routed to an encoder cohort.
 //!
 //! At most two cohorts run at once: the H.264 one (legacy viewers, recording, and v2
-//! viewers that decode nothing better) and one "best" cohort. A viewer whose best
-//! choice would need a third joins the closest cohort it can decode.
+//! viewers that decode nothing better) and one "best" cohort, which may be the other
+//! H.264 encoder for viewers that can't decode the first. A viewer whose best choice
+//! would need a third joins the closest cohort it can decode.
 
 use crate::encoder::caps::{Acceleration, Registry};
 use crate::encoder::{Backend, BitstreamFormat, Codec, Selection, StreamConfig};
@@ -232,7 +233,7 @@ pub struct Viewer<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// The non-H.264 cohort, if any viewer gets it.
+    /// The cohort besides the H.264 one, if any viewer gets it.
     pub best: Option<Candidate>,
     /// Each viewer's choice; None: nothing the server can stream decodes there.
     pub picks: Vec<(u64, Option<Choice>)>,
@@ -241,7 +242,7 @@ pub struct Plan {
 /// Routes `viewers` (in the order they joined) to at most two cohorts. The current best
 /// cohort stays while it is still some viewer's first choice, so viewers aren't moved
 /// back and forth as others come and go; otherwise the earliest viewer whose first
-/// choice is better than H.264 decides it.
+/// choice is another cohort decides it.
 pub fn plan(
     viewers: &[Viewer<'_>],
     offers: &[Offer],
@@ -263,7 +264,7 @@ pub fn plan(
             .iter()
             .filter_map(|p| p.first())
             .map(|c| c.cand)
-            .filter(|c| c.codec != Codec::H264)
+            .filter(|c| *c != h264)
     };
     let best = current
         .filter(|b| firsts().any(|c| c == *b))
