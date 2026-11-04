@@ -317,9 +317,46 @@ fn encoder_config(
     }
 }
 
-/// The configuration a stream from `ecfg` starts with, read from its first IDR.
-fn sample(open: &Open, ecfg: &EncoderConfig) -> Result<StreamConfig, String> {
+/// Each stripe may use up to twice its area share of the budget; the delay-based
+/// controller reins the total in if several stripes move at once. 0 = uncapped.
+fn stripe_share(target: u32, n: usize) -> u32 {
+    if target == 0 {
+        return 0;
+    }
+    ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
+}
+
+/// A keyframe is what a new viewer sees first; don't starve it to the steady-state
+/// frame budget (up to ~8 frames' worth at 4x the cap). An uncapped stream (cap 0)
+/// stays uncapped.
+fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
+    let boost = if cap == 0 {
+        0
+    } else {
+        cap.saturating_mul(4).max(16_000)
+    };
+    RateConfig {
+        quality: crf,
+        max_kbps: boost,
+        buf_kbit: boost / fps.max(1) * 8,
+    }
+}
+
+/// The configuration a stream from `ecfg` starts with, read from an IDR encoded at the
+/// rate a cohort's first keyframe gets (encoders derive the level from it).
+fn sample(
+    open: &Open,
+    ecfg: &EncoderConfig,
+    cfg: &VideoConfig,
+    n: usize,
+) -> Result<StreamConfig, String> {
     let mut enc = open(ecfg)?;
+    let target = if cfg.max_kbps == 0 {
+        0
+    } else {
+        stripe_share(START_KBPS.min(cfg.max_kbps as f64) as u32, n)
+    };
+    enc.set_rate(keyframe_rate(cfg.crf, target, cfg.fps))?;
     let (w, h) = (ecfg.width as usize, ecfg.height as usize);
     let (y, uv) = (
         vec![128u8; w * h],
@@ -377,7 +414,12 @@ fn make_offer(
         let sc = match seen.iter().find(|(h, _)| *h == sh) {
             Some((_, c)) => c.clone(),
             None => {
-                let c = sample(open, &encoder_config(cfg, cand, w, sh, layout.len()))?;
+                let c = sample(
+                    open,
+                    &encoder_config(cfg, cand, w, sh, layout.len()),
+                    cfg,
+                    layout.len(),
+                )?;
                 seen.push((sh, c.clone()));
                 c
             }
@@ -1616,20 +1658,8 @@ fn stripe_worker(
     while let Ok(job) = rx.recv() {
         let buf = &*job.buf;
         let rate = if job.force_idr {
-            // A keyframe is what a new viewer sees first; don't starve it to the
-            // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
-            // An uncapped stream (cap 0) stays uncapped.
-            let boost = if job.cap == 0 {
-                0
-            } else {
-                job.cap.saturating_mul(4).max(16_000)
-            };
             s.applied_kbps = None;
-            Some(RateConfig {
-                quality: job.crf,
-                max_kbps: boost,
-                buf_kbit: boost / s.cfg.fps.max(1) * 8,
-            })
+            Some(keyframe_rate(job.crf, job.cap, s.cfg.fps))
         } else {
             let moved = s
                 .applied_kbps
@@ -1817,11 +1847,7 @@ fn encode_loop(
         let want_crf = if job.paintover { po_crf } else { crf };
         // Each stripe may use up to twice its area share of the budget; the delay-based
         // controller reins the total in if several stripes move at once.
-        let share = if uncapped || target == 0 {
-            0
-        } else {
-            ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
-        };
+        let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let mut pending = 0;
