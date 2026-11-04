@@ -169,7 +169,10 @@ async fn serve(a: HashMap<String, String>) {
         }
     }
     let encoders = std::sync::Arc::new(encoder::caps::Registry::probe(
-        encoder::caps::host_providers(truthy(a.get("encoder-probe"), true)),
+        encoder::caps::host_providers(
+            truthy(a.get("encoder-probe"), true),
+            truthy(a.get("experimental-hw-probes"), false),
+        ),
         encoder::caps::PROBE_TIMEOUT,
     ));
     encoders.log();

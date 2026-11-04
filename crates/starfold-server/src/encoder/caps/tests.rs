@@ -241,12 +241,51 @@ fn hung_probes_become_diagnostics() {
 
 #[test]
 fn software_only_probes_load_no_hardware_backend() {
-    let backends: Vec<Backend> = host_providers(false).iter().map(|p| p.backend()).collect();
+    let backends: Vec<Backend> = host_providers(false, true)
+        .iter()
+        .map(|p| p.backend())
+        .collect();
     assert!(
         backends
             .iter()
             .all(|b| b.name() == "openh264" || b.name() == "x264"),
         "{backends:?}"
+    );
+}
+
+/// By default the vendor-driver probes (VA-API, NVENC, MF) open nothing: their
+/// providers are stand-ins whose every codec reports `disabled`.
+#[test]
+fn experimental_probes_are_off_by_default() {
+    let r = Registry::probe(
+        host_providers(true, false)
+            .into_iter()
+            .filter(|p| p.backend() != Backend::VideoToolbox)
+            .collect(),
+        PROBE_TIMEOUT,
+    );
+    openh264_left(&r);
+    let experimental = [Backend::Vaapi, Backend::Nvenc, Backend::MediaFoundation];
+    let off: Vec<_> = r
+        .encoders
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| experimental.contains(&c.backend))
+        .collect();
+    if cfg!(any(target_os = "linux", windows)) {
+        assert!(!off.is_empty());
+    }
+    let v = serde_json::to_value(&r).unwrap();
+    for (i, c) in &off {
+        assert_eq!(c.status, ProbeStatus::Disabled, "{c:?}");
+        assert_eq!(c.device_id, "not probed");
+        assert!(!c.eligible());
+        assert_eq!(v["encoders"][*i]["status"]["state"], "disabled");
+    }
+    assert!(
+        r.diagnostics.is_empty(),
+        "nothing was loaded: {:?}",
+        r.diagnostics
     );
 }
 

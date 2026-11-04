@@ -26,6 +26,8 @@ pub enum ProbeStatus {
     Discovered,
     /// Only in forms this build never encodes (10-bit, 4:2:2, 4:4:4).
     ProbeOnly,
+    /// Not probed: an experimental probe left off (`--experimental-hw-probes`).
+    Disabled,
     Unavailable(String),
 }
 
@@ -165,7 +167,7 @@ impl EncoderCapability {
 
 /// A probe finding that is no encoder: a missing library, a device that can't be
 /// opened, a probe that failed or hung. A probe that crashes takes the process with it
-/// (panics abort): `--encoder-probe false` skips the hardware probes.
+/// (panics abort), so the vendor-driver probes only run when asked for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Diagnostic {
     pub backend: Backend,
@@ -322,6 +324,7 @@ fn describe(c: &EncoderCapability) -> String {
         ProbeStatus::Verified => "verified".to_string(),
         ProbeStatus::Discovered => "discovered".to_string(),
         ProbeStatus::ProbeOnly => "probe-only".to_string(),
+        ProbeStatus::Disabled => "disabled (--experimental-hw-probes)".to_string(),
         ProbeStatus::Unavailable(r) => format!("unavailable: {r}"),
     };
     if c.eligible() {
@@ -333,9 +336,10 @@ fn describe(c: &EncoderCapability) -> String {
     }
 }
 
-/// The providers for this platform and build; `hardware` false keeps to the software
-/// encoders.
-pub fn host_providers(hardware: bool) -> Vec<Box<dyn ProbeProvider>> {
+/// The providers for this platform and build. `hardware` false keeps to the software
+/// encoders; the VA-API, NVENC and Media Foundation probes load vendor drivers into the
+/// process and have no encoder yet, so they run only with `experimental`.
+pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(Backend::OpenH264))];
     #[cfg(feature = "x264")]
     v.push(Box::new(Software(Backend::X264)));
@@ -344,13 +348,48 @@ pub fn host_providers(hardware: bool) -> Vec<Box<dyn ProbeProvider>> {
     }
     #[cfg(target_os = "macos")]
     v.push(Box::new(super::videotoolbox::Probe));
-    #[cfg(target_os = "linux")]
-    v.push(Box::new(super::vaapi::Probe));
-    #[cfg(any(target_os = "linux", windows))]
-    v.push(Box::new(super::nvenc::Probe));
-    #[cfg(windows)]
-    v.push(Box::new(super::mf::Probe));
+    for b in [Backend::Vaapi, Backend::Nvenc, Backend::MediaFoundation] {
+        let probe: Option<Box<dyn ProbeProvider>> = match b {
+            #[cfg(target_os = "linux")]
+            Backend::Vaapi => Some(Box::new(super::vaapi::Probe)),
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Nvenc => Some(Box::new(super::nvenc::Probe)),
+            #[cfg(windows)]
+            Backend::MediaFoundation => Some(Box::new(super::mf::Probe)),
+            _ => None,
+        };
+        match probe {
+            Some(p) if experimental => v.push(p),
+            Some(_) => v.push(Box::new(Disabled(b))),
+            None => {}
+        }
+    }
     v
+}
+
+/// Stands in for a probe left off: loads nothing, reports each codec as disabled.
+struct Disabled(Backend);
+
+impl ProbeProvider for Disabled {
+    fn backend(&self) -> Backend {
+        self.0
+    }
+
+    fn probe(&self) -> Probe {
+        let caps = [Codec::H264, Codec::Hevc, Codec::Av1]
+            .into_iter()
+            .map(|codec| {
+                let mut c =
+                    EncoderCapability::new(codec, self.0, Acceleration::Hardware, "not probed");
+                c.status = ProbeStatus::Disabled;
+                c
+            })
+            .collect();
+        Probe {
+            caps,
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 /// A compiled-in H.264 encoder, verified by encoding one small picture.
