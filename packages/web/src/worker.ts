@@ -483,12 +483,7 @@ function onVideo(b: Uint8Array) {
 			try {
 				sd.dec = makeDecoder(h.stripe, p);
 			} catch (e) {
-				onDecodeError(
-					h.stripe,
-					sd,
-					epoch,
-					new Error(`configure failed: ${e}`)
-				);
+				onDecodeError(h.stripe, sd, epoch, new Error(`configure failed: ${e}`));
 				return;
 			}
 		}
