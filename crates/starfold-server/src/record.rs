@@ -62,6 +62,8 @@ enum End {
     SegmentCap,
     /// A keyframe with new parameter sets that can't start a segment.
     BadParameterSets,
+    /// A segment couldn't be written; the others are there.
+    SegmentLost,
     /// The hub went away.
     Closed,
 }
@@ -74,6 +76,7 @@ impl End {
             End::Resized => "resized",
             End::SegmentCap => "segment_cap",
             End::BadParameterSets => "bad_parameter_sets",
+            End::SegmentLost => "segment_lost",
             End::Closed => "closed",
         }
     }
@@ -116,6 +119,27 @@ struct Clip {
 }
 
 impl Clip {
+    /// Writes the MP4s. One that fails doesn't take the others with it; only with none
+    /// left is the recording an error.
+    fn write(parts: Vec<Part>, mut end: End) -> Result<Clip, String> {
+        let mut segments = Vec::with_capacity(parts.len());
+        let mut failed = None;
+        for p in parts {
+            match p.write() {
+                Ok(s) => segments.push(s),
+                Err(e) => {
+                    log::warn!("recording segment lost: {e}");
+                    end = End::SegmentLost;
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) if segments.is_empty() => Err(e),
+            _ => Ok(Clip { segments, end }),
+        }
+    }
+
     fn into_zip(self) -> zip::result::ZipResult<Vec<u8>> {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -246,7 +270,7 @@ fn first_segment(clip: Clip) -> Response {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "no segments");
     };
     let mut res = video(first.mp4);
-    if n > 1 {
+    if n > 1 || clip.end == End::SegmentLost {
         log::warn!("recording has {n} segments; returning the first (format=zip has them all)");
         res.headers_mut()
             .insert("x-voxl-segments", header::HeaderValue::from(n));
@@ -315,9 +339,12 @@ fn begin(
     r.hub.replan();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, max).await;
+        // Writing takes a while: nothing acknowledges frames now, so leave first.
         hub.remove_client(client.id);
-        res
+        tokio::task::spawn_blocking(move || Clip::write(parts, end))
+            .await
+            .map_err(|e| e.to_string())?
     }))
 }
 
@@ -327,7 +354,7 @@ async fn collect(
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
-) -> Result<Clip, String> {
+) -> (Vec<Part>, End) {
     let start = Instant::now();
     let deadline = tokio::time::sleep(max);
     tokio::pin!(deadline);
@@ -397,17 +424,7 @@ async fn collect(
         size,
         end_ms: start.elapsed().as_millis() as u64,
     });
-    tokio::task::spawn_blocking(move || {
-        Ok(Clip {
-            segments: parts
-                .into_iter()
-                .map(Part::write)
-                .collect::<Result<_, String>>()?,
-            end,
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    (parts, end)
 }
 
 /// A keyframe's SPS and PPS, the level left out: an MP4 track keeps the first
@@ -546,13 +563,13 @@ mod tests {
             tx.send(unit(*u)).unwrap();
         }
         tx.send(Out::Text("{\"t\":\"hello\"}".into())).unwrap();
-        tokio::time::timeout(
+        let (parts, end) = tokio::time::timeout(
             Duration::from_secs(5),
             collect(&hub, &client, rx, stop, Duration::from_secs(30)),
         )
         .await
-        .expect("the recording ended")
-        .unwrap()
+        .expect("the recording ended");
+        Clip::write(parts, end).unwrap()
     }
 
     /// The payload of the box at `path`, each name found among the previous one's children.
@@ -665,12 +682,58 @@ mod tests {
         b.resize(16, 0);
         b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
         tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
-        let c = collect(&hub, &client, rx, stop, Duration::from_secs(30))
-            .await
-            .unwrap();
+        let (parts, end) = collect(&hub, &client, rx, stop, Duration::from_secs(30)).await;
+        let c = Clip::write(parts, end).unwrap();
         assert_eq!(c.end, End::BadParameterSets);
         assert_eq!(c.segments.len(), 1);
         assert_eq!(check(&c.segments[0].mp4).0, 1);
+    }
+
+    fn part(frames: Vec<mp4::Frame>) -> Part {
+        Part {
+            frames,
+            size: (64, 32),
+            end_ms: 100,
+        }
+    }
+
+    fn keyframe() -> Vec<mp4::Frame> {
+        let Out::Bin(b) = unit(Some((100, 40))) else {
+            unreachable!()
+        };
+        vec![mp4::Frame {
+            ms: 0,
+            key: true,
+            data: b.slice(16..),
+        }]
+    }
+
+    #[test]
+    fn a_segment_that_cant_be_written_leaves_the_others() {
+        let parts = vec![part(keyframe()), part(Vec::new()), part(keyframe())];
+        let c = Clip::write(parts, End::Stopped).unwrap();
+        assert_eq!(c.end, End::SegmentLost);
+        assert_eq!(c.segments.len(), 2);
+        let r = first_segment(c);
+        assert_eq!(r.headers()["x-voxl-segments"], "2");
+        assert_eq!(r.headers()["x-voxl-record-end"], "segment_lost");
+    }
+
+    #[test]
+    fn a_recording_with_no_segment_left_is_an_error() {
+        let e = Clip::write(vec![part(Vec::new())], End::Stopped).err();
+        assert_eq!(e.as_deref(), Some("no frames were recorded"));
+    }
+
+    #[tokio::test]
+    async fn the_recorder_leaves_the_hub_when_it_ends() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30));
+        let (stop_tx, stop) = oneshot::channel();
+        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
+        assert_eq!(r.hub.clients.lock().len(), 1);
+        stop_tx.send(()).unwrap();
+        assert!(done.await.unwrap().is_err(), "no frames were recorded");
+        assert!(r.hub.clients.lock().is_empty());
     }
 
     async fn body(r: Response) -> Vec<u8> {

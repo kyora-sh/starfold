@@ -121,7 +121,7 @@ def _input(actions: Iterable[act.Action | list[act.Action]]) -> _Req[InputResult
 
 
 def _segments(r: httpx.Response) -> Segments:
-    if r.headers.get("content-type") != "application/zip":
+    if r.headers.get("content-type", "").split(";")[0].strip().lower() != "application/zip":
         return Segments([r.content])
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         manifest = json.loads(z.read("manifest.json"))

@@ -192,8 +192,8 @@ If another encoder takes over mid-recording (a hardware encoder failing over to 
 say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
-`end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets` or
-`closed`). Without it you get the first MP4, with `x-voxl-segments` and
+`end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
+`segment_lost` or `closed`). Without it you get the first MP4, with `x-voxl-segments` and
 `x-voxl-record-end` headers when there were more.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep

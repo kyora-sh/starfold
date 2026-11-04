@@ -106,7 +106,7 @@ class Segments(list[bytes]):
     def __init__(self, parts: Iterable[bytes], end_reason: str | None = None) -> None:
         super().__init__(parts)
         self.end_reason = end_reason
-        """Why it ended: stopped, time_limit, resized, segment_cap, bad_parameter_sets or closed."""
+        """Why it ended: stopped, time_limit, resized, segment_cap, bad_parameter_sets, segment_lost or closed."""
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ class Server:
         self.read_only = False
         self.segments = [b"mp4"]
         self.end_reason = "stopped"
+        self.content_type = "application/zip"
 
     def recording(self, *parts: bytes) -> httpx.Response:
         names = [f"segment-{i + 1}.mp4" for i in range(len(parts))]
@@ -46,7 +47,7 @@ class Server:
             z.writestr("manifest.json", json.dumps(manifest))
             for n, p in zip(names, parts, strict=True):
                 z.writestr(n, p)
-        return httpx.Response(200, content=out.getvalue(), headers={"content-type": "application/zip"})
+        return httpx.Response(200, content=out.getvalue(), headers={"content-type": self.content_type})
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.seen.append(req)
@@ -209,6 +210,11 @@ def test_recording_with_several_segments(sf, server):
     assert isinstance(clips, Segments)
     assert clips == [b"part1", b"part2", b"part3"]
     assert clips.end_reason == "segment_cap"
+
+
+def test_the_zip_media_type_is_case_insensitive(sf, server):
+    server.content_type = "Application/Zip; charset=binary"
+    assert sf.record_stop(3) == [b"mp4"]
 
 
 def test_a_server_without_segments_answers_with_one_mp4():
