@@ -1,0 +1,11 @@
+{
+	"name": "@starfold/web",
+	"private": true,
+	"description": "The browser client the server embeds; build.rs bundles src/ with esbuild.",
+	"scripts": {
+		"typecheck": "tsc -p . && tsc -p tsconfig.worker.json && tsc -p tsconfig.worklet.json"
+	},
+	"devDependencies": {
+		"typescript": "5.8.2"
+	}
+}

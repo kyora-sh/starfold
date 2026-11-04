@@ -1,6 +1,12 @@
-# voxl
+# starfold
 
-[![crates.io](https://img.shields.io/crates/v/voxl-server.svg)](https://crates.io/crates/voxl-server)
+starfold is kyora's remote-desktop streaming, with codec negotiation between server and
+browser. It is a fork of [tembo/voxl](https://github.com/tembo/voxl) (MIT, see
+[NOTICE](NOTICE)); the rest of this README is voxl's and still says voxl where it means
+the server. The binary is `starfold`; flags, environment variables and the protocol are
+voxl's.
+
+# voxl
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
 display, a Mac's screen or a Windows desktop as H.264 over a WebSocket to a small web
@@ -10,11 +16,11 @@ folder transfer and dynamic resolution.
 ## Quick start
 
 ```sh
-cargo install voxl-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
-DISPLAY=:1 voxl             # streams display :1 and prints a link that signs you in
+cargo install --locked --path crates/starfold-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
+DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
-Open the link it prints. On a Mac or a Windows PC, `voxl` streams that machine's own
+Open the link it prints. On a Mac or a Windows PC, `starfold` streams that machine's own
 screen instead; see [macOS](#macos) and [Windows](#windows).
 
 ## Benchmarks
@@ -78,25 +84,25 @@ nix-shell
 cargo build --release
 ```
 
-Or install it from [crates.io](https://crates.io/crates/voxl-server) with the same
-libraries on your system (the crate is `voxl-server`, the binary is `voxl`):
+Or install it with the same libraries on your system (the crate is `starfold-server`,
+the binary is `starfold`):
 
 ```sh
-cargo install voxl-server
+cargo install --locked --path crates/starfold-server
 ```
 
 Run it against an X display, then open the link it prints (`?stats` adds an FPS
 overlay):
 
 ```sh
-DISPLAY=:1 ./target/release/voxl --port=6901
+DISPLAY=:1 ./target/release/starfold --port=6901
 # prints: open http://localhost:6901/?token=4f1c… to sign in
 ```
 
 Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
 (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for smooth
 scrolling. voxl accepts selkies' command-line flags; other selkies flags are ignored.
-`voxl --help` lists every flag with its default, and `voxl --version` prints the version.
+`starfold --help` lists every flag with its default, and `starfold --version` prints the version.
 
 | Flag                                                           | Default                            |                                                                                                                   |
 | -------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
@@ -208,7 +214,7 @@ voxl also streams a Mac's own screen, with every feature of the Linux version
 ```sh
 brew install x264 opus pkgconf esbuild
 cargo build --release
-./target/release/voxl --port=6901
+./target/release/starfold --port=6901
 ```
 
 Open the link it prints. On a Mac voxl listens on `127.0.0.1` unless `--addr` says
@@ -240,7 +246,7 @@ vcpkg install x264 libyuv opus --triplet x64-windows-static-md
 $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
 npm install -g esbuild
 cargo build --release
-.\target\release\voxl.exe --port=6901
+.\target\release\starfold.exe --port=6901
 ```
 
 Open the link it prints. As on a Mac, voxl listens on `127.0.0.1` unless `--addr` says

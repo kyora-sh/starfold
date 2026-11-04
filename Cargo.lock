@@ -1306,6 +1306,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "starfold-server"
+version = "0.3.2"
+dependencies = [
+ "axum",
+ "base64",
+ "bindgen",
+ "block2",
+ "bytes",
+ "dispatch2",
+ "env_logger",
+ "futures-util",
+ "getrandom",
+ "libc",
+ "log",
+ "nix",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-foundation",
+ "objc2-screen-capture-kit",
+ "parking_lot",
+ "pkg-config",
+ "png",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vcpkg",
+ "windows",
+ "windows-core",
+ "x11rb",
+ "zip",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1491,41 +1526,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "voxl-server"
-version = "0.3.2"
-dependencies = [
- "axum",
- "base64",
- "bindgen",
- "block2",
- "bytes",
- "dispatch2",
- "env_logger",
- "futures-util",
- "getrandom",
- "libc",
- "log",
- "nix",
- "objc2",
- "objc2-app-kit",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-foundation",
- "objc2-screen-capture-kit",
- "parking_lot",
- "pkg-config",
- "png",
- "serde",
- "serde_json",
- "tokio",
- "vcpkg",
- "windows",
- "windows-core",
- "x11rb",
- "zip",
-]
 
 [[package]]
 name = "wasi"

@@ -11,7 +11,7 @@
 	"ignorePatterns": [
 		"target/**",
 		"node_modules/**",
-		"package-lock.json",
+		"bun.lock",
 		"*.rs",
 		"*.nix",
 		"patches/**",

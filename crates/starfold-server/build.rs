@@ -54,7 +54,7 @@ fn unix_libs(target: &str) -> Vec<std::path::PathBuf> {
         })
         .collect();
     // Embed library dirs so the binary runs outside the build shell. The link args only
-    // reach voxl's own binary, so programs that embed voxl get the dirs as DEP_VOXL_RPATH.
+    // reach starfold's own binary, so programs that embed it get the dirs as DEP_STARFOLD_RPATH.
     let dirs: Vec<_> = std::iter::once(&x264)
         .chain(others.iter())
         .flat_map(|lib| &lib.link_paths)
@@ -68,7 +68,7 @@ fn unix_libs(target: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// x264, libyuv and Opus from vcpkg (`vcpkg install x264 libyuv opus`, triplet from
-/// VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained voxl.exe); returns
+/// VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained starfold.exe); returns
 /// x264's include paths. Capture, audio and input use system DLLs.
 fn windows_libs() -> Vec<std::path::PathBuf> {
     let x264 = vcpkg::Config::new()
@@ -83,8 +83,10 @@ fn windows_libs() -> Vec<std::path::PathBuf> {
     x264.include_paths
 }
 
-/// Bundles the TypeScript web client (web/src) into OUT_DIR/web, which the server
+/// Bundles the TypeScript web client (packages/web/src) into OUT_DIR/web, which the server
 /// embeds. Needs esbuild on PATH (or ESBUILD); shell.nix and default.nix provide it.
+const WEB: &str = "../../packages/web";
+
 fn bundle_web(out: &std::path::Path) {
     // npm installs esbuild on Windows as a .cmd shim.
     let default = if cfg!(windows) {
@@ -95,10 +97,10 @@ fn bundle_web(out: &std::path::Path) {
     let esbuild = std::env::var("ESBUILD").unwrap_or_else(|_| default.into());
     let status = std::process::Command::new(&esbuild)
         .args([
-            "client=web/src/client/main.ts",
-            "worker=web/src/worker.ts",
-            "audio=web/src/worklets/audio.ts",
-            "mic=web/src/worklets/mic.ts",
+            "client=src/client/main.ts",
+            "worker=src/worker.ts",
+            "audio=src/worklets/audio.ts",
+            "mic=src/worklets/mic.ts",
             "--bundle",
             "--format=iife",
             "--target=es2022",
@@ -106,13 +108,14 @@ fn bundle_web(out: &std::path::Path) {
             "--log-level=warning",
         ])
         .arg(format!("--outdir={}", out.join("web").display()))
+        .current_dir(WEB)
         .status()
         .unwrap_or_else(|e| {
             panic!(
-                "running {esbuild} to bundle web/src failed ({e}); use nix-shell, or set ESBUILD"
+                "running {esbuild} to bundle {WEB}/src failed ({e}); use nix-shell, or set ESBUILD"
             )
         });
-    assert!(status.success(), "esbuild failed to bundle web/src");
-    println!("cargo:rerun-if-changed=web/src");
+    assert!(status.success(), "esbuild failed to bundle {WEB}/src");
+    println!("cargo:rerun-if-changed={WEB}/src");
     println!("cargo:rerun-if-env-changed=ESBUILD");
 }
