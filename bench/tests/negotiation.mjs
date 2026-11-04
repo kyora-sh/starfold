@@ -90,6 +90,10 @@ try {
 	check(!!v1 && v1.v.stream.codec === 'h264', `negotiated ${v1 ? `${v1.v.stream.codec} ${v1.coded.codec} ${v1.coded.codedWidth}x${v1.coded.codedHeight} epoch ${v1.v.stream.epoch}` : 'nothing'}`);
 	const r1 = await decoding('after negotiation');
 	check(r1.codec === v1?.coded.codec, `worker decoders configured with ${r1.codec}`);
+	const enc = (await stats()).encoder;
+	const h264 = enc?.chosen?.find((c) => c.codec === 'h264');
+	check(enc?.mode === 'auto' && h264?.backend === 'openh264', `--encoder ${enc?.mode}: H.264 from ${h264?.backend}`);
+	check(r1.encoder === 'openh264 (sw)', `stats overlay encoder ${r1.encoder}`);
 	const e1 = v1 ? v1.v.stream.epoch : 0;
 
 	// 2) A forced switch: a new epoch, a keyframe, frames keep decoding.

@@ -90,6 +90,9 @@ export type CodecMessage =
 			epoch: number;
 			w: number;
 			h: number;
+			/** The server's encoder for this codec, and whether it is hardware. */
+			backend?: string;
+			hardware?: boolean;
 			error?: undefined;
 	  } & VideoOffer)
 	| { t: 'codec'; epoch: number; error: string };
@@ -190,6 +193,8 @@ export interface Stats {
 	implementation: Implementation | null;
 	/** The acceleration preference WebCodecs accepted: a hint, not proof of hardware. */
 	hw: HardwareAcceleration | null;
+	/** Protocol 2: the server's encoder, e.g. `videotoolbox (hw)`. */
+	encoder: string | null;
 	stripes: number;
 	dropped: number;
 	queue: number;

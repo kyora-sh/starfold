@@ -207,3 +207,8 @@ jobs:
         env:
           STARFOLD_EXPECT_HEVC: '1'
         run: cargo test --locked --lib videotoolbox_hevc_negotiated -- --nocapture
+      # --encoder auto streams H.264 and HEVC from VideoToolbox.
+      - name: Auto encoder
+        env:
+          STARFOLD_EXPECT_HW: '1'
+        run: cargo test --locked --lib auto_on_this_host -- --nocapture

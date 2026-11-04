@@ -72,6 +72,8 @@ let epoch = 0;
 let ready = false;
 /** Protocol 2: each stripe's decoder in this epoch. */
 let plans: StripePlan[] = [];
+/** Protocol 2: the server's encoder in this epoch. */
+let encoder: string | null = null;
 /** How each tested configuration decodes here. */
 const accepted = new Map<string, Accepted>();
 /** Decoder errors in this epoch; a codec that keeps failing is reported. */
@@ -131,6 +133,7 @@ function connect() {
 		videoSent = false;
 		epoch = 0;
 		ready = false;
+		encoder = null;
 		resetDecoder();
 		setTimeout(connect, 1000);
 	});
@@ -262,6 +265,7 @@ function onCodec(m: CodecMessage) {
 	if (proto !== 2 || m.epoch <= epoch) return;
 	epoch = m.epoch;
 	ready = false;
+	encoder = null;
 	errors = [];
 	resetDecoder();
 	if (m.error !== undefined) {
@@ -301,6 +305,7 @@ async function configure(c: number, m: Extract<CodecMessage, { w: number }>) {
 		return;
 	}
 	plans = list as StripePlan[];
+	encoder = m.backend ? `${m.backend} (${m.hardware ? 'hw' : 'sw'})` : null;
 	setLayout(
 		m.w,
 		m.h,
@@ -561,6 +566,7 @@ setInterval(() => {
 		decodeP95: p95,
 		pipeMs: n ? st.pipeMs / n : 0,
 		codec: s0?.codec ? s0.codec.slice(s0.codec.indexOf('/') + 1) : null,
+		encoder,
 		implementation: s0?.dec?.implementation ?? null,
 		hw:
 			s0?.dec?.implementation === 'webcodecs'

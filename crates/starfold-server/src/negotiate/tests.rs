@@ -140,9 +140,96 @@ fn candidates_rank_codecs_then_hardware() {
             (Codec::H264, Backend::OpenH264),
         ]
     );
-    let vt = candidates(&r, Backend::VideoToolbox);
-    assert_eq!(vt.last().unwrap().backend, Backend::VideoToolbox);
-    assert!(vt.last().unwrap().hardware);
+    let vt: Vec<(Backend, bool)> = candidates(&r, Backend::VideoToolbox)
+        .iter()
+        .filter(|c| c.codec == Codec::H264)
+        .map(|c| (c.backend, c.hardware))
+        .collect();
+    assert_eq!(
+        vt,
+        vec![(Backend::VideoToolbox, true), (Backend::OpenH264, false)],
+        "a hardware H.264 encoder falls back to OpenH264"
+    );
+}
+
+#[test]
+fn auto_selection() {
+    let sw = || cap(Codec::H264, Backend::OpenH264, false);
+    let vt = || cap(Codec::H264, Backend::VideoToolbox, true);
+    let auto = |caps: Vec<EncoderCapability>| h264_backend(&reg(caps), Selection::Auto);
+    assert_eq!(auto(vec![sw(), vt()]), Ok(Backend::VideoToolbox));
+    let mut discovered = vt();
+    discovered.status = ProbeStatus::Discovered;
+    let mut disabled = cap(Codec::H264, Backend::Vaapi, true);
+    disabled.status = ProbeStatus::Disabled;
+    disabled.implemented = false;
+    let mut experimental = cap(Codec::H264, Backend::Nvenc, true);
+    experimental.implemented = false;
+    let mut no_idr = cap(Codec::H264, Backend::MediaFoundation, true);
+    no_idr.keyframe_control = None;
+    assert_eq!(
+        auto(vec![discovered, disabled, experimental, no_idr, sw()]),
+        Ok(Backend::OpenH264)
+    );
+    assert_eq!(auto(vec![sw()]), Ok(Backend::OpenH264));
+    assert!(auto(vec![]).is_err(), "no OpenH264 either");
+    let pinned = |b, caps| h264_backend(&reg(caps), Selection::Pinned(b));
+    assert_eq!(
+        pinned(Backend::OpenH264, vec![sw(), vt()]),
+        Ok(Backend::OpenH264)
+    );
+    assert_eq!(
+        pinned(Backend::VideoToolbox, vec![sw(), vt()]),
+        Ok(Backend::VideoToolbox)
+    );
+    let mut lost = vt();
+    lost.status = ProbeStatus::Unavailable("no session".into());
+    let e = pinned(Backend::VideoToolbox, vec![sw(), lost]).unwrap_err();
+    assert!(
+        e.contains("videotoolbox") && e.contains("no session"),
+        "{e}"
+    );
+    let e = pinned(Backend::VideoToolbox, vec![sw()]).unwrap_err();
+    assert!(e.contains("no videotoolbox H264 encoder"), "{e}");
+    let r = reg(vec![sw(), vt()]);
+    let h: Vec<Backend> = candidates(&r, Backend::OpenH264)
+        .iter()
+        .map(|c| c.backend)
+        .collect();
+    assert_eq!(h, vec![Backend::OpenH264], "pinned OpenH264 stays software");
+}
+
+#[test]
+fn chosen_is_each_codecs_first_candidate() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, Backend::VideoToolbox, true),
+        cap(Codec::Hevc, Backend::Vaapi, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+    ]);
+    let c: Vec<(Codec, Backend)> = chosen(&candidates(&r, Backend::VideoToolbox))
+        .iter()
+        .map(|c| (c.codec, c.backend))
+        .collect();
+    assert_eq!(
+        c,
+        vec![
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::VideoToolbox)
+        ]
+    );
+}
+
+#[test]
+fn selection_parse() {
+    assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
+    assert_eq!(
+        Selection::parse("openh264"),
+        Ok(Selection::Pinned(Backend::OpenH264))
+    );
+    assert!(Selection::parse("vaapi").is_err());
+    assert!(Selection::parse("h265").unwrap_err().contains("auto"));
+    assert_eq!(Selection::Auto.name(), "auto");
 }
 
 #[test]
@@ -449,7 +536,7 @@ fn server_messages() {
     let m: serde_json::Value = serde_json::from_str(&o.announce(7, 2560, 1600)).unwrap();
     assert_eq!(
         m,
-        serde_json::json!({"t":"codec","epoch":7,"codec":"hevc","format":"annexb","w":2560,"h":1600,
+        serde_json::json!({"t":"codec","epoch":7,"codec":"hevc","backend":"videotoolbox","hardware":true,"format":"annexb","w":2560,"h":1600,
             "stripes":[{"i":0,"y":0,"h":1600,"config":{"codec":"hvc1.1.6.L153.B0","codedWidth":2560,"codedHeight":1600}}]})
     );
     let offers = serde_json::to_value(vec![o]).unwrap();
@@ -471,4 +558,93 @@ fn video_v2_layout() {
     assert_eq!(&v2[1..HDR_V1], &v1[1..HDR_V1]);
     assert_eq!(&v2[HDR_V1..HDR_V2], &[1, 2, 3, 4]);
     assert_eq!(&v2[HDR_V2..], &v1[HDR_V1..]);
+}
+
+/// What `--encoder auto` picks on this host: VideoToolbox H.264 and HEVC on the
+/// kyora-macos runner, OpenH264 alone where no hardware encoder is default-safe yet.
+#[test]
+fn auto_on_this_host() {
+    use crate::encoder::caps::{host_providers, PROBE_TIMEOUT};
+    let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let h264 = h264_backend(&reg, Selection::Auto).unwrap();
+    let got: Vec<(Codec, Backend, bool)> = chosen(&candidates(&reg, h264))
+        .iter()
+        .map(|c| (c.codec, c.backend, c.hardware))
+        .collect();
+    println!("--encoder auto: {got:?}");
+    if cfg!(target_os = "macos") {
+        if std::env::var_os("STARFOLD_EXPECT_HW").is_some() {
+            assert_eq!(
+                got,
+                vec![
+                    (Codec::Hevc, Backend::VideoToolbox, true),
+                    (Codec::H264, Backend::VideoToolbox, true)
+                ]
+            );
+        }
+    } else {
+        assert_eq!(got, vec![(Codec::H264, Backend::OpenH264, false)]);
+    }
+}
+
+#[test]
+fn the_other_h264_encoder_serves_viewers_that_cant_decode_the_first() {
+    const VT264: Candidate = Candidate {
+        codec: Codec::H264,
+        backend: Backend::VideoToolbox,
+        hardware: true,
+    };
+    let offers = vec![
+        offer(HEVC, "hvc1.1.6.L153.B0", &[(0, 1600)], 2560),
+        offer(VT264, "avc1.640034", &[(0, 1600)], 2560),
+        offer(H264, "avc1.42c034", &[(0, 1600)], 2560),
+    ];
+    let baseline = [wc("avc1.42c034", 2560, 1600)];
+    let both = [wc("avc1.640034", 2560, 1600), wc("avc1.42c034", 2560, 1600)];
+    let rejected = [choice(VT264, Implementation::WebCodecs)];
+    let viewers = [
+        viewer(1, &both),
+        viewer(2, &baseline),
+        Viewer {
+            id: 3,
+            legacy: false,
+            caps: &both,
+            rejected: &rejected,
+        },
+        Viewer {
+            id: 4,
+            legacy: true,
+            caps: &[],
+            rejected: &[],
+        },
+    ];
+    let p = plan(&viewers, &offers, VT264, None);
+    assert_eq!(p.best, Some(H264));
+    let got: Vec<Option<Backend>> = p
+        .picks
+        .iter()
+        .map(|(_, c)| c.map(|c| c.cand.backend))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            Some(Backend::VideoToolbox),
+            Some(Backend::OpenH264),
+            Some(Backend::OpenH264),
+            Some(Backend::VideoToolbox)
+        ]
+    );
+    let first = [hevc(), wc("avc1.42c034", 2560, 1600)];
+    let p = plan(
+        &[viewer(5, &first), viewer(2, &baseline)],
+        &offers,
+        VT264,
+        None,
+    );
+    assert_eq!(
+        p.best,
+        Some(HEVC),
+        "the earliest viewer decides the second cohort"
+    );
+    assert_eq!(p.picks[1].1, None);
 }

@@ -175,6 +175,7 @@ function main() {
 						`${m.fps.toFixed(1)} fps  ${(m.kbps / 1000).toFixed(2)} Mbps`,
 						`decode p50 ${m.decodeP50.toFixed(1)} p95 ${m.decodeP95.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms`,
 						`${m.codec || ''} ${m.implementation || ''}${m.hw ? ` (${m.hw})` : ''}`,
+						`${m.encoder || ''}`,
 						`dropped ${m.dropped}  q=${m.queue}`,
 					].join('\n');
 				}
