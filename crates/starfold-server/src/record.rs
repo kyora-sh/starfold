@@ -5,6 +5,11 @@
 //! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
 //!   of everything in between.
 //!
+//! Another encoder taking over mid-recording (new SPS/PPS) starts a new MP4 segment at
+//! its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
+//! every `segment-k.mp4`; without it the response is the first segment, as an MP4, and
+//! `x-voxl-segments` and `x-voxl-record-end` say when there was more.
+//!
 //! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
@@ -25,6 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 /// How long a started recording that ran into the length limit waits for its
 /// `/record/stop` before it is discarded (the caller may have crashed or forgotten).
 const UNCLAIMED: Duration = Duration::from_secs(60);
+/// The most segments of one recording: an encoder flapping between two configurations
+/// ends the recording here.
+const MAX_SEGMENTS: usize = 16;
 
 pub struct Recorder {
     pub hub: Arc<Hub>,
@@ -36,7 +44,131 @@ pub struct Recorder {
 
 struct Active {
     stop: oneshot::Sender<()>,
-    done: tokio::task::JoinHandle<Result<Vec<u8>, String>>,
+    done: Recording,
+}
+
+type Recording = tokio::task::JoinHandle<Result<Clip, String>>;
+
+/// Why a recording ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// `/record/stop`.
+    Stopped,
+    /// The time asked for, or the length limit.
+    TimeLimit,
+    /// A new size: an MP4 track keeps one.
+    Resized,
+    /// Past `MAX_SEGMENTS`.
+    SegmentCap,
+    /// A keyframe with new parameter sets that can't start a segment.
+    BadParameterSets,
+    /// A segment couldn't be written; the others are there.
+    SegmentLost,
+    /// The hub went away.
+    Closed,
+}
+
+impl End {
+    fn name(self) -> &'static str {
+        match self {
+            End::Stopped => "stopped",
+            End::TimeLimit => "time_limit",
+            End::Resized => "resized",
+            End::SegmentCap => "segment_cap",
+            End::BadParameterSets => "bad_parameter_sets",
+            End::SegmentLost => "segment_lost",
+            End::Closed => "closed",
+        }
+    }
+}
+
+/// One segment's frames, until they are written as an MP4.
+struct Part {
+    frames: Vec<mp4::Frame>,
+    size: (u32, u32),
+    end_ms: u64,
+}
+
+impl Part {
+    fn write(self) -> Result<Segment, String> {
+        let mp4 = mp4::write(&self.frames, self.size.0, self.size.1, self.end_ms)?;
+        let (start_ms, last_ms) = match (self.frames.first(), self.frames.last()) {
+            (Some(f), Some(l)) => (f.ms, l.ms),
+            _ => (0, 0),
+        };
+        Ok(Segment {
+            mp4,
+            start_ms,
+            duration_ms: self.end_ms.max(last_ms + mp4::LAST_FRAME_MS) - start_ms,
+            frames: self.frames.len(),
+        })
+    }
+}
+
+struct Segment {
+    mp4: Vec<u8>,
+    /// Since the recording started.
+    start_ms: u64,
+    duration_ms: u64,
+    frames: usize,
+}
+
+struct Clip {
+    segments: Vec<Segment>,
+    end: End,
+}
+
+impl Clip {
+    /// Writes the MP4s. One that fails doesn't take the others with it; only with none
+    /// left is the recording an error.
+    fn write(parts: Vec<Part>, mut end: End) -> Result<Clip, String> {
+        let mut segments = Vec::with_capacity(parts.len());
+        let mut failed = None;
+        for p in parts {
+            match p.write() {
+                Ok(s) => segments.push(s),
+                Err(e) => {
+                    log::warn!("recording segment lost: {e}");
+                    end = End::SegmentLost;
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) if segments.is_empty() => Err(e),
+            _ => Ok(Clip { segments, end }),
+        }
+    }
+
+    fn into_zip(self) -> zip::result::ZipResult<Vec<u8>> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let file = |i: usize| format!("segment-{}.mp4", i + 1);
+        let segments: Vec<_> = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                serde_json::json!({
+                    "file": file(i),
+                    "start_ms": s.start_ms,
+                    "duration_ms": s.duration_ms,
+                    "frames": s.frames,
+                })
+            })
+            .collect();
+        let manifest = serde_json::json!({ "end_reason": self.end.name(), "segments": segments });
+        let total: usize = self.segments.iter().map(|s| s.mp4.len()).sum();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::with_capacity(total + 4096)));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file("manifest.json", opts)?;
+        z.write_all(manifest.to_string().as_bytes())?;
+        for (i, s) in self.segments.into_iter().enumerate() {
+            z.start_file(file(i), opts)?;
+            z.write_all(&s.mp4)?;
+        }
+        Ok(z.finish()?.into_inner())
+    }
 }
 
 impl Recorder {
@@ -131,13 +263,69 @@ pub async fn screenshot(State(r): State<Arc<Recorder>>) -> Response {
     }
 }
 
+/// The first segment, as an MP4; the response names what else there was.
+fn first_segment(clip: Clip) -> Response {
+    let n = clip.segments.len();
+    let Some(first) = clip.segments.into_iter().next() else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "no segments");
+    };
+    let mut res = video(first.mp4);
+    if n > 1 || clip.end == End::SegmentLost {
+        log::warn!("recording has {n} segments; returning the first (format=zip has them all)");
+        res.headers_mut()
+            .insert("x-voxl-segments", header::HeaderValue::from(n));
+        res.headers_mut().insert(
+            "x-voxl-record-end",
+            header::HeaderValue::from_static(clip.end.name()),
+        );
+    }
+    res
+}
+
+async fn respond(done: Recording, zip: bool) -> Response {
+    let clip = match done.await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if !zip {
+        return first_segment(clip);
+    }
+    match tokio::task::spawn_blocking(move || clip.into_zip()).await {
+        Ok(Ok(z)) => (
+            [
+                (header::CONTENT_TYPE, "application/zip"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"voxl.zip\"",
+                ),
+            ],
+            z,
+        )
+            .into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Whether `format=` asks for the zip of all segments. None for a format we don't have.
+fn wants_zip(q: &HashMap<String, String>) -> Option<bool> {
+    match q.get("format").map(String::as_str) {
+        None | Some("mp4") => Some(false),
+        Some("zip") => Some(true),
+        Some(_) => None,
+    }
+}
+
+const BAD_FORMAT: &str = "format must be mp4 or zip";
+
 /// Joins as a viewer and collects frames until `stop`, `max` or a geometry change.
 #[allow(clippy::result_large_err)]
 fn begin(
     r: &Arc<Recorder>,
     stop: oneshot::Receiver<()>,
     max: Duration,
-) -> Result<tokio::task::JoinHandle<Result<Vec<u8>, String>>, Response> {
+) -> Result<Recording, Response> {
     if r.hub.stripes.lock().len() > 1 {
         return Err(err(
             StatusCode::CONFLICT,
@@ -151,9 +339,12 @@ fn begin(
     r.hub.replan();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, max).await;
+        // Writing takes a while: nothing acknowledges frames now, so leave first.
         hub.remove_client(client.id);
-        res
+        tokio::task::spawn_blocking(move || Clip::write(parts, end))
+            .await
+            .map_err(|e| e.to_string())?
     }))
 }
 
@@ -163,41 +354,57 @@ async fn collect(
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
-) -> Result<Vec<u8>, String> {
+) -> (Vec<Part>, End) {
     let start = Instant::now();
     let deadline = tokio::time::sleep(max);
     tokio::pin!(deadline);
+    let mut parts: Vec<Part> = Vec::new();
     let mut frames: Vec<mp4::Frame> = Vec::new();
     let mut size = (0, 0);
     let mut first: Option<Vec<Vec<u8>>> = None;
-    loop {
+    let mut last_ms = None;
+    let end = loop {
         tokio::select! {
-            _ = &mut stop => break,
-            _ = &mut deadline => break,
+            _ = &mut stop => break End::Stopped,
+            _ = &mut deadline => break End::TimeLimit,
             m = rx.recv() => match m {
-                None => break,
+                None => break End::Closed,
                 Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
                     // Acknowledge at once, so the recorder never holds the stream back.
                     client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
                     hub.wake();
                     let key = b[1] & 1 == 1;
+                    // Time the frame was captured: now, less the pipeline time in its header.
+                    let pipe = u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10;
+                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(pipe);
+                    let ms = last_ms.map_or(ms, |l: u64| ms.max(l + 1));
                     if key {
                         let p = params(&b[16..]);
                         match &first {
                             None => first = Some(p),
-                            // Another encoder took over the stream (its frames may already
-                            // have been queued when this one was): it can't share the track.
-                            Some(f) if !p.is_empty() && *f != p => break,
+                            // Another encoder took over the stream: it can't share the
+                            // track, so its keyframe starts the next segment.
+                            Some(f) if !p.is_empty() && *f != p => {
+                                if !complete(&p) {
+                                    break End::BadParameterSets;
+                                }
+                                if parts.len() + 1 == MAX_SEGMENTS {
+                                    break End::SegmentCap;
+                                }
+                                parts.push(Part {
+                                    frames: std::mem::take(&mut frames),
+                                    size,
+                                    end_ms: ms,
+                                });
+                                first = Some(p);
+                            }
                             Some(_) => {}
                         }
                     }
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
                     }
-                    // Time the frame was captured: now, less the pipeline time in its header.
-                    let pipe = u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10;
-                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(pipe);
-                    let ms = frames.last().map_or(ms, |l: &mp4::Frame| ms.max(l.ms + 1));
+                    last_ms = Some(ms);
                     frames.push(mp4::Frame {
                         ms,
                         key,
@@ -205,15 +412,19 @@ async fn collect(
                     });
                 }
                 // A new size restarts the stream; an MP4 track keeps one size, so stop.
-                Some(Out::Text(t)) if !frames.is_empty() && t.contains("\"hello\"") => break,
+                Some(Out::Text(t)) if !frames.is_empty() && t.contains("\"hello\"") => {
+                    break End::Resized
+                }
                 _ => {}
             },
         }
-    }
-    let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end))
-        .await
-        .map_err(|e| e.to_string())?
+    };
+    parts.push(Part {
+        frames,
+        size,
+        end_ms: start.elapsed().as_millis() as u64,
+    });
+    (parts, end)
 }
 
 /// A keyframe's SPS and PPS, the level left out: an MP4 track keeps the first
@@ -230,6 +441,11 @@ fn params(d: &[u8]) -> Vec<Vec<u8>> {
             v
         })
         .collect()
+}
+
+/// Whether parameter sets from `params` can open an MP4 (`mp4::write` needs these).
+fn complete(p: &[Vec<u8>]) -> bool {
+    p.iter().any(|n| n[0] & 0x1f == 7 && n.len() >= 4) && p.iter().any(|n| n[0] & 0x1f == 8)
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
@@ -250,17 +466,16 @@ pub async fn record(
     let Some(len) = record_len(secs, r.max) else {
         return err(StatusCode::BAD_REQUEST, "seconds must be positive");
     };
+    let Some(zip) = wants_zip(&q) else {
+        return err(StatusCode::BAD_REQUEST, BAD_FORMAT);
+    };
     // The deadline ends it; the stop side is never used.
     let (_keep, stop) = oneshot::channel();
     let done = match begin(&r, stop, len) {
         Ok(d) => d,
         Err(e) => return e,
     };
-    match done.await {
-        Ok(Ok(mp4)) => video(mp4),
-        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    respond(done, zip).await
 }
 
 pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
@@ -298,17 +513,16 @@ pub async fn stop(
     State(r): State<Arc<Recorder>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    let Some(zip) = wants_zip(&q) else {
+        return err(StatusCode::BAD_REQUEST, BAD_FORMAT);
+    };
     let id = q.get("id").and_then(|s| s.parse::<u64>().ok());
     let Some(a) = id.and_then(|id| r.active.lock().remove(&id)) else {
         return err(StatusCode::NOT_FOUND, "no such recording");
     };
     let _ = a.stop.send(());
     log::info!("recording {} stopped", id.unwrap_or(0));
-    match a.done.await {
-        Ok(Ok(mp4)) => video(mp4),
-        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    respond(a.done, zip).await
 }
 
 #[cfg(test)]
@@ -339,31 +553,261 @@ mod tests {
         Out::Bin(bytes::Bytes::from(b))
     }
 
-    #[tokio::test]
-    async fn another_encoders_keyframe_ends_the_recording() {
+    /// Queues `units` and a size change, which ends the recording in queue order.
+    async fn clip(units: &[Option<(u8, u8)>]) -> Clip {
         let hub = Hub::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx.clone());
         let (_keep, stop) = oneshot::channel();
-        for u in [
+        for u in units {
+            tx.send(unit(*u)).unwrap();
+        }
+        tx.send(Out::Text("{\"t\":\"hello\"}".into())).unwrap();
+        let (parts, end) = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect(&hub, &client, rx, stop, Duration::from_secs(30)),
+        )
+        .await
+        .expect("the recording ended");
+        Clip::write(parts, end).unwrap()
+    }
+
+    /// The payload of the box at `path`, each name found among the previous one's children.
+    fn find<'a>(mut b: &'a [u8], path: &[&[u8; 4]]) -> &'a [u8] {
+        for name in path {
+            let mut at = 0;
+            b = loop {
+                let len = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+                if &b[at + 4..at + 8] == *name {
+                    break &b[at + 8..at + len];
+                }
+                at += len;
+            };
+        }
+        b
+    }
+
+    fn be32(b: &[u8]) -> u32 {
+        u32::from_be_bytes(b[..4].try_into().unwrap())
+    }
+
+    /// Checks the boxes agree; returns the sample count, their total duration, avcC's SPS and PPS.
+    fn check(mp4: &[u8]) -> (u32, u32, Vec<u8>, Vec<u8>) {
+        assert_eq!(&mp4[4..8], b"ftyp");
+        let moov = find(mp4, &[b"moov"]);
+        let mdat = find(mp4, &[b"mdat"]);
+        let stbl = find(mp4, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]);
+        let samples = be32(&find(stbl, &[b"stsz"])[8..]);
+        let stts = find(stbl, &[b"stts"]);
+        let runs = be32(&stts[4..]) as usize;
+        let total: u32 = (0..runs)
+            .map(|i| be32(&stts[8 + i * 8..]) * be32(&stts[12 + i * 8..]))
+            .sum();
+        assert_eq!(be32(&find(moov, &[b"mvhd"])[16..]), total);
+        let sizes = find(stbl, &[b"stsz"]);
+        let bytes: u32 = (0..samples as usize)
+            .map(|i| be32(&sizes[12 + i * 4..]))
+            .sum();
+        assert_eq!(bytes as usize, mdat.len());
+        let at = moov.windows(4).position(|w| w == b"avcC").unwrap() + 4;
+        let c = &moov[at..];
+        let sps_len = u16::from_be_bytes([c[6], c[7]]) as usize;
+        let sps = c[8..8 + sps_len].to_vec();
+        let p = 8 + sps_len;
+        let pps_len = u16::from_be_bytes([c[p + 1], c[p + 2]]) as usize;
+        (samples, total, sps, c[p + 3..p + 3 + pps_len].to_vec())
+    }
+
+    #[tokio::test]
+    async fn another_encoders_keyframe_starts_a_segment() {
+        let c = clip(&[
             Some((100, 40)),
             None,
             Some((100, 41)),
             None,
             Some((66, 41)),
             None,
-        ] {
-            tx.send(unit(u)).unwrap();
+        ])
+        .await;
+        assert_eq!(c.end, End::Resized);
+        assert_eq!(c.segments.len(), 2);
+        let (a, b) = (&c.segments[0], &c.segments[1]);
+        let (samples, total, sps, pps) = check(&a.mp4);
+        assert_eq!(samples, 4, "a new level continues");
+        assert_eq!(a.frames, 4);
+        assert_eq!(total as u64, a.duration_ms);
+        assert_eq!(sps, [0x67, 100, 0, 40, 0xac]);
+        assert_eq!(pps, [0x68, 0xee]);
+        let (samples, total, sps, pps) = check(&b.mp4);
+        assert_eq!(samples, 2);
+        assert_eq!(b.frames, 2);
+        assert_eq!(total as u64, b.duration_ms);
+        assert_eq!(sps, [0x67, 66, 0, 41, 0xac]);
+        assert_eq!(pps, [0x68, 0xee]);
+        assert!(a.start_ms < b.start_ms);
+        assert!(
+            b.start_ms <= a.start_ms + a.duration_ms,
+            "no gap between the segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_level_keeps_one_segment() {
+        let c = clip(&[Some((100, 40)), None, Some((100, 41)), None]).await;
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(check(&c.segments[0].mp4).0, 4);
+    }
+
+    #[tokio::test]
+    async fn a_flapping_encoder_ends_at_the_segment_cap() {
+        let units: Vec<_> = (0..MAX_SEGMENTS + 5)
+            .flat_map(|i| [Some((if i % 2 == 0 { 100 } else { 66 }, 40)), None])
+            .collect();
+        let c = clip(&units).await;
+        assert_eq!(c.end, End::SegmentCap);
+        assert_eq!(c.segments.len(), MAX_SEGMENTS);
+        for s in &c.segments {
+            assert_eq!(check(&s.mp4).0, 2);
         }
-        let mp4 = tokio::time::timeout(
-            Duration::from_secs(5),
-            collect(&hub, &client, rx, stop, Duration::from_secs(30)),
-        )
-        .await
-        .expect("the recording ended")
-        .unwrap();
-        let stsz = mp4.windows(4).position(|w| w == b"stsz").unwrap();
-        let count = u32::from_be_bytes(mp4[stsz + 12..stsz + 16].try_into().unwrap());
-        assert_eq!(count, 4, "a new level continues, a new profile ends it");
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_that_cant_start_a_segment_ends_the_recording() {
+        let hub = Hub::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx.clone());
+        let (_keep, stop) = oneshot::channel();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        let mut b = vec![0x01, 1, 0, 0, 0, 2];
+        b.resize(16, 0);
+        b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
+        tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
+        let (parts, end) = collect(&hub, &client, rx, stop, Duration::from_secs(30)).await;
+        let c = Clip::write(parts, end).unwrap();
+        assert_eq!(c.end, End::BadParameterSets);
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(check(&c.segments[0].mp4).0, 1);
+    }
+
+    fn part(frames: Vec<mp4::Frame>) -> Part {
+        Part {
+            frames,
+            size: (64, 32),
+            end_ms: 100,
+        }
+    }
+
+    fn keyframe() -> Vec<mp4::Frame> {
+        let Out::Bin(b) = unit(Some((100, 40))) else {
+            unreachable!()
+        };
+        vec![mp4::Frame {
+            ms: 0,
+            key: true,
+            data: b.slice(16..),
+        }]
+    }
+
+    #[test]
+    fn a_segment_that_cant_be_written_leaves_the_others() {
+        let parts = vec![part(keyframe()), part(Vec::new()), part(keyframe())];
+        let c = Clip::write(parts, End::Stopped).unwrap();
+        assert_eq!(c.end, End::SegmentLost);
+        assert_eq!(c.segments.len(), 2);
+        let r = first_segment(c);
+        assert_eq!(r.headers()["x-voxl-segments"], "2");
+        assert_eq!(r.headers()["x-voxl-record-end"], "segment_lost");
+    }
+
+    #[test]
+    fn a_recording_with_no_segment_left_is_an_error() {
+        let e = Clip::write(vec![part(Vec::new())], End::Stopped).err();
+        assert_eq!(e.as_deref(), Some("no frames were recorded"));
+    }
+
+    #[tokio::test]
+    async fn the_recorder_leaves_the_hub_when_it_ends() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30));
+        let (stop_tx, stop) = oneshot::channel();
+        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
+        assert_eq!(r.hub.clients.lock().len(), 1);
+        stop_tx.send(()).unwrap();
+        assert!(done.await.unwrap().is_err(), "no frames were recorded");
+        assert!(r.hub.clients.lock().is_empty());
+    }
+
+    async fn body(r: Response) -> Vec<u8> {
+        axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn one_segment_is_a_plain_mp4() {
+        let c = clip(&[Some((100, 40)), None]).await;
+        let mp4 = c.segments[0].mp4.clone();
+        let r = first_segment(c);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert!(r.headers().get("x-voxl-segments").is_none());
+        assert!(r.headers().get("x-voxl-record-end").is_none());
+        assert_eq!(body(r).await, mp4);
+    }
+
+    #[tokio::test]
+    async fn without_zip_several_segments_are_the_first_and_headers() {
+        let c = clip(&[Some((100, 40)), Some((66, 40))]).await;
+        let mp4 = c.segments[0].mp4.clone();
+        let r = first_segment(c);
+        assert_eq!(r.headers()["x-voxl-segments"], "2");
+        assert_eq!(r.headers()["x-voxl-record-end"], "resized");
+        assert_eq!(body(r).await, mp4);
+    }
+
+    #[tokio::test]
+    async fn the_zip_has_a_manifest_and_every_segment() {
+        use std::io::Read;
+        let c = clip(&[Some((100, 40)), None, Some((66, 40))]).await;
+        let parts: Vec<Vec<u8>> = c.segments.iter().map(|s| s.mp4.clone()).collect();
+        let starts: Vec<u64> = c.segments.iter().map(|s| s.start_ms).collect();
+        let z = c.into_zip().unwrap();
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(z)).unwrap();
+        let read = |a: &mut zip::ZipArchive<_>, name: &str| {
+            let mut v = Vec::new();
+            a.by_name(name).unwrap().read_to_end(&mut v).unwrap();
+            v
+        };
+        let m: serde_json::Value = serde_json::from_slice(&read(&mut a, "manifest.json")).unwrap();
+        assert_eq!(m["end_reason"], "resized");
+        let segs = m["segments"].as_array().unwrap();
+        assert_eq!(segs.len(), 2);
+        for (i, s) in segs.iter().enumerate() {
+            assert_eq!(s["start_ms"], starts[i]);
+            assert_eq!(read(&mut a, s["file"].as_str().unwrap()), parts[i]);
+        }
+        assert_eq!(segs[0]["file"], "segment-1.mp4");
+        assert_eq!(segs[0]["frames"], 2);
+        assert_eq!(segs[1]["frames"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_format_leaves_the_recording_running() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30));
+        let started = start(State(r.clone())).await;
+        let id = serde_json::from_slice::<serde_json::Value>(&body(started).await).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let q = |f: &str| {
+            Query(HashMap::from([
+                ("id".to_string(), id.to_string()),
+                ("format".to_string(), f.to_string()),
+            ]))
+        };
+        let bad = stop(State(r.clone()), q("avi")).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(r.active.lock().contains_key(&id));
+        let done = stop(State(r.clone()), q("zip")).await;
+        assert_eq!(done.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.active.lock().is_empty());
     }
 }

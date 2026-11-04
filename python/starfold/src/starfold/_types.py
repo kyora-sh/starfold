@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from PIL.Image import Image
 
 
@@ -96,6 +98,15 @@ class InputResult:
 class Recording:
     id: int
     max_seconds: int
+
+
+class Segments(list[bytes]):
+    """A recording's MP4s, in order: one, unless another encoder took over mid-recording."""
+
+    def __init__(self, parts: Iterable[bytes], end_reason: str | None = None) -> None:
+        super().__init__(parts)
+        self.end_reason = end_reason
+        """Why it ended: stopped, time_limit, resized, segment_cap, bad_parameter_sets, segment_lost or closed."""
 
 
 @dataclass(frozen=True)

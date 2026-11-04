@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
 import os
+import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +21,7 @@ from ._types import (
     ReadOnlyError,
     Recording,
     Screenshot,
+    Segments,
     StarfoldConnectionError,
     StarfoldError,
     StarfoldTimeoutError,
@@ -116,8 +120,16 @@ def _input(actions: Iterable[act.Action | list[act.Action]]) -> _Req[InputResult
     )
 
 
-def _record(seconds: float) -> _Req[bytes]:
-    return _Req("GET", "/record", lambda r: r.content, params={"seconds": seconds}, extra_s=seconds)
+def _segments(r: httpx.Response) -> Segments:
+    if r.headers.get("content-type", "").split(";")[0].strip().lower() != "application/zip":
+        return Segments([r.content])
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        manifest = json.loads(z.read("manifest.json"))
+        return Segments([z.read(s["file"]) for s in manifest["segments"]], manifest["end_reason"])
+
+
+def _record(seconds: float) -> _Req[Segments]:
+    return _Req("GET", "/record", _segments, params={"seconds": seconds, "format": "zip"}, extra_s=seconds)
 
 
 def _record_start() -> _Req[Recording]:
@@ -126,9 +138,9 @@ def _record_start() -> _Req[Recording]:
     )
 
 
-def _record_stop(recording: Recording | int) -> _Req[bytes]:
+def _record_stop(recording: Recording | int) -> _Req[Segments]:
     rid = recording.id if isinstance(recording, Recording) else recording
-    return _Req("POST", "/record/stop", lambda r: r.content, params={"id": rid})
+    return _Req("POST", "/record/stop", _segments, params={"id": rid, "format": "zip"})
 
 
 def _files_list(path: str) -> _Req[FileList]:
@@ -256,14 +268,14 @@ class Starfold(_Base):
     def type_text(self, text: str) -> InputResult:
         return self.actions([act.type_text(text)])
 
-    def record(self, seconds: float) -> bytes:
+    def record(self, seconds: float) -> Segments:
         """An MP4 of the next `seconds`."""
         return self._do(_record(seconds))
 
     def record_start(self) -> Recording:
         return self._do(_record_start())
 
-    def record_stop(self, recording: Recording | int) -> bytes:
+    def record_stop(self, recording: Recording | int) -> Segments:
         return self._do(_record_stop(recording))
 
     def files_list(self, path: str = "") -> FileList:
@@ -359,13 +371,13 @@ class AsyncStarfold(_Base):
     async def type_text(self, text: str) -> InputResult:
         return await self.actions([act.type_text(text)])
 
-    async def record(self, seconds: float) -> bytes:
+    async def record(self, seconds: float) -> Segments:
         return await self._do(_record(seconds))
 
     async def record_start(self) -> Recording:
         return await self._do(_record_start())
 
-    async def record_stop(self, recording: Recording | int) -> bytes:
+    async def record_stop(self, recording: Recording | int) -> Segments:
         return await self._do(_record_stop(recording))
 
     async def files_list(self, path: str = "") -> FileList:

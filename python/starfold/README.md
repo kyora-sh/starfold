@@ -24,7 +24,7 @@ with Starfold("http://localhost:6901", password="...") as sf:  # password defaul
     sf.drag(100, 100, 400, 100)
     sf.actions([act.key("ctrl+l"), act.type_text("example.com"), act.key("Enter")])
 
-    clip = sf.record(5)  # MP4 bytes
+    clips = sf.record(5)  # a list of MP4s: one, or more if the encoder changed mid-recording
     sf.files_upload("data.csv", "local/data.csv")
     print([e.name for e in sf.files_list().entries])
 ```

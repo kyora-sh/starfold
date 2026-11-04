@@ -259,7 +259,18 @@ async fn serve(a: HashMap<String, String>) {
     #[cfg(windows)]
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
-    let candidates = negotiate::candidates(&encoders, encoder);
+    let mut candidates = negotiate::candidates(&encoders, encoder);
+    // VOXL_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
+    if std::env::var_os("VOXL_TEST_HOOKS").is_some() && encoder != encoder::Backend::OpenH264 {
+        let fallback = negotiate::Candidate {
+            codec: encoder::Codec::H264,
+            backend: encoder::Backend::OpenH264,
+            hardware: false,
+        };
+        if !candidates.contains(&fallback) {
+            candidates.push(fallback);
+        }
+    }
     for c in negotiate::chosen(&candidates) {
         log::info!(
             "--encoder {}: {:?} from {} ({})",

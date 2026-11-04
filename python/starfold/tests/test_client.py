@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 import struct
+import zipfile
 
 import httpx
 import pytest
@@ -12,6 +14,7 @@ from starfold import (
     NotFoundError,
     ReadOnlyError,
     Recording,
+    Segments,
     Starfold,
     StarfoldConnectionError,
     StarfoldError,
@@ -29,6 +32,22 @@ class Server:
         self.password = password
         self.seen: list[httpx.Request] = []
         self.read_only = False
+        self.segments = [b"mp4"]
+        self.end_reason = "stopped"
+        self.content_type = "application/zip"
+
+    def recording(self, *parts: bytes) -> httpx.Response:
+        names = [f"segment-{i + 1}.mp4" for i in range(len(parts))]
+        manifest = {
+            "end_reason": self.end_reason,
+            "segments": [{"file": n, "start_ms": 0, "duration_ms": 1, "frames": 1} for n in names],
+        }
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as z:
+            z.writestr("manifest.json", json.dumps(manifest))
+            for n, p in zip(names, parts, strict=True):
+                z.writestr(n, p)
+        return httpx.Response(200, content=out.getvalue(), headers={"content-type": self.content_type})
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.seen.append(req)
@@ -46,13 +65,15 @@ class Server:
                 )
             return httpx.Response(200, json={"seq": 40, "events": len(json.loads(req.content))})
         if path == "/record":
-            return httpx.Response(200, content=b"mp4:" + q["seconds"].encode())
+            assert q["format"] == "zip"
+            return self.recording(b"mp4:" + q["seconds"].encode())
         if path == "/record/start":
             return httpx.Response(200, json={"id": 3, "max_seconds": 300})
         if path == "/record/stop":
             if q["id"] != "3":
                 return httpx.Response(404, json={"error": "no such recording"})
-            return httpx.Response(200, content=b"mp4")
+            assert q["format"] == "zip"
+            return self.recording(*self.segments)
         if path == "/files/list":
             entries = [{"name": "a.txt", "dir": False, "size": 3, "mtime": 1700000000000}]
             return httpx.Response(200, json={"path": q["path"], "entries": entries})
@@ -171,13 +192,39 @@ def test_password_from_environment(monkeypatch):
 
 
 def test_recording(sf, server):
-    assert sf.record(2.5) == b"mp4:2.5"
+    assert sf.record(2.5) == [b"mp4:2.5"]
     assert server.seen[-1].extensions["timeout"]["read"] == 32.5
     rec = sf.record_start()
     assert rec == Recording(id=3, max_seconds=300)
-    assert sf.record_stop(rec) == b"mp4"
+    clips = sf.record_stop(rec)
+    assert clips == [b"mp4"]
+    assert clips.end_reason == "stopped"
     with pytest.raises(NotFoundError):
         sf.record_stop(4)
+
+
+def test_recording_with_several_segments(sf, server):
+    server.segments = [b"part1", b"part2", b"part3"]
+    server.end_reason = "segment_cap"
+    clips = sf.record_stop(3)
+    assert isinstance(clips, Segments)
+    assert clips == [b"part1", b"part2", b"part3"]
+    assert clips.end_reason == "segment_cap"
+
+
+def test_the_zip_media_type_is_case_insensitive(sf, server):
+    server.content_type = "Application/Zip; charset=binary"
+    assert sf.record_stop(3) == [b"mp4"]
+
+
+def test_a_server_without_segments_answers_with_one_mp4():
+    def older(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"mp4", headers={"content-type": "video/mp4"})
+
+    with Starfold("http://desk:6901", password="pw", transport=httpx.MockTransport(older)) as c:
+        clips = c.record_stop(3)
+    assert clips == [b"mp4"]
+    assert clips.end_reason is None
 
 
 def test_files(sf, server, tmp_path):
