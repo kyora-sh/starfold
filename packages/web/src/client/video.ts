@@ -48,6 +48,8 @@ export function createVideo(
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
+	/** Waiting for the first presented frame of a stripe <video> (re-armed if it is removed first). */
+	let armed = false;
 	let painted = false;
 	/** Where the worker presents: <video> stripes, or the canvas (always for dav1d-wasm). */
 	let surface: 'video' | 'canvas' = useVideo ? 'video' : 'canvas';
@@ -69,6 +71,7 @@ export function createVideo(
 			o.video.remove();
 		}
 		outs = [];
+		armed = false;
 	}
 
 	function build(list: Stripe[]) {
@@ -107,12 +110,16 @@ export function createVideo(
 			return;
 		}
 		if (!outs.length) open();
-		if (!painted && outs[0] && parts.length) {
-			painted = true;
+		if (!painted && !armed && outs[0] && parts.length) {
+			armed = true;
 			const v = outs[0].video;
-			if ('requestVideoFrameCallback' in v)
-				v.requestVideoFrameCallback(() => onFirstPaint());
-			else requestAnimationFrame(() => onFirstPaint());
+			const done = () => {
+				if (!v.isConnected) return;
+				painted = true;
+				onFirstPaint();
+			};
+			if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(done);
+			else requestAnimationFrame(done);
 		}
 		for (const p of parts) {
 			const o = outs[p.i];
