@@ -271,7 +271,6 @@ fn first_segment(clip: Clip) -> Response {
     };
     let mut res = video(first.mp4);
     if n > 1 || clip.end == End::SegmentLost {
-        log::warn!("recording has {n} segments; returning the first (format=zip has them all)");
         res.headers_mut()
             .insert("x-voxl-segments", header::HeaderValue::from(n));
         res.headers_mut().insert(
@@ -282,12 +281,23 @@ fn first_segment(clip: Clip) -> Response {
     res
 }
 
-async fn respond(done: Recording, zip: bool) -> Response {
+/// What to log when a request gets only the first of `n` segments. `/record` has no id.
+fn partial_warning(route: &str, id: Option<u64>, n: usize, zip: bool) -> Option<String> {
+    let id = id.map_or("none".to_string(), |i| i.to_string());
+    (!zip && n > 1).then(|| {
+        format!("{route}: recording {id} has {n} segments; returning the first (format=zip has them all)")
+    })
+}
+
+async fn respond(done: Recording, zip: bool, route: &str, id: Option<u64>) -> Response {
     let clip = match done.await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    if let Some(w) = partial_warning(route, id, clip.segments.len(), zip) {
+        log::warn!("{w}");
+    }
     if !zip {
         return first_segment(clip);
     }
@@ -475,7 +485,7 @@ pub async fn record(
         Ok(d) => d,
         Err(e) => return e,
     };
-    respond(done, zip).await
+    respond(done, zip, "/record", None).await
 }
 
 pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
@@ -522,7 +532,7 @@ pub async fn stop(
     };
     let _ = a.stop.send(());
     log::info!("recording {} stopped", id.unwrap_or(0));
-    respond(a.done, zip).await
+    respond(a.done, zip, "/record/stop", id).await
 }
 
 #[cfg(test)]
@@ -687,6 +697,21 @@ mod tests {
         assert_eq!(c.end, End::BadParameterSets);
         assert_eq!(c.segments.len(), 1);
         assert_eq!(check(&c.segments[0].mp4).0, 1);
+    }
+
+    #[test]
+    fn only_a_request_that_loses_segments_is_warned_about() {
+        let w = partial_warning("/record/stop", Some(7), 3, false).unwrap();
+        for s in ["/record/stop", "recording 7", "3 segments"] {
+            assert!(w.contains(s), "{w}");
+        }
+        let w = partial_warning("/record", None, 2, false).unwrap();
+        for s in ["/record:", "recording none", "2 segments"] {
+            assert!(w.contains(s), "{w}");
+        }
+        assert_eq!(partial_warning("/record/stop", Some(7), 3, true), None);
+        assert_eq!(partial_warning("/record/stop", Some(7), 1, false), None);
+        assert_eq!(partial_warning("/record", None, 1, false), None);
     }
 
     fn part(frames: Vec<mp4::Frame>) -> Part {
