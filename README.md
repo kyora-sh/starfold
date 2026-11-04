@@ -208,6 +208,16 @@ blinking text caret redraws about twice a second, so keep `idle` under 500 ms or
 the caret out of `region`. voxl already knows which parts of the screen change (XDamage,
 ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polling.
 
+`POST /input` drives the mouse and keyboard with JSON actions (one, or an array applied in
+order) and answers with the `seq` from before them, so `/wait?change&since=` sees what they
+did. A `--read-only` server refuses it with 403. `python/starfold` wraps all of this.
+
+```sh
+curl -u ":$VOXL_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
+  -d '[{"type":"click","x":400,"y":300},{"type":"type","text":"hello\n"},{"type":"key","key":"ctrl+s"}]'
+# {"seq":812,"events":19}
+```
+
 ### macOS
 
 voxl also streams a Mac's own screen, with every feature of the Linux version

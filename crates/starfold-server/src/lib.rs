@@ -5,6 +5,7 @@
 //! `tembo voxl`) embed the server the same way.
 
 mod access;
+mod actions;
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]

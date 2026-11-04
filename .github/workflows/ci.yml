@@ -36,6 +36,27 @@ jobs:
       - name: Type-check
         run: bun run typecheck
 
+  python:
+    name: Python (ruff, pytest)
+    runs-on: kyora-8x16
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: python/starfold
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.11.8
+      - run: uv sync --locked
+      - name: Format
+        run: uv run --locked ruff format --check
+      - name: Lint
+        run: uv run --locked ruff check
+      # Unit tests; the Xvfb integration test skips without STARFOLD_BIN.
+      - name: Test
+        run: uv run --locked pytest
+
   rust:
     name: Rust (rustfmt, clippy, test)
     runs-on: kyora-8x16
