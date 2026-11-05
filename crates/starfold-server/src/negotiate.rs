@@ -90,6 +90,8 @@ pub fn format_name(f: BitstreamFormat) -> &'static str {
     match f {
         BitstreamFormat::AnnexB => "annexb",
         BitstreamFormat::Av1LowOverhead => "av1-low-overhead",
+        #[cfg(feature = "libvpx")]
+        BitstreamFormat::Vpx => "vpx",
     }
 }
 
@@ -136,6 +138,8 @@ fn codec_rank(c: Codec) -> u8 {
         Codec::Av1 => 0,
         Codec::Hevc => 1,
         Codec::H264 => 2,
+        #[cfg(feature = "libvpx")]
+        Codec::Vp8 | Codec::Vp9 => 1,
     }
 }
 
@@ -148,6 +152,8 @@ pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
             .eligible(Codec::H264)
             .find(|e| e.acceleration == Acceleration::Hardware)
             .map_or(Backend::OpenH264, |e| e.backend),
+        #[cfg(feature = "sw-arm")]
+        Selection::Arm(..) => Backend::OpenH264,
     };
     reg.check(b, Codec::H264).map(|_| b)
 }
@@ -193,6 +199,25 @@ pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
         });
     }
     v
+}
+
+/// A bench arm's candidates: the arm first, then only the H.264 cohort. Fails if the arm
+/// can't encode here, so a bench run never measures the fallback by mistake.
+#[cfg(feature = "sw-arm")]
+pub fn arm_candidates(
+    backend: Backend,
+    codec: Codec,
+    h264: Vec<Candidate>,
+) -> Result<Vec<Candidate>, String> {
+    crate::encoder::caps::sample_encode(backend, codec)?;
+    let arm = Candidate {
+        codec,
+        backend,
+        hardware: false,
+    };
+    Ok(std::iter::once(arm)
+        .chain(h264.into_iter().filter(|c| c.codec == Codec::H264))
+        .collect())
 }
 
 /// Each codec's first candidate, as the startup log and /stats name it.

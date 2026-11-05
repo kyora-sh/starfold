@@ -73,6 +73,8 @@ fn codec_string(c: Codec, high: bool, level: u32) -> String {
         Codec::H264 => format!("avc1.42c0{level:02x}"),
         Codec::Hevc => format!("hvc1.1.6.L{level}.B0"),
         Codec::Av1 => format!("av01.0.{level:02}M.08"),
+        #[cfg(feature = "libvpx")]
+        Codec::Vp8 | Codec::Vp9 => unreachable!("no bench arm in these tests"),
     }
 }
 

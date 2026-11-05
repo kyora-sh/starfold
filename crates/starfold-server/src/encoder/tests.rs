@@ -1,6 +1,9 @@
 use super::h264::{nal_type, nal_units, ParamSets, NAL_IDR, NAL_PPS, NAL_SPS};
 use super::*;
 
+#[cfg(feature = "sw-arm")]
+mod arms;
+
 fn backends() -> Vec<Backend> {
     vec![
         Backend::OpenH264,

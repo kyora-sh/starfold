@@ -167,7 +167,7 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    if encoder.name() != "x264" {
+    if encoder.name() != "x264" && !selection.is_arm() {
         for flag in ["preset", "paintover-crf"]
             .iter()
             .filter(|f| a.contains_key(**f))
@@ -270,6 +270,13 @@ async fn serve(a: HashMap<String, String>) {
         if !candidates.contains(&fallback) {
             candidates.push(fallback);
         }
+    }
+    #[cfg(feature = "sw-arm")]
+    if let encoder::Selection::Arm(name, backend, codec) = selection {
+        candidates = negotiate::arm_candidates(backend, codec, candidates).unwrap_or_else(|e| {
+            log::error!("--encoder {name}: {e}");
+            std::process::exit(2);
+        });
     }
     for c in negotiate::chosen(&candidates) {
         log::info!(

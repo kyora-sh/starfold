@@ -17,6 +17,8 @@ mod tests;
 mod vaapi;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
+#[cfg(feature = "libvpx")]
+mod vpx;
 #[cfg(feature = "x264")]
 mod x264;
 
@@ -26,12 +28,18 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    #[cfg(feature = "libvpx")]
+    Vp8,
+    #[cfg(feature = "libvpx")]
+    Vp9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitstreamFormat {
     AnnexB,
     Av1LowOverhead,
+    #[cfg(feature = "libvpx")]
+    Vpx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +177,8 @@ pub enum Backend {
     OpenH264,
     #[cfg(feature = "x264")]
     X264,
+    #[cfg(feature = "libvpx")]
+    Libvpx,
     VideoToolbox,
     Vaapi,
     Nvenc,
@@ -207,6 +217,8 @@ impl Backend {
             Backend::OpenH264 => "openh264",
             #[cfg(feature = "x264")]
             Backend::X264 => "x264",
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => "libvpx",
             Backend::VideoToolbox => "videotoolbox",
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
@@ -220,6 +232,8 @@ impl Backend {
             Backend::OpenH264 => codec == Codec::H264,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => matches!(codec, Codec::Vp8 | Codec::Vp9),
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
@@ -233,6 +247,8 @@ impl Backend {
             Backend::OpenH264 => Some(openh264::MAX_MBS),
             #[cfg(feature = "x264")]
             Backend::X264 => None,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(openh264::MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
@@ -245,6 +261,8 @@ impl Backend {
             Backend::OpenH264 => 16,
             #[cfg(feature = "x264")]
             Backend::X264 => 2,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => 16,
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
@@ -262,20 +280,46 @@ impl Backend {
 pub enum Selection {
     Auto,
     Pinned(Backend),
+    /// A bench arm: this encoder, with the OpenH264 cohort beside it.
+    #[cfg(feature = "sw-arm")]
+    Arm(&'static str, Backend, Codec),
 }
+
+/// The `--encoder` names of this build's bench arms.
+#[cfg(feature = "sw-arm")]
+pub const ARMS: &[(&str, Backend, Codec)] = &[
+    #[cfg(feature = "libvpx")]
+    ("libvpx-vp8", Backend::Libvpx, Codec::Vp8),
+    #[cfg(feature = "libvpx")]
+    ("libvpx-vp9", Backend::Libvpx, Codec::Vp9),
+];
 
 impl Selection {
     pub fn parse(s: &str) -> Result<Self, String> {
+        #[cfg(feature = "sw-arm")]
+        if let Some(&(name, backend, codec)) = ARMS.iter().find(|a| a.0 == s) {
+            return Ok(Selection::Arm(name, backend, codec));
+        }
         match s {
             "auto" => Ok(Selection::Auto),
             _ => Backend::parse(s).map(Selection::Pinned),
         }
     }
 
+    pub fn is_arm(self) -> bool {
+        #[cfg(feature = "sw-arm")]
+        if matches!(self, Selection::Arm(..)) {
+            return true;
+        }
+        false
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Selection::Auto => "auto",
             Selection::Pinned(b) => b.name(),
+            #[cfg(feature = "sw-arm")]
+            Selection::Arm(name, ..) => name,
         }
     }
 }
@@ -291,7 +335,7 @@ pub struct EncoderConfig {
     pub rate: RateConfig,
     /// OpenH264's lowest QP: its bitrate mode otherwise spends the whole cap.
     pub best_quality: f32,
-    /// x264's preset.
+    /// x264's preset; a bench arm's preset or speed.
     pub preset: String,
 }
 
@@ -331,6 +375,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
+        #[cfg(feature = "libvpx")]
+        Backend::Libvpx => Box::new(vpx::Vpx::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),

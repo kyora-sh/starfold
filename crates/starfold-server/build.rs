@@ -58,9 +58,47 @@ fn nasm_check() {
     println!("cargo:rerun-if-env-changed=NASM");
 }
 
+/// The bench's software encoders this build has: linked, with their bindings in OUT_DIR.
+#[cfg(feature = "sw-arm")]
+fn arm_libs() -> Vec<pkg_config::Library> {
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let arms = [
+        (
+            cfg!(feature = "libvpx"),
+            "vpx",
+            "#include <vpx/vpx_encoder.h>\n#include <vpx/vp8cx.h>\nstatic const int STARFOLD_VPX_ABI = VPX_ENCODER_ABI_VERSION;\n",
+            "(vpx|vp8|vp9|VPX|VP8|VP9|STARFOLD).*",
+        ),
+    ];
+    arms.into_iter()
+        .filter(|a| a.0)
+        .map(|(_, name, header, allow)| {
+            let lib = pkg_config::probe_library(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut b = bindgen::Builder::default()
+                .header_contents("wrap.h", header)
+                .allowlist_function(allow)
+                .allowlist_type(allow)
+                .allowlist_var(allow)
+                .layout_tests(false);
+            for p in &lib.include_paths {
+                b = b.clang_arg(format!("-I{}", p.display()));
+            }
+            let code = b.generate().expect("bindgen").to_string();
+            std::fs::write(out.join(format!("{name}.rs")), code).unwrap();
+            lib
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "sw-arm"))]
+fn arm_libs() -> Vec<pkg_config::Library> {
+    Vec::new()
+}
+
 /// x264 (with the feature), libyuv, Opus and PulseAudio from pkg-config.
 fn unix_libs(target: &str) -> X264 {
     let x264 = cfg!(feature = "x264").then(|| pkg_config::probe_library("x264").expect("x264"));
+    let arms = arm_libs();
     // macOS captures NV12 (no libyuv) and gets audio from ScreenCaptureKit (no PulseAudio).
     let libs: &[&str] = if target == "macos" {
         &["opus"]
@@ -84,6 +122,7 @@ fn unix_libs(target: &str) -> X264 {
     let dirs: Vec<_> = x264
         .iter()
         .chain(others.iter())
+        .chain(arms.iter())
         .flat_map(|lib| &lib.link_paths)
         .collect();
     for p in &dirs {
@@ -98,6 +137,9 @@ fn unix_libs(target: &str) -> X264 {
 /// plus `x264` for the feature; triplet from VCPKGRS_TRIPLET, e.g. x64-windows-static-md
 /// for a self-contained starfold.exe). Capture, audio and input use system DLLs.
 fn windows_libs() -> X264 {
+    if cfg!(feature = "sw-arm") {
+        panic!("the bench's software encoders build on Linux and macOS only");
+    }
     let x264 = cfg!(feature = "x264").then(|| {
         vcpkg::Config::new()
             .find_package("x264")
