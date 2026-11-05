@@ -910,14 +910,15 @@ fn a_tight_budget_takes_a_smaller_step() {
     };
     let s = openh264::Sharpness::new(24);
     assert_eq!(s.pick(refine(20, 200_000)), Some(20));
-    assert_eq!(s.pick(refine(20, 90_000)), Some(22));
-    assert_eq!(s.pick(refine(20, 41_000)), Some(23));
-    assert_eq!(s.pick(refine(20, 40_000)), None);
+    assert_eq!(s.pick(refine(20, 82_000)), Some(20));
+    assert_eq!(s.pick(refine(20, 45_000)), Some(22));
+    assert_eq!(s.pick(refine(20, 21_000)), Some(23));
+    assert_eq!(s.pick(refine(20, 20_000)), None);
     assert_eq!(s.pick(refine(24, 200_000)), None);
     // A coarse picture sharpens far further for the same bytes.
     assert_eq!(
         openh264::Sharpness::new(48).pick(refine(20, 50_000)),
-        Some(44)
+        Some(41)
     );
     let mut s = openh264::Sharpness::new(24);
     s.off = true;
@@ -933,8 +934,8 @@ fn the_estimate_learns_from_what_frames_cost() {
         mbs,
     };
     let mut s = openh264::Sharpness::new(24);
-    assert_eq!(s.pick(budget(20_000)), Some(20));
-    // Four times what was expected counts at once.
+    assert_eq!(s.pick(budget(10_000)), Some(20));
+    // More than expected counts at once.
     s.refined(20, mbs, 80_000);
     assert_eq!(s.pick(budget(20_000)), Some(19));
     // Cheaper than expected mostly replaces it; next to nothing doesn't count.
@@ -952,12 +953,27 @@ fn the_estimate_learns_from_what_frames_cost() {
     for _ in 0..8 {
         s.skipped();
     }
-    assert_eq!(s.pick(budget(6_000)), Some(28));
+    assert_eq!(s.pick(budget(6_000)), Some(27));
     // A skip needn't lower an estimate that was already low.
     let mut s = openh264::Sharpness::new(24);
     s.skipped();
-    assert_eq!(s.pick(budget(5_000)), Some(23));
-    assert_eq!(s.pick(budget(4_999)), None);
+    assert_eq!(s.pick(budget(2_500)), Some(23));
+    assert_eq!(s.pick(budget(2_499)), None);
+}
+
+#[test]
+fn the_picture_follows_recent_motion_not_its_worst_frame() {
+    let mut s = openh264::Sharpness::new(12);
+    s.moved(24);
+    assert_eq!(s.qp, 24, "coarser counts at once");
+    s.moved(51);
+    assert_eq!(s.qp, 51);
+    s.moved(35);
+    assert_eq!(s.qp, 47);
+    for _ in 0..20 {
+        s.moved(35);
+    }
+    assert_eq!(s.qp, 35, "settles on what motion is doing now");
 }
 
 /// Thousands of rate-control switches against the same motion without them, in a long mix

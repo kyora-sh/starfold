@@ -18,8 +18,9 @@ pub const MAX_MBS: usize = 36864;
 const MAX_FPS: u32 = 60;
 /// What an uncapped rate (`max_kbps` 0) becomes: level 5.2's bitrate.
 const UNCAPPED_BPS: c_int = 240_000_000;
-/// What one QP step costs per macroblock on dense text, until a frame says otherwise.
-const REFINE_COST: f64 = 5.0;
+/// What one QP step costs per macroblock, until a frame says otherwise: desktop text is
+/// 1.3 to 2, a screen packed with it 5.
+const REFINE_COST: f64 = 2.5;
 const REFINE_COST_RANGE: (f64, f64) = (1.0, 15.0);
 /// Frames sent at a fixed QP so far, and their bytes.
 pub static REFINED_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -28,7 +29,7 @@ pub static REFINED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// How coarse the picture still is, and what sharpening it costs. A QP step costs the same
 /// below 28 and less and less above it, down to almost nothing at 51 (1080p text, measured).
 pub(super) struct Sharpness {
-    qp: i32,
+    pub(super) qp: i32,
     cost: f64,
     pub(super) off: bool,
 }
@@ -42,8 +43,14 @@ impl Sharpness {
         }
     }
 
+    /// Coarser at once, finer slowly: rate control swings frame to frame and one spike at
+    /// the top says little about the picture, while what moved last is at least this coarse.
     pub(super) fn moved(&mut self, qp: i32) {
-        self.qp = self.qp.max(qp);
+        self.qp = if qp >= self.qp {
+            qp
+        } else {
+            (self.qp * 3 + qp) / 4
+        };
     }
 
     /// QP steps from where the picture stands to `qp`, in steps of `cost`.
