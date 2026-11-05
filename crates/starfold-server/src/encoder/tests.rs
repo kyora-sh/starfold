@@ -101,6 +101,7 @@ fn encode_one(
             pts_ms,
             force_keyframe,
             static_mbs: None,
+            refine: None,
         },
     )
     .unwrap()
@@ -690,6 +691,7 @@ fn cpu_per_stream() {
                         pts_ms: f as i64 * 1000 / fps as i64,
                         force_keyframe: f == 0,
                         static_mbs: Some(&mut hints),
+                        refine: None,
                     },
                 )
                 .unwrap();
@@ -710,6 +712,282 @@ fn cpu_per_stream() {
             bytes as f64 * 8.0 / secs / 1000.0,
             pct(0.5),
             pct(0.95)
+        );
+    }
+}
+
+fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
+    let se: u64 = (0..p.h)
+        .flat_map(|r| (0..p.w).map(move |c| (r, c)))
+        .map(|(r, c)| (a[r * stride + c] as i64 - p.y[r * p.w + c] as i64).pow(2) as u64)
+        .sum();
+    match se {
+        0 => 99.0,
+        _ => 10.0 * (255.0f64 * 255.0 * (p.w * p.h) as f64 / se as f64).log10(),
+    }
+}
+
+/// An OpenH264 stream decoded as it goes: scrolled text, then whatever the test does.
+struct Refining {
+    enc: Box<dyn VideoEncoder>,
+    dec: ::openh264::decoder::Decoder,
+    pic: Picture,
+    pts: i64,
+    scrolled: usize,
+    last_psnr: f64,
+}
+
+impl Refining {
+    fn new(threads: u32, fps: u32) -> Self {
+        let (w, h) = (640, 480);
+        let mut cfg = config(Backend::OpenH264, w, h, 8000);
+        cfg.threads = threads;
+        cfg.fps = fps;
+        cfg.best_quality = 24.0;
+        let mut me = Refining {
+            enc: open(&cfg).unwrap(),
+            dec: ::openh264::decoder::Decoder::new().unwrap(),
+            pic: Picture::new(w as usize, h as usize),
+            pts: 0,
+            scrolled: 0,
+            last_psnr: 0.0,
+        };
+        me.step(true, None);
+        me
+    }
+
+    /// Bytes and whether it was a keyframe; a frame that doesn't come out is 0 bytes.
+    fn step(&mut self, force_keyframe: bool, refine: Option<Refine>) -> (usize, bool) {
+        use ::openh264::formats::YUVSource;
+        self.pts += 33;
+        let aus = self
+            .enc
+            .encode(
+                &self.pic.view(),
+                EncodeOptions {
+                    pts_ms: self.pts,
+                    force_keyframe,
+                    static_mbs: None,
+                    refine,
+                },
+            )
+            .unwrap();
+        let (mut n, mut key) = (0, false);
+        for au in &aus {
+            n += au.data.len();
+            key |= au.keyframe;
+            if let Some(d) = self.dec.decode(&au.data).unwrap() {
+                self.last_psnr = luma_psnr(d.y(), d.strides().0, &self.pic);
+            }
+        }
+        (n, key)
+    }
+
+    fn scroll(&mut self, frames: usize) -> usize {
+        let (w, h) = (self.pic.w, self.pic.h);
+        (0..frames)
+            .map(|_| {
+                self.scrolled += 12;
+                self.pic.texture(0, 0, 0, w, h, self.scrolled);
+                let (n, key) = self.step(false, None);
+                assert!(!key, "motion got an IDR");
+                n
+            })
+            .sum()
+    }
+
+    fn mbs(&self) -> usize {
+        self.pic.w.div_ceil(16) * self.pic.h.div_ceil(16)
+    }
+
+    fn pass(&mut self, qp: u8, max_bytes: Option<usize>) -> (usize, bool) {
+        let mbs = self.mbs();
+        self.step(false, Some(Refine { qp, max_bytes, mbs }))
+    }
+}
+
+#[test]
+fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
+    for (threads, fps) in [(1, 30), (4, 30), (1, 120), (4, 120)] {
+        let mut s = Refining::new(threads, fps);
+        s.scroll(30);
+        let motion = s.last_psnr;
+        s.enc.set_rate(RateConfig::new(24.0, 3000, fps)).unwrap();
+        let mut prev = motion;
+        for qp in [20, 16, 12] {
+            let (n, key) = s.pass(qp, None);
+            assert!(
+                n > 0 && !key,
+                "t{threads} f{fps} qp {qp}: {n} bytes, key {key}"
+            );
+            assert!(
+                s.last_psnr > prev,
+                "t{threads} f{fps} qp {qp}: {} after {prev}",
+                s.last_psnr
+            );
+            prev = s.last_psnr;
+        }
+        assert!(prev > motion + 3.0, "t{threads} f{fps}: {motion} -> {prev}");
+        s.scroll(5);
+    }
+}
+
+#[test]
+fn refining_leaves_rate_control_where_it_was() {
+    let mut plain = Refining::new(1, 30);
+    let mut refined = Refining::new(1, 30);
+    plain.scroll(30);
+    refined.scroll(30);
+    for _ in 0..3 {
+        plain.step(false, None);
+    }
+    for qp in [20, 16, 12] {
+        refined.pass(qp, None);
+    }
+    // The sharper reference costs a little for a moment; what matters is where it settles.
+    plain.scroll(10);
+    refined.scroll(10);
+    let (a, b) = (plain.scroll(110) as f64, refined.scroll(110) as f64);
+    assert!((b / a - 1.0).abs() < 0.03, "motion after: {a} vs {b} bytes");
+}
+
+#[test]
+fn a_refining_pass_with_nothing_to_gain_sends_nothing() {
+    let mut s = Refining::new(1, 30);
+    s.scroll(5);
+    assert!(s.pass(12, None).0 > 0);
+    let before = s.last_psnr;
+    assert_eq!(s.pass(16, None).0, 0);
+    assert_eq!(s.pass(12, None).0, 0);
+    assert_eq!(s.last_psnr, before);
+}
+
+#[test]
+fn a_keyframe_stays_under_rate_control() {
+    let mut s = Refining::new(1, 30);
+    s.scroll(5);
+    let mbs = s.mbs();
+    let refine = Refine {
+        qp: 12,
+        max_bytes: None,
+        mbs,
+    };
+    let (plain, key) = s.step(true, None);
+    assert!(key);
+    let (with, key) = s.step(true, Some(refine));
+    assert!(key);
+    assert!(with < plain * 2, "IDR at the pass's QP: {with} vs {plain}");
+}
+
+#[test]
+fn a_tight_budget_takes_a_smaller_step() {
+    let mbs = 8160;
+    let refine = |qp, max_bytes| Refine {
+        qp,
+        max_bytes: Some(max_bytes),
+        mbs,
+    };
+    let s = openh264::Sharpness::new(24);
+    assert_eq!(s.pick(refine(20, 200_000)), Some(20));
+    assert_eq!(s.pick(refine(20, 90_000)), Some(22));
+    assert_eq!(s.pick(refine(20, 41_000)), Some(23));
+    assert_eq!(s.pick(refine(20, 40_000)), None);
+    assert_eq!(s.pick(refine(24, 200_000)), None);
+}
+
+#[test]
+fn the_estimate_learns_from_what_frames_cost() {
+    let mbs = 1000;
+    let budget = |max_bytes| Refine {
+        qp: 12,
+        max_bytes: Some(max_bytes),
+        mbs,
+    };
+    let mut s = openh264::Sharpness::new(24);
+    assert_eq!(s.pick(budget(20_000)), Some(20));
+    // Four times what was expected counts at once.
+    s.refined(20, mbs, 80_000);
+    assert_eq!(s.pick(budget(20_000)), Some(19));
+    // Cheaper than expected counts by half.
+    s.refined(19, mbs, 1_000);
+    assert_eq!(s.pick(budget(20_000)), Some(17));
+    // Motion puts the picture back where it was.
+    s.moved(30);
+    assert_eq!(s.pick(budget(1_000)), None);
+    assert_eq!(s.pick(budget(1_000_000)), Some(12));
+    // A stuck estimate comes back down.
+    s.refined(29, mbs, 1_000_000);
+    assert_eq!(s.pick(budget(6_000)), None);
+    for _ in 0..8 {
+        s.skipped();
+    }
+    assert_eq!(s.pick(budget(6_000)), Some(28));
+    // A skip needn't lower an estimate that was already low.
+    let mut s = openh264::Sharpness::new(24);
+    s.skipped();
+    assert_eq!(s.pick(budget(5_000)), Some(23));
+    assert_eq!(s.pick(budget(4_999)), None);
+}
+
+/// Thousands of rate-control switches against the same motion without them, in a long mix
+/// of scrolling, typing and video: `SOAK_FRAMES` frames at each cap, decoded throughout.
+#[test]
+#[ignore]
+fn refine_soak() {
+    let frames: usize = std::env::var("SOAK_FRAMES").map_or(60_000, |v| v.parse().unwrap());
+    const SEGMENT: usize = 24;
+    let window = frames / 4 / SEGMENT * SEGMENT;
+    for kbps in [8000, 2000] {
+        let run = |ladder: bool| {
+            let mut s = Refining::new(1, 30);
+            s.enc.set_rate(RateConfig::new(24.0, kbps, 30)).unwrap();
+            let (w, h) = (s.pic.w, s.pic.h);
+            let (mut bytes, mut passes, mut pass_bytes) = (vec![0usize; 4], 0usize, 0usize);
+            for f in 0..window * 4 {
+                match (f / SEGMENT) % 4 {
+                    0 | 3 => {
+                        s.scrolled += 12;
+                        s.pic.texture(0, 0, 0, w, h, s.scrolled);
+                    }
+                    1 => s.pic.texture(f as u32, 40, 40, 200, 56, 0),
+                    _ => s.pic.video(f),
+                }
+                let (n, key) = s.step(false, None);
+                assert!(!key, "motion got an IDR at {f}");
+                bytes[f / window] += n;
+                if ladder && f % SEGMENT == SEGMENT - 1 {
+                    for qp in [20, 16, 12] {
+                        let max = Some(kbps as usize * 200 / 8);
+                        let (n, key) = s.pass(qp, max);
+                        assert!(!key, "a pass got an IDR at {f}");
+                        passes += (n > 0) as usize;
+                        pass_bytes += n;
+                    }
+                }
+            }
+            (bytes, passes, pass_bytes)
+        };
+        let (base, _, _) = run(false);
+        let (with, passes, pass_bytes) = run(true);
+        let per_s = |b: usize| b as f64 * 8.0 / 1000.0 / (window as f64 / 30.0);
+        for q in 0..4 {
+            let ratio = with[q] as f64 / base[q] as f64;
+            println!(
+                "soak {kbps} kbps quarter {q}: motion {:.0} kbps, with switches {:.0} kbps, ratio {ratio:.3}",
+                per_s(base[q]),
+                per_s(with[q])
+            );
+            assert!(per_s(with[q]) < kbps as f64 * 1.1, "over the cap");
+        }
+        println!(
+            "soak {kbps} kbps: {passes} fixed-QP frames, {} KB",
+            pass_bytes / 1024
+        );
+        let r: Vec<f64> = (0..4).map(|q| with[q] as f64 / base[q] as f64).collect();
+        assert!(passes >= 1000);
+        assert!(
+            (r[3] / r[0] - 1.0).abs() < 0.05,
+            "motion bytes drift: {r:?}"
         );
     }
 }

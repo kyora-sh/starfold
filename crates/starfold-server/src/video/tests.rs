@@ -65,7 +65,11 @@ struct Fake {
     /// Counts this encoder's requested keyframes: (all, at the keyframe budget).
     keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
     kbps: u32,
+    /// Every encode's refine option and the rate it ran at.
+    refines: Option<Refines>,
 }
+
+type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
 
 fn codec_string(c: Codec, high: bool, level: u32) -> String {
     match c {
@@ -91,6 +95,9 @@ impl VideoEncoder for Fake {
             g.wait();
         }
         self.n += 1;
+        if let Some(r) = &self.refines {
+            r.lock().unwrap().push((opts.refine, self.kbps));
+        }
         if let (Some(k), true) = (&self.keys, opts.force_keyframe) {
             k.0.fetch_add(1, Ordering::Relaxed);
             if self.kbps >= 16_000 {
@@ -152,6 +159,7 @@ struct Opts {
     /// Hardware H.264 cohorts' encoders fail from their 3rd picture on, and so do
     /// reopened ones.
     h264_hw_breaks: bool,
+    refines: Option<Refines>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -179,6 +187,7 @@ fn fakes(o: Opts) -> Open {
                 gate: None,
                 keys: None,
                 kbps: 0,
+                refines: o.refines.clone(),
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -217,6 +226,7 @@ fn fakes(o: Opts) -> Open {
             gate: o.gate.clone().filter(|_| hevc),
             keys: o.h264_keys.clone().filter(|_| !hevc && h264 == 1),
             kbps: 0,
+            refines: o.refines.clone().filter(|_| !hevc),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -281,6 +291,7 @@ fn whole(w: u32, h: u32) -> Frame {
         buf: Arc::new(I420::new(w as usize, h as usize)),
         paintover: false,
         paintover_final: false,
+        refine_qp: None,
         band: Some(Band { y0: 0, y1: h }),
         mb_dirty: None,
         captured_at: Instant::now(),
@@ -1205,6 +1216,7 @@ fn skipped_damage_is_caught_up() {
         buf: Arc::new(I420::new(32, 32)),
         paintover: false,
         paintover_final: false,
+        refine_qp: None,
         band,
         mb_dirty: mb.map(Arc::new),
         captured_at: Instant::now(),
@@ -1346,4 +1358,151 @@ fn videotoolbox_hevc_negotiated() {
         "hevc negotiated: {s} from videotoolbox, {} frames, first NAL types {types:?}",
         got.len()
     );
+}
+
+fn burst() -> Burst {
+    Burst::new(3, Duration::ZERO)
+}
+
+#[test]
+fn motion_stopping_refines_once_then_goes_quiet() {
+    let mut b = burst();
+    assert!(!b.due(), "nothing to refine before any motion");
+    b.moved();
+    let mut qps = Vec::new();
+    while b.due() {
+        qps.push(b.pass());
+    }
+    assert_eq!(qps, [20, 16, 12]);
+    assert!(!b.due());
+}
+
+#[test]
+fn a_burst_waits_for_the_picture_to_stay_still() {
+    let mut b = Burst::new(3, Duration::from_secs(60));
+    b.moved();
+    assert!(!b.due());
+}
+
+#[test]
+fn new_damage_cancels_the_rest_and_starts_over() {
+    let mut b = burst();
+    b.moved();
+    assert_eq!(b.pass(), 20);
+    b.moved();
+    assert_eq!(b.pass(), 20, "the finer rungs are gone");
+    assert_eq!(b.pass(), 16);
+    assert_eq!(b.pass(), 12);
+    assert!(!b.due());
+}
+
+#[test]
+fn any_burst_length_ends_at_the_finest_rung() {
+    let qps = |n| {
+        let mut b = Burst::new(n, Duration::ZERO);
+        b.moved();
+        std::iter::from_fn(|| b.due().then(|| b.pass())).collect::<Vec<_>>()
+    };
+    assert_eq!(qps(0), [] as [u8; 0]);
+    assert_eq!(qps(1), [12]);
+    assert_eq!(qps(2), [16, 12]);
+    assert_eq!(qps(5), [20, 20, 20, 16, 12]);
+}
+
+/// A cursor blinks: damage, a still moment, damage. Each blink refines only its own
+/// blocks, a burst at most, then nothing is pending until the next one.
+#[test]
+fn a_blinking_cursor_does_not_storm() {
+    let mut b = burst();
+    let mut r = Refiner::new(100, 10);
+    r.clear_all();
+    let mut passes = 0;
+    for _ in 0..10 {
+        let mut dirty = vec![0u8; 100];
+        dirty[42] = 1;
+        r.mark(&dirty);
+        b.moved();
+        while b.due() {
+            let Some((map, band)) = r.pending_map() else {
+                b.stop();
+                break;
+            };
+            assert_eq!(map.iter().filter(|&&m| m != 0).count(), 1);
+            assert_eq!((band.y0, band.y1), (64, 80));
+            b.pass();
+            passes += 1;
+            if b.left == 0 {
+                r.clear_all();
+            }
+        }
+        assert!(r.pending_map().is_none());
+    }
+    assert_eq!(passes, 30);
+}
+
+#[test]
+fn a_constantly_changing_region_gets_no_burst() {
+    let mut b = Burst::new(3, Duration::from_millis(50));
+    for _ in 0..5 {
+        b.moved();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!b.due());
+    }
+}
+
+fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let cands = [cand];
+    let mut eng = engine(
+        &hub,
+        &cands,
+        Opts {
+            refines: Some(seen.clone()),
+            ..Default::default()
+        },
+    );
+    let (c, _rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    seen.lock().unwrap().clear();
+    eng.replan();
+    let views = eng.views();
+    eng.update_rates(&views);
+    let takes = eng.takes(&views, 33.0);
+    let mut f = whole(W, H);
+    f.paintover = true;
+    f.refine_qp = Some(16);
+    eng.dispatch(&f, &views, &takes);
+    settle(&eng);
+    let got = seen.lock().unwrap().clone();
+    got
+}
+
+#[test]
+fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
+    let seen = refines_through(H264);
+    let (refine, kbps) = seen.last().copied().unwrap();
+    let start = START_KBPS as usize;
+    assert_eq!(
+        refine,
+        Some(Refine {
+            qp: 16,
+            max_bytes: Some(start * REFINE_FRAME_MS / 8),
+            mbs: (W as usize).div_ceil(16) * (H as usize).div_ceil(16),
+        })
+    );
+    assert_ne!(
+        kbps,
+        stripe_share(START_KBPS as u32, 1) * 2,
+        "paint-over rate applied"
+    );
+}
+
+#[test]
+fn a_pass_stays_a_rate_change_for_other_encoders() {
+    let seen = refines_through(H264_HW);
+    let (refine, kbps) = seen.last().copied().unwrap();
+    assert_eq!(refine, None);
+    assert_eq!(kbps, stripe_share(START_KBPS as u32, 1) * 2);
 }

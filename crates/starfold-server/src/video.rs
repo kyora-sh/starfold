@@ -8,8 +8,8 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{
-    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, StreamConfig,
-    VideoEncoder,
+    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, Refine,
+    StreamConfig, VideoEncoder,
 };
 use crate::hub::wait_any;
 use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto};
@@ -54,6 +54,8 @@ struct Frame {
     paintover: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
+    /// The QP a backend that refines by QP aims for: only once motion has stopped.
+    refine_qp: Option<u8>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -1257,6 +1259,47 @@ struct Refiner {
     cols: usize,
 }
 
+/// The paint-over after motion: a few passes once the picture has been still for a moment,
+/// none while it keeps changing. New damage starts them over.
+struct Burst {
+    len: u32,
+    delay: Duration,
+    left: u32,
+    last_motion: Instant,
+}
+
+/// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
+const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+/// The most of the bitrate cap one refining frame may take; the viewer waits for it.
+const REFINE_FRAME_MS: usize = 200;
+
+impl Burst {
+    fn new(len: u32, delay: Duration) -> Self {
+        Burst {
+            len,
+            delay,
+            left: 0,
+            last_motion: Instant::now(),
+        }
+    }
+    fn moved(&mut self) {
+        self.left = self.len;
+        self.last_motion = Instant::now();
+    }
+    fn due(&self) -> bool {
+        self.left > 0 && self.last_motion.elapsed() >= self.delay
+    }
+    fn stop(&mut self) {
+        self.left = 0;
+    }
+    /// Takes a pass; the last ones get the rungs, so any burst length ends at the finest.
+    fn pass(&mut self) -> u8 {
+        self.left -= 1;
+        let last = REFINE_RUNGS.len() - 1;
+        REFINE_RUNGS[last.saturating_sub(self.left as usize)]
+    }
+}
+
 const REFINE_STILL_MS: u32 = 300;
 const REFINE_EVERY: Duration = Duration::from_millis(250);
 
@@ -1368,8 +1411,10 @@ fn capture_loop(
     let min_interval = interval.mul_f64(0.85);
     let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
-    let mut last_motion = Instant::now();
-    let mut paintover_left = 0u32;
+    let mut burst = Burst::new(
+        cfg.paintover_burst,
+        Duration::from_millis(cfg.paintover_delay_ms),
+    );
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -1421,15 +1466,16 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        let mut paintover_due = paintover_left > 0
-            && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
+        let mut paintover_due = burst.due();
         let catch_up = eng.catch_up_due(&views, interval_ms);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
-            let timeout = if paintover_left == 0 {
+            let timeout = if burst.left == 0 {
                 100
             } else {
-                cfg.paintover_delay_ms
-                    .saturating_sub(last_motion.elapsed().as_millis() as u64) as i32
+                burst
+                    .delay
+                    .saturating_sub(burst.last_motion.elapsed())
+                    .as_millis() as i32
                     + 1
             };
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
@@ -1510,7 +1556,7 @@ fn capture_loop(
             match refiner.pending_map() {
                 Some(m) => Some(m),
                 None => {
-                    paintover_left = 0;
+                    burst.stop();
                     if !catch_up {
                         continue;
                     }
@@ -1534,14 +1580,14 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         let mut refine = None;
+        let mut refine_qp = None;
         let paintover = if is_motion {
-            last_motion = Instant::now();
-            paintover_left = cfg.paintover_burst;
+            burst.moved();
             // Piggyback sharpening of blocks that have gone still on this frame.
             refine = if want_key { None } else { refiner.due() };
             refine.is_some()
         } else if paintover_due {
-            paintover_left -= 1;
+            refine_qp = Some(burst.pass());
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1550,9 +1596,11 @@ fn capture_loop(
         if want_key {
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
+            burst.moved();
         }
         let frame_paintover = paintover && refine.is_none();
-        if frame_paintover && paintover_left == 0 {
+        let paintover_final = frame_paintover && burst.left == 0;
+        if paintover_final {
             refiner.clear_all();
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
@@ -1585,7 +1633,8 @@ fn capture_loop(
             &Frame {
                 buf,
                 paintover,
-                paintover_final: frame_paintover && paintover_left == 0,
+                paintover_final,
+                refine_qp,
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
@@ -1649,6 +1698,8 @@ struct StripeJob {
     boost: bool,
     crf: f32,
     cap: u32,
+    /// The pass's QP, and what its frame may cost.
+    refine: Option<(u8, Option<usize>)>,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -1762,7 +1813,13 @@ fn stripe_worker(
     };
     while let Ok(job) = rx.recv() {
         let buf = &*job.buf;
-        let rate = if job.force_idr && job.boost {
+        // A frame at a fixed QP is outside rate control; leave its budget alone.
+        let refine = job
+            .refine
+            .filter(|_| !job.force_idr && s.cfg.backend.refines_by_qp());
+        let rate = if refine.is_some() {
+            None
+        } else if job.force_idr && job.boost {
             s.applied_kbps = None;
             Some(keyframe_rate(job.crf, job.cap, s.cfg.fps))
         } else {
@@ -1791,8 +1848,8 @@ fn stripe_worker(
             stride_uv: suv,
         };
         // Nonzero on unchanged macroblocks of this stripe (x264's X264_MBINFO_CONSTANT).
+        let rows = s.h.div_ceil(16);
         let mut info = job.mb_dirty.as_ref().map(|d| {
-            let rows = s.h.div_ceil(16);
             let start = (s.y / 16) * job.mb_cols;
             d[start..start + rows * job.mb_cols]
                 .iter()
@@ -1805,6 +1862,13 @@ fn stripe_worker(
             EncodeOptions {
                 pts_ms: job.ts,
                 force_keyframe: job.force_idr,
+                refine: refine.map(|(qp, max_bytes)| Refine {
+                    qp,
+                    max_bytes,
+                    mbs: info.as_ref().map_or(rows * job.mb_cols, |m| {
+                        m.iter().filter(|&&c| c == 0).count()
+                    }),
+                }),
                 static_mbs: info.as_deref_mut(),
             },
         );
@@ -1973,6 +2037,10 @@ fn encode_loop(
         // controller reins the total in if several stripes move at once.
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
+        let refine = job.refine_qp.map(|qp| {
+            let bytes = target as usize * REFINE_FRAME_MS / 8 / n;
+            (qp, (!uncapped).then_some(bytes))
+        });
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
@@ -1989,6 +2057,7 @@ fn encode_loop(
                     boost,
                     crf: want_crf,
                     cap,
+                    refine,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
