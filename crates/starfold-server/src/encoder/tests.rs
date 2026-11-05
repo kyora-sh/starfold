@@ -832,6 +832,27 @@ fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
     }
 }
 
+/// The keyframe budget and a stripe's share both go past what the encoder opened with.
+#[test]
+fn refining_works_above_the_rate_the_encoder_opened_with() {
+    let mut s = Refining::new(1, 30);
+    s.enc.set_rate(RateConfig::new(24.0, 64_000, 30)).unwrap();
+    assert!(s.step(true, None).1);
+    let (n, key) = s.pass(20, None);
+    assert!(
+        n > 0 && !key,
+        "right after the boosted keyframe: {n} bytes, key {key}"
+    );
+    s.enc.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
+    s.scroll(5);
+    let (n, key) = s.pass(16, None);
+    assert!(n > 0 && !key, "at a raised cap: {n} bytes, key {key}");
+    s.enc.set_rate(RateConfig::new(24.0, 2_000, 30)).unwrap();
+    s.scroll(5);
+    let (n, key) = s.pass(12, None);
+    assert!(n > 0 && !key, "at a lowered cap: {n} bytes, key {key}");
+}
+
 #[test]
 fn refining_leaves_rate_control_where_it_was() {
     let mut plain = Refining::new(1, 30);
@@ -893,6 +914,9 @@ fn a_tight_budget_takes_a_smaller_step() {
     assert_eq!(s.pick(refine(20, 41_000)), Some(23));
     assert_eq!(s.pick(refine(20, 40_000)), None);
     assert_eq!(s.pick(refine(24, 200_000)), None);
+    let mut s = openh264::Sharpness::new(24);
+    s.off = true;
+    assert_eq!(s.pick(refine(20, 200_000)), None);
 }
 
 #[test]

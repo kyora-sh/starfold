@@ -30,6 +30,7 @@ pub static REFINED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(super) struct Sharpness {
     qp: i32,
     cost: f64,
+    pub(super) off: bool,
 }
 
 impl Sharpness {
@@ -37,6 +38,7 @@ impl Sharpness {
         Sharpness {
             qp,
             cost: REFINE_COST,
+            off: false,
         }
     }
 
@@ -51,6 +53,9 @@ impl Sharpness {
     /// The lowest QP down to the pass's whose frame is expected to fit.
     pub(super) fn pick(&self, r: Refine) -> Option<i32> {
         let want = r.qp as i32;
+        if self.off {
+            return None;
+        }
         match r.max_bytes {
             None => (want < self.qp).then_some(want),
             Some(max) => (want..self.qp).find(|&q| self.expected(r.mbs, q) <= max as f64),
@@ -229,6 +234,9 @@ impl OpenH264 {
     fn fix_qp(&mut self, qp: c_int) -> Result<(), EncodeError> {
         let mut p: sys::SEncParamExt = self.get_option(sys::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT)?;
         p.sSpatialLayers[0].iDLayerQp = qp;
+        // Only the layer's rate follows set_rate; this checks it against the overall one.
+        p.iTargetBitrate = self.bps;
+        p.iMaxBitrate = self.bps;
         self.option(sys::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &mut p)?;
         self.rate_control(sys::RC_OFF_MODE)
     }
@@ -310,7 +318,13 @@ impl VideoEncoder for OpenH264 {
             })?;
         }
         if let Some((qp, _)) = fixed {
-            self.fix_qp(qp)?;
+            // Nothing is lost, the picture just stays as it is: not worth the keyframe a
+            // failed encode costs, again after every burst.
+            if let Err(e) = self.fix_qp(qp) {
+                log::warn!("no more refinement on this stream: {e}");
+                self.sharpness.off = true;
+                return Ok(Vec::new());
+            }
         }
         let encoded = unsafe { self.vt().EncodeFrame.unwrap()(self.enc, &src, &mut *self.info) };
         if fixed.is_some() {
