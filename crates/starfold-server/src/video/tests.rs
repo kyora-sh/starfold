@@ -1258,6 +1258,24 @@ fn a_pass_waits_for_the_last_one_to_arrive() {
         c.ack(None, f.2);
     }
     assert!(eng.drained(&views));
+    let busy = &eng.cohorts[0].shared.busy;
+    busy.fetch_add(1, Ordering::AcqRel);
+    assert!(!eng.drained(&views), "a pass is still being encoded");
+    eng.cohorts[0].shared.busy.fetch_sub(1, Ordering::AcqRel);
+    assert!(eng.drained(&views));
+}
+
+#[test]
+fn a_viewer_that_stopped_answering_holds_back_no_pass() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (c, _rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    let views = eng.views();
+    assert!(!eng.drained(&views));
+    c.inflight.lock().front_mut().unwrap().sent -= Duration::from_millis(REFINE_DRAIN_MS as u64);
+    assert!(eng.drained(&views));
 }
 
 #[test]
@@ -1637,6 +1655,18 @@ fn an_uncapped_stream_has_no_byte_budget() {
     let now = Instant::now();
     let mut b = Burst::new(3, NO_DELAY, now);
     b.account(now, 0, u32::MAX as u64);
+    b.moved(now);
+    assert!(b.due(now));
+}
+
+#[test]
+fn what_an_uncapped_stream_spent_is_no_debt_under_a_cap() {
+    let now = Instant::now();
+    let mut b = Burst::new(3, NO_DELAY, now);
+    b.account(now, 0, 0);
+    b.account(now, 0, 1_000_000);
+    b.account(now, 0, 2_000_000);
+    b.account(now, 2000, 2_000_000);
     b.moved(now);
     assert!(b.due(now));
 }

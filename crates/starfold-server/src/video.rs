@@ -959,12 +959,16 @@ impl Engine {
             .collect()
     }
 
-    /// Whether every viewer has everything it was sent.
+    /// Whether what was encoded so far has reached the viewers. One that hasn't answered
+    /// for a while holds back nobody: flow control deals with it.
     fn drained(&self, views: &[View]) -> bool {
-        views
+        self.cohorts
             .iter()
-            .flat_map(|v| &v.clients)
-            .all(|c| c.backlog().0 == 0)
+            .all(|c| c.shared.busy.load(Ordering::Acquire) == 0)
+            && views.iter().flat_map(|v| &v.clients).all(|c| {
+                let (n, age) = c.backlog();
+                n == 0 || age >= REFINE_DRAIN_MS
+            })
     }
 
     /// Whether a keyframe is owed by a cohort that isn't failing: one that is retries
@@ -1312,6 +1316,8 @@ const REFINE_QUIET: Duration = Duration::from_secs(5);
 /// ladder after a single stop, even on a thin link.
 const REFINE_SHARE: f64 = 0.10;
 const REFINE_WINDOW_S: f64 = 10.0;
+/// The longest a pass waits for the last one to arrive.
+const REFINE_DRAIN_MS: u128 = 1000;
 
 impl Burst {
     fn new(len: u32, delay: Duration, now: Instant) -> Self {
@@ -1337,8 +1343,11 @@ impl Burst {
     fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
         let rate = target_kbps as f64 * 1000.0 / 8.0 * REFINE_SHARE;
         let dt = now.saturating_duration_since(self.refilled).as_secs_f64();
-        self.tokens = (self.tokens + dt * rate - spent.saturating_sub(self.spent) as f64)
-            .min(rate * REFINE_WINDOW_S);
+        self.tokens = match target_kbps {
+            0 => f64::INFINITY,
+            _ => (self.tokens + dt * rate - spent.saturating_sub(self.spent) as f64)
+                .min(rate * REFINE_WINDOW_S),
+        };
         self.refilled = now;
         self.spent = spent;
         self.target = target_kbps;
@@ -1557,7 +1566,11 @@ fn capture_loop(
         let now = Instant::now();
         burst.account(
             now,
-            hub.target_kbps.load(Ordering::Relaxed),
+            // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
+            match cfg.max_kbps {
+                0 => 0,
+                _ => hub.target_kbps.load(Ordering::Relaxed),
+            },
             hub.stats.paintover_bytes.load(Ordering::Relaxed),
         );
         // One pass in flight at most: what a viewer types next never waits behind two.
