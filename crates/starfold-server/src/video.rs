@@ -97,8 +97,6 @@ struct Skipped {
     band: Option<Band>,
     /// None: analyse everything.
     mb: Option<Vec<u8>>,
-    /// A pass of a burst was among it: this cohort is owed the ladder it missed.
-    pass: bool,
 }
 
 fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
@@ -106,10 +104,8 @@ fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
         None => Skipped {
             band: f.band,
             mb: f.mb_dirty.as_ref().map(|m| m.to_vec()),
-            pass: f.refine_qp.is_some(),
         },
         Some(p) => Skipped {
-            pass: p.pass || f.refine_qp.is_some(),
             band: union_opt(p.band, f.band),
             mb: match (p.mb, &f.mb_dirty) {
                 (Some(a), Some(b)) => Some(or_maps(&a, b)),
@@ -984,9 +980,7 @@ impl Engine {
             .any(|(c, take)| take && c.skipped.is_some())
     }
 
-    /// Whether a cohort caught up on a pass it missed: the burst that had it is over.
-    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) -> bool {
-        let mut owed = false;
+    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) {
         for ((c, v), &take) in self.cohorts.iter_mut().zip(views).zip(takes) {
             if v.clients.is_empty() {
                 continue;
@@ -995,12 +989,8 @@ impl Engine {
                 c.skipped = Some(skip(c.skipped.take(), f));
                 continue;
             }
-            let mut missed = false;
             let frame = match c.skipped.take() {
-                Some(s) => {
-                    missed = s.pass;
-                    catch_up(s, f.clone())
-                }
+                Some(s) => catch_up(s, f.clone()),
                 None => f.clone(),
             };
             let Some(tx) = c.tx.as_ref() else { continue };
@@ -1010,25 +1000,19 @@ impl Engine {
                 *c.shared.last_key.lock() = Instant::now();
             }
             c.shared.busy.fetch_add(1, Ordering::AcqRel);
-            match tx.try_send(Job {
+            if let Err(e) = tx.try_send(Job {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
             }) {
-                Ok(()) => owed |= missed,
-                Err(e) => {
-                    c.shared.busy.fetch_sub(1, Ordering::AcqRel);
-                    if force {
-                        c.shared.idr_inflight.store(false, Ordering::Release);
-                    }
-                    let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
-                    let mut s = skip(None, &j.frame);
-                    s.pass |= missed;
-                    c.skipped = Some(s);
+                c.shared.busy.fetch_sub(1, Ordering::AcqRel);
+                if force {
+                    c.shared.idr_inflight.store(false, Ordering::Release);
                 }
+                let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
+                c.skipped = Some(skip(None, &j.frame));
             }
         }
-        owed
     }
 }
 
@@ -1290,9 +1274,11 @@ struct Refiner {
 }
 
 /// The paint-over after motion: a few passes once the picture has been still for a moment,
-/// none while it keeps changing. New damage starts them over. A burst waits longer after
-/// costly ones close together, and for its share of the bitrate; it isn't dropped, so the
-/// picture still converges once the stops end.
+/// none while it keeps changing. New damage starts them over. On a stream with one cohort
+/// the passes are a ladder of QPs; a burst then waits longer after costly ones close
+/// together, and for its share of the bitrate, but isn't dropped, so the picture still
+/// converges once the stops end. Cohorts keep no state of their own to take a ladder at
+/// their own pace, so with two or more a burst is plain passes.
 struct Burst {
     len: u32,
     delay: Duration,
@@ -1309,6 +1295,10 @@ struct Burst {
     target: u32,
     /// Keyframes sent so far.
     keyframes: u64,
+    /// One cohort has viewers.
+    single: bool,
+    /// This burst is a ladder: it started on one cohort and none has joined since.
+    ladder: bool,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
@@ -1343,16 +1333,24 @@ impl Burst {
             refilled: now,
             target: 0,
             keyframes: 0,
+            single: true,
+            ladder: true,
         }
     }
     fn moved(&mut self, now: Instant) {
         self.left = self.len;
         self.last_motion = now;
+        self.ladder = self.single;
+    }
+    /// A second cohort ends the ladder for good; what follows the next motion is decided then.
+    fn cohorts(&mut self, with_viewers: usize) {
+        self.single = with_viewers <= 1;
+        self.ladder &= self.single;
     }
     /// A keyframe that went out is squeezed into the rate cap, so it starts a burst. One
     /// only asked for says nothing: an encoder that drops them is asked again and again.
     fn keyframe_sent(&mut self, sent: u64, now: Instant) -> bool {
-        let new = sent != self.keyframes;
+        let new = sent != self.keyframes && self.single;
         self.keyframes = sent;
         if new {
             self.moved(now);
@@ -1380,11 +1378,14 @@ impl Burst {
     }
     /// How long the picture must stay still before a burst.
     fn gap(&self, now: Instant) -> Duration {
-        self.delay * (1 << self.level(now))
+        match self.ladder {
+            true => self.delay * (1 << self.level(now)),
+            false => self.delay,
+        }
     }
     /// Only a burst's first pass waits for budget: one under way finishes.
     fn funded(&self) -> bool {
-        self.left < self.len || self.target == 0 || self.tokens > 0.0
+        !self.ladder || self.left < self.len || self.target == 0 || self.tokens > 0.0
     }
     fn due(&self, now: Instant) -> bool {
         self.left > 0
@@ -1402,8 +1403,13 @@ impl Burst {
     fn stop(&mut self) {
         self.left = 0;
     }
-    /// Takes a pass; the last ones get the rungs, so any burst length ends at the finest.
-    fn pass(&mut self, now: Instant) -> u8 {
+    /// Takes a pass; the last ones of a ladder get the rungs, so any burst length ends at
+    /// the finest.
+    fn pass(&mut self, now: Instant) -> Option<u8> {
+        if !self.ladder {
+            self.left -= 1;
+            return None;
+        }
         if self.left == self.len {
             let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
             self.backoff = (self.level(now) + costly as u32).min(REFINE_MAX_BACKOFF);
@@ -1412,7 +1418,7 @@ impl Burst {
         }
         self.left -= 1;
         let last = REFINE_RUNGS.len() - 1;
-        REFINE_RUNGS[last.saturating_sub(self.left as usize)]
+        Some(REFINE_RUNGS[last.saturating_sub(self.left as usize)])
     }
 }
 
@@ -1593,11 +1599,12 @@ fn capture_loop(
             },
             hub.stats.paintover_bytes.load(Ordering::Relaxed),
         );
+        burst.cohorts(views.iter().filter(|v| !v.clients.is_empty()).count());
         if burst.keyframe_sent(hub.stats.keyframes.load(Ordering::Relaxed), now) {
             refiner.mark_all();
         }
         // One pass in flight at most: what a viewer types next never waits behind two.
-        let mut paintover_due = burst.due(now) && eng.drained(&views);
+        let mut paintover_due = burst.due(now) && (!burst.ladder || eng.drained(&views));
         let catch_up = eng.catch_up_due(&views, interval_ms);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
             let timeout = if burst.due(now) {
@@ -1714,7 +1721,7 @@ fn capture_loop(
             refine = if want_key { None } else { refiner.due() };
             refine.is_some()
         } else if paintover_due {
-            refine_qp = Some(burst.pass(t0));
+            refine_qp = burst.pass(t0);
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1755,7 +1762,7 @@ fn capture_loop(
             mb_dirty.take().map(Arc::new)
         };
         last_capture = t0;
-        let owed = eng.dispatch(
+        eng.dispatch(
             &Frame {
                 buf,
                 paintover,
@@ -1769,10 +1776,6 @@ fn capture_loop(
             &views,
             &takes,
         );
-        if owed {
-            refiner.mark_all();
-            burst.moved(t0);
-        }
     }
 }
 
