@@ -10,7 +10,7 @@ mod hevc;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
-pub mod openh264;
+pub(crate) mod openh264;
 #[cfg(test)]
 mod tests;
 #[cfg(target_os = "linux")]
@@ -126,8 +126,6 @@ pub struct Refine {
     pub qp: u8,
     /// What the frame may cost (None: uncapped).
     pub max_bytes: Option<usize>,
-    /// Macroblocks still at motion quality.
-    pub mbs: usize,
 }
 
 #[derive(Default)]

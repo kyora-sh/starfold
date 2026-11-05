@@ -116,6 +116,8 @@ fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
 }
 
 fn catch_up(s: Skipped, mut f: Frame) -> Frame {
+    // What was skipped has to go out, and a pass may send nothing.
+    f.refine_qp = None;
     f.band = union_opt(s.band, f.band);
     f.mb_dirty = match (s.mb, f.mb_dirty) {
         (Some(a), Some(b)) => Some(Arc::new(or_maps(&a, &b))),
@@ -957,6 +959,15 @@ impl Engine {
             .collect()
     }
 
+    /// Whether a keyframe is owed by a cohort that isn't failing: one that is retries
+    /// keyframes for as long as it fails, and that says nothing about the picture.
+    fn healthy_key(&self, views: &[View]) -> bool {
+        self.cohorts
+            .iter()
+            .zip(views)
+            .any(|(c, v)| v.want_key && c.shared.failures.load(Ordering::Acquire) == 0)
+    }
+
     /// Whether a cohort that skipped damage has room for it now: worth a capture even
     /// when nothing else changed, or that cohort's viewers keep stale regions.
     fn catch_up_due(&self, views: &[View], interval_ms: f64) -> bool {
@@ -1260,40 +1271,115 @@ struct Refiner {
 }
 
 /// The paint-over after motion: a few passes once the picture has been still for a moment,
-/// none while it keeps changing. New damage starts them over.
+/// none while it keeps changing. New damage starts them over. A burst waits longer after
+/// costly ones close together, and for its share of the bitrate; it isn't dropped, so the
+/// picture still converges once the stops end.
 struct Burst {
     len: u32,
     delay: Duration,
     left: u32,
     last_motion: Instant,
+    backoff: u32,
+    last_burst: Option<Instant>,
+    /// Paint-over bytes sent so far, and when the last burst started.
+    spent: u64,
+    spent_at_start: u64,
+    tokens: f64,
+    refilled: Instant,
+    /// The bitrate cap in kbit/s; 0 is uncapped.
+    target: u32,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
 const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
 /// The most of the bitrate cap one refining frame may take; the viewer waits for it.
 const REFINE_FRAME_MS: usize = 200;
+/// A burst this cheap (a cursor, a typed glyph) doesn't count towards backing off.
+const REFINE_CHEAP_BYTES: u64 = 32 * 1024;
+const REFINE_MAX_BACKOFF: u32 = 4;
+/// Backing off ends after this long without a burst.
+const REFINE_QUIET: Duration = Duration::from_secs(5);
+/// Bursts may take this share of the cap, averaged over the window: enough for a whole
+/// ladder after a single stop, even on a thin link.
+const REFINE_SHARE: f64 = 0.10;
+const REFINE_WINDOW_S: f64 = 10.0;
 
 impl Burst {
-    fn new(len: u32, delay: Duration) -> Self {
+    fn new(len: u32, delay: Duration, now: Instant) -> Self {
         Burst {
             len,
             delay,
             left: 0,
-            last_motion: Instant::now(),
+            last_motion: now,
+            backoff: 0,
+            last_burst: None,
+            spent: 0,
+            spent_at_start: 0,
+            tokens: f64::INFINITY,
+            refilled: now,
+            target: 0,
         }
     }
-    fn moved(&mut self) {
+    fn moved(&mut self, now: Instant) {
         self.left = self.len;
-        self.last_motion = Instant::now();
+        self.last_motion = now;
     }
-    fn due(&self) -> bool {
-        self.left > 0 && self.last_motion.elapsed() >= self.delay
+    /// Brings the byte budget up to date with what has been sent and the current cap.
+    fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
+        let rate = target_kbps as f64 * 1000.0 / 8.0 * REFINE_SHARE;
+        let dt = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.tokens = (self.tokens + dt * rate - spent.saturating_sub(self.spent) as f64)
+            .min(rate * REFINE_WINDOW_S);
+        self.refilled = now;
+        self.spent = spent;
+        self.target = target_kbps;
+    }
+    /// How long the picture must stay still before a burst.
+    fn gap(&self, now: Instant) -> Duration {
+        let quiet = self
+            .last_burst
+            .is_none_or(|t| now.saturating_duration_since(t) >= REFINE_QUIET);
+        if quiet {
+            self.delay
+        } else {
+            self.delay * (1 << self.backoff)
+        }
+    }
+    /// Only a burst's first pass waits for budget: one under way finishes.
+    fn funded(&self) -> bool {
+        self.left < self.len || self.target == 0 || self.tokens > 0.0
+    }
+    fn due(&self, now: Instant) -> bool {
+        self.left > 0
+            && now.saturating_duration_since(self.last_motion) >= self.gap(now)
+            && self.funded()
+    }
+    /// How long until `due` can change, in ms.
+    fn wait_ms(&self, now: Instant) -> i32 {
+        if self.left == 0 || !self.funded() {
+            return 100;
+        }
+        let still = now.saturating_duration_since(self.last_motion);
+        self.gap(now).saturating_sub(still).as_millis() as i32 + 1
     }
     fn stop(&mut self) {
         self.left = 0;
     }
     /// Takes a pass; the last ones get the rungs, so any burst length ends at the finest.
-    fn pass(&mut self) -> u8 {
+    fn pass(&mut self, now: Instant) -> u8 {
+        if self.left == self.len {
+            let recent = self
+                .last_burst
+                .is_some_and(|t| now.saturating_duration_since(t) < REFINE_QUIET);
+            let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
+            self.backoff = match (recent, costly) {
+                (false, _) => 0,
+                (true, true) => (self.backoff + 1).min(REFINE_MAX_BACKOFF),
+                (true, false) => self.backoff,
+            };
+            self.last_burst = Some(now);
+            self.spent_at_start = self.spent;
+        }
         self.left -= 1;
         let last = REFINE_RUNGS.len() - 1;
         REFINE_RUNGS[last.saturating_sub(self.left as usize)]
@@ -1414,6 +1500,7 @@ fn capture_loop(
     let mut burst = Burst::new(
         cfg.paintover_burst,
         Duration::from_millis(cfg.paintover_delay_ms),
+        Instant::now(),
     );
     let mut had_clients = false;
     let mut full_next = true;
@@ -1466,18 +1553,16 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        let mut paintover_due = burst.due();
+        let now = Instant::now();
+        burst.account(
+            now,
+            hub.target_kbps.load(Ordering::Relaxed),
+            hub.stats.paintover_bytes.load(Ordering::Relaxed),
+        );
+        let mut paintover_due = burst.due(now);
         let catch_up = eng.catch_up_due(&views, interval_ms);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
-            let timeout = if burst.left == 0 {
-                100
-            } else {
-                burst
-                    .delay
-                    .saturating_sub(burst.last_motion.elapsed())
-                    .as_millis() as i32
-                    + 1
-            };
+            let timeout = burst.wait_ms(now);
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
             continue;
         }
@@ -1582,12 +1667,12 @@ fn capture_loop(
         let mut refine = None;
         let mut refine_qp = None;
         let paintover = if is_motion {
-            burst.moved();
+            burst.moved(t0);
             // Piggyback sharpening of blocks that have gone still on this frame.
             refine = if want_key { None } else { refiner.due() };
             refine.is_some()
         } else if paintover_due {
-            refine_qp = Some(burst.pass());
+            refine_qp = Some(burst.pass(t0));
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1596,7 +1681,9 @@ fn capture_loop(
         if want_key {
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
-            burst.moved();
+            if eng.healthy_key(&views) {
+                burst.moved(t0);
+            }
         }
         let frame_paintover = paintover && refine.is_none();
         let paintover_final = frame_paintover && burst.left == 0;
@@ -1848,8 +1935,8 @@ fn stripe_worker(
             stride_uv: suv,
         };
         // Nonzero on unchanged macroblocks of this stripe (x264's X264_MBINFO_CONSTANT).
-        let rows = s.h.div_ceil(16);
         let mut info = job.mb_dirty.as_ref().map(|d| {
+            let rows = s.h.div_ceil(16);
             let start = (s.y / 16) * job.mb_cols;
             d[start..start + rows * job.mb_cols]
                 .iter()
@@ -1862,13 +1949,7 @@ fn stripe_worker(
             EncodeOptions {
                 pts_ms: job.ts,
                 force_keyframe: job.force_idr,
-                refine: refine.map(|(qp, max_bytes)| Refine {
-                    qp,
-                    max_bytes,
-                    mbs: info.as_ref().map_or(rows * job.mb_cols, |m| {
-                        m.iter().filter(|&&c| c == 0).count()
-                    }),
-                }),
+                refine: refine.map(|(qp, max_bytes)| Refine { qp, max_bytes }),
                 static_mbs: info.as_deref_mut(),
             },
         );
@@ -2128,6 +2209,12 @@ fn encode_loop(
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
+        if paintover && !all_key {
+            hub.stats.paintover_frames.fetch_add(1, Ordering::Relaxed);
+            hub.stats
+                .paintover_bytes
+                .fetch_add(total as u64, Ordering::Relaxed);
+        }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }

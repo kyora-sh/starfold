@@ -9,7 +9,6 @@ use super::{
 use openh264_sys2 as sys;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Level 5.2's frame size, OpenH264's limit for one picture.
 pub const MAX_MBS: usize = 36864;
@@ -22,67 +21,71 @@ const UNCAPPED_BPS: c_int = 240_000_000;
 /// 1.3 to 2, a screen packed with it 5.
 const REFINE_COST: f64 = 2.5;
 const REFINE_COST_RANGE: (f64, f64) = (1.0, 15.0);
-/// Frames sent at a fixed QP so far, and their bytes.
-pub static REFINED_FRAMES: AtomicU64 = AtomicU64::new(0);
-pub static REFINED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// How coarse the picture still is, and what sharpening it costs. A QP step costs the same
-/// below 28 and less and less above it, down to almost nothing at 51 (1080p text, measured).
+/// How coarse each macroblock still is, and what sharpening them costs. A QP step costs the
+/// same below 28 and less and less above it, down to almost nothing at 51 (1080p text,
+/// measured). A fixed QP reaches every macroblock whatever changed, so all of them count.
 pub(super) struct Sharpness {
-    pub(super) qp: i32,
+    pub(super) qp: Vec<u8>,
     cost: f64,
     pub(super) off: bool,
 }
 
 impl Sharpness {
-    pub(super) fn new(qp: i32) -> Self {
+    pub(super) fn new(mbs: usize, qp: i32) -> Self {
         Sharpness {
-            qp,
+            qp: vec![qp as u8; mbs],
             cost: REFINE_COST,
             off: false,
         }
     }
 
-    /// Coarser at once, finer slowly: rate control swings frame to frame and one spike at
-    /// the top says little about the picture, while what moved last is at least this coarse.
-    pub(super) fn moved(&mut self, qp: i32) {
-        self.qp = if qp >= self.qp {
-            qp
-        } else {
-            (self.qp * 3 + qp) / 4
-        };
+    /// A frame went out under rate control at `qp`, touching what `static_mbs` doesn't mark.
+    pub(super) fn moved(&mut self, qp: i32, static_mbs: Option<&[u8]>) {
+        match static_mbs.filter(|m| m.len() == self.qp.len()) {
+            Some(m) => {
+                for (q, _) in self.qp.iter_mut().zip(m).filter(|(_, &s)| s == 0) {
+                    *q = qp as u8;
+                }
+            }
+            None => self.qp.fill(qp as u8),
+        }
     }
 
-    /// QP steps from where the picture stands to `qp`, in steps of `cost`.
+    /// Macroblock-steps from where the picture stands to `qp`, in units of `cost`.
     fn steps(&self, qp: i32) -> f64 {
-        (qp..self.qp)
-            .map(|q| ((52 - q) as f64 / 24.0).min(1.0))
-            .sum()
-    }
-
-    fn expected(&self, mbs: usize, qp: i32) -> f64 {
-        mbs as f64 * self.steps(qp) * self.cost
+        let mut count = [0usize; 52];
+        for &q in &self.qp {
+            count[q.min(51) as usize] += 1;
+        }
+        let (mut total, mut below) = (0.0, 0);
+        for q in (qp.max(0)..51).rev() {
+            below += count[q as usize + 1];
+            total += below as f64 * ((52 - q) as f64 / 24.0).min(1.0);
+        }
+        total
     }
 
     /// The lowest QP down to the pass's whose frame is expected to fit.
     pub(super) fn pick(&self, r: Refine) -> Option<i32> {
         let want = r.qp as i32;
+        let top = self.qp.iter().copied().max().unwrap_or(0) as i32;
         if self.off {
             return None;
         }
         match r.max_bytes {
-            None => (want < self.qp).then_some(want),
-            Some(max) => (want..self.qp).find(|&q| self.expected(r.mbs, q) <= max as f64),
+            None => (want < top).then_some(want),
+            Some(max) => (want..top).find(|&q| self.steps(q) * self.cost <= max as f64),
         }
     }
 
     /// The next pass is most likely this picture again, so a frame's cost mostly replaces
     /// the estimate; one larger than expected does at once. One with next to nothing to
     /// sharpen says nothing about the next picture.
-    pub(super) fn refined(&mut self, qp: i32, mbs: usize, bytes: usize) {
+    pub(super) fn refined(&mut self, qp: i32, bytes: usize) {
         let steps = self.steps(qp);
-        if mbs > 0 && steps > 0.0 && bytes >= 1024 {
-            let seen = bytes as f64 / (mbs as f64 * steps);
+        if steps > 0.0 && bytes >= 1024 {
+            let seen = bytes as f64 / steps;
             let cost = if seen > self.cost {
                 seen
             } else {
@@ -90,7 +93,9 @@ impl Sharpness {
             };
             self.cost = cost.clamp(REFINE_COST_RANGE.0, REFINE_COST_RANGE.1);
         }
-        self.qp = qp;
+        for q in &mut self.qp {
+            *q = (*q).min(qp as u8);
+        }
     }
 
     /// A pass that didn't fit: an estimate left high by an odd frame must not stop every later one.
@@ -110,6 +115,9 @@ pub struct OpenH264 {
     width: u32,
     height: u32,
     sharpness: Sharpness,
+    /// Makes the library itself refuse the switch to a fixed QP.
+    #[cfg(test)]
+    pub(crate) break_switch: bool,
 }
 
 // The encoder is only ever used from one thread at a time.
@@ -148,7 +156,12 @@ impl OpenH264 {
             pts: -1,
             width: cfg.width,
             height: cfg.height,
-            sharpness: Sharpness::new((cfg.best_quality.round() as c_int).clamp(12, 51)),
+            sharpness: Sharpness::new(
+                cfg.width.div_ceil(16) as usize * cfg.height.div_ceil(16) as usize,
+                (cfg.best_quality.round() as c_int).clamp(12, 51),
+            ),
+            #[cfg(test)]
+            break_switch: false,
         };
         let mut level: c_int = sys::WELS_LOG_ERROR;
         me.option(sys::ENCODER_OPTION_TRACE_LEVEL, &mut level)?;
@@ -252,6 +265,10 @@ impl OpenH264 {
         // Only the layer's rate follows set_rate; this checks it against the overall one.
         p.iTargetBitrate = self.bps;
         p.iMaxBitrate = self.bps;
+        #[cfg(test)]
+        if self.break_switch {
+            p.iSpatialLayerNum = 0;
+        }
         self.option(sys::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &mut p)?;
         self.rate_control(sys::RC_OFF_MODE)
     }
@@ -301,9 +318,11 @@ impl VideoEncoder for OpenH264 {
             )));
         }
         f.check()?;
+        // A new encoder's first frame is an IDR whether asked for or not.
+        let idr = opts.force_keyframe || self.pts < 0;
         self.pts = opts.pts_ms.max(self.pts + 1);
-        let refine = opts.refine.filter(|_| !opts.force_keyframe);
-        let fixed = refine.and_then(|r| self.sharpness.pick(r).map(|q| (q, r.mbs)));
+        let refine = opts.refine.filter(|_| !idr);
+        let fixed = refine.and_then(|r| self.sharpness.pick(r));
         if refine.is_some() && fixed.is_none() {
             self.sharpness.skipped();
             return Ok(Vec::new());
@@ -332,7 +351,7 @@ impl VideoEncoder for OpenH264 {
                 self.vt().ForceIntraFrame.unwrap()(self.enc, true)
             })?;
         }
-        if let Some((qp, _)) = fixed {
+        if let Some(qp) = fixed {
             // Nothing is lost, the picture just stays as it is: not worth the keyframe a
             // failed encode costs, again after every burst.
             if let Err(e) = self.fix_qp(qp) {
@@ -351,16 +370,13 @@ impl VideoEncoder for OpenH264 {
             return Ok(Vec::new());
         }
         match fixed {
-            Some((qp, mbs)) => {
-                let bytes = info.iFrameSizeInBytes as usize;
-                self.sharpness.refined(qp, mbs, bytes);
-                REFINED_FRAMES.fetch_add(1, Ordering::Relaxed);
-                REFINED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-            }
+            Some(qp) => self.sharpness.refined(qp, info.iFrameSizeInBytes as usize),
             None => {
+                let whole = info.eFrameType == sys::videoFrameTypeIDR;
                 let s: sys::SEncoderStatistics =
                     self.get_option(sys::ENCODER_OPTION_GET_STATISTICS)?;
-                self.sharpness.moved(s.uiAverageFrameQP as c_int);
+                let map = opts.static_mbs.as_deref().filter(|_| !whole);
+                self.sharpness.moved(s.uiAverageFrameQP as c_int, map);
             }
         }
         let info = &*self.info;

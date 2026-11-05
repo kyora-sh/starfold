@@ -373,6 +373,9 @@ pub struct Stats {
     pub convert_us: AtomicU64,
     pub flow_blocked: AtomicU64,
     pub paintovers: AtomicU64,
+    /// Paint-over frames that came out, and their bytes.
+    pub paintover_frames: AtomicU64,
+    pub paintover_bytes: AtomicU64,
     pub keyframes: AtomicU64,
     pub refines: AtomicU64,
     pub damage_wait_us: AtomicU64,
