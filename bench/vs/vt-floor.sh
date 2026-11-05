@@ -12,10 +12,14 @@ run_set() { # name rounds arm...   arm = label|test|env words
   for ((i = 0; i < n; i++)); do
     for ((k = 0; k < len; k++)); do
       IFS='|' read -r label test envs <<< "${arms[$(((k + i) % len))]}"
+      local load=0 pids=() y
+      case " $envs " in *" LOAD="*) load=${envs##*LOAD=}; load=${load%% *};; esac
+      for ((y = 0; y < load; y++)); do yes > /dev/null & pids+=($!); done
       # shellcheck disable=SC2086
-      if ! env VT_REPORT=1 $envs "$bin" "$test" --ignored --nocapture --test-threads=1 2>&1 | grep -oE '(bench|stages|vtcfg|pipeline) .*' | sed "s/^/set=$name cell=$label round=$i /"; then
+      if ! env VT_REPORT=1 $envs "$bin" "$test" --ignored --nocapture --test-threads=1 2>&1 | grep -oE '(bench|stages|vtcfg|vtkfi|pipeline) .*' | sed "s/^/set=$name cell=$label round=$i /"; then
         echo "FAILED set=$name cell=$label round=$i"
       fi
+      if [ ${#pids[@]} -gt 0 ]; then kill "${pids[@]}"; wait "${pids[@]}" 2> /dev/null; fi
     done
   done
 }
@@ -53,6 +57,24 @@ for s in $sets; do
         done
       done
       run_set p "$rounds" "${arms[@]}" ;;
+    z)
+      OFF="VT_LL=0 VT_RT=0"
+      for c in h264 hevc; do
+        C="BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=33"
+        arms+=("$c-base|cpu_per_stream|$C")
+        arms+=("$c-base-load1|cpu_per_stream|$C LOAD=1")
+        arms+=("$c-base-load2|cpu_per_stream|$C LOAD=2")
+        arms+=("$c-base-decl60|cpu_per_stream|$C FPS=60")
+        arms+=("$c-base-decl120|cpu_per_stream|$C FPS=120")
+        arms+=("$c-off|cpu_per_stream|$C $OFF")
+        arms+=("$c-off-load2|cpu_per_stream|$C $OFF LOAD=2")
+        arms+=("$c-off-load6|cpu_per_stream|$C $OFF LOAD=6")
+        arms+=("$c-off-nokfi|cpu_per_stream|$C $OFF VT_KFI=0")
+        arms+=("$c-off-nokfi-k8000|cpu_per_stream|$C $OFF VT_KFI=0 KBPS=8000")
+        arms+=("$c-off-nokfi-k2000|cpu_per_stream|$C $OFF VT_KFI=0 KBPS=2000")
+        arms+=("$c-base-k2000|cpu_per_stream|$C KBPS=2000")
+      done
+      run_set z "$rounds" "${arms[@]}" ;;
     r)
       for cfg in "base:" "off:VT_LL=0 VT_RT=0"; do
         for c in h264 hevc; do

@@ -343,7 +343,24 @@ impl VideoToolbox {
                 let n = number(kCFNumberSInt32Type, v.parse::<i32>().unwrap())?;
                 mfdc = Some(s.set(kVTCompressionPropertyKey_MaxFrameDelayCount, n.0));
             }
+            let kfi_default = s
+                .copy(kVTCompressionPropertyKey_MaxKeyFrameInterval)
+                .and_then(|v| get_i64(v.0));
+            let mut kfi = None;
+            if let Some(v) = exp("VT_KFI") {
+                let n = number(kCFNumberSInt32Type, v.parse::<i32>().unwrap())?;
+                let d = number(kCFNumberDoubleType, 0f64)?;
+                kfi = Some((
+                    s.set(kVTCompressionPropertyKey_MaxKeyFrameInterval, n.0),
+                    s.set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, d.0),
+                ));
+            }
             if exp("VT_REPORT").is_some() {
+                println!(
+                    "vtkfi default={kfi_default:?} set={kfi:?} read={:?}",
+                    s.copy(kVTCompressionPropertyKey_MaxKeyFrameInterval)
+                        .and_then(|v| get_i64(v.0))
+                );
                 let read = |k| s.copy(k).and_then(|v| get_i64(v.0));
                 println!(
                     "vtcfg codec={:?} llrc={llrc} encoder_id={:?} mfdc_set={mfdc:?} mfdc_read={:?} fps_read={:?} realtime_read={:?}",
