@@ -2,8 +2,10 @@
 // panning, grainy picture). Top left, a marker strip in 16 px cells the harness reads back:
 // rows 0-1 are 8 check bits + a 12-bit frame number + 20 bits of wall-clock ms; row 2 is the
 // last key, 5 bits (0-25, 31 = none) then the same 5 inverted, so a frame carrying a tag was
-// provably caused by that key. SIGUSR1 freezes the picture, writes what scroll and video draw to
-// the file named by argv[5] (the harness rebuilds any frame from it) and prints FROZEN.
+// provably caused by that key. SIGUSR1 freezes the picture and prints FROZEN, then writes what scroll
+// and video draw to the file named by argv[5] (the harness rebuilds any frame from it) and prints
+// DUMPED. argv[6], if given, is the page as raw BGRX, W wide and H + 6000 tall: real rendered text
+// for the scroll and as the typing backdrop.
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -114,25 +116,42 @@ static void on_freeze(int s) {
 	(void)s;
 	freeze = 1;
 }
-static int cx = 80, cy = 80;
+static int cx = 80, cy = 74;
+static XFontStruct *font;
 static void key(XEvent *e) {
 	KeySym s = XLookupKeysym(&e->xkey, 0);
 	if (s < 'a' || s > 'z') return;
 	tag = s - 'a';
 	draw_tag();
+	XSetBackground(d, g, 0xffffff);
 	XSetForeground(d, g, 0x202020);
-	XFillRectangle(d, w, g, cx, cy, 14, 22);
-	XSetForeground(d, g, 0xffffff);
-	XFillRectangle(d, w, g, cx + 3, cy + 4 + tag % 8, 8, 4);
-	cx += 18;
+	char c = (char)s;
+	if (font) XDrawImageString(d, w, g, cx, cy + 16, &c, 1);
+	else XFillRectangle(d, w, g, cx, cy, 8, 16);
+	cx += 10;
 	if (cx > W - 100) {
 		cx = 80;
-		cy += 30;
-		if (cy > H - 60) cy = 80;
+		cy += 22;
+		if (cy > H - 60) cy = 74;
 		XSetForeground(d, g, 0xffffff);
-		XFillRectangle(d, w, g, 0, cy, W, 30);
+		XFillRectangle(d, w, g, 0, cy, W, 22);
 	}
 	XFlush(d);
+}
+static int load_page(Pixmap p, int ph, const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return 0;
+	size_t size = (size_t)W * ph * 4;
+	char *px = malloc(size);
+	int ok = fread(px, 1, size, f) == size;
+	fclose(f);
+	if (ok) {
+		XImage *im = XCreateImage(d, DefaultVisual(d, DefaultScreen(d)), 24, ZPixmap, 0, px, W, ph, 32, W * 4);
+		XPutImage(d, p, g, im, 0, 0, 0, 0, W, ph);
+		XSync(d, False);
+		XDestroyImage(im);
+	} else free(px);
+	return ok;
 }
 static void events(void) {
 	while (XPending(d)) {
@@ -162,9 +181,16 @@ int main(int argc, char **argv) {
 	int ph = H + 6000;
 	Pixmap p = 0;
 	XImage *img = NULL;
-	if (scroll) {
+	if (scroll || typing) {
 		p = XCreatePixmap(d, w, W, ph, DefaultDepth(d, DefaultScreen(d)));
-		page(p, ph);
+		if (argc <= 6 || !load_page(p, ph, argv[6])) page(p, ph);
+		XCopyArea(d, p, w, g, 0, 0, W, H, 0, 0);
+		font = XLoadQueryFont(d, "9x15");
+		if (font) XSetFont(d, g, font->fid);
+		if (typing) {
+			XSetForeground(d, g, 0xffffff);
+			XFillRectangle(d, w, g, 0, 72, W, 24);
+		}
 	} else if (video) {
 		XShmSegmentInfo *si = calloc(1, sizeof *si);
 		img = XShmCreateImage(d, DefaultVisual(d, DefaultScreen(d)), 24, ZPixmap, NULL, si, W, H * LOOP);
@@ -187,6 +213,9 @@ int main(int argc, char **argv) {
 	struct pollfd pf = {.fd = ConnectionNumber(d), .events = POLLIN};
 	for (unsigned n = 1, off = 0;; n++) {
 		if (freeze) {
+			XSync(d, False);
+			puts("FROZEN");
+			fflush(stdout);
 			FILE *dump = argc > 5 && !typing ? fopen(argv[5], "wb") : NULL;
 			if (dump && video) fwrite(img->data, img->bytes_per_line, (size_t)H * LOOP, dump);
 			if (dump && scroll) {
@@ -194,8 +223,7 @@ int main(int argc, char **argv) {
 				fwrite(all->data, all->bytes_per_line, ph, dump);
 			}
 			if (dump) fclose(dump);
-			XSync(d, False);
-			puts("FROZEN");
+			puts("DUMPED");
 			fflush(stdout);
 			for (;;) pause();
 		}

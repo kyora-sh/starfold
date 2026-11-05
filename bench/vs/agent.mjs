@@ -1,10 +1,10 @@
 // VM side: one Xvfb, then per run one streamer and one source, each in its own process group, and
-// a control port on loopback. Usage: node agent.mjs <starfold> <source> <novnc web dir> <password file> <max seconds> <lan|wan> <shaper.py>
+// a control port on loopback. Usage: node agent.mjs <starfold> <source> <novnc web dir> <password file> <max seconds> <lan|wan> <shaper.py> <page raw>
 import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS } from './config.mjs';
-const [bin, source, web, pwFile, maxS, link, shaper] = process.argv.slice(2);
+const [bin, source, web, pwFile, maxS, link, shaper, page] = process.argv.slice(2);
 const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock', DUMP = '/tmp/vs-dump.raw';
 const pw = fs.readFileSync(pwFile, 'utf8').trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,7 +34,7 @@ const listening = async (port) => {
 };
 async function start(arm, wl) {
 	await stop();
-	src = group(source, [wl, WIDTH, HEIGHT, FPS, DUMP].map(String), { stdio: ['ignore', 'pipe', 'ignore'] });
+	src = group(source, [wl, WIDTH, HEIGHT, FPS, DUMP, page].map(String), { stdio: ['ignore', 'pipe', 'ignore'] });
 	await new Promise((res, rej) => {
 		const t = setTimeout(() => rej(new Error('source not ready')), 15000);
 		src.stdout.on('data', (b) => { if (String(b).includes('READY')) { clearTimeout(t); res(); } });
@@ -48,17 +48,28 @@ async function start(arm, wl) {
 		await listening(NOVNC_PORT);
 	} else {
 		const log = fs.openSync('/tmp/vs-starfold.log', 'a');
-		run.push(group(bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...STARFOLD_ARGS], { env: { VOXL_PASSWORD: pw, RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
+		const a = ARMS[arm];
+		run.push(group(a.bin ? process.env[a.bin] : bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...(a.args ?? STARFOLD_ARGS)], { env: { VOXL_PASSWORD: pw, RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
 		await listening(STARFOLD_PORT);
 	}
 }
-/** Stops the picture and leaves the X server's truth in `out`, plus the source's frames in DUMP. */
-async function freeze(out) {
-	await new Promise((res, rej) => {
+let dumped = null;
+/** Stops the picture and resolves as soon as the last frame is drawn; the source then writes DUMP. */
+function freeze() {
+	return new Promise((res, rej) => {
 		const t = setTimeout(() => rej(new Error('source did not freeze')), 15000);
-		src.stdout.on('data', (b) => { if (String(b).includes('FROZEN')) { clearTimeout(t); res(); } });
+		dumped = new Promise((done) => {
+			src.stdout.on('data', (x) => {
+				if (String(x).includes('FROZEN')) { clearTimeout(t); res(); }
+				if (String(x).includes('DUMPED')) done();
+			});
+		});
 		process.kill(src.pid, 'SIGUSR1');
 	});
+}
+/** The X server's truth in `out`, once DUMP is complete. */
+async function truth(out) {
+	await dumped;
 	execSync(`xwd -root -silent -display ${DISPLAY} -out ${out}`);
 }
 /** CPU seconds of a process group, every member and thread. */
@@ -101,7 +112,8 @@ http.createServer(async (req, res) => {
 		else if (u.pathname === '/stop') { await stop(); res.end('ok'); }
 		else if (u.pathname === '/cpu') res.end(JSON.stringify({ server: run.reduce((n, c) => n + cpu(c.pid), 0), x: cpu(xvfb.pid), source: cpu(src?.pid) }));
 		else if (u.pathname === '/bytes') res.end(JSON.stringify(bytes(Number(u.searchParams.get('port')))));
-		else if (u.pathname === '/freeze') { await freeze(u.searchParams.get('out')); res.end('ok'); }
+		else if (u.pathname === '/freeze') { await freeze(); res.end('ok'); }
+		else if (u.pathname === '/truth') { await truth(u.searchParams.get('out')); res.end('ok'); }
 		else if (u.pathname === '/vnc-viewers') res.end(String(vncViewers()));
 		else if (u.pathname === '/quit') { res.end('bye'); quit(); }
 		else res.end('ok');

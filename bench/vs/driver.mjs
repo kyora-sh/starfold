@@ -44,6 +44,15 @@ const urlOf = (arm) => {
 	const { quality, compression } = NOVNC_PROFILES[a.profile];
 	return `http://127.0.0.1:${portOf(arm)}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
 };
+const serverStats = async (arm) => (ARMS[arm].kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
+const statsDelta = (a, b) => Object.fromEntries([['keyframes', 'keyframes'], ['paintovers', 'paintovers'], ['refines', 'refines'], ['flowBlocked', 'flow_blocked'], ['encoded', 'encoded'], ['bytes', 'bytes']].filter(([, k]) => typeof b[k] === 'number').map(([n, k]) => [n, b[k] - a[k]]));
+/** Throws unless the one viewer is being served the arm's codec: a fallback must never count as that arm's result. */
+function assertCodec(arm, stats, when) {
+	if (ARMS[arm].kind !== 'starfold' || ARMS[arm].codec === null) return;
+	const want = ARMS[arm].codec ?? 'h264';
+	const got = (stats.clients || []).map((c) => c.stream?.codec);
+	if (got.length !== 1 || got[0] !== want) throw new Error(`codec ${when}: wanted ${want}, served ${JSON.stringify(got)}`);
+}
 async function viewers(arm) {
 	if (ARMS[arm].kind === 'starfold') {
 		const r = await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } });
@@ -51,6 +60,7 @@ async function viewers(arm) {
 	}
 	return Number(await ctl('/vnc-viewers'));
 }
+const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000];
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
 function reader({ cell, w, h, readback }) {
 	const vs = (window.vs = { frames: [], tags: [], keys: [], bad: 0, ticks: 0, long: 0, longMs: 0, seen: false, sync: 0 });
@@ -69,31 +79,64 @@ function reader({ cell, w, h, readback }) {
 		}
 		return null;
 	};
-	let last = -1, lastTag = -1;
+	const own = new WeakMap();
+	const contextOf = (el) => {
+		if (!own.has(el)) {
+			let ctx = null;
+			try { ctx = el.getContext('2d'); } catch {}
+			own.set(el, ctx);
+		}
+		return own.get(el);
+	};
+	let last = -1, lastTag = -1, pending = false;
+	const decode = (t, on) => {
+		let v = 0, ck = 0;
+		for (let b = 0; b < 32; b++) v = (v | (on(b % 20, b >= 20 ? 1 : 0) << b)) >>> 0;
+		for (let b = 32; b < 40; b++) ck |= on(b % 20, 1) << (b - 32);
+		if (((v ^ (v >>> 8) ^ (v >>> 16) ^ (v >>> 24)) & 0xff) === ck) {
+			vs.seen = true;
+			const n = v >>> 20;
+			if (n !== last) {
+				last = n;
+				let lat = (Date.now() & 0xfffff) - (v & 0xfffff);
+				if (lat < -500000) lat += 0x100000;
+				vs.frames.push([t, n, lat]);
+			}
+		} else vs.bad++;
+		let tag = 0, inv = 0;
+		for (let b = 0; b < 5; b++) { tag |= on(b, 2) << b; inv |= on(b + 5, 2) << b; }
+		if ((tag ^ inv) === 31 && tag !== lastTag) { lastTag = tag; vs.tags.push([t, tag]); }
+	};
+	const centre = (col, row) => [col * cell + cell / 2, row * cell + cell / 2];
+	const fromRgba = (t, d) => decode(t, (col, row) => { const [px, py] = centre(col, row); const i = (py * w + px) * 4; return d[i] + d[i + 1] + d[i + 2] > 382 ? 1 : 0; });
+	// The least the page can do per arm, so the reading doesn't slow what it reads: a 2D canvas is read
+	// in place, a <video> gives up only the strip's luma, and a transferred canvas has to be drawn.
 	const tick = () => {
 		vs.ticks++;
 		const el = pick();
-		if (el) {
-			x.drawImage(el, 0, 0, w, h, 0, 0, w, h);
-			const d = x.getImageData(0, 0, w, h).data;
-			const bit = (col, row) => { const i = ((row * cell + cell / 2) * w + col * cell + cell / 2) * 4; return d[i] + d[i + 1] + d[i + 2] > 382 ? 1 : 0; };
+		if (el && !pending) {
 			const t = performance.now();
-			let v = 0, ck = 0;
-			for (let b = 0; b < 32; b++) v = (v | (bit(b % 20, b >= 20 ? 1 : 0) << b)) >>> 0;
-			for (let b = 32; b < 40; b++) ck |= bit(b % 20, 1) << (b - 32);
-			if (((v ^ (v >>> 8) ^ (v >>> 16) ^ (v >>> 24)) & 0xff) === ck) {
-				vs.seen = true;
-				const n = v >>> 20;
-				if (n !== last) {
-					last = n;
-					let lat = (Date.now() & 0xfffff) - (v & 0xfffff);
-					if (lat < -500000) lat += 0x100000;
-					vs.frames.push([t, n, lat]);
+			const ctx = el.tagName === 'CANVAS' ? contextOf(el) : null;
+			if (ctx) fromRgba(t, ctx.getImageData(0, 0, w, h).data);
+			else if (el.tagName === 'VIDEO' && !vs.noFrames) {
+				let f = null;
+				try { f = new VideoFrame(el, { timestamp: 0 }); } catch { vs.noFrames = true; }
+				if (f && ['I420', 'I420A', 'NV12'].includes(f.format)) {
+					pending = true;
+					const rect = { x: 0, y: 0, width: w, height: h };
+					const buf = new Uint8Array(f.allocationSize({ rect }));
+					f.copyTo(buf, { rect }).then((layout) => {
+						const { offset, stride } = layout[0];
+						decode(t, (col, row) => { const [px, py] = centre(col, row); return buf[offset + py * stride + px] > 126 ? 1 : 0; });
+					}).catch(() => { vs.bad++; }).finally(() => { pending = false; f.close(); });
+				} else {
+					if (f) { vs.format = f.format; f.close(); }
+					vs.noFrames = true;
 				}
-			} else vs.bad++;
-			let tag = 0, inv = 0;
-			for (let b = 0; b < 5; b++) { tag |= bit(b, 2) << b; inv |= bit(b + 5, 2) << b; }
-			if ((tag ^ inv) === 31 && tag !== lastTag) { lastTag = tag; vs.tags.push([t, tag]); }
+			} else {
+				x.drawImage(el, 0, 0, w, h, 0, 0, w, h);
+				fromRgba(t, x.getImageData(0, 0, w, h).data);
+			}
 		}
 		requestAnimationFrame(tick);
 	};
@@ -163,18 +206,22 @@ async function run(arm, wl, readback = true) {
 			vs.sync = performance.now();
 			performance.mark('vs-sync');
 		});
+		const f0 = await serverStats(arm);
+		assertCodec(arm, f0, 'at start');
 		const c0 = chromeCpu(), s0 = await ctlJson('/cpu'), b0 = await ctlJson(`/bytes?port=${port}`), t0 = Date.now();
 		const typing = typeKeys(p, wl, t0 + win * 1000);
 		await sleep((win * 1000) / 2);
 		const vMid = await viewers(arm);
 		await sleep((win * 1000) / 2);
 		const dt = (Date.now() - t0) / 1000, c1 = chromeCpu(), s1 = await ctlJson('/cpu'), b1 = await ctlJson(`/bytes?port=${port}`);
+		const f1 = await serverStats(arm);
+		assertCodec(arm, f1, 'at end');
 		const vEnd = await viewers(arm);
 		await typing;
 		await sleep(2000);
 		const r = await p.evaluate(() => {
 			const vs = window.vs;
-			return { frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
+			return { frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
 		});
 		const tr = swapsOf(await b.stopTracing());
 		const off = tr.sync === null ? null : tr.sync - r.sync;
@@ -193,12 +240,13 @@ async function run(arm, wl, readback = true) {
 		};
 		return {
 			...frames,
+			...statsDelta(f0, f1),
 			keys: r.keys.length, keysSeen: i2p.length, keysMissing: missing,
 			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p),
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
 			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, browserCpu: ((c1 - c0) / dt) * 100,
 			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
-			rafHz: r.ticks / dt, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
+			rafHz: r.ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,
 		};
 	} finally {
@@ -222,29 +270,33 @@ async function quality(arm, wl, round) {
 		await sleep(3000);
 		await p.mouse.click(WIDTH / 2, HEIGHT / 2);
 		await sleep(200);
-		const stats = async () => (ARMS[arm].kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
-		const s0 = await stats();
+		const s0 = await serverStats(arm);
+		assertCodec(arm, s0, 'at start');
 		if (wl === 'typing') await typeKeys(p, wl, Date.now() + 5000);
 		else for (let i = 0; i < 6; i++) { await p.screenshot({ path: `${dir}/motion-${i}.png`, animations: 'allow' }); await sleep(800); }
-		const s1 = await stats();
+		const s1 = await serverStats(arm);
+		assertCodec(arm, s1, 'at end');
 		const viewerCount = await viewers(arm);
-		await ctl(`/freeze?out=${dir}/truth.xwd`);
-		const t0 = Date.now();
-		for (const ms of [250, 1000, 3000]) {
+		await ctl('/freeze');
+		const t0 = Date.now(), shotAt = {}, after = {};
+		for (const ms of SETTLE_MS) {
 			await sleep(Math.max(0, ms - (Date.now() - t0)));
+			shotAt[ms] = Date.now() - t0;
 			await p.screenshot({ path: `${dir}/settled-${ms}.png`, animations: 'allow' });
+			after[ms] = statsDelta(s1, await serverStats(arm));
 		}
-		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, wl, '/tmp/vs-dump.raw'], { encoding: 'utf8', maxBuffer: 1 << 24 }));
-		const delta = (k) => (typeof s1[k] === 'number' ? s1[k] - s0[k] : undefined);
+		await ctl(`/truth?out=${dir}/truth.xwd`);
+		const crops = process.env.CROPS && round === 0 ? [`${process.env.CROPS}/${arm}-${wl}`] : [];
+		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, wl, '/tmp/vs-dump.raw', ...crops], { encoding: 'utf8', maxBuffer: 1 << 24 }));
 		fs.rmSync(dir, { recursive: true, force: true });
-		return { ...scores, viewerCount, keyframes: delta('keyframes'), paintovers: delta('paintovers'), flowBlocked: delta('flow_blocked') };
+		return { ...scores, viewerCount, motion: statsDelta(s0, s1), shotAt, afterFreeze: after };
 	} finally {
 		await ctx.close();
 		await ctl('/stop').catch(() => {});
 		await sleep(500);
 	}
 }
-const arms = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => link === 'wan' || !ARMS[a].wanOnly);
+const arms = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => !ARMS[a].probe && (link === 'wan' || !ARMS[a].wanOnly));
 const wls = process.env.WORKLOADS ? process.env.WORKLOADS.split(',') : WORKLOADS;
 const results = {}, ledger = {};
 const out = process.env.OUT ? fs.createWriteStream(process.env.OUT) : null;

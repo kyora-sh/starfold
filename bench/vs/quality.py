@@ -1,6 +1,8 @@
 """Scores screenshots against what the source drew: SSIM and PSNR on luma, marker strip and pointer masked.
 ssimText only counts windows with detail in the truth, so white space can't flatter text. Motion shots
-name their own frame in the marker strip. Usage: quality.py <dir> <typing|scroll|video> <source dump>"""
+name their own frame in the marker strip, which the source draws just after the picture, so the best
+of that frame and its neighbours is scored. With <crop prefix>, saves 100% text crops of the last settled
+shot and the truth. Usage: quality.py <dir> <typing|scroll|video> <source dump> [crop prefix]"""
 import glob, json, os, struct, sys
 import numpy as np
 from PIL import Image
@@ -8,6 +10,8 @@ from PIL import Image
 W, H, CELL, LOOP, STEP, PAGE = 1920, 1080, 16, 30, 20, 1080 + 6000
 STRIP_W, STRIP_H, WIN = 20 * CELL, 3 * CELL, 8
 root, wl, dump = sys.argv[1:4]
+crop = sys.argv[4] if len(sys.argv) > 4 else None
+CROP = (60, 60, 760, 360) if wl == "typing" else (410, 150, 1110, 450)
 
 
 def luma(rgb):
@@ -90,7 +94,11 @@ def mean(rows, key):
 
 truth = xwd(f"{root}/truth.xwd")
 out = {}
-for path in sorted(glob.glob(f"{root}/settled-*.png")):
+settled = sorted(glob.glob(f"{root}/settled-*.png"), key=lambda x: int(os.path.basename(x)[8:-4]))
+if crop:
+    Image.fromarray(truth.astype(np.uint8)).crop(CROP).save(f"{crop}-truth.png")
+    Image.open(settled[-1]).convert("RGB").crop(CROP).save(f"{crop}-settled.png")
+for path in settled:
     ms = os.path.basename(path)[8:-4]
     for k, v in score(png(path), truth).items():
         out[f"settled{ms}{k[0].upper()}{k[1:]}"] = v
@@ -101,7 +109,7 @@ for path in sorted(glob.glob(f"{root}/motion-*.png")):
     if n is None:
         torn += 1
         continue
-    rows.append(score(shot, drawn(n)))
+    rows.append(max((score(shot, drawn(m)) for m in (n, n + 1, n - 1)), key=lambda r: r["psnr"]))
 if rows or torn:
     out.update(motionSsim=mean(rows, "ssim"), motionSsimText=mean(rows, "ssimText"), motionPsnr=mean(rows, "psnr"), motionShots=len(rows), motionTorn=torn)
 print(json.dumps(out))
