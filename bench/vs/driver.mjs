@@ -1,6 +1,8 @@
 // Browser side. Every arm is measured by reading the marker strip back from the visible surface once
 // per animation frame, so frame timing and latency have one definition everywhere; the viz swap trace
-// runs alongside. Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, KEYS, OUT, BUDGET_S.
+// runs alongside. QUALITY_ROUNDS adds screenshots against the X server's truth (quality.py).
+// Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, OUT, BUDGET_S, CONTROL_ROUNDS, ARMS, WORKLOADS.
+import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
 import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS } from './config.mjs';
@@ -206,7 +208,43 @@ async function run(arm, wl, readback = true) {
 		await sleep(500);
 	}
 }
-const arms = Object.keys(ARMS).filter((a) => link === 'wan' || !ARMS[a].wanOnly).filter((a) => !process.env.ARMS || process.env.ARMS.split(',').includes(a));
+/** Screenshots are the compositor's output, the same path for every arm. Own runs: they disturb the timing. */
+async function quality(arm, wl, round) {
+	await ctl(`/start?arm=${arm}&wl=${wl}`);
+	const dir = `/tmp/vs-q/${arm}-${wl}-${round}`;
+	fs.mkdirSync(dir, { recursive: true });
+	const ctx = await b.newContext({ viewport: { width: WIDTH, height: HEIGHT } });
+	try {
+		const p = await ctx.newPage();
+		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback: true });
+		await p.goto(urlOf(arm), { waitUntil: 'commit', timeout: 20000 });
+		await p.waitForFunction(() => window.vs.seen, null, { timeout: 15000 });
+		await sleep(3000);
+		await p.mouse.click(WIDTH / 2, HEIGHT / 2);
+		await sleep(200);
+		const stats = async () => (ARMS[arm].kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
+		const s0 = await stats();
+		if (wl === 'typing') await typeKeys(p, wl, Date.now() + 5000);
+		else for (let i = 0; i < 6; i++) { await p.screenshot({ path: `${dir}/motion-${i}.png`, animations: 'allow' }); await sleep(800); }
+		const s1 = await stats();
+		const viewerCount = await viewers(arm);
+		await ctl(`/freeze?out=${dir}/truth.xwd`);
+		const t0 = Date.now();
+		for (const ms of [250, 1000, 3000]) {
+			await sleep(Math.max(0, ms - (Date.now() - t0)));
+			await p.screenshot({ path: `${dir}/settled-${ms}.png`, animations: 'allow' });
+		}
+		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, wl, '/tmp/vs-dump.raw'], { encoding: 'utf8', maxBuffer: 1 << 24 }));
+		const delta = (k) => (typeof s1[k] === 'number' ? s1[k] - s0[k] : undefined);
+		fs.rmSync(dir, { recursive: true, force: true });
+		return { ...scores, viewerCount, keyframes: delta('keyframes'), paintovers: delta('paintovers'), flowBlocked: delta('flow_blocked') };
+	} finally {
+		await ctx.close();
+		await ctl('/stop').catch(() => {});
+		await sleep(500);
+	}
+}
+const arms = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => link === 'wan' || !ARMS[a].wanOnly);
 const wls = process.env.WORKLOADS ? process.env.WORKLOADS.split(',') : WORKLOADS;
 const results = {}, ledger = {};
 const out = process.env.OUT ? fs.createWriteStream(process.env.OUT) : null;
@@ -235,7 +273,27 @@ for (let i = 0; i < rounds && Date.now() - started < budget; i++) {
 		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, true, 'main');
 }
 for (let i = 0; i < controlRounds && Date.now() - started < budget; i++)
-	for (let k = 0; k < arms.length; k++) await slot(arms[(k + i) % arms.length], 'video', i, false, 'no-readback');
+	for (const [w, wl] of wls.entries())
+		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, false, 'no-readback');
+for (let i = 0; i < Number(process.env.QUALITY_ROUNDS || 0) && Date.now() - started < budget; i++)
+	for (const [w, wl] of wls.entries())
+		for (let k = 0; k < arms.length; k++) {
+			const arm = arms[(k + i + w) % arms.length];
+			const key = `quality|${wl}|${arm}`;
+			const l = (ledger[key] ??= { attempted: 0, valid: 0, failed: 0, why: [] });
+			l.attempted++;
+			try {
+				const r = await quality(arm, wl, i);
+				if (r.viewerCount !== 1) throw new Error(`viewers ${r.viewerCount}`);
+				l.valid++;
+				emit({ set: 'quality', wl, arm, round: i, ...r });
+			} catch (e) {
+				l.failed++;
+				const why = redact(e).split('\n')[0];
+				l.why.push(why);
+				emit({ set: 'quality', wl, arm, round: i, failed: why });
+			}
+		}
 const median = (v) => pct(v, 0.5);
 console.log('LEDGER', JSON.stringify(ledger));
 for (const key of Object.keys(results).sort()) {

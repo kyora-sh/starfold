@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh <lan|wan> <rounds> <window s> <results file>: one set on this VM. Env: CHROME_ZIP, NOVNC_TGZ, CONTROL_ROUNDS, ARMS, WORKLOADS.
+# run.sh <lan|wan> <rounds> <window s> <results file>: one set on this VM. Env: CHROME_ZIP, NOVNC_TGZ, CONTROL_ROUNDS, QUALITY_ROUNDS, ARMS, WORKLOADS.
 set -u
 cd "$(dirname "$(readlink -f "$0")")/../.."
 link=${1:-lan} rounds=${2:-5} win=${3:-10} out=${4:-/tmp/vs-results.jsonl}

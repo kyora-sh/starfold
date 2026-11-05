@@ -3,7 +3,7 @@
 # CHROME_ZIP and NOVNC_TGZ (noVNC's source tag tarball: the npm package's lib/ has a top-level await in CommonJS).
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq >/dev/null 2>&1
-sudo apt-get install -y -qq nasm esbuild libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 >/dev/null 2>&1
+sudo apt-get install -y -qq nasm esbuild libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 x11-apps python3-numpy python3-pil >/dev/null 2>&1
 cargo +1.93.0 build --release --locked 2>&1 | tail -3
 cc -O2 bench/vs/source.c -lX11 -lXext -lm -o /tmp/vs-source || { echo 'source did not build'; exit 1; }
 rm -rf /tmp/novnc; mkdir -p /tmp/novnc

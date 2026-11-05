@@ -2,7 +2,8 @@
 // panning, grainy picture). Top left, a marker strip in 16 px cells the harness reads back:
 // rows 0-1 are 8 check bits + a 12-bit frame number + 20 bits of wall-clock ms; row 2 is the
 // last key, 5 bits (0-25, 31 = none) then the same 5 inverted, so a frame carrying a tag was
-// provably caused by that key.
+// provably caused by that key. SIGUSR1 freezes the picture, writes what scroll and video draw to
+// the file named by argv[5] (the harness rebuilds any frame from it) and prints FROZEN.
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -17,6 +18,7 @@
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
+#include <unistd.h>
 #define CELL 16
 #define STRIP_W (20 * CELL)
 #define STRIP_H (3 * CELL)
@@ -107,6 +109,11 @@ static void picture(uint32_t *px) {
 	free(a);
 	free(b);
 }
+static volatile sig_atomic_t freeze;
+static void on_freeze(int s) {
+	(void)s;
+	freeze = 1;
+}
 static int cx = 80, cy = 80;
 static void key(XEvent *e) {
 	KeySym s = XLookupKeysym(&e->xkey, 0);
@@ -171,15 +178,30 @@ int main(int argc, char **argv) {
 	draw_frame(0);
 	draw_tag();
 	XSync(d, False);
+	struct sigaction sa = {.sa_handler = on_freeze};
+	sigaction(SIGUSR1, &sa, NULL);
 	puts("SOURCE READY");
 	fflush(stdout);
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	struct pollfd pf = {.fd = ConnectionNumber(d), .events = POLLIN};
 	for (unsigned n = 1, off = 0;; n++) {
+		if (freeze) {
+			FILE *dump = argc > 5 && !typing ? fopen(argv[5], "wb") : NULL;
+			if (dump && video) fwrite(img->data, img->bytes_per_line, (size_t)H * LOOP, dump);
+			if (dump && scroll) {
+				XImage *all = XGetImage(d, p, 0, 0, W, ph, AllPlanes, ZPixmap);
+				fwrite(all->data, all->bytes_per_line, ph, dump);
+			}
+			if (dump) fclose(dump);
+			XSync(d, False);
+			puts("FROZEN");
+			fflush(stdout);
+			for (;;) pause();
+		}
 		if (typing) {
 			events();
-			poll(&pf, 1, -1);
+			poll(&pf, 1, 100);
 			continue;
 		}
 		if (scroll) {
@@ -210,7 +232,7 @@ int main(int argc, char **argv) {
 				left.tv_nsec += 1000000000L;
 				left.tv_sec--;
 			}
-			if (left.tv_sec < 0) break;
+			if (left.tv_sec < 0 || freeze) break;
 			if (ppoll(&pf, 1, &left, NULL) == 0) break;
 		}
 	}
