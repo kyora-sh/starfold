@@ -57,6 +57,27 @@ for s in $sets; do
         done
       done
       run_set p "$rounds" "${arms[@]}" ;;
+    q)
+      command -v ffmpeg > /dev/null || brew install ffmpeg > /dev/null 2>&1
+      dump=$(mktemp -d)
+      for ((i = 0; i < rounds; i++)); do
+        qarms=()
+        for c in h264 hevc; do
+          for k in 30000 8000 2000; do
+            for d in 30 60 120; do qarms+=("$c-decl$d-k$k $c $d $k"); done
+          done
+        done
+        for ((a = 0; a < ${#qarms[@]}; a++)); do
+          read -r label c d k <<< "${qarms[$(((a + i) % ${#qarms[@]}))]}"
+          run_set q 1 "$label|cpu_per_stream|BACKEND=videotoolbox CODEC=$c FRAMES=150 PACE_MS=33 FPS=$d KBPS=$k DUMP=$dump"
+          for w in typing scrolling video; do
+            ffmpeg -hide_banner -nostats -loglevel error -y -f "$c" -framerate 30 -i "$dump/$w.bits" -f rawvideo -pix_fmt yuv420p -s 1920x1080 -framerate 30 -i "$dump/$w.yuv" -lavfi "[0:v]trim=start_frame=30,setpts=N,format=yuv420p,split=2[a0][a1];[1:v]trim=start_frame=30,setpts=N,format=yuv420p,split=2[b0][b1];[a0][b0]psnr=stats_file=$dump/p.log[o0];[a1][b1]ssim=stats_file=$dump/s.log[o1]" -map '[o0]' -f null - -map '[o1]' -f null - 2>&1 | tail -3
+            awk -v tag="quality set=q cell=$label round=$i workload=$w" '{for(i=1;i<=NF;i++) if($i ~ /^psnr_y:/){v=substr($i,8); if(v=="inf")v=99; v+=0; s+=v; if(n==0||v<m)m=v; n++}} END{printf "%s frames=%d psnr_y_avg=%.3f psnr_y_min=%.3f", tag, n, (n?s/n:0), m}' "$dump/p.log"
+            awk '{for(i=1;i<=NF;i++) if($i ~ /^All:/){v=substr($i,5)+0; s+=v; if(n==0||v<m)m=v; n++}} END{printf " ssim_avg=%.5f ssim_min=%.5f\n", (n?s/n:0), m}' "$dump/s.log"
+            rm -f "$dump/$w.bits" "$dump/$w.yuv" "$dump/p.log" "$dump/s.log"
+          done
+        done
+      done ;;
     z)
       OFF="VT_LL=0 VT_RT=0"
       for c in h264 hevc; do
