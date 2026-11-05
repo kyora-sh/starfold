@@ -914,6 +914,11 @@ fn a_tight_budget_takes_a_smaller_step() {
     assert_eq!(s.pick(refine(20, 41_000)), Some(23));
     assert_eq!(s.pick(refine(20, 40_000)), None);
     assert_eq!(s.pick(refine(24, 200_000)), None);
+    // A coarse picture sharpens far further for the same bytes.
+    assert_eq!(
+        openh264::Sharpness::new(48).pick(refine(20, 50_000)),
+        Some(44)
+    );
     let mut s = openh264::Sharpness::new(24);
     s.off = true;
     assert_eq!(s.pick(refine(20, 200_000)), None);
@@ -932,9 +937,11 @@ fn the_estimate_learns_from_what_frames_cost() {
     // Four times what was expected counts at once.
     s.refined(20, mbs, 80_000);
     assert_eq!(s.pick(budget(20_000)), Some(19));
-    // Cheaper than expected counts by half.
-    s.refined(19, mbs, 1_000);
-    assert_eq!(s.pick(budget(20_000)), Some(17));
+    // Cheaper than expected mostly replaces it; next to nothing doesn't count.
+    s.refined(19, mbs, 2_000);
+    assert_eq!(s.pick(budget(20_000)), Some(16));
+    s.refined(19, mbs, 13);
+    assert_eq!(s.pick(budget(20_000)), Some(16));
     // Motion puts the picture back where it was.
     s.moved(30);
     assert_eq!(s.pick(budget(1_000)), None);

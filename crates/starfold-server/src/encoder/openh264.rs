@@ -25,8 +25,8 @@ const REFINE_COST_RANGE: (f64, f64) = (1.0, 15.0);
 pub static REFINED_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub static REFINED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// How coarse the picture still is, and what sharpening it costs: over the QPs a refinement
-/// crosses, bytes grow about linearly with the steps.
+/// How coarse the picture still is, and what sharpening it costs. A QP step costs the same
+/// below 28 and less and less above it, down to almost nothing at 51 (1080p text, measured).
 pub(super) struct Sharpness {
     qp: i32,
     cost: f64,
@@ -46,8 +46,15 @@ impl Sharpness {
         self.qp = self.qp.max(qp);
     }
 
+    /// QP steps from where the picture stands to `qp`, in steps of `cost`.
+    fn steps(&self, qp: i32) -> f64 {
+        (qp..self.qp)
+            .map(|q| ((52 - q) as f64 / 24.0).min(1.0))
+            .sum()
+    }
+
     fn expected(&self, mbs: usize, qp: i32) -> f64 {
-        mbs as f64 * (self.qp - qp) as f64 * self.cost
+        mbs as f64 * self.steps(qp) * self.cost
     }
 
     /// The lowest QP down to the pass's whose frame is expected to fit.
@@ -62,16 +69,17 @@ impl Sharpness {
         }
     }
 
-    /// A frame that came out larger than expected counts at once, a smaller one by half:
-    /// the next pass may be on a thin link.
+    /// The next pass is most likely this picture again, so a frame's cost mostly replaces
+    /// the estimate; one larger than expected does at once. One with next to nothing to
+    /// sharpen says nothing about the next picture.
     pub(super) fn refined(&mut self, qp: i32, mbs: usize, bytes: usize) {
-        let steps = self.qp - qp;
-        if mbs > 0 && steps > 0 {
-            let seen = bytes as f64 / (mbs as f64 * steps as f64);
+        let steps = self.steps(qp);
+        if mbs > 0 && steps > 0.0 && bytes >= 1024 {
+            let seen = bytes as f64 / (mbs as f64 * steps);
             let cost = if seen > self.cost {
                 seen
             } else {
-                (self.cost + seen) / 2.0
+                0.25 * self.cost + 0.75 * seen
             };
             self.cost = cost.clamp(REFINE_COST_RANGE.0, REFINE_COST_RANGE.1);
         }
