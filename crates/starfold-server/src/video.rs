@@ -16,7 +16,7 @@ use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto};
 use crate::negotiate::{self, Candidate, Choice, DecodeCap, DecoderConfig, Offer, StripeOffer};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -223,6 +223,8 @@ struct Shared {
     failures: AtomicU32,
     /// When the capture thread last sent this cohort a keyframe job.
     last_key: Mutex<Instant>,
+    /// Keyframes this cohort sent.
+    keyframes: AtomicU64,
     w: u32,
     h: u32,
 }
@@ -664,6 +666,7 @@ impl Engine {
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
+            keyframes: AtomicU64::new(0),
             w: self.w,
             h: self.h,
         });
@@ -957,6 +960,26 @@ impl Engine {
                     && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, interval_ms))
             })
             .collect()
+    }
+
+    /// How many cohorts have viewers; the encoders go by it too, for a pass already queued.
+    fn with_viewers(&self, views: &[View]) -> usize {
+        let n = views.iter().filter(|v| !v.clients.is_empty()).count();
+        self.hub.viewer_cohorts.store(n, Ordering::Release);
+        n
+    }
+
+    /// The only cohort with viewers, if there is one, and the keyframes it sent.
+    fn sole_keyframes(&self, views: &[View]) -> Option<(u64, u64)> {
+        let mut with = self
+            .cohorts
+            .iter()
+            .zip(views)
+            .filter(|(_, v)| !v.clients.is_empty());
+        let (c, _) = with.next()?;
+        with.next()
+            .is_none()
+            .then(|| (c.shared.id, c.shared.keyframes.load(Ordering::Acquire)))
     }
 
     /// Whether what was encoded so far has reached the viewers. One that hasn't answered
@@ -1293,8 +1316,8 @@ struct Burst {
     refilled: Instant,
     /// The bitrate cap in kbit/s; 0 is uncapped.
     target: u32,
-    /// Keyframes sent so far.
-    keyframes: u64,
+    /// The sole cohort at the last look, and the keyframes it had sent.
+    keyframes: Option<(u64, u64)>,
     /// One cohort has viewers.
     single: bool,
     /// This burst is a ladder: it started on one cohort and none has joined since.
@@ -1332,7 +1355,7 @@ impl Burst {
             tokens: f64::INFINITY,
             refilled: now,
             target: 0,
-            keyframes: 0,
+            keyframes: None,
             single: true,
             ladder: true,
         }
@@ -1347,11 +1370,12 @@ impl Burst {
         self.single = with_viewers <= 1;
         self.ladder &= self.single;
     }
-    /// A keyframe that went out is squeezed into the rate cap, so it starts a burst. One
-    /// only asked for says nothing: an encoder that drops them is asked again and again.
-    fn keyframe_sent(&mut self, sent: u64, now: Instant) -> bool {
-        let new = sent != self.keyframes && self.single;
-        self.keyframes = sent;
+    /// A keyframe the sole cohort sent is squeezed into the rate cap, so it starts a burst.
+    /// One only asked for says nothing: an encoder that drops them is asked again and again.
+    /// Nor does one from before it was alone.
+    fn keyframe_sent(&mut self, sole: Option<(u64, u64)>, now: Instant) -> bool {
+        let new = matches!((self.keyframes, sole), (Some(a), Some(b)) if a.0 == b.0 && a.1 != b.1);
+        self.keyframes = sole;
         if new {
             self.moved(now);
         }
@@ -1599,8 +1623,8 @@ fn capture_loop(
             },
             hub.stats.paintover_bytes.load(Ordering::Relaxed),
         );
-        burst.cohorts(views.iter().filter(|v| !v.clients.is_empty()).count());
-        if burst.keyframe_sent(hub.stats.keyframes.load(Ordering::Relaxed), now) {
+        burst.cohorts(eng.with_viewers(&views));
+        if burst.keyframe_sent(eng.sole_keyframes(&views), now) {
             refiner.mark_all();
         }
         // One pass in flight at most: what a viewer types next never waits behind two.
@@ -2164,7 +2188,8 @@ fn encode_loop(
         // controller reins the total in if several stripes move at once.
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
-        let refine = job.refine_qp.map(|qp| {
+        let single = hub.viewer_cohorts.load(Ordering::Acquire) <= 1;
+        let refine = job.refine_qp.filter(|_| single).map(|qp| {
             let bytes = target as usize * REFINE_FRAME_MS / 8 / n;
             (qp, (!uncapped).then_some(bytes))
         });
@@ -2264,6 +2289,7 @@ fn encode_loop(
         }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
+            sh.keyframes.fetch_add(1, Ordering::Release);
         }
         frame_id = frame_id.wrapping_add(1);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.

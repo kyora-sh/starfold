@@ -1307,12 +1307,17 @@ fn only_a_keyframe_that_went_out_starts_a_burst() {
     let mut b = Burst::new(3, GAP, now);
     b.moved(now);
     let due = now + GAP;
-    assert!(!b.keyframe_sent(sent, due));
+    let views = eng.views();
+    let sole = eng.sole_keyframes(&views);
+    assert_eq!(sole.map(|s| s.1), Some(0));
+    assert!(!b.keyframe_sent(sole, due));
+    assert!(!b.keyframe_sent(sole, due));
     assert!(b.due(due), "the retries postpone nothing");
-    assert!(b.keyframe_sent(1, due));
+    let id = sole.unwrap().0;
+    assert!(b.keyframe_sent(Some((id, 1)), due));
     assert!(!b.due(due), "a real one is motion");
     assert!(b.due(due + GAP));
-    assert!(!b.keyframe_sent(1, due + GAP));
+    assert!(!b.keyframe_sent(Some((id, 1)), due + GAP));
 }
 
 /// Takes the whole burst, as the capture loop does while `due`.
@@ -1360,7 +1365,16 @@ fn two_cohorts_have_no_budget() {
     let now = Instant::now();
     let mut b = Burst::new(3, GAP, now);
     b.account(now, 2000, 0);
-    b.account(now, 2000, 10_000_000);
+    for i in 1..5 {
+        b.account(now, 2000, 500_000 * i);
+        b.moved(now);
+        for _ in 0..3 {
+            b.pass(now);
+        }
+    }
+    b.moved(now);
+    assert!(b.gap(now) > GAP, "backed off");
+    assert!(!b.funded(), "and over budget");
     b.cohorts(2);
     for i in 0..8 {
         let t = now + Duration::from_secs(i);
@@ -1372,16 +1386,88 @@ fn two_cohorts_have_no_budget() {
 }
 
 #[test]
-fn only_one_cohort_restarts_a_burst_on_a_keyframe() {
+fn only_the_sole_cohorts_keyframes_restart_a_burst() {
     let now = Instant::now();
     let mut b = Burst::new(3, NO_DELAY, now);
-    b.cohorts(2);
-    assert!(!b.keyframe_sent(1, now));
+    b.keyframe_sent(None, now);
+    assert!(
+        !b.keyframe_sent(Some((1, 1)), now),
+        "from before it was alone"
+    );
     assert!(!b.due(now));
-    b.cohorts(1);
-    assert!(!b.keyframe_sent(1, now), "that one was already counted");
-    assert!(b.keyframe_sent(2, now));
+    assert!(b.keyframe_sent(Some((1, 2)), now));
     assert!(b.due(now));
+    b.stop();
+    assert!(!b.keyframe_sent(None, now), "two cohorts");
+    assert!(
+        !b.keyframe_sent(Some((1, 3)), now),
+        "sent while it wasn't alone"
+    );
+    assert!(!b.keyframe_sent(Some((2, 9)), now), "another cohort");
+    assert!(!b.due(now));
+}
+
+/// The other cohort's keyframe lands, unseen, just before its viewer leaves.
+#[test]
+fn another_cohorts_keyframe_starts_no_ladder_on_the_one_left() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
+    let (a, mut ra) = client(&hub);
+    let (b, mut rb) = client(&hub);
+    join_v2(&hub, &a, &[Codec::Hevc]);
+    join_legacy(&hub, &b);
+    push(&mut eng);
+    ready(&a, &drain(&mut ra));
+    acked(&b, &mut rb);
+    let now = Instant::now();
+    let mut burst = Burst::new(3, NO_DELAY, now);
+    eng.replan();
+    let views = eng.views();
+    assert_eq!(eng.with_viewers(&views), 2);
+    burst.cohorts(2);
+    burst.keyframe_sent(eng.sole_keyframes(&views), now);
+    push(&mut eng);
+    assert!(
+        hub.stats.keyframes.load(Ordering::Relaxed) >= 2,
+        "HEVC's came in"
+    );
+    hub.remove_client(a.id);
+    eng.replan();
+    let views = eng.views();
+    assert_eq!(eng.with_viewers(&views), 1);
+    burst.cohorts(1);
+    assert!(!burst.keyframe_sent(eng.sole_keyframes(&views), now));
+    assert!(!burst.due(now));
+}
+
+/// The capture thread had dispatched the pass when the second cohort became ready.
+#[test]
+fn a_queued_pass_loses_its_qp_once_a_second_cohort_has_viewers() {
+    let run = |cohorts: usize| {
+        let seen = Refines::default();
+        let hub = Hub::new();
+        let opts = Opts {
+            refines: Some(seen.clone()),
+            ..Default::default()
+        };
+        let mut eng = engine(&hub, &[H264], opts);
+        let (c, _rx) = client(&hub);
+        join_legacy(&hub, &c);
+        push(&mut eng);
+        eng.replan();
+        let views = eng.views();
+        let takes = eng.takes(&views, 33.0);
+        hub.viewer_cohorts.store(cohorts, Ordering::Release);
+        let mut f = whole(W, H);
+        f.paintover = true;
+        f.refine_qp = Some(16);
+        eng.dispatch(&f, &views, &takes);
+        settle(&eng);
+        let got = seen.lock().unwrap().last().unwrap().0;
+        got.map(|r| r.qp)
+    };
+    assert_eq!(run(1), Some(16));
+    assert_eq!(run(2), None);
 }
 
 /// A recording is a protocol 1 viewer of the H.264 cohort, so beside an H.264 viewer it is
@@ -1399,7 +1485,7 @@ fn a_recording_is_a_second_cohort_only_beside_another_codec() {
         ready(&viewer, &drain(&mut rv));
         eng.replan();
         let views = eng.views();
-        views.iter().filter(|v| !v.clients.is_empty()).count()
+        eng.with_viewers(&views)
     };
     assert_eq!(with_viewers(Codec::H264), 1);
     assert_eq!(with_viewers(Codec::Hevc), 2);
@@ -1428,7 +1514,7 @@ fn two_cohorts_go_quiet_after_a_plain_burst() {
     acked(&b, &mut rb);
     eng.replan();
     let views = eng.views();
-    let cohorts = views.iter().filter(|v| !v.clients.is_empty()).count();
+    let cohorts = eng.with_viewers(&views);
     assert_eq!(cohorts, 2);
     let now = Instant::now();
     let mut burst = Burst::new(3, NO_DELAY, now);
