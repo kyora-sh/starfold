@@ -18,8 +18,9 @@ const MAX_FPS: u32 = 60;
 /// What an uncapped rate (`max_kbps` 0) becomes: level 5.2's bitrate.
 const UNCAPPED_BPS: c_int = 240_000_000;
 /// What one QP step costs per macroblock, until a frame says otherwise: desktop text is
-/// 1.3 to 2, a screen packed with it 5.
-const REFINE_COST: f64 = 2.5;
+/// 1.3 to 2, a screen packed with it 5 to 15. Starting high costs a thin link one soft pass,
+/// starting low a frame that blocks input.
+const REFINE_COST: f64 = 5.0;
 const REFINE_COST_RANGE: (f64, f64) = (1.0, 15.0);
 
 /// How coarse each macroblock still is, and what sharpening them costs. A QP step costs the
@@ -79,9 +80,9 @@ impl Sharpness {
         }
     }
 
-    /// The next pass is most likely this picture again, so a frame's cost mostly replaces
-    /// the estimate; one larger than expected does at once. One with next to nothing to
-    /// sharpen says nothing about the next picture.
+    /// A frame larger than expected replaces the estimate at once, a smaller one by half:
+    /// passes over the same picture vary several times over, and only too large a frame
+    /// hurts. One with next to nothing to sharpen says nothing about the next picture.
     pub(super) fn refined(&mut self, qp: i32, bytes: usize) {
         let steps = self.steps(qp);
         if steps > 0.0 && bytes >= 1024 {
@@ -89,7 +90,7 @@ impl Sharpness {
             let cost = if seen > self.cost {
                 seen
             } else {
-                0.25 * self.cost + 0.75 * seen
+                (self.cost + seen) / 2.0
             };
             self.cost = cost.clamp(REFINE_COST_RANGE.0, REFINE_COST_RANGE.1);
         }

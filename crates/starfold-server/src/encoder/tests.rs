@@ -951,14 +951,13 @@ fn a_tight_budget_takes_a_smaller_step() {
     };
     let s = openh264::Sharpness::new(8160, 24);
     assert_eq!(s.pick(refine(20, 200_000)), Some(20));
-    assert_eq!(s.pick(refine(20, 82_000)), Some(20));
-    assert_eq!(s.pick(refine(20, 45_000)), Some(22));
-    assert_eq!(s.pick(refine(20, 21_000)), Some(23));
-    assert_eq!(s.pick(refine(20, 20_000)), None);
+    assert_eq!(s.pick(refine(20, 90_000)), Some(22));
+    assert_eq!(s.pick(refine(20, 41_000)), Some(23));
+    assert_eq!(s.pick(refine(20, 40_000)), None);
     assert_eq!(s.pick(refine(24, 200_000)), None);
     // A coarse picture sharpens far further for the same bytes.
     let s = openh264::Sharpness::new(8160, 48);
-    assert_eq!(s.pick(refine(20, 50_000)), Some(41));
+    assert_eq!(s.pick(refine(20, 50_000)), Some(44));
     let mut s = openh264::Sharpness::new(8160, 24);
     s.off = true;
     assert_eq!(s.pick(refine(20, 200_000)), None);
@@ -966,21 +965,20 @@ fn a_tight_budget_takes_a_smaller_step() {
 
 #[test]
 fn the_estimate_learns_from_what_frames_cost() {
-    let mbs = 1000;
     let budget = |max_bytes| Refine {
         qp: 12,
         max_bytes: Some(max_bytes),
     };
-    let mut s = openh264::Sharpness::new(mbs, 24);
-    assert_eq!(s.pick(budget(10_000)), Some(20));
-    // More than expected counts at once.
-    s.refined(20, 80_000);
-    assert_eq!(s.pick(budget(20_000)), Some(19));
-    // Cheaper than expected mostly replaces it; next to nothing doesn't count.
-    s.refined(19, 2_000);
-    assert_eq!(s.pick(budget(20_000)), Some(16));
-    s.refined(19, 13);
-    assert_eq!(s.pick(budget(20_000)), Some(16));
+    let mut s = openh264::Sharpness::new(1000, 24);
+    assert_eq!(s.pick(budget(10_000)), Some(22));
+    // More than expected counts at once, up to the most a screen costs.
+    s.refined(22, 80_000);
+    assert_eq!(s.pick(budget(30_000)), Some(20));
+    // Cheaper than expected counts by half; next to nothing doesn't count.
+    s.refined(20, 2_000);
+    assert_eq!(s.pick(budget(16_000)), Some(18));
+    s.refined(20, 13);
+    assert_eq!(s.pick(budget(16_000)), Some(18));
     // Motion puts the picture back where it was.
     s.moved(30, None);
     assert_eq!(s.pick(budget(1_000)), None);
@@ -991,12 +989,12 @@ fn the_estimate_learns_from_what_frames_cost() {
     for _ in 0..8 {
         s.skipped();
     }
-    assert_eq!(s.pick(budget(6_000)), Some(27));
+    assert_eq!(s.pick(budget(6_000)), Some(28));
     // A skip needn't lower an estimate that was already low.
-    let mut s = openh264::Sharpness::new(mbs, 24);
+    let mut s = openh264::Sharpness::new(1000, 24);
     s.skipped();
-    assert_eq!(s.pick(budget(2_500)), Some(23));
-    assert_eq!(s.pick(budget(2_499)), None);
+    assert_eq!(s.pick(budget(5_000)), Some(23));
+    assert_eq!(s.pick(budget(4_999)), None);
 }
 
 #[test]
@@ -1014,18 +1012,18 @@ fn the_estimate_counts_every_block_still_coarse() {
     let mut s = openh264::Sharpness::new(1000, 12);
     s.moved(24, Some(&moved(0..100)));
     assert_eq!(s.pick(budget(1_000_000)), Some(12));
-    assert_eq!(s.pick(budget(250)), Some(23));
-    assert_eq!(s.pick(budget(249)), None);
+    assert_eq!(s.pick(budget(500)), Some(23));
+    assert_eq!(s.pick(budget(499)), None);
     // A region that went still earlier still counts when another one stops later.
     s.moved(24, Some(&moved(100..1000)));
-    assert_eq!(s.pick(budget(250)), None);
-    assert_eq!(s.pick(budget(2_500)), Some(23));
+    assert_eq!(s.pick(budget(500)), None);
+    assert_eq!(s.pick(budget(5_000)), Some(23));
     // A pass that only got part of the way leaves all of it that coarse, however small
     // the next stop is.
     s.refined(20, 0);
     s.moved(24, Some(&moved(0..1)));
-    assert_eq!(s.pick(budget(2_500)), Some(20));
-    assert_eq!(s.pick(budget(2_510)), Some(19));
+    assert_eq!(s.pick(budget(5_000)), Some(20));
+    assert_eq!(s.pick(budget(5_020)), Some(19));
     // A map that doesn't match counts as everything.
     let mut s = openh264::Sharpness::new(1000, 12);
     s.moved(24, Some(&[0u8; 10]));

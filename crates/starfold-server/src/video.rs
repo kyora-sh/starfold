@@ -959,6 +959,14 @@ impl Engine {
             .collect()
     }
 
+    /// Whether every viewer has everything it was sent.
+    fn drained(&self, views: &[View]) -> bool {
+        views
+            .iter()
+            .flat_map(|v| &v.clients)
+            .all(|c| c.backlog().0 == 0)
+    }
+
     /// Whether a keyframe is owed by a cohort that isn't failing: one that is retries
     /// keyframes for as long as it fails, and that says nothing about the picture.
     fn healthy_key(&self, views: &[View]) -> bool {
@@ -1552,10 +1560,15 @@ fn capture_loop(
             hub.target_kbps.load(Ordering::Relaxed),
             hub.stats.paintover_bytes.load(Ordering::Relaxed),
         );
-        let mut paintover_due = burst.due(now);
+        // One pass in flight at most: what a viewer types next never waits behind two.
+        let mut paintover_due = burst.due(now) && eng.drained(&views);
         let catch_up = eng.catch_up_due(&views, interval_ms);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
-            let timeout = burst.wait_ms(now);
+            let timeout = if burst.due(now) {
+                100
+            } else {
+                burst.wait_ms(now)
+            };
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
             continue;
         }

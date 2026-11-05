@@ -1246,6 +1246,21 @@ fn caught_up_damage_is_no_refining_pass() {
 }
 
 #[test]
+fn a_pass_waits_for_the_last_one_to_arrive() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    let views = eng.views();
+    assert!(!eng.drained(&views), "a frame is on its way");
+    for f in videos(&drain(&mut rx)) {
+        c.ack(None, f.2);
+    }
+    assert!(eng.drained(&views));
+}
+
+#[test]
 fn only_a_healthy_cohorts_keyframe_restarts_the_burst() {
     let hub = Hub::new();
     let mut eng = engine(&hub, &[H264], Opts::default());
