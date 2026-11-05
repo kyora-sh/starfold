@@ -1297,7 +1297,8 @@ const REFINE_FRAME_MS: usize = 200;
 /// A burst this cheap (a cursor, a typed glyph) doesn't count towards backing off.
 const REFINE_CHEAP_BYTES: u64 = 32 * 1024;
 const REFINE_MAX_BACKOFF: u32 = 4;
-/// Backing off ends after this long without a burst.
+/// Each step of backing off wears off after this long without a burst, so a stream that
+/// keeps stopping still gets one about this often.
 const REFINE_QUIET: Duration = Duration::from_secs(5);
 /// Bursts may take this share of the cap, averaged over the window: enough for a whole
 /// ladder after a single stop, even on a thin link.
@@ -1334,16 +1335,15 @@ impl Burst {
         self.spent = spent;
         self.target = target_kbps;
     }
+    fn level(&self, now: Instant) -> u32 {
+        let quiet = self.last_burst.map_or(0, |t| {
+            (now.saturating_duration_since(t).as_secs_f64() / REFINE_QUIET.as_secs_f64()) as u32
+        });
+        self.backoff.saturating_sub(quiet)
+    }
     /// How long the picture must stay still before a burst.
     fn gap(&self, now: Instant) -> Duration {
-        let quiet = self
-            .last_burst
-            .is_none_or(|t| now.saturating_duration_since(t) >= REFINE_QUIET);
-        if quiet {
-            self.delay
-        } else {
-            self.delay * (1 << self.backoff)
-        }
+        self.delay * (1 << self.level(now))
     }
     /// Only a burst's first pass waits for budget: one under way finishes.
     fn funded(&self) -> bool {
@@ -1368,15 +1368,8 @@ impl Burst {
     /// Takes a pass; the last ones get the rungs, so any burst length ends at the finest.
     fn pass(&mut self, now: Instant) -> u8 {
         if self.left == self.len {
-            let recent = self
-                .last_burst
-                .is_some_and(|t| now.saturating_duration_since(t) < REFINE_QUIET);
             let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
-            self.backoff = match (recent, costly) {
-                (false, _) => 0,
-                (true, true) => (self.backoff + 1).min(REFINE_MAX_BACKOFF),
-                (true, false) => self.backoff,
-            };
+            self.backoff = (self.level(now) + costly as u32).min(REFINE_MAX_BACKOFF);
             self.last_burst = Some(now);
             self.spent_at_start = self.spent;
         }
@@ -2173,6 +2166,7 @@ fn encode_loop(
             buf,
             paintover,
             paintover_final,
+            refine_qp,
             band,
             captured_at,
             marker_ms,
@@ -2209,7 +2203,7 @@ fn encode_loop(
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
-        if paintover && !all_key {
+        if refine_qp.is_some() && !all_key {
             hub.stats.paintover_frames.fetch_add(1, Ordering::Relaxed);
             hub.stats
                 .paintover_bytes

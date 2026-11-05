@@ -1548,8 +1548,48 @@ fn a_quiet_spell_ends_the_backoff() {
         }
     }
     let last = start + Duration::from_secs(5);
-    assert!(b.gap(last + Duration::from_secs(1)) > GAP);
-    assert_eq!(b.gap(last + REFINE_QUIET), GAP);
+    let gap = |after: Duration| b.gap(last + after).as_millis();
+    assert_eq!(gap(Duration::from_secs(1)), 2400);
+    assert_eq!(gap(REFINE_QUIET), 1200);
+    assert_eq!(gap(REFINE_QUIET * 3), 300);
+    assert_eq!(gap(REFINE_QUIET * 4), 150);
+}
+
+/// The picture keeps stopping for less than the gap: a burst every `REFINE_QUIET` or so
+/// goes through anyway, and once the stops end the picture converges within the longest
+/// gap, however much was spent.
+#[test]
+fn repeated_stops_keep_refining_now_and_then_and_converge_after() {
+    let start = Instant::now();
+    let mut b = Burst::new(3, GAP, start);
+    let still = Duration::from_millis(450);
+    let (mut bursts, mut spent) = (Vec::new(), 0);
+    for i in 0..300u32 {
+        let stop = start + Duration::from_millis(900) * i;
+        b.account(stop, 2000, spent);
+        b.moved(stop);
+        if b.due(stop + still) {
+            bursts.push(stop);
+            spent += 100_000;
+            for _ in 0..3 {
+                b.pass(stop + still);
+            }
+        } else {
+            b.stop();
+        }
+    }
+    let spacing = |w: &[Instant]| (w[1] - w[0]).as_secs_f64();
+    let late: Vec<f64> = bursts[bursts.len() / 2..].windows(2).map(spacing).collect();
+    assert!(late.len() >= 15, "{} bursts", bursts.len());
+    assert!(
+        late.iter().all(|&s| s < 2.0 * REFINE_QUIET.as_secs_f64()),
+        "{late:?}"
+    );
+    let last = start + Duration::from_millis(900) * 300;
+    b.moved(last);
+    let settled = last + GAP * (1 << REFINE_MAX_BACKOFF) + Duration::from_secs(5);
+    b.account(settled, 2000, spent);
+    assert!(b.due(settled));
 }
 
 #[test]
