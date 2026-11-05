@@ -97,6 +97,8 @@ struct Skipped {
     band: Option<Band>,
     /// None: analyse everything.
     mb: Option<Vec<u8>>,
+    /// A pass of a burst was among it: this cohort is owed the ladder it missed.
+    pass: bool,
 }
 
 fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
@@ -104,8 +106,10 @@ fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
         None => Skipped {
             band: f.band,
             mb: f.mb_dirty.as_ref().map(|m| m.to_vec()),
+            pass: f.refine_qp.is_some(),
         },
         Some(p) => Skipped {
+            pass: p.pass || f.refine_qp.is_some(),
             band: union_opt(p.band, f.band),
             mb: match (p.mb, &f.mb_dirty) {
                 (Some(a), Some(b)) => Some(or_maps(&a, b)),
@@ -971,15 +975,6 @@ impl Engine {
             })
     }
 
-    /// Whether a keyframe is owed by a cohort that isn't failing: one that is retries
-    /// keyframes for as long as it fails, and that says nothing about the picture.
-    fn healthy_key(&self, views: &[View]) -> bool {
-        self.cohorts
-            .iter()
-            .zip(views)
-            .any(|(c, v)| v.want_key && c.shared.failures.load(Ordering::Acquire) == 0)
-    }
-
     /// Whether a cohort that skipped damage has room for it now: worth a capture even
     /// when nothing else changed, or that cohort's viewers keep stale regions.
     fn catch_up_due(&self, views: &[View], interval_ms: f64) -> bool {
@@ -989,7 +984,9 @@ impl Engine {
             .any(|(c, take)| take && c.skipped.is_some())
     }
 
-    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) {
+    /// Whether a cohort caught up on a pass it missed: the burst that had it is over.
+    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) -> bool {
+        let mut owed = false;
         for ((c, v), &take) in self.cohorts.iter_mut().zip(views).zip(takes) {
             if v.clients.is_empty() {
                 continue;
@@ -998,8 +995,12 @@ impl Engine {
                 c.skipped = Some(skip(c.skipped.take(), f));
                 continue;
             }
+            let mut missed = false;
             let frame = match c.skipped.take() {
-                Some(s) => catch_up(s, f.clone()),
+                Some(s) => {
+                    missed = s.pass;
+                    catch_up(s, f.clone())
+                }
                 None => f.clone(),
             };
             let Some(tx) = c.tx.as_ref() else { continue };
@@ -1009,19 +1010,25 @@ impl Engine {
                 *c.shared.last_key.lock() = Instant::now();
             }
             c.shared.busy.fetch_add(1, Ordering::AcqRel);
-            if let Err(e) = tx.try_send(Job {
+            match tx.try_send(Job {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
             }) {
-                c.shared.busy.fetch_sub(1, Ordering::AcqRel);
-                if force {
-                    c.shared.idr_inflight.store(false, Ordering::Release);
+                Ok(()) => owed |= missed,
+                Err(e) => {
+                    c.shared.busy.fetch_sub(1, Ordering::AcqRel);
+                    if force {
+                        c.shared.idr_inflight.store(false, Ordering::Release);
+                    }
+                    let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
+                    let mut s = skip(None, &j.frame);
+                    s.pass |= missed;
+                    c.skipped = Some(s);
                 }
-                let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
-                c.skipped = Some(skip(None, &j.frame));
             }
         }
+        owed
     }
 }
 
@@ -1300,6 +1307,8 @@ struct Burst {
     refilled: Instant,
     /// The bitrate cap in kbit/s; 0 is uncapped.
     target: u32,
+    /// Keyframes sent so far.
+    keyframes: u64,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
@@ -1333,11 +1342,22 @@ impl Burst {
             tokens: f64::INFINITY,
             refilled: now,
             target: 0,
+            keyframes: 0,
         }
     }
     fn moved(&mut self, now: Instant) {
         self.left = self.len;
         self.last_motion = now;
+    }
+    /// A keyframe that went out is squeezed into the rate cap, so it starts a burst. One
+    /// only asked for says nothing: an encoder that drops them is asked again and again.
+    fn keyframe_sent(&mut self, sent: u64, now: Instant) -> bool {
+        let new = sent != self.keyframes;
+        self.keyframes = sent;
+        if new {
+            self.moved(now);
+        }
+        new
     }
     /// Brings the byte budget up to date with what has been sent and the current cap.
     fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
@@ -1573,6 +1593,9 @@ fn capture_loop(
             },
             hub.stats.paintover_bytes.load(Ordering::Relaxed),
         );
+        if burst.keyframe_sent(hub.stats.keyframes.load(Ordering::Relaxed), now) {
+            refiner.mark_all();
+        }
         // One pass in flight at most: what a viewer types next never waits behind two.
         let mut paintover_due = burst.due(now) && eng.drained(&views);
         let catch_up = eng.catch_up_due(&views, interval_ms);
@@ -1700,9 +1723,6 @@ fn capture_loop(
         if want_key {
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
-            if eng.healthy_key(&views) {
-                burst.moved(t0);
-            }
         }
         let frame_paintover = paintover && refine.is_none();
         let paintover_final = frame_paintover && burst.left == 0;
@@ -1735,7 +1755,7 @@ fn capture_loop(
             mb_dirty.take().map(Arc::new)
         };
         last_capture = t0;
-        eng.dispatch(
+        let owed = eng.dispatch(
             &Frame {
                 buf,
                 paintover,
@@ -1749,6 +1769,10 @@ fn capture_loop(
             &views,
             &takes,
         );
+        if owed {
+            refiner.mark_all();
+            burst.moved(t0);
+        }
     }
 }
 

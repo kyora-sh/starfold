@@ -67,6 +67,8 @@ struct Fake {
     kbps: u32,
     /// Every encode's refine option and the rate it ran at.
     refines: Option<Refines>,
+    /// A requested keyframe comes out as nothing at all.
+    empty_keys: bool,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -103,6 +105,9 @@ impl VideoEncoder for Fake {
             if self.kbps >= 16_000 {
                 k.1.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if self.empty_keys && opts.force_keyframe {
+            return Ok(Vec::new());
         }
         if self.fail_from.is_some_and(|f| self.n >= f) || self.fail_at == Some(self.n) {
             return Err(EncodeError("session lost".into()));
@@ -160,6 +165,8 @@ struct Opts {
     /// reopened ones.
     h264_hw_breaks: bool,
     refines: Option<Refines>,
+    /// H.264 cohorts' encoders drop every keyframe (the offer's sample encode still works).
+    h264_empty_keys: bool,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -188,6 +195,7 @@ fn fakes(o: Opts) -> Open {
                 keys: None,
                 kbps: 0,
                 refines: o.refines.clone(),
+                empty_keys: false,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -227,6 +235,7 @@ fn fakes(o: Opts) -> Open {
             keys: o.h264_keys.clone().filter(|_| !hevc && h264 == 1),
             kbps: 0,
             refines: o.refines.clone().filter(|_| !hevc),
+            empty_keys: o.h264_empty_keys && !hevc && h264 > 0,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -767,7 +776,10 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
     let takes = eng.takes(&views, 33.0);
     let mut still = whole(W, H);
     still.band = None;
-    eng.dispatch(&still, &views, &takes);
+    assert!(
+        !eng.dispatch(&still, &views, &takes),
+        "it missed motion, no pass"
+    );
     settle(&eng);
     assert_eq!(
         videos(&drain(&mut rs)).len(),
@@ -1279,21 +1291,80 @@ fn a_viewer_that_stopped_answering_holds_back_no_pass() {
 }
 
 #[test]
-fn only_a_healthy_cohorts_keyframe_restarts_the_burst() {
+fn only_a_keyframe_that_went_out_starts_a_burst() {
     let hub = Hub::new();
-    let mut eng = engine(&hub, &[H264], Opts::default());
+    let opts = Opts {
+        h264_empty_keys: true,
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
     let (c, _rx) = client(&hub);
     join_legacy(&hub, &c);
-    eng.replan();
-    let views = eng.views();
-    assert!(views[0].want_key);
-    assert!(eng.healthy_key(&views));
-    eng.cohorts[0].shared.failures.store(1, Ordering::Release);
-    assert!(!eng.healthy_key(&views));
-    eng.cohorts[0].shared.failures.store(0, Ordering::Release);
+    for _ in 0..3 {
+        push(&mut eng);
+    }
+    let sent = hub.stats.keyframes.load(Ordering::Relaxed);
+    assert_eq!(sent, 0, "dropped by the encoder");
+    assert!(eng.views()[0].want_key, "and asked for again");
+    let now = Instant::now();
+    let mut b = Burst::new(3, GAP, now);
+    b.moved(now);
+    let due = now + GAP;
+    assert!(!b.keyframe_sent(sent, due));
+    assert!(b.due(due), "the retries postpone nothing");
+    assert!(b.keyframe_sent(1, due));
+    assert!(!b.due(due), "a real one is motion");
+    assert!(b.due(due + GAP));
+    assert!(!b.keyframe_sent(1, due + GAP));
+}
+
+/// Two cohorts share a burst. One is held back by a viewer that isn't answering while the
+/// other takes the whole ladder; when it recovers, its damage goes out at once under rate
+/// control and the ladder starts over for it.
+#[test]
+fn a_recovered_cohort_gets_the_ladder_it_missed() {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[HEVC, H264], opts);
+    let (slow, _rs) = client(&hub);
+    let (fast, mut rf) = client(&hub);
+    join_legacy(&hub, &slow);
+    join_v2(&hub, &fast, &[Codec::Hevc, Codec::H264]);
     push(&mut eng);
-    let views = eng.views();
-    assert!(!eng.healthy_key(&views), "no keyframe owed");
+    ready(&fast, &drain(&mut rf));
+    let pass = |eng: &mut Engine, qp: Option<u8>| {
+        eng.replan();
+        let views = eng.views();
+        let takes = eng.takes(&views, 33.0);
+        let mut f = whole(W, H);
+        f.band = None;
+        f.paintover = qp.is_some();
+        f.refine_qp = qp;
+        let owed = eng.dispatch(&f, &views, &takes);
+        settle(eng);
+        owed
+    };
+    for _ in 0..40 {
+        push(&mut eng);
+        acked(&fast, &mut rf);
+    }
+    let h264 = eng.cohorts.iter().find(|k| k.shared.cand == H264).unwrap();
+    assert!(h264.skipped.is_some(), "held back");
+    for qp in REFINE_RUNGS {
+        assert!(!pass(&mut eng, Some(qp)));
+        acked(&fast, &mut rf);
+    }
+    seen.lock().unwrap().clear();
+    slow.inflight.lock().clear();
+    assert!(pass(&mut eng, None), "owed the ladder");
+    assert_eq!(seen.lock().unwrap().last().unwrap().0, None);
+    assert!(!pass(&mut eng, Some(20)), "and owed nothing after it");
+    let (refine, _) = *seen.lock().unwrap().last().unwrap();
+    assert_eq!(refine.map(|r| r.qp), Some(20));
 }
 
 #[test]
