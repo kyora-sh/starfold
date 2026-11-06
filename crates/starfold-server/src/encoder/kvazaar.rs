@@ -83,9 +83,9 @@ impl Kvazaar {
         Ok(k)
     }
 
+    /// A new encoder with the current settings. The old one is closed only once the new one
+    /// opened, so a failure leaves a working encoder behind.
     fn reopen(&mut self) -> Result<(), EncodeError> {
-        self.close();
-        self.stale = false;
         let api = self.api;
         let cfg = unsafe { (api.config_alloc.unwrap())() };
         if cfg.is_null() {
@@ -134,7 +134,10 @@ impl Kvazaar {
             Ok(enc)
         })();
         unsafe { (api.config_destroy.unwrap())(cfg) };
-        self.enc = set?;
+        let enc = set?;
+        self.close();
+        self.enc = enc;
+        self.stale = false;
         Ok(())
     }
 
@@ -211,7 +214,7 @@ impl VideoEncoder for Kvazaar {
         }
         p.check()?;
         let mut out = Vec::new();
-        if (opts.force_keyframe || self.stale) && self.pts >= 0 {
+        if self.stale || (opts.force_keyframe && self.pts >= 0) {
             out.extend(self.drain()?);
             self.reopen()?;
         }

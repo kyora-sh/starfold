@@ -66,6 +66,10 @@ impl Svt {
             return Err(EncodeError(format!("SVT-AV1 can't encode {:?}", c.codec)));
         }
         let preset = super::arm_speed("svt-av1", &c.preset, PRESET)?;
+        let preset = i8::try_from(preset)
+            .ok()
+            .filter(|p| (-2..=13).contains(p))
+            .ok_or_else(|| EncodeError(format!("SVT-AV1 preset {preset} is not in -2..=13")))?;
         let mut cfg: ffi::EbSvtAv1EncConfiguration = unsafe { mem::zeroed() };
         let mut handle: *mut ffi::EbComponentType = ptr::null_mut();
         check("init handle", unsafe {
@@ -81,7 +85,7 @@ impl Svt {
             ready: false,
         };
         let color = ColorInfo::SRGB_BT601_LIMITED;
-        cfg.enc_mode = preset as i8;
+        cfg.enc_mode = preset;
         cfg.source_width = c.width;
         cfg.source_height = c.height;
         cfg.frame_rate_numerator = c.fps.max(1);

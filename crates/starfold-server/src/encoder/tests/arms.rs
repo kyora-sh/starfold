@@ -496,3 +496,29 @@ fn a_kvazaar_rate_change_reopens_with_a_keyframe() {
     let keys: Vec<bool> = units.iter().map(|a| a.keyframe).collect();
     assert_eq!(keys, vec![true, false, false, true]);
 }
+
+#[cfg(feature = "kvazaar")]
+#[test]
+fn a_kvazaar_rate_change_before_the_first_picture_applies() {
+    let mut enc = open(&arm_config(Backend::Kvazaar, Codec::Hevc, 320, 240, 4000)).unwrap();
+    enc.set_rate(RateConfig::new(16.0, 1000, 30)).unwrap();
+    let mut p = Picture::new(320, 240);
+    let mut units = encode_all(&mut *enc, &p, 0, true);
+    p.texture(1, 16, 16, 64, 64, 0);
+    units.extend(encode_all(&mut *enc, &p, 1, false));
+    units.extend(enc.drain().unwrap());
+    let keys: Vec<bool> = units.iter().map(|a| a.keyframe).collect();
+    assert_eq!(keys, vec![true, false]);
+}
+
+#[cfg(feature = "svt-av1")]
+#[test]
+fn an_svt_preset_out_of_range_is_an_error() {
+    for preset in ["268", "14", "-3"] {
+        let c = EncoderConfig {
+            preset: preset.into(),
+            ..arm_config(Backend::SvtAv1, Codec::Av1, 320, 240, 4000)
+        };
+        assert!(open(&c).is_err(), "{preset}");
+    }
+}
