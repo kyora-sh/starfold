@@ -45,7 +45,7 @@ const urlOf = (arm) => {
 	return `http://127.0.0.1:${portOf(arm)}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
 };
 const serverStats = async (arm) => (ARMS[arm].kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
-const statsDelta = (a, b) => Object.fromEntries([['keyframes', 'keyframes'], ['paintovers', 'paintovers'], ['refines', 'refines'], ['flowBlocked', 'flow_blocked'], ['encoded', 'encoded'], ['bytes', 'bytes']].filter(([, k]) => typeof b[k] === 'number').map(([n, k]) => [n, b[k] - a[k]]));
+const statsDelta = (a, b) => Object.fromEntries([['keyframes', 'keyframes'], ['paintovers', 'paintovers'], ['refines', 'refines'], ['refinedFrames', 'paintover_frames'], ['refinedBytes', 'paintover_bytes'], ['flowBlocked', 'flow_blocked'], ['encoded', 'encoded'], ['bytes', 'bytes']].filter(([, k]) => typeof b[k] === 'number').map(([n, k]) => [n, b[k] - a[k]]));
 /** Throws unless the one viewer is being served the arm's codec: a fallback must never count as that arm's result. */
 function assertCodec(arm, stats, when) {
 	if (ARMS[arm].kind !== 'starfold' || ARMS[arm].codec === null) return;
@@ -60,7 +60,7 @@ async function viewers(arm) {
 	}
 	return Number(await ctl('/vnc-viewers'));
 }
-const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000];
+const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000, 8000];
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
 function reader({ cell, w, h, readback }) {
 	const vs = (window.vs = { frames: [], tags: [], keys: [], bad: 0, ticks: 0, long: 0, longMs: 0, seen: false, sync: 0 });
@@ -152,7 +152,7 @@ function swapsOf(buf) {
 }
 async function typeKeys(p, wl, until) {
 	const letters = 'abcdefghijklmnopqrstuvwxyz';
-	const gap = wl === 'typing' ? [150, 100] : [300, 100];
+	const gap = wl === 'typing' ? [150, 100] : wl === 'mixed' || wl === 'paged' ? [700, 600] : [300, 100];
 	const sent = [];
 	let prev = '';
 	while (Date.now() < until) {
@@ -165,15 +165,16 @@ async function typeKeys(p, wl, until) {
 	}
 	return sent;
 }
-/** Each key's first visible frame: tags appear in order, so a tag only answers its own key. */
+const KEY_CAP_MS = 5000;
+/** Each key's first visible frame: tags appear in order, so a tag only answers its own key. A key with no tag inside the cap is missed. */
 function answer(keys, tags) {
 	const i2p = [];
 	let at = 0, missing = 0;
 	for (const [t, key] of keys) {
 		const v = key.charCodeAt(0) - 97;
 		let i = at;
-		while (i < tags.length && !(tags[i][0] >= t && tags[i][1] === v)) i++;
-		if (i === tags.length) { missing++; continue; }
+		while (i < tags.length && tags[i][0] < t + KEY_CAP_MS && !(tags[i][0] >= t && tags[i][1] === v)) i++;
+		if (i === tags.length || tags[i][0] >= t + KEY_CAP_MS) { missing++; continue; }
 		at = i + 1;
 		i2p.push(tags[i][0] - t);
 	}
@@ -218,7 +219,7 @@ async function run(arm, wl, readback = true) {
 		assertCodec(arm, f1, 'at end');
 		const vEnd = await viewers(arm);
 		await typing;
-		await sleep(2000);
+		await sleep(KEY_CAP_MS);
 		const r = await p.evaluate(() => {
 			const vs = window.vs;
 			return { frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
@@ -273,23 +274,80 @@ async function quality(arm, wl, round) {
 		const s0 = await serverStats(arm);
 		assertCodec(arm, s0, 'at start');
 		if (wl === 'typing') await typeKeys(p, wl, Date.now() + 5000);
+		else if (wl === 'mixed' || wl === 'paged') await typeKeys(p, wl, Date.now() + Number(process.env.MIXED_S || 30) * 1000);
 		else for (let i = 0; i < 6; i++) { await p.screenshot({ path: `${dir}/motion-${i}.png`, animations: 'allow' }); await sleep(800); }
 		const s1 = await serverStats(arm);
 		assertCodec(arm, s1, 'at end');
 		const viewerCount = await viewers(arm);
 		await ctl('/freeze');
-		const t0 = Date.now(), shotAt = {}, after = {};
+		const t0 = Date.now(), shotAt = {}, after = {}, timeline = [];
+		let polling = !!process.env.TIMELINE;
+		const acked0 = polling ? Object.values(await ctlJson(`/bytes?port=${portOf(arm)}`)) : [];
+		const poller = (async () => { while (polling) { const a = Object.values(await ctlJson(`/bytes?port=${portOf(arm)}`)); const st = statsDelta(s1, await serverStats(arm)); timeline.push([Date.now() - t0, Math.max(0, ...a.map((x, i) => x - (acked0[i] ?? 0))), st.refinedFrames ?? 0, st.refinedBytes ?? 0, st.paintovers ?? 0]); await sleep(40); } })();
 		for (const ms of SETTLE_MS) {
 			await sleep(Math.max(0, ms - (Date.now() - t0)));
 			shotAt[ms] = Date.now() - t0;
 			await p.screenshot({ path: `${dir}/settled-${ms}.png`, animations: 'allow' });
 			after[ms] = statsDelta(s1, await serverStats(arm));
 		}
+		polling = false;
+		await poller;
 		await ctl(`/truth?out=${dir}/truth.xwd`);
 		const crops = process.env.CROPS && round === 0 ? [`${process.env.CROPS}/${arm}-${wl}`] : [];
 		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, wl, '/tmp/vs-dump.raw', ...crops], { encoding: 'utf8', maxBuffer: 1 << 24 }));
 		fs.rmSync(dir, { recursive: true, force: true });
-		return { ...scores, viewerCount, motion: statsDelta(s0, s1), shotAt, afterFreeze: after };
+		return { ...scores, viewerCount, motion: statsDelta(s0, s1), shotAt, afterFreeze: after, timeline };
+	} finally {
+		await ctx.close();
+		await ctl('/stop').catch(() => {});
+		await sleep(500);
+	}
+}
+/** A long mixed run: thousands of refinements, a browser decoding all of it, then the settled picture against the truth. */
+async function soak(arm, seconds) {
+	await ctl(`/start?arm=${arm}&wl=mixed`);
+	const dir = `/tmp/vs-q/${arm}-soak`;
+	fs.mkdirSync(dir, { recursive: true });
+	const ctx = await b.newContext({ viewport: { width: WIDTH, height: HEIGHT } });
+	try {
+		const p = await ctx.newPage();
+		const errs = [], decodeErrs = [];
+		p.on('pageerror', (e) => errs.push(String(e)));
+		p.on('console', (m) => { const t = m.text(); if (/decoder? error|decode failed|keyframe needed|EncodingError|OperationError/i.test(t)) decodeErrs.push(t.slice(0, 200)); });
+		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback: true });
+		await p.goto(urlOf(arm), { waitUntil: 'commit', timeout: 20000 });
+		await p.waitForFunction(() => window.vs.seen, null, { timeout: 15000 });
+		await sleep(3000);
+		await p.mouse.click(WIDTH / 2, HEIGHT / 2);
+		await sleep(200);
+		await p.evaluate(() => { const vs = window.vs; vs.frames.length = vs.tags.length = vs.keys.length = 0; vs.bad = vs.ticks = 0; });
+		const s0 = await serverStats(arm);
+		assertCodec(arm, s0, 'at start');
+		const t0 = Date.now(), until = t0 + seconds * 1000, windows = [];
+		const typing = typeKeys(p, 'mixed', until);
+		let prev = s0;
+		while (Date.now() < until) {
+			await sleep(Math.min(60000, Math.max(0, until - Date.now())));
+			const s = await serverStats(arm);
+			const dl = statsDelta(prev, s);
+			const v = await p.evaluate(() => { const vs = window.vs; const r = { frames: vs.frames.length, bad: vs.bad, tags: vs.tags.slice(), keys: vs.keys.slice(), lat: vs.frames.map((f) => f[2]) }; vs.frames.length = 0; vs.tags.length = 0; vs.keys.length = 0; return r; });
+			const { i2p, missing } = answer(v.keys, v.tags);
+			windows.push({ at: Math.round((Date.now() - t0) / 1000), targetKbps: s.target_kbps, ...dl, viewerFrames: v.frames, badReads: v.bad, frameLatP50: pct(v.lat, 0.5), frameLatP95: pct(v.lat, 0.95), i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: i2p.length ? Math.max(...i2p) : null, keysSeen: i2p.length, keysMissing: missing, decodeErrs: decodeErrs.length, errs: errs.length });
+			console.log(`SOAK ${arm} ${JSON.stringify(windows.at(-1))}`);
+			assertCodec(arm, s, `at ${windows.at(-1).at} s`);
+			prev = s;
+		}
+		await typing;
+		const s1 = await serverStats(arm);
+		await ctl('/freeze');
+		await sleep(1500);
+		await p.screenshot({ path: `${dir}/settled-1500.png`, animations: 'allow' });
+		await ctl(`/truth?out=${dir}/truth.xwd`);
+		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, 'typing', '/tmp/vs-dump.raw'], { encoding: 'utf8', maxBuffer: 1 << 24 }));
+		fs.rmSync(dir, { recursive: true, force: true });
+		const viewerCount = await viewers(arm);
+		const stats = await p.evaluate(() => (window.voxlStats ? { dropped: window.voxlStats.dropped, codec: window.voxlStats.codec, implementation: window.voxlStats.implementation } : null));
+		return { ...scores, total: statsDelta(s0, s1), windows, decodeErrs: decodeErrs.slice(0, 5), decodeErrCount: decodeErrs.length, errs: errs.slice(0, 5), viewerCount, stats };
 	} finally {
 		await ctx.close();
 		await ctl('/stop').catch(() => {});
@@ -346,6 +404,10 @@ for (let i = 0; i < Number(process.env.QUALITY_ROUNDS || 0) && Date.now() - star
 				emit({ set: 'quality', wl, arm, round: i, failed: why });
 			}
 		}
+if (process.env.SOAK_S) for (const arm of arms) {
+	try { emit({ set: 'soak', arm, ...(await soak(arm, Number(process.env.SOAK_S))) }); }
+	catch (e) { emit({ set: 'soak', arm, failed: redact(e).split('\n')[0] }); }
+}
 const median = (v) => pct(v, 0.5);
 console.log('LEDGER', JSON.stringify(ledger));
 for (const key of Object.keys(results).sort()) {

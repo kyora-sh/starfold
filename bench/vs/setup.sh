@@ -21,6 +21,12 @@ page.paste(im.crop((0, 0, 1920, 7080)), (0, 0))
 r, g, b = page.split()
 open('/tmp/vs-page.raw', 'wb').write(Image.merge('RGBA', (b, g, r, Image.new('L', page.size, 255))).tobytes())
 " || { echo 'no page'; exit 1; }
+if [ -f "${BEFORE_TGZ:-}" ]; then
+	mkdir -p /tmp/before && tar -xzf "$BEFORE_TGZ" -C /tmp/before
+	(cd /tmp/before && CARGO_TARGET_DIR=/tmp/t-before cargo +1.93.0 build --release --locked 2>&1 | tail -1)
+	export STARFOLD_BEFORE_BIN=/tmp/t-before/release/starfold
+	[ -x "$STARFOLD_BEFORE_BIN" ] || echo 'BEFORE DID NOT BUILD'
+fi
 if [ "${PROBE_BUILDS:-0}" = 1 ]; then
 	sudo apt-get install -y -qq libx264-dev libclang-dev >/dev/null 2>&1
 	CARGO_TARGET_DIR=/tmp/t-x264 cargo +1.93.0 build --release --locked --features x264 2>&1 | tail -1

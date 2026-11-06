@@ -177,11 +177,11 @@ int main(int argc, char **argv) {
 	XSetInputFocus(d, w, RevertToParent, CurrentTime);
 	g = XCreateGC(d, w, 0, NULL);
 	XClearWindow(d, w);
-	int typing = !strcmp(mode, "typing"), scroll = !strcmp(mode, "scroll"), video = !strcmp(mode, "video");
+	int paged = !strcmp(mode, "paged"), mixed = !strcmp(mode, "mixed"), typing = !strcmp(mode, "typing"), scroll = !strcmp(mode, "scroll"), video = !strcmp(mode, "video");
 	int ph = H + 6000;
 	Pixmap p = 0;
 	XImage *img = NULL;
-	if (scroll || typing) {
+	if (scroll || typing || mixed || paged) {
 		p = XCreatePixmap(d, w, W, ph, DefaultDepth(d, DefaultScreen(d)));
 		if (argc <= 6 || !load_page(p, ph, argv[6])) page(p, ph);
 		XCopyArea(d, p, w, g, 0, 0, W, H, 0, 0);
@@ -191,7 +191,8 @@ int main(int argc, char **argv) {
 			XSetForeground(d, g, 0xffffff);
 			XFillRectangle(d, w, g, 0, 72, W, 24);
 		}
-	} else if (video) {
+	}
+	if (video || mixed) {
 		XShmSegmentInfo *si = calloc(1, sizeof *si);
 		img = XShmCreateImage(d, DefaultVisual(d, DefaultScreen(d)), 24, ZPixmap, NULL, si, W, H * LOOP);
 		si->shmid = shmget(IPC_PRIVATE, (size_t)img->bytes_per_line * H * LOOP, IPC_CREAT | 0600);
@@ -232,7 +233,13 @@ int main(int argc, char **argv) {
 			poll(&pf, 1, 100);
 			continue;
 		}
-		if (scroll) {
+		/* mixed: 200 ms of scrolling, a still moment, 200 ms of video, a still moment */
+		int phase = paged ? n % 150 : n % 40;
+		if (paged && phase >= 6) {
+			/* page down, then read for 5 s */
+		} else if (mixed && (phase >= 26 || (phase >= 6 && phase < 20))) {
+			/* still */
+		} else if (scroll || paged || (mixed && phase < 6)) {
 			off = (off + 20) % (ph - H);
 			XCopyArea(d, p, w, g, 0, off + STRIP_H, W, H - STRIP_H, 0, STRIP_H);
 			XCopyArea(d, p, w, g, STRIP_W, off, W - STRIP_W, STRIP_H, STRIP_W, 0);
@@ -242,8 +249,10 @@ int main(int argc, char **argv) {
 			XShmPutImage(d, w, g, img, 0, top + STRIP_H, 0, STRIP_H, W, H - STRIP_H, False);
 			XShmPutImage(d, w, g, img, STRIP_W, top, STRIP_W, 0, W - STRIP_W, STRIP_H, False);
 		}
-		draw_frame(n);
-		draw_tag();
+		if (paged ? phase < 6 : !mixed || phase < 6 || (phase >= 20 && phase < 26)) {
+			draw_frame(n);
+			draw_tag();
+		}
 		XSync(d, False);
 		t.tv_nsec += ns;
 		while (t.tv_nsec >= 1000000000L) {

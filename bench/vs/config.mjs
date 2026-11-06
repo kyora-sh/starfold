@@ -11,7 +11,7 @@ export const STARFOLD_ARGS = ['--audio-enabled=false', '--enable-basic-auth=true
 export const WIDTH = 1920, HEIGHT = 1080, FPS = 30;
 export const STARFOLD_PORT = 6930, NOVNC_PORT = 6932, CTL_PORT = 6940;
 // The shaped link: bench/shaper.py in front of each port at +1000, the queue bounded at 2x BDP.
-export const WAN = { rttMs: 50, mbps: 20, queueBytes: 250000, portOffset: 1000 };
+export const WAN = { rttMs: Number(process.env.WAN_RTT || 50), mbps: Number(process.env.WAN_MBPS || 20), queueBytes: Number(process.env.WAN_QUEUE || 250000), portOffset: 1000 };
 // `codec` is what the viewer must be served (/stats clients[].stream.codec): omitted = h264, null = this
 // server doesn't report it. Being served anything else fails the run.
 export const ARMS = {
@@ -20,6 +20,7 @@ export const ARMS = {
 	'starfold-video': { kind: 'starfold', query: '' },
 	'starfold-canvas': { kind: 'starfold', query: '&present=canvas' },
 	// Only when named in ARMS: which encoder path refines a still picture. `bin` names the env var holding the binary.
+	before: { kind: 'starfold', query: '', probe: true, bin: 'STARFOLD_BEFORE_BIN', args: STARFOLD_ARGS },
 	'floor-16': { kind: 'starfold', query: '', probe: true, args: [...STARFOLD_ARGS, '--crf=16'] },
 	'floor-12': { kind: 'starfold', query: '', probe: true, args: [...STARFOLD_ARGS, '--crf=12'] },
 	'starfold-x264': { kind: 'starfold', query: '', probe: true, bin: 'STARFOLD_X264_BIN', args: [...STARFOLD_ARGS.slice(0, 3), '--encoder=x264'] },
