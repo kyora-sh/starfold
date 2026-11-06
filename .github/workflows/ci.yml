@@ -212,3 +212,52 @@ jobs:
         env:
           STARFOLD_EXPECT_HW: '1'
         run: cargo test --locked --lib auto_on_this_host -- --nocapture
+
+  safari-decode:
+    name: Safari WebCodecs decode support (bench arms, by hand)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: kyora-macos
+    timeout-minutes: 10
+    steps:
+      - name: Versions
+        run: |
+          sw_vers
+          defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString
+          /usr/bin/safaridriver --version
+      - name: isConfigSupported through safaridriver
+        shell: python3 {0}
+        run: |
+          import json, os, signal, subprocess, sys, time, urllib.request
+          driver = subprocess.Popen(["/usr/bin/safaridriver", "-p", "4444"], start_new_session=True)
+          def call(method, path, body=None):
+              req = urllib.request.Request("http://127.0.0.1:4444" + path, method=method,
+                  data=None if body is None else json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)["value"]
+          try:
+              time.sleep(2)
+              try:
+                  sid = call("POST", "/session", {"capabilities": {"alwaysMatch": {"browserName": "safari"}}})["sessionId"]
+              except Exception as e:
+                  body = getattr(e, "read", lambda: b"")().decode(errors="replace")
+                  print(f"NO SESSION: {e} {body}")
+                  sys.exit(0)
+              codecs = {"openh264 (control)": "avc1.42c028", "libvpx VP8": "vp8", "libvpx VP9": "vp09.00.41.08",
+                        "libaom / SVT-AV1 (full)": "av01.0.08M.08.0.110.01.13.06.0", "AV1 (short form)": "av01.0.08M.08",
+                        "x265": "hvc1.1.6.L153.90", "Kvazaar": "hvc1.1.6.L186.80"}
+              script = """const [codecs, done] = arguments; (async () => {
+                if (typeof VideoDecoder === 'undefined') return done({ua: navigator.userAgent, rows: 'no VideoDecoder'});
+                const rows = [];
+                for (const [arm, codec] of Object.entries(codecs)) for (const hardwareAcceleration of ['prefer-hardware', 'no-preference']) {
+                  let s; try { s = (await VideoDecoder.isConfigSupported({codec, codedWidth: 1920, codedHeight: 1080, hardwareAcceleration})).supported; }
+                  catch (e) { s = 'throws ' + e.name; }
+                  rows.push({arm, codec, hardwareAcceleration, supported: s});
+                }
+                done({ua: navigator.userAgent, rows});
+              })();"""
+              call("POST", f"/session/{sid}/url", {"url": "about:blank"})
+              print(json.dumps({"browser": "safari", **call("POST", f"/session/{sid}/execute/async", {"script": script, "args": [codecs]})}))
+              call("DELETE", f"/session/{sid}")
+          finally:
+              os.killpg(driver.pid, signal.SIGTERM)
+              driver.wait(timeout=10)
