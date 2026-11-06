@@ -444,4 +444,8 @@ impl VideoEncoder for Pad {
         let aus = self.inner.drain()?;
         Ok(self.fix(aus))
     }
+
+    fn refinable(&self, r: Refine) -> bool {
+        self.inner.refinable(r)
+    }
 }
