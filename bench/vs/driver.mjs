@@ -80,6 +80,12 @@ function reader({ cell, w, h, readback }) {
 		}
 		return null;
 	};
+	// A canvas is read only after something drew on it: reading every frame holds up a page that decodes on its main thread.
+	let drawn = true;
+	for (const m of ['drawImage', 'putImageData', 'fillRect']) {
+		const f = CanvasRenderingContext2D.prototype[m];
+		CanvasRenderingContext2D.prototype[m] = function (...a) { if (this.canvas !== c) drawn = true; return f.apply(this, a); };
+	}
 	const own = new WeakMap();
 	const contextOf = (el) => {
 		if (!own.has(el)) {
@@ -118,7 +124,7 @@ function reader({ cell, w, h, readback }) {
 		if (el && !pending) {
 			const t = performance.now();
 			const ctx = el.tagName === 'CANVAS' ? contextOf(el) : null;
-			if (ctx) fromRgba(t, ctx.getImageData(0, 0, w, h).data);
+			if (ctx) { if (drawn) { drawn = false; fromRgba(t, ctx.getImageData(0, 0, w, h).data); } }
 			else if (el.tagName === 'VIDEO' && !vs.noFrames) {
 				let f = null;
 				try { f = new VideoFrame(el, { timestamp: 0 }); } catch { vs.noFrames = true; }
