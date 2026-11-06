@@ -193,6 +193,7 @@ function saveDiag(name, r) {
 	const dir = `${process.env.DIAG}/${name}`;
 	fs.mkdirSync(dir, { recursive: true });
 	fs.writeFileSync(`${dir}/page.json`, JSON.stringify(r));
+	if (name.endsWith('-soak')) return;
 	for (const f of ['vs-keys.log', 'vs-idx.log', 'vs-s0.h264']) if (fs.existsSync(`/tmp/${f}`)) fs.copyFileSync(`/tmp/${f}`, `${dir}/${f}`);
 	try { execFileSync('python3', ['bench/vs/diag.py', dir], { stdio: 'inherit' }); } catch (e) { console.log(`diag.py ${name}: ${e}`); }
 	fs.rmSync(`${dir}/vs-s0.h264`, { force: true });
