@@ -426,11 +426,13 @@ pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -
         return error(StatusCode::SERVICE_UNAVAILABLE, "input is unavailable");
     };
     let seq = s.hub.activity.seq();
+    let hub = s.hub.clone();
     let run = tokio::spawn(async move {
         let mut events = 0u64;
         for step in steps {
             match step {
                 Step::Event(e) => {
+                    hub.note_input();
                     tx.send(e.event()).ok()?;
                     events += 1;
                 }

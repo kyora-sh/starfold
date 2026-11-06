@@ -71,6 +71,10 @@ struct Fake {
     empty_keys: bool,
     /// Refining passes this encoder still has something to sharpen with (None: none).
     refinable: Option<Arc<AtomicUsize>>,
+    /// A refining pass spends this much of its budget (None: a few bytes).
+    fill: Option<f64>,
+    /// The least budget a step of sharpening needs (None: any).
+    step_bytes: Option<usize>,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -104,6 +108,11 @@ impl VideoEncoder for Fake {
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
         }
+        if let (Some(step), Some(r)) = (self.step_bytes, opts.refine) {
+            if r.max_bytes.is_some_and(|m| m < step) {
+                return Ok(Vec::new());
+            }
+        }
         if let (Some(left), Some(_)) = (&self.refinable, opts.refine) {
             let _ = left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         }
@@ -118,6 +127,16 @@ impl VideoEncoder for Fake {
         }
         if self.fail_from.is_some_and(|f| self.n >= f) || self.fail_at == Some(self.n) {
             return Err(EncodeError("session lost".into()));
+        }
+        if let (Some(f), Some(r)) = (self.fill, opts.refine) {
+            let mut data = vec![0; ((r.max_bytes.unwrap_or(0) as f64 * f) as usize).max(6)];
+            data[..5].copy_from_slice(&[0, 0, 0, 1, 0x41]);
+            return Ok(vec![AccessUnit {
+                pts_ms: opts.pts_ms,
+                keyframe: false,
+                data,
+                config: None,
+            }]);
         }
         let relevel = self.relevel == Some(self.n);
         let key = opts.force_keyframe || self.n == 1 || relevel;
@@ -145,10 +164,13 @@ impl VideoEncoder for Fake {
         Ok(Vec::new())
     }
 
-    fn refinable(&self, _: Refine) -> bool {
+    fn refinable(&self, r: Refine) -> bool {
         self.refinable
             .as_ref()
             .is_some_and(|n| n.load(Ordering::Relaxed) > 0)
+            && self
+                .step_bytes
+                .is_none_or(|b| r.max_bytes.is_none_or(|m| m >= b))
     }
 }
 
@@ -182,6 +204,10 @@ struct Opts {
     h264_empty_keys: bool,
     /// Refining passes the first H.264 stripe's encoder has something to sharpen with.
     h264_refinable: Option<Arc<AtomicUsize>>,
+    /// H.264 refining passes spend this much of their budget.
+    refine_fill: Option<f64>,
+    /// The least budget a step of H.264 sharpening needs.
+    h264_step_bytes: Option<usize>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -212,6 +238,8 @@ fn fakes(o: Opts) -> Open {
                 refines: o.refines.clone(),
                 empty_keys: false,
                 refinable: None,
+                fill: None,
+                step_bytes: None,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -253,6 +281,8 @@ fn fakes(o: Opts) -> Open {
             refines: o.refines.clone().filter(|_| !hevc),
             empty_keys: o.h264_empty_keys && !hevc && h264 > 0,
             refinable: o.h264_refinable.clone().filter(|_| !hevc && h264 == 1),
+            fill: o.refine_fill.filter(|_| !hevc),
+            step_bytes: o.h264_step_bytes.filter(|_| !hevc),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -318,6 +348,7 @@ fn whole(w: u32, h: u32) -> Frame {
         paintover: false,
         paintover_final: false,
         refine_tail: false,
+        refine_idle: false,
         refine_qp: None,
         band: Some(Band { y0: 0, y1: h }),
         mb_dirty: None,
@@ -1360,6 +1391,7 @@ fn skipped_damage_is_caught_up() {
         paintover: false,
         paintover_final: false,
         refine_tail: false,
+        refine_idle: false,
         refine_qp: None,
         band,
         mb_dirty: mb.map(Arc::new),
@@ -2374,7 +2406,7 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
         refine,
         Some(Refine {
             qp: 20,
-            max_bytes: Some(start * REFINE_FRAME_MS / 8 * REFINE_PLAN_PCT / 100),
+            max_bytes: Some(start * REFINE_LADDER_MS / 8 * REFINE_PLAN_PCT / 100),
         })
     );
     assert_ne!(
@@ -2512,6 +2544,373 @@ fn the_tail_reaches_every_stripe_that_can_still_sharpen() {
     assert!(
         !eng.cohorts[0].refine.refiner.any_pending(),
         "then it stops"
+    );
+}
+
+/// Busy stop/start: `cycles` times motion then `still_ms` of still turns 50 ms apart, then a
+/// last stop. Refining passes spend `fill` times their budget; `fall_to` drops the bitrate
+/// target (kbit/s) at that stop.
+struct Busy {
+    cycles: usize,
+    still_ms: u64,
+    fill: f64,
+    fall_to: Option<f64>,
+}
+
+struct BusyRun {
+    /// From the last stop to its first pass.
+    wait: Duration,
+    /// Bytes charged against the share.
+    charged: u64,
+    /// The share of the target over every turn, plus the window it starts with.
+    share: f64,
+    /// The bitrate target when the last stop came (kbit/s).
+    target_at_stop: u32,
+    /// The least the budget held.
+    min_tokens: f64,
+    /// Turns a due ladder waited for budget, and how many of them came after the last stop.
+    held: usize,
+    held_after_stop: usize,
+    /// The budget when the last stop came.
+    tokens_at_stop: f64,
+    /// Refining passes taken.
+    passes: usize,
+}
+
+fn stop_start(b: Busy) -> BusyRun {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        refine_fill: Some(b.fill),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    // The target holds still unless the case drops it: a run slow enough to cross the
+    // controller's wall-clock windows would otherwise ramp it.
+    let rc = &mut eng.cohorts[0].rc;
+    (rc.max, rc.target) = (START_KBPS, START_KBPS);
+    let passes = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0.is_some())
+            .count()
+    };
+    let step = Duration::from_millis(50);
+    let mut t = Instant::now();
+    let per_s = |kbps: u32| kbps as f64 * 1000.0 / 8.0;
+    let first = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    let mut run = BusyRun {
+        wait: Duration::ZERO,
+        charged: 0,
+        share: per_s(first) * REFINE_SHARE * REFINE_WINDOW_S,
+        target_at_stop: 0,
+        min_tokens: f64::INFINITY,
+        held: 0,
+        held_after_stop: 0,
+        tokens_at_stop: 0.0,
+        passes: 0,
+    };
+    let mut turn = |eng: &mut Engine, run: &mut BusyRun, t: Instant, motion: bool| {
+        let band = motion.then_some(Band { y0: 0, y1: H });
+        capture(eng, W, H, band, t);
+        acked(&c, &mut rx);
+        let k = &eng.cohorts[0];
+        run.share += per_s(k.shared.target.load(Ordering::Relaxed)) * REFINE_SHARE * 0.05;
+        let burst = &k.refine.burst;
+        run.min_tokens = run.min_tokens.min(burst.tokens);
+        let waiting = burst.left == burst.len && burst.tail == 0 && !burst.funded();
+        let held = (waiting && t - burst.last_motion >= burst.gap(t)) as usize;
+        run.held += held;
+        if run.target_at_stop > 0 {
+            run.held_after_stop += held;
+        }
+    };
+    for _ in 0..b.cycles {
+        turn(&mut eng, &mut run, t, true);
+        for _ in 0..b.still_ms / 50 {
+            t += step;
+            turn(&mut eng, &mut run, t, false);
+        }
+        t += step;
+    }
+    if let Some(kbps) = b.fall_to {
+        let rc = &mut eng.cohorts[0].rc;
+        (rc.max, rc.target) = (kbps, kbps);
+    }
+    turn(&mut eng, &mut run, t, true);
+    run.target_at_stop = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    run.tokens_at_stop = eng.cohorts[0].refine.burst.tokens;
+    let stop = t;
+    let before = passes();
+    while passes() == before {
+        t += step;
+        turn(&mut eng, &mut run, t, false);
+        assert!(t - stop < Duration::from_secs(120), "no pass at all");
+    }
+    run.wait = t - stop;
+    run.charged = eng.cohorts[0]
+        .shared
+        .paintover_bytes
+        .load(Ordering::Acquire);
+    run.passes = passes();
+    run
+}
+
+/// A ladder is three 200 ms passes planned at 55%: refilled at a 10% share, 3.3 s of debt at
+/// the target it was charged at. The first pass after a stop waits that, scaled by how far the
+/// target has fallen since and by how far the passes overshot their plan, plus the longest gap.
+fn bound(overshoot: f64, fall: f64) -> Duration {
+    Duration::from_millis(150 << REFINE_MAX_BACKOFF)
+        + Duration::from_secs_f64(3.3 * overshoot * fall)
+        + Duration::from_millis(100)
+}
+
+/// Dense text: no step fits a ladder pass's budget, so its passes come out empty and sharpen
+/// nothing; one fits a tail pass's. The ladder still hands over to the tail, at the tail's budget.
+#[test]
+fn a_picture_too_dense_for_a_ladder_pass_still_gets_its_tail() {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let per_s = START_KBPS as usize * 1000 / 8;
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(6))),
+        h264_step_bytes: Some(per_s / 2 * 55 / 100),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    for _ in 0..20 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    let passes: Vec<(u8, Option<usize>)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.0.map(|r| (r.qp, r.max_bytes)))
+        .collect();
+    let (ladder, tail) = (Some(per_s / 5 * 55 / 100), Some(per_s * 55 / 100));
+    let mut want = vec![(20, ladder), (16, ladder), (12, ladder)];
+    want.extend([(12, tail); 6]);
+    assert_eq!(passes, want);
+}
+
+/// A legacy viewer on OpenH264 with `left` passes' worth to sharpen (each step needing at
+/// least `step` bytes, if given), its keyframe acked; motion at the returned instant.
+fn refining_from(
+    left: usize,
+    step: Option<usize>,
+) -> (
+    Arc<Hub>,
+    Engine,
+    Arc<Client>,
+    UnboundedReceiver<Out>,
+    Refines,
+    Instant,
+) {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+        h264_step_bytes: step,
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let t = Instant::now();
+    capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+    acked(&c, &mut rx);
+    seen.lock().unwrap().clear();
+    (hub, eng, c, rx, seen, t)
+}
+
+/// Still turns 100 ms apart from `from` to `to`, each acked; the passes they took, and when.
+fn still_until(
+    eng: &mut Engine,
+    c: &Client,
+    rx: &mut UnboundedReceiver<Out>,
+    seen: &Refines,
+    from: Instant,
+    to: Instant,
+) -> Vec<(Duration, Option<usize>)> {
+    let mut out = Vec::new();
+    let mut t = from;
+    while t < to {
+        t += Duration::from_millis(100);
+        let before = seen.lock().unwrap().len();
+        capture(eng, W, H, None, t);
+        acked(c, rx);
+        for r in seen.lock().unwrap()[before..].iter().filter_map(|r| r.0) {
+            out.push((t - from, r.max_bytes));
+        }
+    }
+    out
+}
+
+/// What a viewer types next waits behind one pass at most: while input or damage is recent,
+/// every pass, tail ones included, keeps to the ladder's budget; only an idle screen gets the
+/// tail's.
+#[test]
+fn a_pass_while_input_or_damage_is_recent_stays_ladder_sized() {
+    let per_s = START_KBPS as usize * 1000 / 8;
+    let (ladder, tail) = (Some(per_s / 5 * 55 / 100), Some(per_s * 55 / 100));
+    let (hub, mut eng, c, mut rx, seen, t) = refining_from(200, None);
+    let busy = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t,
+        t + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert!(busy.len() > 3, "the tail ran while busy: {busy:?}");
+    assert!(busy.iter().all(|p| p.1 == ladder), "{busy:?}");
+    let idle = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t + REFINE_IDLE,
+        t + REFINE_IDLE * 2,
+    );
+    assert!(
+        !idle.is_empty() && idle.iter().all(|p| p.1 == tail),
+        "{idle:?}"
+    );
+    // Input with nothing on screen to show for it yet counts as much as damage.
+    let typed = t + REFINE_IDLE * 2;
+    *hub.input_at.lock() = Some(typed);
+    let after = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        typed,
+        typed + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert!(
+        !after.is_empty() && after.iter().all(|p| p.1 == ladder),
+        "{after:?}"
+    );
+}
+
+/// Dense text: no step fits a ladder pass. While busy no tail pass is taken at all; once the
+/// screen has been idle for REFINE_IDLE the tail runs at its budget until nothing is left.
+#[test]
+fn a_dense_picture_waits_for_idle_then_converges() {
+    let per_s = START_KBPS as usize * 1000 / 8;
+    let tail = Some(per_s * 55 / 100);
+    let (_hub, mut eng, c, mut rx, seen, t) = refining_from(6, Some(per_s / 2 * 55 / 100));
+    let busy = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t,
+        t + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert_eq!(
+        busy.len(),
+        3,
+        "the ladder, and no tail while busy: {busy:?}"
+    );
+    let idle = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t + REFINE_IDLE - Duration::from_millis(100),
+        t + REFINE_IDLE * 3,
+    );
+    assert_eq!(idle.len(), 6, "{idle:?}");
+    assert!(idle.iter().all(|p| p.1 == tail), "{idle:?}");
+    assert!(
+        !eng.cohorts[0].refine.refiner.any_pending(),
+        "converged and quiet"
+    );
+}
+
+#[test]
+fn the_first_pass_after_a_busy_stop_comes_within_the_bound() {
+    let busy = |cycles, fill, fall_to| {
+        stop_start(Busy {
+            cycles,
+            still_ms: 1500,
+            fill,
+            fall_to,
+        })
+    };
+    for cycles in [1, 3, 30] {
+        let r = busy(cycles, 1.0, None);
+        let b = bound(1.0, 1.0);
+        assert!(
+            r.wait <= b,
+            "{cycles} cycle(s): first pass after {:?}, bound {b:?}",
+            r.wait
+        );
+    }
+    let r = busy(30, 1.8, None);
+    let b = bound(1.8, 1.0);
+    assert!(
+        r.wait <= b,
+        "passes 1.8x their plan: first pass after {:?}, bound {b:?}",
+        r.wait
+    );
+    // Passes over their plan leave the budget in debt at the stop; the target then falls 4x.
+    let r = busy(3, 1.8, Some(2000.0));
+    assert!(r.tokens_at_stop < 0.0, "no debt to repay at the stop");
+    assert!(
+        r.held_after_stop > 0,
+        "repayment never held the next ladder"
+    );
+    let fall = START_KBPS / r.target_at_stop as f64;
+    let b = bound(1.8, fall);
+    assert!(
+        r.wait <= b,
+        "target fell {fall}x: first pass after {:?}, bound {b:?}",
+        r.wait
+    );
+}
+
+/// Passes that overshoot their plan keep the budget in debt, so ladders wait for it; what is
+/// charged still stays within the share of the target as it was, plus the window it starts with
+/// and the last ladder, which finishes once begun.
+#[test]
+fn a_busy_screen_keeps_its_charged_refinement_within_the_share() {
+    let r = stop_start(Busy {
+        cycles: 30,
+        still_ms: 3000,
+        fill: 1.8,
+        fall_to: None,
+    });
+    assert!(
+        r.min_tokens < 0.0 && r.held > 0,
+        "the budget never held a ladder back"
+    );
+    let last_ladder = 3.0 * 1.8 * START_KBPS * 1000.0 / 8.0 * 0.2 * 0.55;
+    // Each charged pass carries its stripe header; before the first turn the budget refills over
+    // the real time setup took, under one 50 ms step.
+    let slack = (r.passes * HDR) as f64 + START_KBPS * 1000.0 / 8.0 * REFINE_SHARE * 0.05;
+    let allowed = r.share + last_ladder + slack;
+    assert!(
+        (r.charged as f64) <= allowed,
+        "charged {} against {allowed:.0} allowed",
+        r.charged
     );
 }
 
