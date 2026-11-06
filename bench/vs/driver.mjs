@@ -1,7 +1,7 @@
 // Browser side. Every arm is measured by reading the marker strip back from the visible surface once
 // per animation frame, so frame timing and latency have one definition everywhere; the viz swap trace
 // runs alongside. QUALITY_ROUNDS adds screenshots against the X server's truth (quality.py).
-// Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, OUT, BUDGET_S, CONTROL_ROUNDS, ARMS, WORKLOADS.
+// Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, OUT, BUDGET_S, CONTROL_ROUNDS, PARITY_ROUNDS, ARMS, WORKLOADS.
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
@@ -368,6 +368,15 @@ for (let i = 0; i < rounds && Date.now() - started < budget; i++) {
 	for (const [w, wl] of wls.entries())
 		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, true, 'main');
 }
+// Reader against no reader, each arm's pair side by side: whether reading the strip moves what the link delivers.
+for (let i = 0; i < Number(process.env.PARITY_ROUNDS || 0) && Date.now() - started < budget; i++)
+	for (const [w, wl] of wls.entries()) {
+		const pairs = arms.flatMap((arm) => [[arm, true], [arm, false]]);
+		for (let k = 0; k < pairs.length; k++) {
+			const [arm, readback] = pairs[(k + i + w) % pairs.length];
+			await slot(arm, wl, i, readback, readback ? 'parity-reader' : 'parity-none');
+		}
+	}
 for (let i = 0; i < controlRounds && Date.now() - started < budget; i++)
 	for (const [w, wl] of wls.entries())
 		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, false, 'no-readback');
