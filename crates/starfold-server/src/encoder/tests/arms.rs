@@ -5,6 +5,7 @@ use super::*;
 fn arm_config(backend: Backend, codec: Codec, w: u32, h: u32, kbps: u32) -> EncoderConfig {
     EncoderConfig {
         codec,
+        preset: String::new(),
         ..config(backend, w, h, kbps)
     }
 }
@@ -115,6 +116,16 @@ fn bad_pictures_are_errors() {
     });
 }
 
+#[cfg(feature = "libvpx")]
+#[test]
+fn a_speed_that_is_not_a_number_is_an_error() {
+    let c = EncoderConfig {
+        preset: "fast".into(),
+        ..arm_config(Backend::Libvpx, Codec::Vp9, 320, 240, 4000)
+    };
+    assert!(open(&c).is_err());
+}
+
 #[test]
 fn a_rate_change_keeps_encoding() {
     each_arm(|name, backend, codec| {
@@ -131,9 +142,76 @@ fn a_rate_change_keeps_encoding() {
     });
 }
 
-/// One arm through typing, scrolling and video, for `bench/arms/run.sh`: ARM, PRESET, KBPS,
-/// CRF, FRAMES, THREADS, WORKLOAD; DUMP=<dir> writes the bitstream and the source for
-/// ffmpeg to score. One `bench` line per workload.
+/// `bench/vs/source.c`'s video picture as 4:2:0: a pan, grain and moving discs, 30 frames long.
+fn film(w: usize, h: usize, grain: u32) -> Vec<Picture> {
+    use std::f64::consts::PI;
+    const LOOP: usize = 30;
+    let mut s = 0x9e3779b9u32;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    let noise = |n: u32| (n % grain.max(1)) as i32 - grain as i32 / 2;
+    (0..LOOP)
+        .map(|f| {
+            let (pan, ph) = ((f * w / LOOP) as f64, 2.0 * PI * f as f64 / LOOP as f64);
+            let mut rgb = vec![[0i32; 3]; w * h];
+            for y in 0..h {
+                let b =
+                    (y as f64 / 61.0 + ph).sin() * 40.0 + (y as f64 / 17.0 - 2.0 * ph).sin() * 12.0;
+                for x in 0..w {
+                    let t = 2.0 * PI * (x as f64 + pan) / w as f64;
+                    let base = 128 + ((3.0 * t).sin() * 50.0 + (11.0 * t).sin() * 20.0 + b) as i32;
+                    let n = next();
+                    rgb[y * w + x] = [
+                        base + noise(n),
+                        base / 2 + 40 + noise(n >> 8),
+                        255 - base + noise(n >> 16),
+                    ];
+                }
+            }
+            for k in 0..8usize {
+                let t = ph + k as f64 * 0.8;
+                let cx = w as f64 / 2.0 + (t * (1 + k % 2) as f64).cos() * w as f64 * 0.38;
+                let cy = h as f64 / 2.0 + t.sin() * h as f64 * 0.36;
+                let rad = 60.0 + k as f64 * 14.0;
+                for y in 0..h {
+                    for x in 0..w {
+                        if (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2) < rad * rad {
+                            let blue = (next() & 31) as i32 + 40;
+                            rgb[y * w + x] = [k as i32 * 31, 255 - k as i32 * 25, blue];
+                        }
+                    }
+                }
+            }
+            let mut p = Picture::new(w, h);
+            let cw = w.div_ceil(2);
+            for (i, c) in rgb.iter_mut().enumerate() {
+                c.iter_mut().for_each(|v| *v = (*v).clamp(0, 255));
+                p.y[i] = (16 + ((66 * c[0] + 129 * c[1] + 25 * c[2] + 128) >> 8)) as u8;
+            }
+            for (i, (u, v)) in p.u.iter_mut().zip(p.v.iter_mut()).enumerate() {
+                let (x, y) = (i % cw * 2, i / cw * 2);
+                let mut sum = [0i32; 3];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let c = rgb[(y + dy).min(h - 1) * w + (x + dx).min(w - 1)];
+                    sum.iter_mut().zip(c).for_each(|(a, b)| *a += b);
+                }
+                let [r, g, b] = sum.map(|v| v / 4);
+                *u = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)) as u8;
+                *v = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)) as u8;
+            }
+            p
+        })
+        .collect()
+}
+
+/// One arm through typing, scrolling, settled and video, for `bench/arms/run.sh`: ARM, PRESET,
+/// KBPS, CRF, FRAMES, THREADS, WORKLOAD, GRAIN; DUMP=<dir> writes the bitstream, the source and
+/// `<arm>-<workload>.units` (source frame, bytes, keyframe per unit) for ffmpeg to score. One
+/// `bench` line per workload. `settled` scrolls for two seconds, then holds still.
 #[cfg(unix)]
 #[test]
 #[ignore]
@@ -156,7 +234,8 @@ fn arm_bench() {
         (r.ru_utime.tv_sec + r.ru_stime.tv_sec) as f64
             + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 / 1e6
     };
-    let workloads = var("WORKLOAD", "typing,scrolling,video");
+    let workloads = var("WORKLOAD", "typing,scrolling,settled,video");
+    let frame_of = |pts: i64| (pts as f64 * fps as f64 / 1000.0).round() as u64;
     for workload in workloads.split(',') {
         let mut enc = open(&EncoderConfig {
             fps,
@@ -176,11 +255,17 @@ fn arm_bench() {
             let f = std::fs::File::create(format!("{d}/{arm}-{workload}.yuv")).unwrap();
             std::io::BufWriter::new(f)
         });
+        let mut index = dump.as_ref().map(|d| {
+            let f = std::fs::File::create(format!("{d}/{arm}-{workload}.units")).unwrap();
+            std::io::BufWriter::new(f)
+        });
         if let Some(s) = stream.as_mut() {
             ivf_header(s, codec, w as u16, h as u16);
         }
         let mut p = Picture::new(w, h);
-        let (mut bytes, mut lat, mut cpu_s, mut units) = (0usize, Vec::new(), 0.0, 0usize);
+        let reel = (workload == "video").then(|| film(w, h, num("GRAIN", 4) as u32));
+        let (mut bytes, mut total, mut lat, mut cpu_s, mut units) =
+            (0usize, 0usize, Vec::new(), 0.0, 0usize);
         for f in 0..frames {
             match workload {
                 "typing" => {
@@ -188,19 +273,34 @@ fn arm_bench() {
                     p.texture(f as u32 + 1, x, y, x + 12, y + 22, 0);
                 }
                 "scrolling" => p.texture(0, 300, 90, 1500, 990, f * 8),
-                _ => p.video(f),
+                "settled" if f < 2 * fps as usize => p.texture(0, 300, 90, 1500, 990, f * 8),
+                "settled" => {}
+                "video" => {}
+                other => panic!("no workload {other}"),
             }
+            let p = reel.as_ref().map_or(&p, |r| &r[f % r.len()]);
             if let Some(s) = source.as_mut() {
                 s.write_all(&p.y).unwrap();
                 s.write_all(&p.u).unwrap();
                 s.write_all(&p.v).unwrap();
             }
             let (c0, t0) = (cpu(), std::time::Instant::now());
-            let aus = encode_one(&mut *enc, &p, f as i64 * 1000 / fps as i64, f == 0);
+            let aus = encode_one(&mut *enc, p, f as i64 * 1000 / fps as i64, f == 0);
             let (dt, dc) = (t0.elapsed().as_secs_f64() * 1e3, cpu() - c0);
             for a in &aus {
+                total += a.data.len();
                 if let Some(s) = stream.as_mut() {
                     ivf_frame(s, codec, units as u64, &a.data);
+                }
+                if let Some(s) = index.as_mut() {
+                    writeln!(
+                        s,
+                        "{} {} {}",
+                        frame_of(a.pts_ms),
+                        a.data.len(),
+                        a.keyframe as u8
+                    )
+                    .unwrap();
                 }
                 units += 1;
             }
@@ -211,8 +311,19 @@ fn arm_bench() {
             }
         }
         for a in enc.drain().unwrap() {
+            total += a.data.len();
             if let Some(s) = stream.as_mut() {
                 ivf_frame(s, codec, units as u64, &a.data);
+            }
+            if let Some(s) = index.as_mut() {
+                writeln!(
+                    s,
+                    "{} {} {}",
+                    frame_of(a.pts_ms),
+                    a.data.len(),
+                    a.keyframe as u8
+                )
+                .unwrap();
             }
             units += 1;
         }
@@ -220,10 +331,11 @@ fn arm_bench() {
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
+            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} total_kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
             var("PRESET", "default"),
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
+            total as f64 * 8.0 * fps as f64 / frames as f64 / 1000.0,
             pct(0.5),
             pct(0.95)
         );
