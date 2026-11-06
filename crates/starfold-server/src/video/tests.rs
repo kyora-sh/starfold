@@ -73,6 +73,8 @@ struct Fake {
     refinable: Option<Arc<AtomicUsize>>,
     /// A refining pass spends this much of its budget (None: a few bytes).
     fill: Option<f64>,
+    /// The frame rate of every rate change.
+    rates: Option<Arc<StdMutex<Vec<u32>>>>,
     /// The least budget a step of sharpening needs (None: any).
     step_bytes: Option<usize>,
 }
@@ -93,6 +95,9 @@ fn codec_string(c: Codec, high: bool, level: u32) -> String {
 impl VideoEncoder for Fake {
     fn set_rate(&mut self, r: RateConfig) -> Result<(), EncodeError> {
         self.kbps = r.max_kbps;
+        if let Some(rates) = &self.rates {
+            rates.lock().unwrap().push(r.fps);
+        }
         Ok(())
     }
 
@@ -206,6 +211,8 @@ struct Opts {
     h264_refinable: Option<Arc<AtomicUsize>>,
     /// H.264 refining passes spend this much of their budget.
     refine_fill: Option<f64>,
+    /// The frame rate of every rate change of the first H.264 stripe's encoder.
+    h264_rates: Option<Arc<StdMutex<Vec<u32>>>>,
     /// The least budget a step of H.264 sharpening needs.
     h264_step_bytes: Option<usize>,
 }
@@ -239,6 +246,7 @@ fn fakes(o: Opts) -> Open {
                 empty_keys: false,
                 refinable: None,
                 fill: None,
+                rates: None,
                 step_bytes: None,
             }) as Box<dyn VideoEncoder>);
         }
@@ -282,6 +290,7 @@ fn fakes(o: Opts) -> Open {
             empty_keys: o.h264_empty_keys && !hevc && h264 > 0,
             refinable: o.h264_refinable.clone().filter(|_| !hevc && h264 == 1),
             fill: o.refine_fill.filter(|_| !hevc),
+            rates: o.h264_rates.clone().filter(|_| !hevc && h264 == 1),
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
         }) as Box<dyn VideoEncoder>)
     })
@@ -2912,6 +2921,41 @@ fn a_busy_screen_keeps_its_charged_refinement_within_the_share() {
         "charged {} against {allowed:.0} allowed",
         r.charged
     );
+}
+
+/// Frames skipped by flow control or a busy encoder don't count: the encoder budgets each frame
+/// for the rate the cohort actually takes them at in motion, never below FPS_FLOOR, and a still
+/// in between doesn't drag it down.
+#[test]
+fn the_encoder_budgets_for_the_rate_a_cohort_takes_frames_at() {
+    let rates = Arc::new(StdMutex::new(Vec::new()));
+    let hub = Hub::new();
+    let opts = Opts {
+        h264_rates: Some(rates.clone()),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    let mut motion = |eng: &mut Engine, t: &mut Instant, every_ms: u64, for_ms: u64| {
+        for _ in 0..for_ms / every_ms {
+            *t += Duration::from_millis(every_ms);
+            capture(eng, W, H, Some(Band { y0: 0, y1: H }), *t);
+            acked(&c, &mut rx);
+        }
+    };
+    let last = |rates: &Arc<StdMutex<Vec<u32>>>| *rates.lock().unwrap().last().unwrap();
+    motion(&mut eng, &mut t, 100, 3000);
+    assert_eq!(last(&rates), 10);
+    t += Duration::from_secs(2);
+    motion(&mut eng, &mut t, 33, 4000);
+    assert_eq!(last(&rates), 30, "{:?}", rates.lock().unwrap());
+    motion(&mut eng, &mut t, 400, 6000);
+    assert_eq!(last(&rates), FPS_FLOOR);
+    assert!(rates.lock().unwrap().iter().all(|&f| f >= FPS_FLOOR));
 }
 
 #[test]

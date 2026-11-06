@@ -125,6 +125,8 @@ pub struct RateConfig {
     pub max_kbps: u32,
     /// Rate buffer in kbit (x264's VBV).
     pub buf_kbit: u32,
+    /// Frames per second to budget each frame for: the rate frames actually arrive at.
+    pub fps: u32,
 }
 
 impl RateConfig {
@@ -134,6 +136,7 @@ impl RateConfig {
             quality,
             max_kbps,
             buf_kbit: max_kbps / fps.max(1) * 5 / 4,
+            fps,
         }
     }
 }

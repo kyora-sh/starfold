@@ -1144,3 +1144,42 @@ fn refine_soak() {
         );
     }
 }
+
+/// Told frames now come at a third of the rate, rate control gives each about three times the
+/// bytes, and the stream carries on without an IDR.
+#[test]
+fn a_lower_frame_rate_budgets_more_per_frame_without_an_idr() {
+    let (w, h) = (640usize, 480usize);
+    let mut enc = open(&config(Backend::OpenH264, w as u32, h as u32, 2000)).unwrap();
+    let mut p = Picture::new(w, h);
+    let mut run = |enc: &mut Box<dyn VideoEncoder>, from: usize, frames: usize, step: usize| {
+        let (mut bytes, mut keys) = (Vec::new(), 0);
+        for i in 0..frames {
+            let f = from + i * step;
+            p.video(f);
+            let aus = enc
+                .encode(
+                    &p.view(),
+                    EncodeOptions {
+                        pts_ms: (f * 1000 / 30) as i64,
+                        force_keyframe: false,
+                        static_mbs: None,
+                        refine: None,
+                    },
+                )
+                .unwrap();
+            keys += aus.iter().filter(|a| a.keyframe).count();
+            bytes.push(aus.iter().map(|a| a.data.len()).sum::<usize>());
+        }
+        let tail = &bytes[frames / 3..];
+        (tail.iter().sum::<usize>() / tail.len(), keys)
+    };
+    let (at30, _) = run(&mut enc, 0, 45, 1);
+    enc.set_rate(RateConfig::new(24.0, 2000, 10)).unwrap();
+    let (at10, keys) = run(&mut enc, 45, 45, 3);
+    assert_eq!(keys, 0, "no IDR for a rate change");
+    assert!(
+        at10 >= at30 * 2,
+        "{at30} bytes a frame at 30 fps, {at10} at 10"
+    );
+}

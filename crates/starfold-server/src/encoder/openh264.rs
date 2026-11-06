@@ -112,6 +112,8 @@ pub struct OpenH264 {
     bps: c_int,
     /// Frames OpenH264 budgets per second over frames that arrive per second.
     rate_scale: f64,
+    /// The frame rate rate control budgets each frame for.
+    fps: u32,
     pts: i64,
     width: u32,
     height: u32,
@@ -154,6 +156,7 @@ impl OpenH264 {
             params: ParamSets::default(),
             bps: bps(cfg.rate.max_kbps, rate_scale),
             rate_scale,
+            fps: cfg.fps.clamp(1, MAX_FPS),
             pts: -1,
             width: cfg.width,
             height: cfg.height,
@@ -300,6 +303,13 @@ impl OpenH264 {
 
 impl VideoEncoder for OpenH264 {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+        let fps = rate.fps.clamp(1, MAX_FPS);
+        if fps != self.fps {
+            // Frames budget the bitrate over this rate, not over the rate the stream opened at.
+            let mut f = fps as f32;
+            self.option(sys::ENCODER_OPTION_FRAME_RATE, &mut f)?;
+            self.fps = fps;
+        }
         let b = bps(rate.max_kbps, self.rate_scale);
         if b == self.bps {
             return Ok(());
