@@ -56,6 +56,8 @@ struct Frame {
     paintover_final: bool,
     /// The QP a backend that refines by QP aims for: only once motion has stopped.
     refine_qp: Option<u8>,
+    /// A pass after the ladder: its bytes don't count against the refinement share.
+    refine_tail: bool,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -223,7 +225,7 @@ struct Shared {
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
     keyframes: AtomicU64,
-    /// What this cohort's refining passes cost.
+    /// What this cohort's refining passes cost, tail passes left out.
     paintover_bytes: AtomicU64,
     /// The last refining pass left something its successor could still sharpen.
     refinable: AtomicBool,
@@ -1438,7 +1440,7 @@ struct Burst {
     /// The encoder refines by QP.
     ladder: bool,
     /// Last-rung passes after the ladder, while the encoder still has something one of them
-    /// could sharpen: they fill an idle link and cost the next burst nothing.
+    /// could sharpen: they fill an idle link, so their bytes aren't counted in `spent`.
     tail: u32,
 }
 
@@ -1492,13 +1494,10 @@ impl Burst {
     fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
         let rate = target_kbps as f64 * 1000.0 / 8.0 * REFINE_SHARE;
         let dt = now.saturating_duration_since(self.refilled).as_secs_f64();
-        let charged = match self.tail > 0 {
-            true => 0,
-            false => spent.saturating_sub(self.spent),
-        };
         self.tokens = match target_kbps {
             0 => f64::INFINITY,
-            _ => (self.tokens + dt * rate - charged as f64).min(rate * REFINE_WINDOW_S),
+            _ => (self.tokens + dt * rate - spent.saturating_sub(self.spent) as f64)
+                .min(rate * REFINE_WINDOW_S),
         };
         self.refilled = now;
         self.spent = spent;
@@ -1696,6 +1695,7 @@ impl Refinement {
         out.paintover = true;
         out.paintover_final = self.burst.left == 1;
         out.refine_qp = self.burst.rung();
+        out.refine_tail = self.burst.tail > 0;
         Some((out, Step::Pass))
     }
 
@@ -1981,6 +1981,7 @@ fn capture_loop(
                 buf,
                 paintover: false,
                 paintover_final: false,
+                refine_tail: false,
                 refine_qp: None,
                 mb_dirty: mb_dirty.map(Arc::new),
                 band,
@@ -2421,18 +2422,19 @@ fn encode_loop(
         let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
         let mut configs: Vec<Option<StreamConfig>> = (0..n).map(|_| None).collect();
         let mut failed = false;
-        let mut refinable = false;
+        let mut refinable = vec![false; n];
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
-                refinable |= r.refinable;
+                refinable[r.i] = r.refinable;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
                 results[r.i] = r.out;
                 configs[r.i] = r.config;
             }
         }
         if job.refine_qp.is_some() {
-            sh.refinable.store(refinable, Ordering::Release);
+            sh.refinable
+                .store(refinable.contains(&true), Ordering::Release);
         }
         let worst = fails.iter().copied().max().unwrap_or(0);
         sh.failures.store(worst, Ordering::Release);
@@ -2452,13 +2454,22 @@ fn encode_loop(
             paintover,
             paintover_final,
             refine_qp,
+            refine_tail,
             band,
             captured_at,
             marker_ms,
             ..
         } = job;
         drop(buf);
-        for (y, h, touched) in stripes.iter_mut() {
+        for (i, (y, h, touched)) in stripes.iter_mut().enumerate() {
+            // A pass by QP keeps each stripe it reached as long as that stripe can still sharpen,
+            // whether or not its blocks are pending any more.
+            if refine_qp.is_some() {
+                if selected[i] {
+                    *touched = refinable[i];
+                }
+                continue;
+            }
             if paintover_final {
                 *touched = false;
             }
@@ -2493,8 +2504,10 @@ fn encode_loop(
             hub.stats
                 .paintover_bytes
                 .fetch_add(total as u64, Ordering::Relaxed);
-            sh.paintover_bytes
-                .fetch_add(total as u64, Ordering::Release);
+            if !refine_tail {
+                sh.paintover_bytes
+                    .fetch_add(total as u64, Ordering::Release);
+            }
         }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);

@@ -315,6 +315,7 @@ fn whole(w: u32, h: u32) -> Frame {
         buf: Arc::new(I420::new(w as usize, h as usize)),
         paintover: false,
         paintover_final: false,
+        refine_tail: false,
         refine_qp: None,
         band: Some(Band { y0: 0, y1: h }),
         mb_dirty: None,
@@ -1356,6 +1357,7 @@ fn skipped_damage_is_caught_up() {
         buf: Arc::new(I420::new(32, 32)),
         paintover: false,
         paintover_final: false,
+        refine_tail: false,
         refine_qp: None,
         band,
         mb_dirty: mb.map(Arc::new),
@@ -2431,24 +2433,84 @@ fn the_tail_has_a_limit() {
     assert!(qps[2..].iter().all(|&q| q == 12));
 }
 
+/// A legacy viewer on OpenH264 over `cfg`, its first stripe's encoder with `left` refining
+/// passes' worth to sharpen, the keyframe acked and its ladder started.
+fn refining(
+    cfg: VideoConfig,
+    left: &Arc<AtomicUsize>,
+) -> (
+    Arc<Hub>,
+    Engine,
+    Arc<Client>,
+    UnboundedReceiver<Out>,
+    Instant,
+) {
+    let hub = Hub::new();
+    let opts = Opts {
+        h264_refinable: Some(left.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264], fakes(opts)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    acked(&c, &mut rx);
+    (hub, eng, c, rx, t)
+}
+
 #[test]
 fn tail_bytes_cost_the_next_burst_nothing() {
-    let now = Instant::now();
-    let mut b = Burst::new(3, NO_DELAY, now);
-    b.account(now, 2000, 0);
-    b.moved(now);
+    let left = Arc::new(AtomicUsize::new(10));
+    let (hub, mut eng, c, mut rx, mut t) = refining(config(), &left);
     for _ in 0..3 {
-        b.pass(now);
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
     }
-    b.account(now, 2000, 50_000);
-    let after_ladder = b.tokens;
-    assert!(after_ladder < 250_000.0, "the ladder is charged");
-    b.more();
-    b.pass(now);
-    b.account(now, 2000, 5_000_000);
-    assert_eq!(b.tokens, after_ladder, "the tail is not");
-    b.moved(now);
-    assert!(b.due(now));
+    let charged = eng.cohorts[0]
+        .shared
+        .paintover_bytes
+        .load(Ordering::Acquire);
+    let sent = hub.stats.paintover_bytes.load(Ordering::Relaxed);
+    assert!(charged > 0, "the ladder is charged");
+    for _ in 0..20 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    assert_eq!(left.load(Ordering::Relaxed), 0, "the tail ran");
+    assert!(hub.stats.paintover_bytes.load(Ordering::Relaxed) > sent);
+    assert_eq!(
+        eng.cohorts[0]
+            .shared
+            .paintover_bytes
+            .load(Ordering::Acquire),
+        charged,
+        "the tail is not"
+    );
+}
+
+/// The top stripe's blocks were sharpened on a motion frame (no longer pending), yet its
+/// encoder can still sharpen: the tail keeps reaching it until it can't.
+#[test]
+fn the_tail_reaches_every_stripe_that_can_still_sharpen() {
+    let left = Arc::new(AtomicUsize::new(8));
+    let (_hub, mut eng, c, mut rx, mut t) = refining(two_stripes(), &left);
+    let (cols, rows) = (W.div_ceil(16) as usize, H.div_ceil(16) as usize);
+    let r = &mut eng.cohorts[0].refine.refiner;
+    for (i, p) in r.pending.iter_mut().enumerate() {
+        *p &= i / cols >= rows / 2;
+    }
+    for _ in 0..30 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    assert_eq!(left.load(Ordering::Relaxed), 0);
+    assert!(
+        !eng.cohorts[0].refine.refiner.any_pending(),
+        "then it stops"
+    );
 }
 
 #[test]
