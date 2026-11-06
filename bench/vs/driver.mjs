@@ -89,8 +89,12 @@ function reader({ cell, w, h, readback, wsTs }) {
 			if (u && u[0] === 3) vs.ws.push([performance.now(), 0]);
 			return send.call(this, d);
 		};
-		const WS = WebSocket;
-		window.WebSocket = class extends WS { constructor(...a) { super(...a); this.addEventListener('message', (e) => vs.ws.push([performance.now(), e.data.byteLength ?? e.data.size ?? 0])); } };
+		const on = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'onmessage');
+		Object.defineProperty(WebSocket.prototype, 'onmessage', {
+			configurable: true,
+			get: on.get,
+			set(f) { on.set.call(this, typeof f === 'function' ? function (e) { vs.ws.push([performance.now(), e.data?.byteLength || 1]); return f.call(this, e); } : f); },
+		});
 	}
 	if (!readback) return;
 	const c = document.createElement('canvas');
@@ -209,7 +213,7 @@ async function run(arm, wl, readback = true) {
 		const ready = ARMS[arm].kind === 'starfold'
 			? () => window.vs?.firstFrame !== undefined || window.starfoldFirstFrame !== undefined
 			: () => window.novncConnected === true;
-		await p.waitForFunction(ready, null, { timeout: 15000 });
+		await p.waitForFunction(ready, null, { timeout: 15000 }).catch((e) => { throw new Error(`${String(e.message).split('\n')[0]}${errs.length ? ` page: ${errs[0]}` : ''}`); });
 		if (readback) await p.waitForFunction(() => window.vs.seen, null, { timeout: 15000 });
 		else await sleep(1000);
 		await sleep(3000);
