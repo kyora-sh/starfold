@@ -2,7 +2,7 @@
 
 starfold (`--encoder auto`, OpenH264 on Linux, `<video>` presentation, plus one `?present=canvas` arm) against noVNC as kyora runs it,
 on kyora Linux VMs at 1920x1080, 30 fps source, for typing, scrolling and video. Harness: `bench/vs/` (usage in the headers of `run.sh` and `driver.mjs`).
-Code: WAN sets at 38c19ca, dense sets at 0aa0693 (same scoring and reader code), LAN sets at 5c9731b.
+Code: WAN sets at 38c19ca, dense sets at 0aa0693 (same scoring and reader code), LAN sets at 5c9731b, the RFB tap at 59e4c42.
 Shared VMs are noisy: trust direction over absolutes, and compare arms only within one VM run.
 
 ## Arms and links
@@ -20,7 +20,12 @@ Shared VMs are noisy: trust direction over absolutes, and compare arms only with
 - Arms interleaved with rotating order inside one VM run, n>=5 per cell (n=12 for the rate sets); median [min..max].
 - Failures count: every cell shows valid/attempted, and the failure ledger is in the logs. One viewer per run, checked mid-run and at the end.
 - Frame timing and key-to-paint come from a page-side reader: the source draws a marker strip, the reader decodes it after each draw
-  (event-driven: a 2D canvas is read only after something drew on it). Keys toggle a tagged region, so a frame is provably caused by a key.
+  (event-driven: a 2D canvas is read only after something drew on it). Each key toggles a tagged region that carries its letter; keys and
+  tags are paired in order within a 5 s cap, preferring the shortest latencies. A tag carries a letter, not a sequence number, so when the
+  same letter repeats within the cap a stale frame can be paired with the later press: the pairing is optimistic, can only understate
+  latency, and matters most for the slowest arms (noVNC at 2 and 20 Mbit/s), so it errs in noVNC's favour.
+- Display updates are counted as compositor swaps (Chrome trace), a proxy for painted updates, not a count of distinct remote updates.
+  Tables show the median interval between swaps; swap counts in these logs ran past the measured window, so no swap rates are reported.
 - Rate (Mbit/s) is TCP payload acked by the viewer per server connection (`ss`), the same count for every arm.
 - Quality: browser screenshots against an `xwd` of the X server after the picture freezes (`bench/vs/quality.py`), SSIM and PSNR on luma,
   with the marker strip and pointer masked; text SSIM only counts windows with detail in the truth.
@@ -44,54 +49,54 @@ VM and CALIB not recorded (this set predates the CALIB rule)
 
 main / typing
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | - | - | - | 256/256 | 36 [34..37] | 57 [54..59] | 0.00 [0.00..0.00] | 3 [3..3] | 8 [7..10] | 5.1 [5.1..5.2] | - |
-| starfold-video | 5/5 | 0 | - | - | - | 250/250 | 27 [26..28] | 35 [33..42] | 0.03 [0.02..0.03] | 4 [4..5] | 9 [7..11] | 12.7 [12.2..13.2] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | - | - | - | 252/252 | 26 [24..28] | 53 [45..58] | 0.02 [0.02..0.03] | 4 [4..5] | 39 [36..40] | 12.5 [11.9..12.6] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | - | - | - | 256/256 | 36 [34..37] | 57 [54..59] | 0.00 [0.00..0.00] | 3 [3..3] | 8 [7..10] | 200 [183..200] | - |
+| starfold-video | 5/5 | 0 | - | - | - | 250/250 | 27 [26..28] | 35 [33..42] | 0.03 [0.02..0.03] | 4 [4..5] | 9 [7..11] | 72 [66..80] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | - | - | - | 252/252 | 26 [24..28] | 53 [45..58] | 0.02 [0.02..0.03] | 4 [4..5] | 39 [36..40] | 82 [66..94] | 0,0,0,0,0 |
 
 main / scroll
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | 29.0 [29.0..29.3] | 50 [50..53] | 0 [0..1] | 146/146 | 56 [53..62] | 85 [78..90] | 90.48 [89.54..90.74] | 42 [40..46] | 100 [93..117] | 48.7 [48.2..50.1] | - |
-| starfold-video | 5/5 | 0 | 29.9 [29.8..30.0] | 67 [67..67] | 0 [0..0] | 145/145 | 34 [32..38] | 49 [48..50] | 7.23 [6.42..8.11] | 26 [22..33] | 26 [21..33] | 55.3 [55.2..55.7] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.1] | 67 [50..67] | 0 [0..0] | 143/143 | 46 [43..55] | 63 [59..63] | 7.39 [6.86..8.39] | 24 [23..28] | 73 [68..81] | 53.3 [52.5..53.5] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | 29.0 [29.0..29.3] | 50 [50..53] | 0 [0..1] | 146/146 | 56 [53..62] | 85 [78..90] | 90.48 [89.54..90.74] | 42 [40..46] | 100 [93..117] | 33 [33..33] | - |
+| starfold-video | 5/5 | 0 | 29.9 [29.8..30.0] | 67 [67..67] | 0 [0..0] | 145/145 | 34 [32..38] | 49 [48..50] | 7.23 [6.42..8.11] | 26 [22..33] | 26 [21..33] | 29 [28..29] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.1] | 67 [50..67] | 0 [0..0] | 143/143 | 46 [43..55] | 63 [59..63] | 7.39 [6.86..8.39] | 24 [23..28] | 73 [68..81] | 33 [33..33] | 0,0,0,0,0 |
 
 main / video
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | 29.7 [29.1..29.9] | 53 [49..54] | 0 [0..0] | 144/144 | 60 [58..64] | 85 [83..87] | 112.24 [110.60..112.78] | 40 [38..42] | 130 [123..144] | 45.1 [44.9..45.6] | - |
-| starfold-video | 5/5 | 0 | 30.0 [29.7..30.1] | 50 [50..50] | 0 [0..0] | 145/145 | 37 [33..38] | 54 [50..56] | 14.47 [14.42..14.48] | 42 [37..44] | 29 [26..33] | 54.8 [54.4..55.2] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.0] | 50 [50..50] | 0 [0..0] | 144/144 | 55 [51..58] | 71 [60..74] | 14.47 [14.43..14.48] | 42 [40..47] | 76 [74..85] | 53.0 [52.3..53.3] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | 29.7 [29.1..29.9] | 53 [49..54] | 0 [0..0] | 144/144 | 60 [58..64] | 85 [83..87] | 112.24 [110.60..112.78] | 40 [38..42] | 130 [123..144] | 33 [33..33] | - |
+| starfold-video | 5/5 | 0 | 30.0 [29.7..30.1] | 50 [50..50] | 0 [0..0] | 145/145 | 37 [33..38] | 54 [50..56] | 14.47 [14.42..14.48] | 42 [37..44] | 29 [26..33] | 29 [29..29] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.0] | 50 [50..50] | 0 [0..0] | 144/144 | 55 [51..58] | 71 [60..74] | 14.47 [14.43..14.48] | 42 [40..47] | 76 [74..85] | 33 [33..33] | 0,0,0,0,0 |
 
 #### LAN, no-reader control (reader v1, 5c9731b)
 VM and CALIB not recorded (this set predates the CALIB rule)
 
 no-readback / typing
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | - | - | - | 0/251 | - | - | 0.00 [0.00..0.00] | 3 [3..4] | 3 [3..3] | 4.9 [4.9..5.3] | - |
-| starfold-video | 5/5 | 0 | - | - | - | 0/252 | - | - | 0.02 [0.02..0.03] | 4 [4..5] | 7 [6..9] | 12.6 [12.5..12.9] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | - | - | - | 0/252 | - | - | 0.02 [0.02..0.03] | 5 [4..6] | 14 [12..17] | 12.7 [12.2..13.2] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | - | - | - | 0/251 | - | - | 0.00 [0.00..0.00] | 3 [3..4] | 3 [3..3] | 204 [191..206] | - |
+| starfold-video | 5/5 | 0 | - | - | - | 0/252 | - | - | 0.02 [0.02..0.03] | 4 [4..5] | 7 [6..9] | 70 [61..85] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | - | - | - | 0/252 | - | - | 0.02 [0.02..0.03] | 5 [4..6] | 14 [12..17] | 74 [50..85] | 0,0,0,0,0 |
 
 no-readback / scroll
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | - | - | - | 0/144 | - | - | 90.65 [89.49..90.77] | 45 [41..47] | 103 [91..110] | 51.4 [49.3..52.7] | - |
-| starfold-video | 5/5 | 0 | - | - | - | 0/145 | - | - | 7.82 [7.31..8.26] | 26 [25..32] | 24 [23..29] | 55.0 [54.7..55.2] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | - | - | - | 0/145 | - | - | 8.13 [6.28..8.98] | 26 [25..26] | 49 [47..50] | 54.3 [54.2..54.9] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | - | - | - | 0/144 | - | - | 90.65 [89.49..90.77] | 45 [41..47] | 103 [91..110] | 29 [28..30] | - |
+| starfold-video | 5/5 | 0 | - | - | - | 0/145 | - | - | 7.82 [7.31..8.26] | 26 [25..32] | 24 [23..29] | 29 [28..29] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | - | - | - | 0/145 | - | - | 8.13 [6.28..8.98] | 26 [25..26] | 49 [47..50] | 32 [31..32] | 0,0,0,0,0 |
 
 no-readback / video
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | - | - | - | 0/145 | - | - | 111.77 [111.48..112.41] | 39 [39..43] | 127 [126..140] | 45.1 [44.9..45.6] | - |
-| starfold-video | 5/5 | 0 | - | - | - | 0/144 | - | - | 14.47 [14.42..14.48] | 41 [39..54] | 27 [26..36] | 55.4 [54.8..55.6] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | - | - | - | 0/144 | - | - | 14.43 [14.42..14.48] | 43 [39..61] | 52 [48..70] | 54.3 [52.9..54.3] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | - | - | - | 0/145 | - | - | 111.77 [111.48..112.41] | 39 [39..43] | 127 [126..140] | 33 [32..33] | - |
+| starfold-video | 5/5 | 0 | - | - | - | 0/144 | - | - | 14.47 [14.42..14.48] | 41 [39..54] | 27 [26..36] | 29 [28..29] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | - | - | - | 0/144 | - | - | 14.43 [14.42..14.48] | 43 [39..61] | 52 [48..70] | 31 [30..32] | 0,0,0,0,0 |
 
 LAN quality (n=5, PSNR dB / text SSIM; settled = +500 ms to +8 s after the picture freezes, identical across that range):
 
@@ -108,14 +113,19 @@ starfold leads once the picture settles and trails noVNC q7 slightly while scrol
 ### WAN 20 Mbit/s, 50 ms RTT
 
 **noVNC runs in one of two modes here.** Without the reader, each noVNC connection settles into either a fast mode (20.0 Mbit/s,
-an update every ~154 ms on scroll) or a slow mode (14.2-14.5 Mbit/s, ~213 ms). Per update the server side is identical in both
-(request to first byte ~5 ms, same bytes per update, same x11vnc CPU; measured with an RFB tap at the relay, `bench/vs/rfb-tap.py`),
-and host steal is ~0 in both. The slow cycle is a strict request-then-response loop at link speed: 383 KB per scroll update is 153 ms
+a swap every ~154 ms on scroll) or a slow mode (14.2-14.5 Mbit/s, ~213 ms). An RFB tap at the relay (`bench/vs/rfb-tap.py`, which parses the client stream; 24 connections, half in each mode) shows the
+server side the same per update in both modes: request to first byte 4-18 ms, the same bytes per update (~385 KB scroll, ~472 KB video)
+and the same x11vnc CPU within the run. The difference is the time from the last byte leaving the relay to the next request: 135-139 vs
+201-205 ms on scroll, 171-177 vs 233-234 ms on video. The relay sits before the shaper, so that time includes the update's passage
+through the shaped link. Host steal is ~0 in both modes. The slow cycle is a strict request-then-response loop at link speed: 383 KB per scroll update is 153 ms
 at 20 Mbit/s plus one 50 ms round trip, ~203 ms predicted vs 211 ms measured (video: 239 vs 245 ms). The fast cycle is shorter than
-transfer plus round trip, so some request must overlap the previous update's delivery. In the browser, noVNC sends its next request
-0.1 ms after the last WebSocket message reaches its handler, so it does not hold the request; the time is lost before the message
-reaches the page. The share of fast connections is not stable across VM runs: video was fast in 1 of 12 here, and in 9 of 10 in a
-run later dropped by the CALIB rule. Any page hook (the frame reader, or a WebSocket timing hook) shifts noVNC toward the slow mode. **The cause is open.**
+transfer plus round trip, so some request must overlap the previous update's delivery. In a diagnostic run with a WebSocket timing hook, every
+connection was in the slow mode, and noVNC sent its next request 0.1 ms after the last WebSocket message reached its handler: in the slow
+mode it does not hold the request in the page, so the extra time is spent before the message reaches the page. That is an inference for
+the slow mode only; no fast-mode connection was timed this way. The share of fast connections is not stable across VM runs: video was
+fast in 1 of 12 no-reader runs here, and in 9 of 10 in a run later dropped by the CALIB rule. Page hooks seem to shift noVNC toward the
+slow mode (scroll: 0 of 12 fast with the reader vs 4 of 12 without; the WebSocket hook: 0 of 24), though on video the reader runs were
+fast 2 of 12 vs 1 of 12 without, so this is a tendency, not a rule. **The cause is open.**
 kyora's vmd relay may behave differently from websockify.
 
 #### WAN 20 Mbit/s scroll, rate (p20-scroll)
@@ -138,45 +148,47 @@ VM: AMD EPYC; CALIB 1.76 s / 1.91 s (drift 8.3%)
 | starfold-video (video) | no | 12/12 | 0 | 14.4, 14.4, 14.4, 14.5, 14.4, 14.4, 14.4, 14.4, 14.4, 14.4, 14.4, 14.4 | 14.44 | - | 29 [28..29] |
 | starfold-video (video) | yes | 12/12 | 0 | 14.4, 14.4, 14.4, 14.5, 14.4, 14.4, 14.4, 14.4, 14.5, 14.4, 14.4, 14.5 | 14.44 | - | 28 [28..29] |
 
-The latency table below needs the reader, so **its noVNC rows are slow-mode only; no noVNC latency was measured in the fast mode.**
-Next to them, the no-reader rate sets give the best available measure of noVNC in its natural mix of modes: on scroll, 4 of 12 connections fast (20.0 Mbit/s, 9.8 updates/s, ~154 ms per update) and 8 slow (14.2-14.5 Mbit/s, 7.1 updates/s, ~213 ms);
-on video, 1 of 12 fast (20.0 Mbit/s, 8.0 updates/s, ~189 ms) and 11 slow (15.4 Mbit/s, 6.2 updates/s, ~245 ms).
+The latency tables below need the reader, and **every noVNC run in them (wan-ts, wan-v) was in the slow mode, so their noVNC latency
+is slow-mode latency.** The only fast-mode noVNC latency samples are the 2 video reader runs of the rate set above, perturbed by the
+reader: 463 and 466 ms p50 at 5.3 FPS, against 361-393 ms at 4.0 FPS for the 10 slow ones in the same run. In those two runs the fast
+mode moved more data without cutting key-to-paint, consistent with updates queueing behind overlapped requests; n=2. Next to them, the no-reader rate sets give the best available measure of noVNC in its natural mix of modes: on scroll, 4 of 12 connections fast (20.0 Mbit/s, a swap every ~154 ms) and 8 slow (14.2-14.5 Mbit/s, ~213 ms);
+on video, 1 of 12 fast (20.0 Mbit/s, ~189 ms) and 11 slow (15.4 Mbit/s, ~245 ms).
 
 #### WAN 20 Mbit/s / 50 ms: typing + scroll (wan-ts)
 VM: AMD EPYC; CALIB 1.95 s / 2.16 s (drift 11.1%)
 
 main / typing
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | - | - | - | 248/248 | 88 [85..89] | 109 [108..113] | 0.00 [0.00..0.00] | 6 [6..7] | 11 [11..16] | 5.0 [4.9..5.0] | - |
-| novnc-low | 5/5 | 0 | - | - | - | 246/246 | 87 [85..91] | 111 [108..112] | 0.00 [0.00..0.00] | 6 [6..7] | 11 [10..12] | 4.9 [4.9..5.0] | - |
-| starfold-video | 5/5 | 0 | - | - | - | 253/253 | 70 [68..73] | 91 [86..99] | 0.01 [0.01..0.01] | 4 [4..5] | 14 [13..16] | 11.6 [11.3..11.8] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | - | - | - | 250/250 | 77 [74..94] | 103 [100..132] | 0.01 [0.01..0.01] | 4 [4..5] | 48 [44..70] | 11.3 [11.0..11.6] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | - | - | - | 248/248 | 88 [85..89] | 109 [108..113] | 0.00 [0.00..0.00] | 6 [6..7] | 11 [11..16] | 200 [200..201] | - |
+| novnc-low | 5/5 | 0 | - | - | - | 246/246 | 87 [85..91] | 111 [108..112] | 0.00 [0.00..0.00] | 6 [6..7] | 11 [10..12] | 203 [200..216] | - |
+| starfold-video | 5/5 | 0 | - | - | - | 253/253 | 70 [68..73] | 91 [86..99] | 0.01 [0.01..0.01] | 4 [4..5] | 14 [13..16] | 98 [92..124] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | - | - | - | 250/250 | 77 [74..94] | 103 [100..132] | 0.01 [0.01..0.01] | 4 [4..5] | 48 [44..70] | 109 [104..117] | 0,0,0,0,0 |
 
 main / scroll
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 4/5 | 1 | 3.6 [2.7..4.0] | 575 [466..800] | 35 [26..39] | 117/117 | 357 [340..364] | 456 [434..462] | 13.54 [13.26..13.64] | 46 [46..47] | 42 [40..45] | 6.6 [6.3..6.7] | - |
-| novnc-low | 4/5 | 1 | 4.6 [4.5..5.8] | 424 [317..500] | 46 [44..57] | 118/118 | 230 [218..242] | 300 [288..317] | 9.75 [9.49..10.01] | 48 [46..48] | 44 [41..47] | 10.0 [9.9..10.7] | - |
-| starfold-video | 4/5 | 1 | 28.4 [27.6..28.8] | 75 [67..100] | 4 [4..9] | 118/118 | 88 [87..94] | 156 [137..181] | 6.72 [6.35..7.20] | 27 [22..33] | 31 [26..36] | 54.6 [54.3..55.1] | 0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | 29.2 [28.3..29.4] | 67 [67..67] | 2 [0..4] | 145/145 | 108 [96..112] | 135 [120..159] | 6.00 [5.36..6.14] | 29 [23..32] | 89 [79..99] | 52.1 [51.8..52.7] | 0,0,0,0,0 |
+| novnc | 4/5 | 1 | 3.6 [2.7..4.0] | 575 [466..800] | 35 [26..39] | 117/117 | 357 [340..364] | 456 [434..462] | 13.54 [13.26..13.64] | 46 [46..47] | 42 [40..45] | 233 [232..234] | - |
+| novnc-low | 4/5 | 1 | 4.6 [4.5..5.8] | 424 [317..500] | 46 [44..57] | 118/118 | 230 [218..242] | 300 [288..317] | 9.75 [9.49..10.01] | 48 [46..48] | 44 [41..47] | 150 [135..151] | - |
+| starfold-video | 4/5 | 1 | 28.4 [27.6..28.8] | 75 [67..100] | 4 [4..9] | 118/118 | 88 [87..94] | 156 [137..181] | 6.72 [6.35..7.20] | 27 [22..33] | 31 [26..36] | 27 [26..27] | 0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | 29.2 [28.3..29.4] | 67 [67..67] | 2 [0..4] | 145/145 | 108 [96..112] | 135 [120..159] | 6.00 [5.36..6.14] | 29 [23..32] | 89 [79..99] | 32 [32..32] | 0,0,0,0,0 |
 
 #### WAN 20 Mbit/s / 50 ms: video (wan-v)
 VM: AMD EPYC; CALIB 1.84 s / 1.86 s (drift 1.0%)
 
 main / video
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | 4.1 [4.0..4.1] | 250 [250..283] | 40 [39..40] | 146/146 | 389 [362..396] | 486 [484..492] | 15.42 [15.35..15.43] | 16 [15..16] | 31 [27..32] | 6.2 [6.2..6.2] | - |
-| novnc-low | 5/5 | 0 | 8.5 [8.4..8.5] | 133 [117..133] | 82 [82..84] | 144/144 | 171 [167..193] | 231 [225..235] | 10.26 [10.25..10.38] | 17 [15..17] | 30 [29..33] | 12.9 [12.8..13.0] | - |
-| starfold-video | 5/5 | 0 | 30.0 [29.9..30.1] | 51 [50..67] | 0 [0..0] | 144/144 | 109 [108..110] | 130 [126..133] | 14.47 [14.44..14.47] | 39 [38..43] | 31 [28..37] | 55.1 [54.9..55.8] | 0,0,0,0,0 |
-| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.1] | 50 [50..50] | 0 [0..0] | 145/145 | 125 [123..130] | 145 [138..146] | 14.45 [14.42..14.48] | 39 [37..41] | 71 [67..78] | 47.2 [46.7..51.0] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | 4.1 [4.0..4.1] | 250 [250..283] | 40 [39..40] | 146/146 | 389 [362..396] | 486 [484..492] | 15.42 [15.35..15.43] | 16 [15..16] | 31 [27..32] | 250 [250..250] | - |
+| novnc-low | 5/5 | 0 | 8.5 [8.4..8.5] | 133 [117..133] | 82 [82..84] | 144/144 | 171 [167..193] | 231 [225..235] | 10.26 [10.25..10.38] | 17 [15..17] | 30 [29..33] | 117 [117..117] | - |
+| starfold-video | 5/5 | 0 | 30.0 [29.9..30.1] | 51 [50..67] | 0 [0..0] | 144/144 | 109 [108..110] | 130 [126..133] | 14.47 [14.44..14.47] | 39 [38..43] | 31 [28..37] | 29 [28..29] | 0,0,0,0,0 |
+| starfold-canvas | 5/5 | 0 | 30.0 [30.0..30.1] | 50 [50..50] | 0 [0..0] | 145/145 | 125 [123..130] | 145 [138..146] | 14.45 [14.42..14.48] | 39 [37..41] | 71 [67..78] | 33 [33..33] | 0,0,0,0,0 |
 
-In noVNC's slow mode, which is the only mode its latency was measured in, its scroll key-to-paint is 357 ms p50 against starfold's 88 ms,
-at 3.6 vs 28.4 FPS; its fast mode updates ~28% more often, and its latency there is not measured.
+In the slow mode, the only mode in which noVNC scroll latency was measured, noVNC's scroll key-to-paint is 357 ms p50 against
+starfold's 88 ms, at 3.6 vs 28.4 FPS; its fast-mode scroll latency is not measured.
 
 ### WAN 2 Mbit/s, 50 ms RTT
 
@@ -195,11 +207,11 @@ VM: AMD EPYC; CALIB 1.51 s / 1.51 s (drift 0.2%)
 
 main / scroll
 
-| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swaps/s | keyframes |
+| arm | valid/att | flagged | FPS | iv p95 ms | gaps>100 | key seen | i2p p50 ms | i2p p95 ms | Mbit/s | server % | browser % | swap p50 ms | keyframes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| novnc | 5/5 | 0 | 0.7 [0.6..0.7] | 1668 [1649..3466] | 6 [5..6] | 37/146 | 1743 [1622..1794] | 2870 [1917..3007] | 1.92 [1.92..1.92] | 19 [18..20] | 14 [11..15] | 1.0 [1.0..1.0] | - |
-| novnc-low | 5/5 | 0 | 1.3 [1.3..1.4] | 817 [817..833] | 12 [12..13] | 61/144 | 963 [860..1027] | 1165 [1148..1476] | 1.84 [1.84..1.86] | 19 [18..20] | 16 [14..18] | 1.9 [1.9..2.0] | - |
-| starfold-video | 5/5 | 0 | 12.5 [12.3..13.2] | 233 [216..250] | 32 [29..35] | 137/146 | 306 [268..396] | 526 [494..631] | 1.80 [1.79..1.82] | 11 [11..12] | 13 [12..16] | 24.5 [24.2..24.5] | 0,0,0,0,0 |
+| novnc | 5/5 | 0 | 0.7 [0.6..0.7] | 1668 [1649..3466] | 6 [5..6] | 37/146 | 1743 [1622..1794] | 2870 [1917..3007] | 1.92 [1.92..1.92] | 19 [18..20] | 14 [11..15] | 1601 [1583..1634] | - |
+| novnc-low | 5/5 | 0 | 1.3 [1.3..1.4] | 817 [817..833] | 12 [12..13] | 61/144 | 963 [860..1027] | 1165 [1148..1476] | 1.84 [1.84..1.86] | 19 [18..20] | 16 [14..18] | 767 [764..782] | - |
+| starfold-video | 5/5 | 0 | 12.5 [12.3..13.2] | 233 [216..250] | 32 [29..35] | 137/146 | 306 [268..396] | 526 [494..631] | 1.80 [1.79..1.82] | 11 [11..12] | 13 [12..16] | 39 [37..42] | 0,0,0,0,0 |
 
 At 2 Mbit/s a key counts as seen only if its tagged frame arrives within 5 s; noVNC answered 37 of 146 keys in time (low: 61 of 144),
 starfold 137 of 146. Latency percentiles cover answered keys only, so noVNC's are flattered by the keys it never answered in time.
@@ -213,7 +225,7 @@ Quality at 2 Mbit/s, scroll page (n=5, PSNR dB / text SSIM after the picture fre
 | starfold-video | 30.4 / 0.9532 | 33.3 / 0.9788 | 33.3 / 0.9788 | 33.3 [30.5..35.7] / 0.9788 | 27.7 / 0.9032 |
 
 starfold shows a usable picture first (+500 ms) but settles at 33.3 dB and stays there, below both noVNC profiles once they catch up
-(+1 s low, +3 s q7). noVNC's in-motion score is high because each shot shows one complete, if stale, update at 0.7 updates/s; it measures
+(+1 s low, +3 s q7). noVNC's in-motion score is high because each shot shows one complete, if stale, update at 0.7 FPS; it measures
 fidelity, not freshness. 0 keyframes in every starfold run on this page.
 
 Dense text page (`bench/dense.html`, 11 px monospace filling the screen), scroll, n=5, settled PSNR / text SSIM:
