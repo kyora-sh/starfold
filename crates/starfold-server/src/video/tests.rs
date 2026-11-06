@@ -2564,8 +2564,13 @@ struct BusyRun {
     target_at_stop: u32,
     /// The least the budget held.
     min_tokens: f64,
-    /// Turns a due ladder waited for budget.
+    /// Turns a due ladder waited for budget, and how many of them came after the last stop.
     held: usize,
+    held_after_stop: usize,
+    /// The budget when the last stop came.
+    tokens_at_stop: f64,
+    /// Refining passes taken.
+    passes: usize,
 }
 
 fn stop_start(b: Busy) -> BusyRun {
@@ -2599,6 +2604,9 @@ fn stop_start(b: Busy) -> BusyRun {
         target_at_stop: 0,
         min_tokens: f64::INFINITY,
         held: 0,
+        held_after_stop: 0,
+        tokens_at_stop: 0.0,
+        passes: 0,
     };
     let mut turn = |eng: &mut Engine, run: &mut BusyRun, t: Instant, motion: bool| {
         let band = motion.then_some(Band { y0: 0, y1: H });
@@ -2609,7 +2617,11 @@ fn stop_start(b: Busy) -> BusyRun {
         let burst = &k.refine.burst;
         run.min_tokens = run.min_tokens.min(burst.tokens);
         let waiting = burst.left == burst.len && burst.tail == 0 && !burst.funded();
-        run.held += (waiting && t - burst.last_motion >= burst.gap(t)) as usize;
+        let held = (waiting && t - burst.last_motion >= burst.gap(t)) as usize;
+        run.held += held;
+        if run.target_at_stop > 0 {
+            run.held_after_stop += held;
+        }
     };
     for _ in 0..b.cycles {
         turn(&mut eng, &mut run, t, true);
@@ -2625,6 +2637,7 @@ fn stop_start(b: Busy) -> BusyRun {
     }
     turn(&mut eng, &mut run, t, true);
     run.target_at_stop = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    run.tokens_at_stop = eng.cohorts[0].refine.burst.tokens;
     let stop = t;
     let before = passes();
     while passes() == before {
@@ -2637,6 +2650,7 @@ fn stop_start(b: Busy) -> BusyRun {
         .shared
         .paintover_bytes
         .load(Ordering::Acquire);
+    run.passes = passes();
     run
 }
 
@@ -2710,9 +2724,15 @@ fn the_first_pass_after_a_busy_stop_comes_within_the_bound() {
         "passes 1.8x their plan: first pass after {:?}, bound {b:?}",
         r.wait
     );
-    let r = busy(3, 1.0, Some(2000.0));
+    // Passes over their plan leave the budget in debt at the stop; the target then falls 4x.
+    let r = busy(3, 1.8, Some(2000.0));
+    assert!(r.tokens_at_stop < 0.0, "no debt to repay at the stop");
+    assert!(
+        r.held_after_stop > 0,
+        "repayment never held the next ladder"
+    );
     let fall = START_KBPS / r.target_at_stop as f64;
-    let b = bound(1.0, fall);
+    let b = bound(1.8, fall);
     assert!(
         r.wait <= b,
         "target fell {fall}x: first pass after {:?}, bound {b:?}",
@@ -2736,9 +2756,12 @@ fn a_busy_screen_keeps_its_charged_refinement_within_the_share() {
         "the budget never held a ladder back"
     );
     let last_ladder = 3.0 * 1.8 * START_KBPS * 1000.0 / 8.0 * 0.2 * 0.55;
-    let allowed = r.share + last_ladder;
+    // Each charged pass carries its stripe header; before the first turn the budget refills over
+    // the real time setup took, under one 50 ms step.
+    let slack = (r.passes * HDR) as f64 + START_KBPS * 1000.0 / 8.0 * REFINE_SHARE * 0.05;
+    let allowed = r.share + last_ladder + slack;
     assert!(
-        (r.charged as f64) <= allowed * 1.02,
+        (r.charged as f64) <= allowed,
         "charged {} against {allowed:.0} allowed",
         r.charged
     );
