@@ -3,7 +3,7 @@
 import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import http from 'http';
-import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS } from './config.mjs';
+import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS, KEYS_LOG } from './config.mjs';
 const [bin, source, web, pwFile, maxS, link, shaper, page] = process.argv.slice(2);
 const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock', DUMP = '/tmp/vs-dump.raw';
 const pw = fs.readFileSync(pwFile, 'utf8').trim();
@@ -45,7 +45,8 @@ const listening = async (port) => {
 };
 async function start(arm, wl) {
 	await stop();
-	src = group(source, [wl, WIDTH, HEIGHT, FPS, DUMP, page].map(String), { stdio: ['ignore', 'pipe', 'ignore'] });
+	fs.writeFileSync(KEYS_LOG, '');
+	src = group(source, [wl, WIDTH, HEIGHT, FPS, DUMP, page, KEYS_LOG].map(String), { stdio: ['ignore', 'pipe', 'ignore'] });
 	await new Promise((res, rej) => {
 		const t = setTimeout(() => rej(new Error('source not ready')), 15000);
 		src.stdout.on('data', (b) => { if (String(b).includes('READY')) { clearTimeout(t); res(); } });
