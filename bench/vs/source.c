@@ -29,7 +29,8 @@ static int W, H;
 static Display *d;
 static Window w;
 static GC g;
-static unsigned tag = 31;
+static unsigned tag = 31, cur;
+static FILE *keylog;
 static void cell(int col, int row, int on) {
 	XSetForeground(d, g, on ? 0xffffff : 0x000000);
 	XFillRectangle(d, w, g, col * CELL, row * CELL, CELL, CELL);
@@ -123,6 +124,12 @@ static void key(XEvent *e) {
 	if (s < 'a' || s > 'z') return;
 	tag = s - 'a';
 	draw_tag();
+	if (keylog) {
+		struct timespec now;
+		clock_gettime(CLOCK_REALTIME, &now);
+		fprintf(keylog, "%lld %u %u\n", (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000, tag, cur);
+		fflush(keylog);
+	}
 	XSetBackground(d, g, 0xffffff);
 	XSetForeground(d, g, 0x202020);
 	char c = (char)s;
@@ -212,7 +219,9 @@ int main(int argc, char **argv) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	struct pollfd pf = {.fd = ConnectionNumber(d), .events = POLLIN};
+	if (getenv("VS_KEYLOG")) keylog = fopen(getenv("VS_KEYLOG"), "w");
 	for (unsigned n = 1, off = 0;; n++) {
+		cur = n;
 		if (freeze) {
 			XSync(d, False);
 			puts("FROZEN");

@@ -4,6 +4,7 @@
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq >/dev/null 2>&1
 sudo apt-get install -y -qq nasm esbuild libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 x11-apps xfonts-base python3-numpy python3-pil >/dev/null 2>&1
+[ -n "${DIAG:-}" ] && { sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1; python3 bench/vs/diag-patch.py; }
 cargo +1.93.0 build --release --locked 2>&1 | tail -3
 cc -O2 bench/vs/source.c -lX11 -lXext -lm -o /tmp/vs-source || { echo 'source did not build'; exit 1; }
 rm -rf /tmp/novnc; mkdir -p /tmp/novnc
@@ -23,6 +24,7 @@ open('/tmp/vs-page.raw', 'wb').write(Image.merge('RGBA', (b, g, r, Image.new('L'
 " || { echo 'no page'; exit 1; }
 if [ -f "${BEFORE_TGZ:-}" ]; then
 	mkdir -p /tmp/before && tar -xzf "$BEFORE_TGZ" -C /tmp/before
+	[ -n "${DIAG:-}" ] && (cd /tmp/before && python3 "$OLDPWD/bench/vs/diag-patch.py")
 	(cd /tmp/before && CARGO_TARGET_DIR=/tmp/t-before cargo +1.93.0 build --release --locked 2>&1 | tail -1)
 	export STARFOLD_BEFORE_BIN=/tmp/t-before/release/starfold
 	[ -x "$STARFOLD_BEFORE_BIN" ] || echo 'BEFORE DID NOT BUILD'

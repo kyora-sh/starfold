@@ -63,7 +63,7 @@ async function viewers(arm) {
 const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000, 8000];
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
 function reader({ cell, w, h, readback }) {
-	const vs = (window.vs = { frames: [], tags: [], keys: [], bad: 0, ticks: 0, long: 0, longMs: 0, seen: false, sync: 0 });
+	const vs = (window.vs = { frames: [], tags: [], keys: [], samples: [], dumps: [], tagBad: 0, busy: 0, bad: 0, ticks: 0, long: 0, longMs: 0, seen: false, sync: 0 });
 	addEventListener('starfold:firstframe', () => (vs.firstFrame = performance.now()));
 	new PerformanceObserver((l) => { for (const e of l.getEntries()) { vs.long++; vs.longMs += e.duration; } }).observe({ type: 'longtask' });
 	addEventListener('keydown', (e) => vs.keys.push([performance.now(), e.key]), true);
@@ -89,13 +89,15 @@ function reader({ cell, w, h, readback }) {
 		return own.get(el);
 	};
 	let last = -1, lastTag = -1, pending = false;
-	const decode = (t, on) => {
-		let v = 0, ck = 0;
+	let lastN = -2, lastT = -2;
+	const decode = (t, on, raw) => {
+		let v = 0, ck = 0, sn = -1, st = -1;
 		for (let b = 0; b < 32; b++) v = (v | (on(b % 20, b >= 20 ? 1 : 0) << b)) >>> 0;
 		for (let b = 32; b < 40; b++) ck |= on(b % 20, 1) << (b - 32);
 		if (((v ^ (v >>> 8) ^ (v >>> 16) ^ (v >>> 24)) & 0xff) === ck) {
 			vs.seen = true;
 			const n = v >>> 20;
+			sn = n;
 			if (n !== last) {
 				last = n;
 				let lat = (Date.now() & 0xfffff) - (v & 0xfffff);
@@ -105,15 +107,20 @@ function reader({ cell, w, h, readback }) {
 		} else vs.bad++;
 		let tag = 0, inv = 0;
 		for (let b = 0; b < 5; b++) { tag |= on(b, 2) << b; inv |= on(b + 5, 2) << b; }
+		if ((tag ^ inv) === 31) st = tag; else vs.tagBad++;
 		if ((tag ^ inv) === 31 && tag !== lastTag) { lastTag = tag; vs.tags.push([t, tag]); }
+		if (sn !== lastN || st !== lastT) { lastN = sn; lastT = st; vs.samples.push([t, sn, st]); }
+		if ((sn < 0 || st < 0) && vs.dumps.length < 40) vs.dumps.push({ t, sn, st, luma: raw() });
 	};
 	const centre = (col, row) => [col * cell + cell / 2, row * cell + cell / 2];
-	const fromRgba = (t, d) => decode(t, (col, row) => { const [px, py] = centre(col, row); const i = (py * w + px) * 4; return d[i] + d[i + 1] + d[i + 2] > 382 ? 1 : 0; });
+	const b64 = (a) => { let s = ''; for (let i = 0; i < a.length; i += 8192) s += String.fromCharCode(...a.subarray(i, i + 8192)); return btoa(s); };
+	const fromRgba = (t, d) => decode(t, (col, row) => { const [px, py] = centre(col, row); const i = (py * w + px) * 4; return d[i] + d[i + 1] + d[i + 2] > 382 ? 1 : 0; }, () => { const y = new Uint8Array(w * h); for (let i = 0; i < y.length; i++) y[i] = (d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]) / 3; return b64(y); });
 	// The least the page can do per arm, so the reading doesn't slow what it reads: a 2D canvas is read
 	// in place, a <video> gives up only the strip's luma, and a transferred canvas has to be drawn.
 	const tick = () => {
 		vs.ticks++;
 		const el = pick();
+		if (pending) vs.busy++;
 		if (el && !pending) {
 			const t = performance.now();
 			const ctx = el.tagName === 'CANVAS' ? contextOf(el) : null;
@@ -127,7 +134,7 @@ function reader({ cell, w, h, readback }) {
 					const buf = new Uint8Array(f.allocationSize({ rect }));
 					f.copyTo(buf, { rect }).then((layout) => {
 						const { offset, stride } = layout[0];
-						decode(t, (col, row) => { const [px, py] = centre(col, row); return buf[offset + py * stride + px] > 126 ? 1 : 0; });
+						decode(t, (col, row) => { const [px, py] = centre(col, row); return buf[offset + py * stride + px] > 126 ? 1 : 0; }, () => { const y = new Uint8Array(w * h); for (let r = 0; r < h; r++) y.set(buf.subarray(offset + r * stride, offset + r * stride + w), r * w); return b64(y); });
 					}).catch(() => { vs.bad++; }).finally(() => { pending = false; f.close(); });
 				} else {
 					if (f) { vs.format = f.format; f.close(); }
@@ -180,6 +187,16 @@ function answer(keys, tags) {
 	}
 	return { i2p, missing };
 }
+let diagRuns = 0;
+/** Every stage's record of one run, for diag-ledger.py: what the source painted, what the server sent, what the page read. */
+function saveDiag(name, r) {
+	const dir = `${process.env.DIAG}/${name}`;
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(`${dir}/page.json`, JSON.stringify(r));
+	for (const f of ['vs-keys.log', 'vs-idx.log', 'vs-s0.h264']) if (fs.existsSync(`/tmp/${f}`)) fs.copyFileSync(`/tmp/${f}`, `${dir}/${f}`);
+	try { execFileSync('python3', ['bench/vs/diag.py', dir], { stdio: 'inherit' }); } catch (e) { console.log(`diag.py ${name}: ${e}`); }
+	fs.rmSync(`${dir}/vs-s0.h264`, { force: true });
+}
 async function run(arm, wl, readback = true) {
 	await ctl(`/start?arm=${arm}&wl=${wl}`);
 	const port = portOf(arm);
@@ -202,8 +219,8 @@ async function run(arm, wl, readback = true) {
 		await b.startTracing(p, { categories: ['viz', 'blink.user_timing'] });
 		await p.evaluate(() => {
 			const vs = window.vs;
-			vs.frames.length = vs.tags.length = vs.keys.length = 0;
-			vs.bad = vs.ticks = vs.long = vs.longMs = 0;
+			vs.frames.length = vs.tags.length = vs.keys.length = vs.samples.length = vs.dumps.length = 0;
+			vs.bad = vs.tagBad = vs.busy = vs.ticks = vs.long = vs.longMs = 0;
 			vs.sync = performance.now();
 			performance.mark('vs-sync');
 		});
@@ -222,9 +239,10 @@ async function run(arm, wl, readback = true) {
 		await sleep(KEY_CAP_MS);
 		const r = await p.evaluate(() => {
 			const vs = window.vs;
-			return { frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
+			return { timeOrigin: performance.timeOrigin, samples: vs.samples, dumps: vs.dumps, tagBad: vs.tagBad, busy: vs.busy, clientDiag: window.voxlStats?.diag ?? null, frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
 		});
 		const tr = swapsOf(await b.stopTracing());
+		if (process.env.DIAG) saveDiag(`${arm}-${wl}-${++diagRuns}`, r);
 		const off = tr.sync === null ? null : tr.sync - r.sync;
 		const swaps = off === null ? [] : tr.raw.map((t) => t - off);
 		const swapIv = swaps.slice(1).map((t, i) => t - swaps[i]);
@@ -338,6 +356,7 @@ async function soak(arm, seconds) {
 			prev = s;
 		}
 		await typing;
+		if (process.env.DIAG) saveDiag(`${arm}-soak`, await p.evaluate(() => ({ dumps: window.vs.dumps, bad: window.vs.bad, tagBad: window.vs.tagBad, samples: [] })));
 		const s1 = await serverStats(arm);
 		await ctl('/freeze');
 		await sleep(1500);
