@@ -63,11 +63,35 @@ async function viewers(arm) {
 }
 const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000, 8000];
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
-function reader({ cell, w, h, readback }) {
+/** Client side of each update request: time from the last message received before it, and from the one before that request. */
+function wsGaps(ws) {
+	const held = [], cycle = [];
+	let last = null, prevReq = null;
+	for (const [t, n] of ws) {
+		if (n > 0) { last = t; continue; }
+		if (last !== null) held.push(t - last);
+		if (prevReq !== null) cycle.push(t - prevReq);
+		prevReq = t;
+		last = null;
+	}
+	return { wsReqs: cycle.length, wsHeldP50: pct(held, 0.5), wsHeldP90: pct(held, 0.9), wsCycleP50: pct(cycle, 0.5) };
+}
+function reader({ cell, w, h, readback, wsTs }) {
 	const vs = (window.vs = { frames: [], tags: [], keys: [], bad: 0, ticks: 0, long: 0, longMs: 0, seen: false, sync: 0 });
 	addEventListener('starfold:firstframe', () => (vs.firstFrame = performance.now()));
 	new PerformanceObserver((l) => { for (const e of l.getEntries()) { vs.long++; vs.longMs += e.duration; } }).observe({ type: 'longtask' });
 	addEventListener('keydown', (e) => vs.keys.push([performance.now(), e.key]), true);
+	if (wsTs) {
+		vs.ws = [];
+		const send = WebSocket.prototype.send;
+		WebSocket.prototype.send = function (d) {
+			const u = d instanceof ArrayBuffer ? new Uint8Array(d) : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : null;
+			if (u && u[0] === 3) vs.ws.push([performance.now(), 0]);
+			return send.call(this, d);
+		};
+		const WS = WebSocket;
+		window.WebSocket = class extends WS { constructor(...a) { super(...a); this.addEventListener('message', (e) => vs.ws.push([performance.now(), e.data.byteLength ?? e.data.size ?? 0])); } };
+	}
 	if (!readback) return;
 	const c = document.createElement('canvas');
 	c.width = w;
@@ -180,7 +204,7 @@ async function run(arm, wl, readback = true) {
 		const p = await ctx.newPage();
 		const errs = [];
 		p.on('pageerror', (e) => errs.push(String(e)));
-		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback });
+		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback, wsTs: !!process.env.WS_TS });
 		await p.goto(urlOf(arm), { waitUntil: 'commit', timeout: 20000 });
 		const ready = ARMS[arm].kind === 'starfold'
 			? () => window.vs?.firstFrame !== undefined || window.starfoldFirstFrame !== undefined
@@ -196,6 +220,7 @@ async function run(arm, wl, readback = true) {
 			const vs = window.vs;
 			vs.frames.length = vs.tags.length = vs.keys.length = 0;
 			vs.bad = vs.ticks = vs.long = vs.longMs = 0;
+			if (vs.ws) vs.ws.length = 0;
 			vs.sync = performance.now();
 			performance.mark('vs-sync');
 		});
@@ -214,7 +239,7 @@ async function run(arm, wl, readback = true) {
 		await sleep(KEY_CAP_MS);
 		const r = await p.evaluate(() => {
 			const vs = window.vs;
-			return { frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
+			return { ws: vs.ws ?? null, frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
 		});
 		const tr = swapsOf(await b.stopTracing());
 		const off = tr.sync === null ? null : tr.sync - r.sync;
@@ -241,6 +266,7 @@ async function run(arm, wl, readback = true) {
 			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
 			rafHz: r.ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,
+			...(r.ws ? wsGaps(r.ws) : {}),
 		};
 	} finally {
 		try { await b.stopTracing(); } catch {}
