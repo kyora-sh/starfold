@@ -1,7 +1,7 @@
 // Browser side. Every arm is measured by reading the marker strip back from the visible surface once
 // per animation frame, so frame timing and latency have one definition everywhere; the viz swap trace
 // runs alongside. QUALITY_ROUNDS adds screenshots against the X server's truth (quality.py).
-// Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, OUT, BUDGET_S, CONTROL_ROUNDS, PARITY_ROUNDS, ARMS, WORKLOADS.
+// Env: CHROMIUM, PLAYWRIGHT_NODE_MODULES, PW, LINK, ROUNDS, WIN, OUT, BUDGET_S, CONTROL_ROUNDS, PARITY_ROUNDS, ARMS, WORKLOADS, SETTLE_MS, WS_TS.
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
@@ -61,7 +61,7 @@ async function viewers(arm) {
 	}
 	return Number(await ctl('/vnc-viewers'));
 }
-const SETTLE_MS = [0, 250, 500, 1000, 2000, 3000, 5000, 8000];
+const SETTLE_MS = process.env.SETTLE_MS ? process.env.SETTLE_MS.split(',').map(Number) : [0, 250, 500, 1000, 2000, 3000, 5000, 8000];
 const CELL = 16, STRIP_W = 20 * CELL, STRIP_H = 3 * CELL;
 /** Client side of each update request: time from the last message received before it, and from the one before that request. */
 function wsGaps(ws) {
