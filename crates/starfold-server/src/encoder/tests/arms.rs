@@ -477,3 +477,22 @@ fn ivf_frame(s: &mut impl std::io::Write, codec: Codec, pts: u64, data: &[u8]) {
     }
     s.write_all(data).unwrap();
 }
+
+#[cfg(feature = "kvazaar")]
+#[test]
+fn a_kvazaar_rate_change_reopens_with_a_keyframe() {
+    let mut enc = open(&arm_config(Backend::Kvazaar, Codec::Hevc, 320, 240, 4000)).unwrap();
+    let mut p = Picture::new(320, 240);
+    let mut units = encode_all(&mut *enc, &p, 0, true);
+    p.texture(1, 16, 16, 64, 64, 0);
+    units.extend(encode_all(&mut *enc, &p, 1, false));
+    enc.set_rate(RateConfig::new(16.0, 4000, 30)).unwrap();
+    p.texture(2, 16, 16, 64, 64, 0);
+    units.extend(encode_all(&mut *enc, &p, 2, false));
+    enc.set_rate(RateConfig::new(16.0, 1000, 30)).unwrap();
+    p.texture(3, 16, 16, 64, 64, 0);
+    units.extend(encode_all(&mut *enc, &p, 3, false));
+    units.extend(enc.drain().unwrap());
+    let keys: Vec<bool> = units.iter().map(|a| a.keyframe).collect();
+    assert_eq!(keys, vec![true, false, false, true]);
+}

@@ -1,6 +1,7 @@
 //! Kvazaar (BSD-3-Clause, only with the `kvazaar` feature): HEVC, low delay with no frame-level
 //! parallelism, presets ultrafast to veryfast. Kvazaar can neither force a keyframe nor change
-//! its rate while open, so both reopen the encoder (the new rate takes effect at that keyframe).
+//! its rate while open, so both reopen the encoder at the next picture: a rate change costs a
+//! keyframe.
 
 #[allow(
     non_camel_case_types,
@@ -36,6 +37,8 @@ pub struct Kvazaar {
     threads: u32,
     preset: &'static str,
     kbps: u32,
+    /// The rate changed since the encoder opened.
+    stale: bool,
     pts: i64,
     units: Units,
 }
@@ -72,6 +75,7 @@ impl Kvazaar {
             threads: c.threads.max(1),
             preset,
             kbps: kbps(c.rate),
+            stale: false,
             pts: -1,
             units: Units::new(c.width, c.height),
         };
@@ -81,6 +85,7 @@ impl Kvazaar {
 
     fn reopen(&mut self) -> Result<(), EncodeError> {
         self.close();
+        self.stale = false;
         let api = self.api;
         let cfg = unsafe { (api.config_alloc.unwrap())() };
         if cfg.is_null() {
@@ -185,9 +190,11 @@ impl Kvazaar {
 }
 
 impl VideoEncoder for Kvazaar {
-    /// Kept for the next keyframe: Kvazaar only takes a rate when it opens.
+    /// Applied by reopening at the next picture: Kvazaar only takes a rate when it opens.
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
-        self.kbps = kbps(rate);
+        let kbps = kbps(rate);
+        self.stale |= kbps != self.kbps;
+        self.kbps = kbps;
         Ok(())
     }
 
@@ -204,7 +211,7 @@ impl VideoEncoder for Kvazaar {
         }
         p.check()?;
         let mut out = Vec::new();
-        if opts.force_keyframe && self.pts >= 0 {
+        if (opts.force_keyframe || self.stale) && self.pts >= 0 {
             out.extend(self.drain()?);
             self.reopen()?;
         }

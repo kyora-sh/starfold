@@ -247,6 +247,8 @@ fn codec_type(codec: Codec) -> u32 {
         Codec::H264 => kCMVideoCodecType_H264,
         Codec::Hevc => kCMVideoCodecType_HEVC,
         Codec::Av1 => kCMVideoCodecType_AV1,
+        #[allow(unreachable_patterns)]
+        _ => 0,
     }
 }
 
@@ -263,7 +265,7 @@ impl VideoToolbox {
         let profile = match cfg.codec {
             Codec::H264 => unsafe { kVTProfileLevel_H264_High_AutoLevel },
             Codec::Hevc => unsafe { kVTProfileLevel_HEVC_Main_AutoLevel },
-            Codec::Av1 => return Err(EncodeError("no VideoToolbox AV1 encoder".into())),
+            other => return Err(EncodeError(format!("no VideoToolbox {other:?} encoder"))),
         };
         let ty = codec_type(cfg.codec);
         // Low-latency rate control: no lookahead or reordering, one IDR then P frames.

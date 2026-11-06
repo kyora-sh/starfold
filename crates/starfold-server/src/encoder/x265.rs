@@ -189,12 +189,14 @@ impl VideoEncoder for X265 {
         p.check()?;
         self.pts = opts.pts_ms.max(self.pts + 1);
         let pic = unsafe { &mut *self.pic };
-        pic.planes = [
-            p.y.as_ptr() as *mut _,
-            p.u.as_ptr() as *mut _,
-            p.v.as_ptr() as *mut _,
-        ];
-        pic.stride = [p.stride_y as i32, p.stride_uv as i32, p.stride_uv as i32];
+        // x265 4.x has a fourth plane slot; 3.5 has three.
+        for (i, (plane, stride)) in [(p.y, p.stride_y), (p.u, p.stride_uv), (p.v, p.stride_uv)]
+            .into_iter()
+            .enumerate()
+        {
+            pic.planes[i] = plane.as_ptr() as *mut _;
+            pic.stride[i] = stride as i32;
+        }
         pic.pts = self.pts;
         pic.sliceType = if opts.force_keyframe {
             ffi::X265_TYPE_IDR as i32

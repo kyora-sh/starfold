@@ -4,7 +4,7 @@
 #   run.sh once <arm> <workload> <kbps> [preset] [crf]    one `bench` line + one `score` line
 #   run.sh search <arm> <workload> <target_db> [preset] [crf]    lowest rate reaching the target
 #   run.sh rounds <file> [n]    interleaved `once` lines
-# Env: FRAMES (300), THREADS (4), METRIC, LO, HI, TOL (hi - lo stops under lo / TOL), DUMP_DIR, KEEP=<dir> for the per-frame logs. Needs ffmpeg and the arm's feature built:
+# Needs ffmpeg and python3-numpy (libs.sh installs numpy). Env: FRAMES (300), THREADS (4), METRIC, LO, HI, TOL (hi - lo stops under lo / TOL), DUMP_DIR, KEEP=<dir> for the per-frame logs. Needs ffmpeg and the arm's feature built:
 # BIN=$(cargo test --release --features <features> --lib --no-run ... ), see bench/arms/README.
 set -euo pipefail
 bin=${BIN:?the test binary}
@@ -64,9 +64,17 @@ once() {
 # METRIC picks the score field to reach: psnr_db for motion, text_psnr_last30_db for text.
 search() {
 	local arm=$1 workload=$2 target=$3 preset=${4:-} crf=${5:-10} lo=${LO:-250} hi=${HI:-64000} best=none got=none
-	local metric=${METRIC:-ssim_db} total=none
+	local metric=${METRIC:-ssim_db} total=none out db
+	out=$(once "$arm" "$workload" "$hi" "$preset" "$crf")
+	echo "$out"
+	db=$(sed -n "s/.* $metric=\([0-9.]*\).*/\1/p" <<< "$out")
+	if awk -v a="$db" -v b="$target" 'BEGIN { exit !(a >= b) }'; then
+		best=$hi got=$db total=$(sed -n 's/.* total_kbps=\([0-9]*\).*/\1/p' <<< "$out")
+	else
+		lo=$hi
+	fi
 	while ((hi - lo > lo / ${TOL:-8})); do
-		local mid=$(((lo + hi) / 2)) out db
+		local mid=$(((lo + hi) / 2))
 		out=$(once "$arm" "$workload" "$mid" "$preset" "$crf")
 		echo "$out"
 		db=$(sed -n "s/.* $metric=\([0-9.]*\).*/\1/p" <<< "$out")

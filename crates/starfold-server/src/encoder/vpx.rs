@@ -96,7 +96,7 @@ impl Vpx {
             if r != ffi::vpx_codec_err_t_VPX_CODEC_OK {
                 return Err(EncodeError(format!("libvpx init failed ({r})")));
             }
-            let enc = Vpx {
+            let mut enc = Vpx {
                 ctx,
                 cfg,
                 codec: c.codec,
@@ -109,8 +109,8 @@ impl Vpx {
         }
     }
 
-    fn control(&self, id: u32, v: c_int) -> Result<(), EncodeError> {
-        let ctx = &*self.ctx as *const _ as *mut ffi::vpx_codec_ctx_t;
+    fn control(&mut self, id: u32, v: c_int) -> Result<(), EncodeError> {
+        let ctx: *mut ffi::vpx_codec_ctx_t = &mut *self.ctx;
         let r = unsafe { ffi::vpx_codec_control_(ctx, id as c_int, v) };
         if r == ffi::vpx_codec_err_t_VPX_CODEC_OK {
             Ok(())
@@ -119,7 +119,7 @@ impl Vpx {
         }
     }
 
-    fn controls(&self, speed: c_int) -> Result<(), EncodeError> {
+    fn controls(&mut self, speed: c_int) -> Result<(), EncodeError> {
         self.control(ffi::vp8e_enc_control_id_VP8E_SET_CPUUSED, speed)?;
         match self.codec {
             Codec::Vp8 => {
@@ -148,7 +148,7 @@ impl Vpx {
     }
 
     fn error(&self, what: &str) -> EncodeError {
-        let ctx = &*self.ctx as *const _ as *mut ffi::vpx_codec_ctx_t;
+        let ctx: *const ffi::vpx_codec_ctx_t = &*self.ctx;
         let msg = unsafe {
             let p = ffi::vpx_codec_error(ctx);
             if p.is_null() {

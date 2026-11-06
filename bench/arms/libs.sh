@@ -11,7 +11,7 @@ if [[ ${1:-} == --env ]]; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 sudo -n apt-get update -qq >/dev/null
-sudo -n apt-get install -y -qq build-essential cmake nasm yasm pkg-config libclang-dev >/dev/null
+sudo -n apt-get install -y -qq build-essential cmake nasm yasm pkg-config libclang-dev python3-numpy >/dev/null
 src=$(mktemp -d)
 trap 'rm -rf "$src"' EXIT
 jobs=$(nproc)

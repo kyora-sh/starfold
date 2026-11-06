@@ -17,14 +17,11 @@ use super::{
     av1, AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig,
     FrameView, RateConfig, StreamConfig, VideoEncoder,
 };
-use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 const PRESET: i32 = 12;
 /// SVT-AV1 refuses targets above 100 Mbit/s, at open and on the fly.
 const UNCAPPED_KBPS: u32 = 100_000;
-/// How long a low-delay encoder may take to hand back the packet for one picture.
-const PACKET_WAIT: Duration = Duration::from_secs(5);
 
 pub struct Svt {
     handle: *mut ffi::EbComponentType,
@@ -117,27 +114,21 @@ impl Svt {
         Ok(enc)
     }
 
-    /// The next packet, waiting up to PACKET_WAIT unless `done` (end of stream sent).
-    fn packet(&mut self, done: bool) -> Result<Option<AccessUnit>, EncodeError> {
-        let start = Instant::now();
-        loop {
-            let mut out: *mut ffi::EbBufferHeaderType = ptr::null_mut();
-            let r = unsafe { ffi::svt_av1_enc_get_packet(self.handle, &mut out, done as u8) };
-            if r == ffi::EbErrorType_EB_NoErrorEmptyQueue {
-                if start.elapsed() > PACKET_WAIT {
-                    return Err(EncodeError("SVT-AV1 gave no packet in time".into()));
-                }
-                std::thread::yield_now();
-                continue;
-            }
-            check("get packet", r)?;
-            if out.is_null() {
-                return Err(EncodeError("SVT-AV1 returned no buffer".into()));
-            }
-            let unit = self.unit(unsafe { &*out });
-            unsafe { ffi::svt_av1_enc_release_out_buffer(&mut out) };
-            return unit;
+    /// The packet for the picture just sent. In low-delay mode `get_packet` blocks until it is
+    /// ready (SVT-AV1's API contract), so there is no polling here.
+    fn packet(&mut self) -> Result<Option<AccessUnit>, EncodeError> {
+        let mut out: *mut ffi::EbBufferHeaderType = ptr::null_mut();
+        let r = unsafe { ffi::svt_av1_enc_get_packet(self.handle, &mut out, 0) };
+        if r == ffi::EbErrorType_EB_NoErrorEmptyQueue {
+            return Ok(None);
         }
+        check("get packet", r)?;
+        if out.is_null() {
+            return Err(EncodeError("SVT-AV1 returned no buffer".into()));
+        }
+        let unit = self.unit(unsafe { &*out });
+        unsafe { ffi::svt_av1_enc_release_out_buffer(&mut out) };
+        unit
     }
 
     fn unit(&mut self, b: &ffi::EbBufferHeaderType) -> Result<Option<AccessUnit>, EncodeError> {
@@ -232,7 +223,7 @@ impl VideoEncoder for Svt {
         check("send picture", unsafe {
             ffi::svt_av1_enc_send_picture(self.handle, &mut header)
         })?;
-        Ok(self.packet(false)?.into_iter().collect())
+        Ok(self.packet()?.into_iter().collect())
     }
 
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {

@@ -92,7 +92,7 @@ impl Aom {
             if r != ffi::aom_codec_err_t_AOM_CODEC_OK {
                 return Err(EncodeError(format!("libaom init failed ({r})")));
             }
-            let enc = Aom {
+            let mut enc = Aom {
                 ctx,
                 cfg,
                 pts: -1,
@@ -104,8 +104,8 @@ impl Aom {
         }
     }
 
-    fn control(&self, id: u32, v: c_int) -> Result<(), EncodeError> {
-        let ctx = &*self.ctx as *const _ as *mut ffi::aom_codec_ctx_t;
+    fn control(&mut self, id: u32, v: c_int) -> Result<(), EncodeError> {
+        let ctx: *mut ffi::aom_codec_ctx_t = &mut *self.ctx;
         let r = unsafe { ffi::aom_codec_control(ctx, id as c_int, v) };
         if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
             Ok(())
@@ -114,7 +114,7 @@ impl Aom {
         }
     }
 
-    fn controls(&self, speed: c_int) -> Result<(), EncodeError> {
+    fn controls(&mut self, speed: c_int) -> Result<(), EncodeError> {
         use ffi::*;
         let color = ColorInfo::SRGB_BT601_LIMITED;
         let tiles = (self.cfg.g_threads.max(1)).ilog2().min(4) as c_int;
@@ -157,7 +157,7 @@ impl Aom {
     }
 
     fn error(&self, what: &str) -> EncodeError {
-        let ctx = &*self.ctx as *const _ as *mut ffi::aom_codec_ctx_t;
+        let ctx: *const ffi::aom_codec_ctx_t = &*self.ctx;
         let msg = unsafe {
             let p = ffi::aom_codec_error(ctx);
             if p.is_null() {
