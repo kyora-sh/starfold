@@ -166,7 +166,6 @@ async function typeKeys(p, wl, until) {
 	}
 	return sent;
 }
-}
 async function run(arm, wl, readback = true) {
 	await ctl(`/start?arm=${arm}&wl=${wl}`);
 	const port = portOf(arm);
