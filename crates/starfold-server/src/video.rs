@@ -959,6 +959,7 @@ impl Engine {
             let replaced = c.active
                 && !v.clients.is_empty()
                 && !v.clients.iter().any(|x| c.viewers.contains(&x.id));
+            let joined = !v.clients.is_empty() && (!c.active || replaced);
             if c.active && (v.clients.is_empty() || replaced) {
                 c.rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
                 c.refine.reset();
@@ -972,7 +973,7 @@ impl Engine {
                 c.active = true;
                 c.rc.update(&v.clients);
             }
-            if replaced {
+            if joined {
                 c.refine.baseline(&c.shared);
                 c.refine.rearm();
             }
@@ -1001,6 +1002,20 @@ impl Engine {
                     && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, interval_ms))
             })
             .collect()
+    }
+
+    /// What this turn of the capture loop has to do besides any new damage.
+    fn turn(&mut self, views: &[View], interval_ms: f64, now: Instant) -> Turn {
+        self.update_refinement(views, now);
+        let takes = self.takes(views, interval_ms);
+        let passes = self.passes(views, &takes, now);
+        let catch_up = self.catch_up_due(&takes);
+        Turn {
+            want_key: views.iter().any(|v| v.want_key),
+            catch_up,
+            takes,
+            passes,
+        }
     }
 
     /// Brings each watched cohort's refinement up to date with what its encoder did.
@@ -1069,17 +1084,15 @@ impl Engine {
             .any(|(c, &take)| take && c.skipped.is_some())
     }
 
-    /// Gives each cohort what this capture means for it; `f` is the capture itself.
-    fn dispatch(
-        &mut self,
-        f: &Frame,
-        views: &[View],
-        takes: &[bool],
-        passes: &[bool],
-        now: Instant,
-    ) {
+    /// Gives each cohort what this capture means for it; `f` is the capture itself. Motion
+    /// reaches every watched cohort, whether or not it can take the frame.
+    fn dispatch(&mut self, f: &Frame, views: &[View], turn: &Turn, now: Instant) {
+        if f.band.is_some() {
+            self.moved(views, now);
+        }
         let stats = &self.hub.stats;
-        for (((c, v), &take), &pass) in self.cohorts.iter_mut().zip(views).zip(takes).zip(passes) {
+        let plans = turn.takes.iter().zip(&turn.passes);
+        for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
             if v.clients.is_empty() {
                 continue;
             }
@@ -1121,6 +1134,21 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+/// What a turn of the capture loop owes the cohorts.
+struct Turn {
+    takes: Vec<bool>,
+    passes: Vec<bool>,
+    want_key: bool,
+    catch_up: bool,
+}
+
+impl Turn {
+    /// Something is due even if nothing changed on screen.
+    fn work(&self) -> bool {
+        self.want_key || self.catch_up || self.passes.contains(&true)
     }
 }
 
@@ -1551,8 +1579,10 @@ impl Refinement {
 
     /// A keyframe that landed unseen may be what the viewer started on.
     fn rearm(&mut self) {
-        self.burst.moved(Instant::now());
-        self.refiner.mark_all();
+        if self.burst.ladder {
+            self.burst.moved(Instant::now());
+            self.refiner.mark_all();
+        }
     }
 
     /// With no viewers nothing the encoder still finishes counts for anyone.
@@ -1801,7 +1831,6 @@ fn capture_loop(
             wait_any(&[cap.fd(), hub.waker.waitable()], 500);
             continue;
         }
-        let want_key = views.iter().any(|v| v.want_key);
         if !had_clients {
             had_clients = true;
             // Our shm copy may be stale: re-grab everything once.
@@ -1811,12 +1840,8 @@ fn capture_loop(
             full_next = true;
         }
         let now = Instant::now();
-        eng.update_refinement(&views, now);
-        let takes = eng.takes(&views, interval_ms);
-        let passes = eng.passes(&views, &takes, now);
-        let paintover_due = passes.iter().any(|&p| p);
-        let catch_up = eng.catch_up_due(&takes);
-        if !cap.damaged && !want_key && !paintover_due && !catch_up {
+        let turn = eng.turn(&views, interval_ms, now);
+        if !cap.damaged && !turn.work() {
             wait_any(
                 &[cap.fd(), hub.waker.waitable()],
                 eng.refine_wait_ms(&views, now),
@@ -1842,7 +1867,7 @@ fn capture_loop(
                 continue;
             }
         }
-        if !takes.iter().any(|&t| t) {
+        if !turn.takes.contains(&true) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
@@ -1885,7 +1910,7 @@ fn capture_loop(
             _ => -1,
         };
         let is_motion = band.is_some();
-        if !is_motion && !want_key && !paintover_due && !catch_up {
+        if !is_motion && !turn.work() {
             // Damage was empty after all.
             continue;
         }
@@ -1901,9 +1926,6 @@ fn capture_loop(
             .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
-        if is_motion {
-            eng.moved(&views, Instant::now());
-        }
         last_capture = t0;
         eng.dispatch(
             &Frame {
@@ -1917,9 +1939,8 @@ fn capture_loop(
                 marker_ms,
             },
             &views,
-            &takes,
-            &passes,
-            t0,
+            &turn,
+            Instant::now(),
         );
     }
 }

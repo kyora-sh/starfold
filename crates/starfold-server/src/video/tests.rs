@@ -314,16 +314,13 @@ fn capture(eng: &mut Engine, w: u32, h: u32, band: Option<Band>, now: Instant) {
     eng.replan();
     let views = eng.views();
     eng.update_rates(&views);
-    eng.update_refinement(&views, now);
-    let takes = eng.takes(&views, 33.0);
-    let passes = eng.passes(&views, &takes, now);
+    let turn = eng.turn(&views, 33.0, now);
     let mut f = whole(w, h);
     f.band = band;
     if band.is_some() {
         eng.mark(&views, None);
-        eng.moved(&views, now);
     }
-    eng.dispatch(&f, &views, &takes, &passes, now);
+    eng.dispatch(&f, &views, &turn, now);
     settle(eng);
 }
 
@@ -549,9 +546,8 @@ fn a_switch_mid_frame_sends_nothing_of_the_old_cohort() {
     gate.set(false);
     eng.replan();
     let views = eng.views();
-    let takes = eng.takes(&views, 33.0);
-    let none = vec![false; takes.len()];
-    eng.dispatch(&whole(W, H), &views, &takes, &none, Instant::now());
+    let turn = eng.turn(&views, 33.0, Instant::now());
+    eng.dispatch(&whole(W, H), &views, &turn, Instant::now());
     assert_eq!(c.codec_error(1).map(|c| c.cand.codec), Some(Codec::Hevc));
     // The picture finishes after the switch (closing the HEVC cohort waits for it).
     let g = gate.clone();
@@ -790,11 +786,10 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
     slow.inflight.lock().clear();
     assert!(eng.catch_up_due(&eng.takes(&eng.views(), 33.0)));
     let views = eng.views();
-    let takes = eng.takes(&views, 33.0);
+    let turn = eng.turn(&views, 33.0, Instant::now());
     let mut still = whole(W, H);
     still.band = None;
-    let none = vec![false; takes.len()];
-    eng.dispatch(&still, &views, &takes, &none, Instant::now());
+    eng.dispatch(&still, &views, &turn, Instant::now());
     settle(&eng);
     assert_eq!(
         videos(&drain(&mut rs)).len(),
@@ -1388,10 +1383,8 @@ fn an_idle_desktop_returns_to_zero_bits() {
     assert_eq!(p.hub.stats.bytes.load(Ordering::Relaxed), bytes);
     assert_eq!(p.hub.stats.encoded.load(Ordering::Relaxed), encoded);
     let views = p.eng.views();
-    let takes = p.eng.takes(&views, 33.0);
     let later = p.t + Duration::from_secs(3600);
-    assert!(!p.eng.passes(&views, &takes, later).contains(&true));
-    assert!(!p.eng.catch_up_due(&takes));
+    assert!(!p.eng.turn(&views, 33.0, later).work(), "no capture either");
 }
 
 #[test]
@@ -1486,6 +1479,21 @@ fn a_blocked_cohort_has_no_pass_to_take() {
     let takes = p.eng.takes(&views, 33.0);
     assert!(!takes[i]);
     assert!(!p.eng.passes(&views, &takes, later)[i]);
+    p.ack_h264();
+    let turn = p.eng.turn(&views, 33.0, later);
+    assert!(turn.passes[i], "its viewer answered");
+}
+
+#[test]
+fn a_pass_is_work_for_the_capture_loop() {
+    let turn = |pass| Turn {
+        takes: vec![true],
+        passes: vec![pass],
+        want_key: false,
+        catch_up: false,
+    };
+    assert!(turn(true).work());
+    assert!(!turn(false).work());
 }
 
 #[test]
@@ -1659,17 +1667,34 @@ fn a_cohort_piggybacks_only_its_own_blocks() {
     r.epoch -= old;
     r.last_refine -= old;
     let views = p.eng.views();
-    let takes = p.eng.takes(&views, 33.0);
-    let none = vec![false; takes.len()];
+    let turn = p.eng.turn(&views, 33.0, Instant::now());
     let mut f = whole(W, H);
     let blocks = (W.div_ceil(16) * H.div_ceil(16)) as usize;
     f.band = Some(Band { y0: 0, y1: 16 });
     f.mb_dirty = Some(Arc::new(vec![0; blocks]));
-    p.eng.dispatch(&f, &views, &takes, &none, Instant::now());
+    p.eng.dispatch(&f, &views, &turn, Instant::now());
     settle(&p.eng);
     assert_eq!(p.hub.stats.refines.load(Ordering::Relaxed), 1);
     assert!(!p.cohort(Codec::H264).refine.refiner.any_pending());
     assert!(p.cohort(Codec::Hevc).refine.refiner.any_pending());
+}
+
+/// Its keyframe may have landed before the look that saw the cohort empty, and been absorbed.
+#[test]
+fn a_viewer_joining_an_empty_ladder_cohort_gets_a_ladder() {
+    let mut p = pair();
+    p.finish();
+    let id = p.h264.id;
+    p.hub.remove_client(id);
+    p.still();
+    assert_eq!(p.left(Codec::H264), 0);
+    let (next, _rx) = client(&p.hub);
+    join_legacy(&p.hub, &next);
+    p.eng.replan();
+    let views = p.eng.views();
+    p.eng.update_rates(&views);
+    assert_eq!(p.left(Codec::H264), 3);
+    assert!(p.cohort(Codec::H264).refine.refiner.any_pending());
 }
 
 #[test]
