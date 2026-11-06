@@ -116,7 +116,7 @@ starfold leads once the picture settles and trails noVNC q7 slightly while scrol
 a swap every ~154 ms on scroll) or a slow mode (14.2-14.5 Mbit/s, ~213 ms); in the 20 Mbit/s rate sets below, host steal was at most 0.1% in both. An RFB tap at the relay (`bench/vs/rfb-tap.py`, which parses the client stream) recorded 24 connections; 2 exceeded the steal
 rule (8.8% and 2.5%) and are left out, leaving 8 fast and 14 slow. Within each workload the server side is the same per update in both
 modes: request to first byte 10-18 ms on scroll and 4-5 ms on video, the same bytes per update (380-390 KB scroll, 472-473 KB video) and
-the same x11vnc CPU (40-44% scroll, 21-24% video, one VM run). The difference is the time from the last byte leaving the relay to the next
+the same Xvfb CPU (40-44% scroll, 21-24% video, one VM run). The difference is the time from the last byte leaving the relay to the next
 request: 135-139 vs 202-204 ms on scroll, 176-177 vs 233-234 ms on video. The relay sits before the shaper, so that time includes the
 update's passage through the shaped link. The slow cycle is a strict request-then-response loop at link speed: 383 KB per scroll update is 153 ms
 at 20 Mbit/s plus one 50 ms round trip, ~203 ms predicted vs 211 ms measured (video: 239 vs 245 ms). The fast cycle is shorter than
