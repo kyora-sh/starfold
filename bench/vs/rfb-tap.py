@@ -6,12 +6,14 @@ import asyncio, sys, time
 target, listen, log = sys.argv[1:4]
 
 HANDSHAKE = 12 + 1 + 1
-FIXED = {0: 20, 3: 10, 4: 8, 5: 6, 150: 10, 250: 4, 255: 12}
+FIXED = {0: 20, 3: 10, 4: 8, 150: 10, 250: 4, 255: 12}
 
 def length(buf, i):
     t = buf[i]
     if t in FIXED:
         return FIXED[t]
+    if t == 5 and len(buf) - i >= 2:
+        return 7 if buf[i + 1] & 0x80 else 6
     if t == 2 and len(buf) - i >= 4:
         return 4 + 4 * int.from_bytes(buf[i + 2:i + 4], 'big')
     if t == 6 and len(buf) - i >= 8:
@@ -20,7 +22,7 @@ def length(buf, i):
         return 9 + buf[i + 8]
     if t == 251 and len(buf) - i >= 7:
         return 8 + 16 * buf[i + 6]
-    return None if t in (2, 6, 248, 251) else -1
+    return None if t in (2, 5, 6, 248, 251) else -1
 
 async def up(r, w, out):
     buf, skip, lost = bytearray(), HANDSHAKE, False

@@ -8,7 +8,18 @@ const [bin, source, web, pwFile, maxS, link, shaper, page] = process.argv.slice(
 const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock', DUMP = '/tmp/vs-dump.raw';
 const pw = fs.readFileSync(pwFile, 'utf8').trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const group = (c, a, o = {}) => spawn(c, a, { detached: true, stdio: 'ignore', ...o, env: { ...process.env, DISPLAY, ...o.env } });
+const owned = new Set();
+const group = (c, a, o = {}) => {
+	const p = spawn(c, a, { detached: true, stdio: 'ignore', ...o, env: { ...process.env, DISPLAY, ...o.env } });
+	owned.add(p);
+	p.on('exit', () => owned.delete(p));
+	return p;
+};
+for (const s of ['SIGINT', 'SIGTERM'])
+	process.on(s, () => {
+		for (const p of owned) { try { process.kill(-p.pid, 'SIGKILL'); } catch {} }
+		process.exit(130);
+	});
 const xvfb = group('Xvfb', [DISPLAY, '-screen', '0', `${WIDTH}x${HEIGHT}x24`, '-dpi', '96', '-shmem', '-ac', '-nolisten', 'tcp', '-noreset']);
 await sleep(1000);
 const shapers = link === 'wan' ? [STARFOLD_PORT, NOVNC_PORT].map((p) => group('python3', [shaper, p + WAN.portOffset, `127.0.0.1:${p}`, WAN.mbps, WAN.rttMs, WAN.queueBytes].map(String))) : [];
@@ -117,7 +128,6 @@ const quit = async () => {
 	await kill([xvfb, ...shapers]);
 	process.exit(0);
 };
-for (const s of ['SIGINT', 'SIGTERM']) process.on(s, quit);
 http.createServer(async (req, res) => {
 	const u = new URL(req.url, 'http://x');
 	try {

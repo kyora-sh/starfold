@@ -72,7 +72,8 @@ procs = []
 try:
     wait_port(7102)
     for mbps in (20, 2):
-        procs = [subprocess.Popen(['python3', shaper, str(l), f'127.0.0.1:{t}', str(mbps), '50', '250000'], start_new_session=True) for l, t in ((7201, 7101), (7202, 7102))]
+        for l, t in ((7201, 7101), (7202, 7102)):
+            procs.append(subprocess.Popen(['python3', shaper, str(l), f'127.0.0.1:{t}', str(mbps), '50', '250000'], start_new_session=True))
         wait_port(7201)
         wait_port(7202)
         for i in range(3):

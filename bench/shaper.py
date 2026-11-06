@@ -29,27 +29,34 @@ async def pipe(reader, writer, rate_bps, delay, cap=0):
         finally:
             writer.close()
     task = asyncio.create_task(sender())
-    last = time.monotonic()
-    while True:
-        while cap and queued > cap:
-            room.clear()
-            w = asyncio.ensure_future(room.wait())
-            await asyncio.wait([w, task], return_when=asyncio.FIRST_COMPLETED)
-            w.cancel()
-            if task.done():
-                return await task
-        data = await reader.read(8192 if cap else 65536)
-        queued += len(data)
-        if not data:
-            await q.put((0, None)); break
-        now = time.monotonic()
-        if rate_bps:
-            last = max(last, now) + len(data) * 8 / rate_bps
-            t = last + delay
-        else:
-            t = now + delay
-        await q.put((t, data))
-    await task
+    w = None
+    try:
+        last = time.monotonic()
+        while True:
+            while cap and queued > cap:
+                room.clear()
+                w = asyncio.ensure_future(room.wait())
+                await asyncio.wait([w, task], return_when=asyncio.FIRST_COMPLETED)
+                w.cancel()
+                if task.done():
+                    return await task
+            data = await reader.read(8192 if cap else 65536)
+            queued += len(data)
+            if not data:
+                await q.put((0, None)); break
+            now = time.monotonic()
+            if rate_bps:
+                last = max(last, now) + len(data) * 8 / rate_bps
+                t = last + delay
+            else:
+                t = now + delay
+            await q.put((t, data))
+        await task
+    finally:
+        for f in (task, w):
+            if f and not f.done():
+                f.cancel()
+        await asyncio.gather(*(f for f in (task, w) if f), return_exceptions=True)
 
 async def handle(cr, cw):
     sr, sw = await asyncio.open_connection(th, int(tp))

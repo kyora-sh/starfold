@@ -113,11 +113,12 @@ starfold leads once the picture settles and trails noVNC q7 slightly while scrol
 ### WAN 20 Mbit/s, 50 ms RTT
 
 **noVNC runs in one of two modes here.** Without the reader, each noVNC connection settles into either a fast mode (20.0 Mbit/s,
-a swap every ~154 ms on scroll) or a slow mode (14.2-14.5 Mbit/s, ~213 ms). An RFB tap at the relay (`bench/vs/rfb-tap.py`, which parses the client stream; 24 connections, half in each mode) shows the
-server side the same per update in both modes: request to first byte 4-18 ms, the same bytes per update (~385 KB scroll, ~472 KB video)
-and the same x11vnc CPU within the run. The difference is the time from the last byte leaving the relay to the next request: 135-139 vs
-201-205 ms on scroll, 171-177 vs 233-234 ms on video. The relay sits before the shaper, so that time includes the update's passage
-through the shaped link. Host steal is ~0 in both modes. The slow cycle is a strict request-then-response loop at link speed: 383 KB per scroll update is 153 ms
+a swap every ~154 ms on scroll) or a slow mode (14.2-14.5 Mbit/s, ~213 ms); in the 20 Mbit/s rate sets below, host steal was at most 0.1% in both. An RFB tap at the relay (`bench/vs/rfb-tap.py`, which parses the client stream) recorded 24 connections; 2 exceeded the steal
+rule (8.8% and 2.5%) and are left out, leaving 8 fast and 14 slow. Within each workload the server side is the same per update in both
+modes: request to first byte 10-18 ms on scroll and 4-5 ms on video, the same bytes per update (380-390 KB scroll, 472-473 KB video) and
+the same x11vnc CPU (40-44% scroll, 21-24% video, one VM run). The difference is the time from the last byte leaving the relay to the next
+request: 135-139 vs 202-204 ms on scroll, 176-177 vs 233-234 ms on video. The relay sits before the shaper, so that time includes the
+update's passage through the shaped link. The slow cycle is a strict request-then-response loop at link speed: 383 KB per scroll update is 153 ms
 at 20 Mbit/s plus one 50 ms round trip, ~203 ms predicted vs 211 ms measured (video: 239 vs 245 ms). The fast cycle is shorter than
 transfer plus round trip, so some request must overlap the previous update's delivery. In a diagnostic run with a WebSocket timing hook, every
 connection was in the slow mode, and noVNC sent its next request 0.1 ms after the last WebSocket message reached its handler: in the slow
@@ -220,12 +221,12 @@ Quality at 2 Mbit/s, scroll page (n=5, PSNR dB / text SSIM after the picture fre
 
 | arm | +500 ms | +1 s | +3 s | +5 s .. +8 s | in motion |
 |---|---|---|---|---|---|
-| noVNC (q7) | 13.7 / 0.00 | 13.7 / 0.00 | 42.7 / 0.9982 (4 of 5 runs) | 42.7 / 0.9983 | 42.6 / 0.9983 |
+| noVNC (q7) | 13.7 / 0.00 | 13.7 / 0.00 | 42.7 in 3 of 5 runs, 13.7-13.8 in 2 | 42.7 / 0.9983 | 42.6 / 0.9983 |
 | noVNC low | 13.9 / -0.01 | 35.9 / 0.9912 | 36.0 / 0.9912 | 36.0 / 0.9912 | 35.8 / 0.9912 |
 | starfold-video | 30.4 / 0.9532 | 33.3 / 0.9788 | 33.3 / 0.9788 | 33.3 [30.5..35.7] / 0.9788 | 27.7 / 0.9032 |
 
 starfold shows a usable picture first (+500 ms) but settles at 33.3 dB and stays there, below both noVNC profiles once they catch up
-(+1 s low, +3 s q7). noVNC's in-motion score is high because each shot shows one complete, if stale, update at 0.7 FPS; it measures
+(+1 s low; q7 by +3 s in 3 of 5 runs and by +5 s in all). noVNC's in-motion score is high because each shot shows one complete, if stale, update at 0.7 FPS; it measures
 fidelity, not freshness. 0 keyframes in every starfold run on this page.
 
 Dense text page (`bench/dense.html`, 11 px monospace filling the screen), scroll, n=5, settled PSNR / text SSIM:
@@ -266,11 +267,11 @@ AV1 has no hardware encoder on any runner yet, so there is no AV1 arm.
 - First sets 1 and 2: the original reader read the canvas every frame and held up noVNC's main thread, suppressing noVNC.
 - First quality set: a synthetic page, and its motion column scored against the wrong frames.
 - Sets scored with the earlier key matcher: a missed key matched the same letter ~26 s later and cascaded; the search is now capped at 5 s.
-- WAN sets run with the previous reader (wan-ts, wan-v, thin-scroll at 5c9731b): that reader cut noVNC to 14.3 vs 20.0 Mbit/s (n=5); rerun here.
+- WAN sets run with the previous reader (wan-ts, wan-v, thin-scroll at 5c9731b): with that reader noVNC ran at 14.3 Mbit/s in every run, against 20.0 in every run without it (n=5), before the two modes were known; rerun here.
 - The first dense set: settle points stopped at +8 s, before any arm had caught up.
 - Headline runs dropped by the CALIB rule (drift 19-26%, steal bursts of 10-20% from other tenants), and rerun.
 
-Open: the cause of the occasional bad reads (noVNC with the reader, 1-5 per run at 20 Mbit/s, 22-44 on LAN scroll) is not settled; they
+Open: the cause of the occasional bad reads (noVNC with the reader: 0-15 per run at 20 Mbit/s, 22-44 on LAN scroll) is not settled; they
 do not change the rate parity.
 
 ## Licences and patents
