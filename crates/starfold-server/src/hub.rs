@@ -373,6 +373,9 @@ pub struct Stats {
     pub convert_us: AtomicU64,
     pub flow_blocked: AtomicU64,
     pub paintovers: AtomicU64,
+    /// Frames of a burst that came out, and their bytes.
+    pub paintover_frames: AtomicU64,
+    pub paintover_bytes: AtomicU64,
     pub keyframes: AtomicU64,
     pub refines: AtomicU64,
     pub damage_wait_us: AtomicU64,
@@ -411,6 +414,8 @@ pub struct Hub {
     pub offer_gen: AtomicU64,
     /// Viewers changed: the video thread routes them again.
     pub replan: AtomicBool,
+    /// Test hook: the video thread treats the H.264 encoder as failed.
+    pub fail_h264: AtomicBool,
     pub next_cohort: AtomicU64,
     /// The running encoder cohorts, for /stats.
     pub cohorts: Mutex<serde_json::Value>,
@@ -440,6 +445,7 @@ impl Hub {
             offers: Mutex::new(Vec::new()),
             offer_gen: AtomicU64::new(0),
             replan: AtomicBool::new(false),
+            fail_h264: AtomicBool::new(false),
             next_cohort: AtomicU64::new(1),
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
             encoder: Mutex::new(serde_json::Value::Null),

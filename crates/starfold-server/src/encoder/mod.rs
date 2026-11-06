@@ -10,7 +10,7 @@ mod hevc;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
-mod openh264;
+pub(crate) mod openh264;
 #[cfg(test)]
 mod tests;
 #[cfg(target_os = "linux")]
@@ -119,6 +119,15 @@ impl RateConfig {
     }
 }
 
+/// One pass of the paint-over after motion, for a backend that sharpens by QP.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Refine {
+    /// The QP this pass aims for.
+    pub qp: u8,
+    /// What the frame may cost (None: uncapped).
+    pub max_bytes: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct EncodeOptions<'a> {
     pub pts_ms: i64,
@@ -126,6 +135,8 @@ pub struct EncodeOptions<'a> {
     /// One byte per macroblock (row-major, `width.div_ceil(16)` per row), nonzero where
     /// nothing changed since the last frame.
     pub static_mbs: Option<&'a mut [u8]>,
+    /// Only with `Backend::refines_by_qp`; no frame comes out if no step of it fits.
+    pub refine: Option<Refine>,
 }
 
 pub struct AccessUnit {
@@ -248,6 +259,11 @@ impl Backend {
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
+    }
+
+    /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
+    pub fn refines_by_qp(self) -> bool {
+        self == Backend::OpenH264
     }
 
     pub fn fits(self, width: u32, height: u32) -> bool {
