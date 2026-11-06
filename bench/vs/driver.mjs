@@ -5,8 +5,8 @@
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
-import { answer, KEY_CAP_MS } from './match.mjs';
-import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS } from './config.mjs';
+import { answer, delivered, KEY_CAP_MS } from './match.mjs';
+import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS, KEYS_LOG } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
 const link = process.env.LINK || 'lan', rounds = Number(process.env.ROUNDS || 5), win = Number(process.env.WIN || 10);
@@ -254,7 +254,12 @@ async function run(arm, wl, readback = true) {
 		const iv = f.slice(1).map((x, i) => x[0] - f[i][0]);
 		const lat = f.map((x) => x[2]);
 		const span = f.length > 1 ? ((f.at(-1)[1] - f[0][1] + 4096) % 4096) + 1 : 0;
-		const { i2p, missing } = answer(r.keys, r.tags);
+		const { i2p, noOwnFrame } = answer(r.keys, r.tags);
+		const sent = r.keys.map((k) => k[1]);
+		const received = fs.readFileSync(KEYS_LOG, 'utf8').split('\n').filter(Boolean).map((l) => l.split(' ')[1]);
+		const reached = delivered(sent, received);
+		if (reached !== sent.length || received.length !== sent.length)
+			throw new Error(`keys lost before the source: ${sent.length} sent, ${received.length} received, ${sent.length - reached} never arrived`);
 		const acked = Object.keys(b1).filter((k) => k in b0).map((k) => b1[k] - b0[k]);
 		const frames = wl === 'typing' || !readback ? {} : {
 			fps: f.length / dt, ivP50: pct(iv, 0.5), ivP95: pct(iv, 0.95), ivP99: pct(iv, 0.99), ivMax: Math.max(...iv), jitter: stddev(iv),
@@ -264,7 +269,7 @@ async function run(arm, wl, readback = true) {
 		return {
 			...frames,
 			...statsDelta(f0, f1),
-			keys: r.keys.length, keysSeen: i2p.length, keysMissing: missing,
+			keys: r.keys.length, keysReceived: received.length, keysSeen: i2p.length, keysNoOwnFrame: noOwnFrame,
 			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p),
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
 			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, stealPct: ((s1.host.steal - s0.host.steal) / (s1.host.all - s0.host.all)) * 100, browserCpu: ((c1 - c0) / dt) * 100,
@@ -354,8 +359,8 @@ async function soak(arm, seconds) {
 			const s = await serverStats(arm);
 			const dl = statsDelta(prev, s);
 			const v = await p.evaluate(() => { const vs = window.vs; const r = { frames: vs.frames.length, bad: vs.bad, tags: vs.tags.slice(), keys: vs.keys.slice(), lat: vs.frames.map((f) => f[2]) }; vs.frames.length = 0; vs.tags.length = 0; vs.keys.length = 0; return r; });
-			const { i2p, missing } = answer(v.keys, v.tags);
-			windows.push({ at: Math.round((Date.now() - t0) / 1000), targetKbps: s.target_kbps, ...dl, viewerFrames: v.frames, badReads: v.bad, frameLatP50: pct(v.lat, 0.5), frameLatP95: pct(v.lat, 0.95), i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: i2p.length ? Math.max(...i2p) : null, keysSeen: i2p.length, keysMissing: missing, decodeErrs: decodeErrs.length, errs: errs.length });
+			const { i2p, noOwnFrame } = answer(v.keys, v.tags);
+			windows.push({ at: Math.round((Date.now() - t0) / 1000), targetKbps: s.target_kbps, ...dl, viewerFrames: v.frames, badReads: v.bad, frameLatP50: pct(v.lat, 0.5), frameLatP95: pct(v.lat, 0.95), i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: i2p.length ? Math.max(...i2p) : null, keysSeen: i2p.length, keysNoOwnFrame: noOwnFrame, decodeErrs: decodeErrs.length, errs: errs.length });
 			console.log(`SOAK ${arm} ${JSON.stringify(windows.at(-1))}`);
 			assertCodec(arm, s, `at ${windows.at(-1).at} s`);
 			prev = s;

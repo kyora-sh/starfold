@@ -28,3 +28,5 @@ export const ARMS = {
 	'voxl-upstream': { kind: 'starfold', query: '', probe: true, bin: 'VOXL_BIN', args: STARFOLD_ARGS.slice(0, 3), codec: null },
 };
 export const WORKLOADS = ['typing', 'scroll', 'video'];
+/** Every key the source window receives, one `<ms> <letter>` line each; truncated at each start. */
+export const KEYS_LOG = '/tmp/vs-keys.log';

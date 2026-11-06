@@ -5,7 +5,8 @@
 // provably caused by that key. SIGUSR1 freezes the picture and prints FROZEN, then writes what scroll
 // and video draw to the file named by argv[5] (the harness rebuilds any frame from it) and prints
 // DUMPED. argv[6], if given, is the page as raw BGRX, W wide and H + 6000 tall: real rendered text
-// for the scroll and as the typing backdrop.
+// for the scroll and as the typing backdrop. argv[7], if given, gets a `<wall ms> <letter>` line per
+// key received, so the harness can tell a key lost before the source from one never painted.
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -118,9 +119,17 @@ static void on_freeze(int s) {
 }
 static int cx = 80, cy = 74;
 static XFontStruct *font;
+static const char *keys_log;
 static void key(XEvent *e) {
 	KeySym s = XLookupKeysym(&e->xkey, 0);
 	if (s < 'a' || s > 'z') return;
+	FILE *kf = keys_log ? fopen(keys_log, "a") : NULL;
+	if (kf) {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		fprintf(kf, "%lld %c\n", (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, (char)s);
+		fclose(kf);
+	}
 	tag = s - 'a';
 	XGrabServer(d);
 	draw_tag();
@@ -164,6 +173,7 @@ static void events(void) {
 }
 int main(int argc, char **argv) {
 	if (argc < 5) return 2;
+	if (argc > 7 && argv[7][0]) keys_log = argv[7];
 	const char *mode = argv[1];
 	W = atoi(argv[2]);
 	H = atoi(argv[3]);
