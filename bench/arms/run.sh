@@ -4,7 +4,7 @@
 #   run.sh once <arm> <workload> <kbps> [preset] [crf]    one `bench` line + one `score` line
 #   run.sh search <arm> <workload> <target_db> [preset] [crf]    lowest rate reaching the target
 #   run.sh rounds <file> [n]    interleaved `once` lines
-# Needs ffmpeg and python3-numpy (libs.sh installs numpy). Env: FRAMES (300), THREADS (4), METRIC, LO, HI, TOL (hi - lo stops under lo / TOL), DUMP_DIR, KEEP=<dir> for the per-frame logs. Needs ffmpeg and the arm's feature built:
+# Needs ffmpeg and python3-numpy (libs.sh installs numpy). Env: FRAMES (300), THREADS (4), METRIC, LO, HI, TOL (hi - lo stops under lo / TOL), DUMP_DIR, KEEP=<dir> for the per-frame logs. The arm's feature must be built:
 # BIN=$(cargo test --release --features <features> --lib --no-run ... ), see bench/arms/README.
 set -euo pipefail
 bin=${BIN:?the test binary}
