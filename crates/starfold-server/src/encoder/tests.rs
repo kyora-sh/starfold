@@ -818,6 +818,47 @@ impl Refining {
     }
 }
 
+/// An odd size opens OpenH264 padded; the refinement worker must still hear when a pass
+/// would sharpen, down to the finest rung.
+#[test]
+fn a_padded_encoder_refines_to_the_last_rung() {
+    for (w, h) in [(1920u32, 1080u32), (1921, 1080)] {
+        let mut enc = open(&EncoderConfig {
+            best_quality: 24.0,
+            ..config(Backend::OpenH264, w, h, 8000)
+        })
+        .unwrap();
+        let mut p = Picture::new(w as usize, h as usize);
+        encode_one(&mut *enc, &p, 0, true);
+        for f in 1..30i64 {
+            p.texture(0, 0, 0, w as usize, h as usize, f as usize * 12);
+            encode_one(&mut *enc, &p, f * 33, false);
+        }
+        let mut pts = 30 * 33;
+        let rungs: Vec<u8> = [20u8, 16, 12]
+            .into_iter()
+            .take_while(|&qp| {
+                let r = Refine {
+                    qp,
+                    max_bytes: None,
+                };
+                if !enc.refinable(r) {
+                    return false;
+                }
+                pts += 33;
+                let opts = EncodeOptions {
+                    pts_ms: pts,
+                    force_keyframe: false,
+                    static_mbs: None,
+                    refine: Some(r),
+                };
+                !enc.encode(&p.view(), opts).unwrap().is_empty()
+            })
+            .collect();
+        assert_eq!(rungs, [20, 16, 12], "{w}x{h}");
+    }
+}
+
 #[test]
 fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
     for (threads, fps) in [(1, 30), (4, 30), (1, 120), (4, 120)] {
