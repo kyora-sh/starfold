@@ -12,7 +12,8 @@ grep -q "\"version\": \"$(node -e "import('./bench/vs/config.mjs').then((c) => c
 cp bench/vs/novnc-viewer.html /tmp/novnc/
 mkdir -p /tmp/pw && (cd /tmp/pw && npm i -s playwright-core >/dev/null 2>&1 && npx -y playwright-core install-deps chromium >/dev/null 2>&1)
 unzip -qo "$CHROME_ZIP" -d /tmp/chrome
-export CHROMIUM=$(find /tmp/chrome -name chrome-headless-shell -type f | head -1) PLAYWRIGHT_NODE_MODULES=/tmp/pw/node_modules/
+CHROMIUM=$(find /tmp/chrome -name chrome-headless-shell -type f | head -1)
+export CHROMIUM PLAYWRIGHT_NODE_MODULES=/tmp/pw/node_modules/
 node bench/vs/page.mjs /tmp/vs-page.png && python3 -c "
 from PIL import Image
 im = Image.open('/tmp/vs-page.png').convert('RGB')
