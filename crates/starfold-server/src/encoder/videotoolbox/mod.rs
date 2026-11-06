@@ -789,6 +789,7 @@ fn verify(codec: Codec) -> Result<Sampled, String> {
                 pts_ms: f * 33,
                 force_keyframe: f == 0,
                 static_mbs: None,
+                refine: None,
             },
         )?);
     }

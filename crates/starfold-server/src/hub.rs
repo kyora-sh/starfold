@@ -81,6 +81,8 @@ pub struct Client {
     pub video: AtomicBool,
     pub audio: AtomicBool,
     pub inflight: Mutex<VecDeque<Inflight>>,
+    /// When an ack last retired a frame in flight.
+    pub acked_at: Mutex<Instant>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
     /// Exponentially-weighted estimate of delivered bytes/sec, from acks.
@@ -115,8 +117,10 @@ impl Client {
         let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
+        let mut retired = false;
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
+                retired = true;
                 acked += f.bytes;
                 if f.id == id {
                     sample = Some(f.sent.elapsed().as_secs_f64() * 1000.0);
@@ -127,6 +131,9 @@ impl Client {
             }
         }
         drop(q);
+        if retired {
+            *self.acked_at.lock() = Instant::now();
+        }
         if let Some(ms) = sample {
             let mut e = self.delay.lock();
             if ms < e.base_ms || e.base_at.elapsed().as_secs() >= 10 {
@@ -246,6 +253,13 @@ impl Client {
             q.len(),
             q.front().map(|f| f.sent.elapsed().as_millis()).unwrap_or(0),
         )
+    }
+
+    /// How long frames have been waiting with no ack retiring any of them: a slow link
+    /// still acks, a hidden tab or dead socket doesn't.
+    pub fn ack_silence_ms(&self) -> u128 {
+        let (_, age) = self.backlog();
+        age.min(self.acked_at.lock().elapsed().as_millis())
     }
 }
 
@@ -373,6 +387,9 @@ pub struct Stats {
     pub convert_us: AtomicU64,
     pub flow_blocked: AtomicU64,
     pub paintovers: AtomicU64,
+    /// Frames of a burst that came out, and their bytes.
+    pub paintover_frames: AtomicU64,
+    pub paintover_bytes: AtomicU64,
     pub keyframes: AtomicU64,
     pub refines: AtomicU64,
     pub damage_wait_us: AtomicU64,
@@ -470,6 +487,7 @@ impl Hub {
             video: AtomicBool::new(false),
             audio: AtomicBool::new(false),
             inflight: Mutex::new(VecDeque::new()),
+            acked_at: Mutex::new(Instant::now()),
             min_rtt_ms: AtomicU32::new(0),
             delivered: Mutex::new(RateEst {
                 window_start: Instant::now(),

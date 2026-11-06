@@ -176,7 +176,9 @@ async fn serve(a: HashMap<String, String>) {
         }
         if a.contains_key("crf") {
             if encoder == encoder::Backend::OpenH264 {
-                log::warn!("--crf with OpenH264 is its lowest QP; bitrate follows --max-kbps");
+                log::warn!(
+                    "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
+                );
             } else {
                 log::warn!("--crf is an x264 setting; {} ignores it", encoder.name());
             }
