@@ -405,6 +405,10 @@ impl VideoEncoder for OpenH264 {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
     }
+
+    fn refinable(&self, r: Refine) -> bool {
+        self.sharpness.pick(r).is_some()
+    }
 }
 
 impl Drop for OpenH264 {

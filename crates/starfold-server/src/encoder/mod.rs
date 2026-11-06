@@ -172,6 +172,10 @@ pub trait VideoEncoder: Send {
         opts: EncodeOptions<'_>,
     ) -> Result<Vec<AccessUnit>, EncodeError>;
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError>;
+    /// Whether a pass like `r` would still sharpen something within its budget.
+    fn refinable(&self, _r: Refine) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

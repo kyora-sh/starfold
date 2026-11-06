@@ -69,6 +69,8 @@ struct Fake {
     refines: Option<Refines>,
     /// A requested keyframe comes out as nothing at all.
     empty_keys: bool,
+    /// Refining passes this encoder still has something to sharpen with (None: none).
+    refinable: Option<Arc<AtomicUsize>>,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -99,6 +101,9 @@ impl VideoEncoder for Fake {
         self.n += 1;
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
+        }
+        if let (Some(left), Some(_)) = (&self.refinable, opts.refine) {
+            let _ = left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         }
         if let (Some(k), true) = (&self.keys, opts.force_keyframe) {
             k.0.fetch_add(1, Ordering::Relaxed);
@@ -137,6 +142,12 @@ impl VideoEncoder for Fake {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
     }
+
+    fn refinable(&self, _: Refine) -> bool {
+        self.refinable
+            .as_ref()
+            .is_some_and(|n| n.load(Ordering::Relaxed) > 0)
+    }
 }
 
 #[derive(Default)]
@@ -167,6 +178,8 @@ struct Opts {
     refines: Option<Refines>,
     /// H.264 cohorts' encoders drop every keyframe (the offer's sample encode still works).
     h264_empty_keys: bool,
+    /// Refining passes the first H.264 stripe's encoder has something to sharpen with.
+    h264_refinable: Option<Arc<AtomicUsize>>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -196,6 +209,7 @@ fn fakes(o: Opts) -> Open {
                 kbps: 0,
                 refines: o.refines.clone(),
                 empty_keys: false,
+                refinable: None,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -236,6 +250,7 @@ fn fakes(o: Opts) -> Open {
             kbps: 0,
             refines: o.refines.clone().filter(|_| !hevc),
             empty_keys: o.h264_empty_keys && !hevc && h264 > 0,
+            refinable: o.h264_refinable.clone().filter(|_| !hevc && h264 == 1),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -2355,7 +2370,7 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
         refine,
         Some(Refine {
             qp: 20,
-            max_bytes: Some(start * REFINE_FRAME_MS / 8),
+            max_bytes: Some(start * REFINE_FRAME_MS / 8 * REFINE_PLAN_PCT / 100),
         })
     );
     assert_ne!(
@@ -2363,6 +2378,77 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
         stripe_share(START_KBPS as u32, 1) * 2,
         "paint-over rate applied"
     );
+}
+
+/// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
+/// the QP of every pass over `turns` still turns, each acked.
+fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264],
+        Opts {
+            refines: Some(seen.clone()),
+            h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    seen.lock().unwrap().clear();
+    for i in 0..turns {
+        if motion_at == Some(i) {
+            t += Duration::from_secs(60);
+            capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+        } else {
+            still(&mut eng, &mut t);
+        }
+        acked(&c, &mut rx);
+    }
+    let got = seen.lock().unwrap();
+    got.iter().filter_map(|(r, _)| r.map(|r| r.qp)).collect()
+}
+
+#[test]
+fn a_still_picture_is_refined_until_the_encoder_has_nothing_left() {
+    assert_eq!(tail(6, 20, None), [20, 16, 12, 12, 12, 12]);
+    assert_eq!(tail(0, 20, None), [20, 16, 12], "the ladder still runs");
+}
+
+#[test]
+fn new_damage_cancels_the_tail() {
+    assert_eq!(tail(100, 8, Some(5)), [20, 16, 12, 12, 20, 16]);
+}
+
+#[test]
+fn the_tail_has_a_limit() {
+    let qps = tail(1000, 200, None);
+    assert_eq!(qps.len(), 3 + REFINE_TAIL_MAX as usize);
+    assert!(qps[2..].iter().all(|&q| q == 12));
+}
+
+#[test]
+fn tail_bytes_cost_the_next_burst_nothing() {
+    let now = Instant::now();
+    let mut b = Burst::new(3, NO_DELAY, now);
+    b.account(now, 2000, 0);
+    b.moved(now);
+    for _ in 0..3 {
+        b.pass(now);
+    }
+    b.account(now, 2000, 50_000);
+    let after_ladder = b.tokens;
+    assert!(after_ladder < 250_000.0, "the ladder is charged");
+    b.more();
+    b.pass(now);
+    b.account(now, 2000, 5_000_000);
+    assert_eq!(b.tokens, after_ladder, "the tail is not");
+    b.moved(now);
+    assert!(b.due(now));
 }
 
 #[test]
