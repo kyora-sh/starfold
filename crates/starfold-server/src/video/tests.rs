@@ -308,17 +308,33 @@ fn whole(w: u32, h: u32) -> Frame {
     }
 }
 
-/// One capture through the capture loop's steps, with `band` changed; returns once
-/// the cohorts are done with it.
-fn push_band(eng: &mut Engine, w: u32, h: u32, band: Option<Band>) {
+/// One turn of the capture loop at `now`: `band` changed, or nothing did. Returns once the
+/// cohorts are done with it.
+fn capture(eng: &mut Engine, w: u32, h: u32, band: Option<Band>, now: Instant) {
     eng.replan();
     let views = eng.views();
     eng.update_rates(&views);
+    eng.update_refinement(&views, now);
     let takes = eng.takes(&views, 33.0);
+    let passes = eng.passes(&views, &takes, now);
     let mut f = whole(w, h);
     f.band = band;
-    eng.dispatch(&f, &views, &takes);
+    if band.is_some() {
+        eng.mark(&views, None);
+        eng.moved(&views, now);
+    }
+    eng.dispatch(&f, &views, &takes, &passes, now);
     settle(eng);
+}
+
+fn push_band(eng: &mut Engine, w: u32, h: u32, band: Option<Band>) {
+    capture(eng, w, h, band, Instant::now())
+}
+
+/// A turn with nothing new on screen, long enough after the last for any gap to be over.
+fn still(eng: &mut Engine, t: &mut Instant) {
+    *t += Duration::from_secs(60);
+    capture(eng, W, H, None, *t);
 }
 
 fn push_at(eng: &mut Engine, w: u32, h: u32) {
@@ -534,7 +550,8 @@ fn a_switch_mid_frame_sends_nothing_of_the_old_cohort() {
     eng.replan();
     let views = eng.views();
     let takes = eng.takes(&views, 33.0);
-    eng.dispatch(&whole(W, H), &views, &takes);
+    let none = vec![false; takes.len()];
+    eng.dispatch(&whole(W, H), &views, &takes, &none, Instant::now());
     assert_eq!(c.codec_error(1).map(|c| c.cand.codec), Some(Codec::Hevc));
     // The picture finishes after the switch (closing the HEVC cohort waits for it).
     let g = gate.clone();
@@ -769,14 +786,15 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
         "its cohort keeps the damage it skipped"
     );
     // Once it catches up, the damage it skipped is due even if nothing else changes.
-    assert!(!eng.catch_up_due(&eng.views(), 33.0));
+    assert!(!eng.catch_up_due(&eng.takes(&eng.views(), 33.0)));
     slow.inflight.lock().clear();
-    assert!(eng.catch_up_due(&eng.views(), 33.0));
+    assert!(eng.catch_up_due(&eng.takes(&eng.views(), 33.0)));
     let views = eng.views();
     let takes = eng.takes(&views, 33.0);
     let mut still = whole(W, H);
     still.band = None;
-    eng.dispatch(&still, &views, &takes);
+    let none = vec![false; takes.len()];
+    eng.dispatch(&still, &views, &takes, &none, Instant::now());
     settle(&eng);
     assert_eq!(
         videos(&drain(&mut rs)).len(),
@@ -785,7 +803,7 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
     );
     let hevc = &eng.cohorts.iter().find(|k| k.shared.cand == HEVC).unwrap();
     assert!(hevc.skipped.is_none());
-    assert!(!eng.catch_up_due(&eng.views(), 33.0));
+    assert!(!eng.catch_up_due(&eng.takes(&eng.views(), 33.0)));
 }
 
 #[test]
@@ -1244,51 +1262,396 @@ fn skipped_damage_is_caught_up() {
     assert!(catch_up(s, f(None, Some(vec![0; 4]))).mb_dirty.is_none());
 }
 
-/// A pass may send nothing, and what a cohort skipped must not go with it.
-#[test]
-fn caught_up_damage_is_no_refining_pass() {
-    let s = skip(None, &whole(32, 32));
-    let mut pass = whole(32, 32);
-    pass.paintover = true;
-    pass.refine_qp = Some(16);
-    assert_eq!(catch_up(s, pass).refine_qp, None);
+/// Takes the whole burst, as the capture loop does while `due`.
+fn passes(b: &mut Burst, now: Instant) -> Vec<Option<u8>> {
+    std::iter::from_fn(|| b.due(now).then(|| take(b, now))).collect()
+}
+
+fn take(b: &mut Burst, now: Instant) -> Option<u8> {
+    let qp = b.rung();
+    b.pass(now);
+    qp
 }
 
 #[test]
-fn a_pass_waits_for_the_last_one_to_arrive() {
+fn a_qp_encoder_takes_the_ladder() {
+    let now = Instant::now();
+    let mut b = Burst::new(3, NO_DELAY, now);
+    b.moved(now);
+    assert_eq!(passes(&mut b, now), [Some(20), Some(16), Some(12)]);
+}
+
+/// An HEVC viewer on a plain cohort and an H.264 viewer on a ladder, keyframes landed.
+struct Pair {
+    hub: Arc<Hub>,
+    eng: Engine,
+    seen: Refines,
+    hevc: Arc<Client>,
+    hevc_rx: UnboundedReceiver<Out>,
+    h264: Arc<Client>,
+    h264_rx: UnboundedReceiver<Out>,
+    t: Instant,
+}
+
+fn pair() -> Pair {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[HEVC, H264], opts);
+    let (hevc, mut hevc_rx) = client(&hub);
+    let (h264, mut h264_rx) = client(&hub);
+    join_v2(&hub, &hevc, &[Codec::Hevc]);
+    join_legacy(&hub, &h264);
+    push(&mut eng);
+    ready(&hevc, &drain(&mut hevc_rx));
+    acked(&h264, &mut h264_rx);
+    push(&mut eng);
+    acked(&hevc, &mut hevc_rx);
+    acked(&h264, &mut h264_rx);
+    let t = Instant::now();
+    seen.lock().unwrap().clear();
+    Pair {
+        hub,
+        eng,
+        seen,
+        hevc,
+        hevc_rx,
+        h264,
+        h264_rx,
+        t,
+    }
+}
+
+impl Pair {
+    fn cohort(&self, codec: Codec) -> &Cohort {
+        let c = self.eng.cohorts.iter();
+        c.into_iter()
+            .find(|c| c.shared.cand.codec == codec)
+            .unwrap()
+    }
+    fn left(&self, codec: Codec) -> u32 {
+        self.cohort(codec).refine.burst.left
+    }
+    fn qps(&self) -> Vec<Option<u8>> {
+        let s = self.seen.lock().unwrap();
+        s.iter().map(|(r, _)| r.map(|r| r.qp)).collect()
+    }
+    fn still(&mut self) {
+        still(&mut self.eng, &mut self.t);
+    }
+    fn ack_hevc(&mut self) {
+        acked(&self.hevc, &mut self.hevc_rx);
+    }
+    fn ack_h264(&mut self) {
+        acked(&self.h264, &mut self.h264_rx);
+    }
+    /// Turns with both viewers answering, until neither cohort has a pass left.
+    fn finish(&mut self) {
+        for _ in 0..8 {
+            self.still();
+            self.ack_hevc();
+            self.ack_h264();
+        }
+    }
+    /// The H.264 viewer falls far enough behind for flow control to stop its cohort.
+    fn stall_h264(&mut self) {
+        let mut q = self.h264.inflight.lock();
+        q.front_mut().unwrap().sent -= Duration::from_millis(500);
+    }
+}
+
+#[test]
+fn each_cohort_refines_its_own_way() {
+    let mut p = pair();
+    p.finish();
+    assert_eq!(p.qps(), [Some(20), Some(16), Some(12)]);
+    assert_eq!((p.left(Codec::Hevc), p.left(Codec::H264)), (0, 0));
+    let bytes = |c: &Cohort| c.shared.paintover_bytes.load(Ordering::Relaxed);
+    assert_eq!(
+        bytes(p.cohort(Codec::Hevc)),
+        0,
+        "plain passes have no budget"
+    );
+    assert!(bytes(p.cohort(Codec::H264)) > 0);
+}
+
+#[test]
+fn an_idle_desktop_returns_to_zero_bits() {
+    let mut p = pair();
+    p.finish();
+    let bytes = p.hub.stats.bytes.load(Ordering::Relaxed);
+    let encoded = p.hub.stats.encoded.load(Ordering::Relaxed);
+    p.finish();
+    assert_eq!(p.hub.stats.bytes.load(Ordering::Relaxed), bytes);
+    assert_eq!(p.hub.stats.encoded.load(Ordering::Relaxed), encoded);
+    let views = p.eng.views();
+    let takes = p.eng.takes(&views, 33.0);
+    let later = p.t + Duration::from_secs(3600);
+    assert!(!p.eng.passes(&views, &takes, later).contains(&true));
+    assert!(!p.eng.catch_up_due(&takes));
+}
+
+#[test]
+fn a_cohort_that_joins_mid_ladder_changes_nothing_for_the_other() {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[HEVC, H264], opts);
+    let (b, mut rb) = client(&hub);
+    join_legacy(&hub, &b);
+    push(&mut eng);
+    acked(&b, &mut rb);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    seen.lock().unwrap().clear();
+    still(&mut eng, &mut t);
+    acked(&b, &mut rb);
+    let (a, mut ra) = client(&hub);
+    join_v2(&hub, &a, &[Codec::Hevc]);
+    still(&mut eng, &mut t);
+    acked(&b, &mut rb);
+    ready(&a, &drain(&mut ra));
+    still(&mut eng, &mut t);
+    acked(&b, &mut rb);
+    let qps: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.0.unwrap().qp)
+        .collect();
+    assert_eq!(qps, [20, 16, 12]);
+    let plain = eng.cohorts.iter().find(|c| !c.refine.burst.ladder).unwrap();
+    assert_eq!(plain.shared.keyframes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_slow_viewer_holds_back_only_its_own_ladder() {
+    let mut p = pair();
+    p.still();
+    assert_eq!(p.qps(), [Some(20)]);
+    for _ in 0..4 {
+        p.still();
+        p.ack_hevc();
+    }
+    assert_eq!(p.qps(), [Some(20)], "not acknowledged yet");
+    assert_eq!(p.left(Codec::H264), 2);
+    assert_eq!(p.left(Codec::Hevc), 0, "the other cohort finished");
+    p.ack_h264();
+    p.finish();
+    assert_eq!(p.qps(), [Some(20), Some(16), Some(12)]);
+}
+
+#[test]
+fn a_viewer_that_stopped_answering_holds_back_no_pass() {
+    let mut p = pair();
+    p.still();
+    p.still();
+    assert_eq!(p.qps(), [Some(20)]);
+    let mut q = p.h264.inflight.lock();
+    q.front_mut().unwrap().sent -= Duration::from_millis(REFINE_DRAIN_MS as u64);
+    drop(q);
+    let c = p.cohort(Codec::H264);
+    let views = p.eng.views();
+    let v = views.iter().zip(&p.eng.cohorts);
+    let v = v.find(|(_, x)| x.shared.id == c.shared.id).unwrap().0;
+    assert!(c.drained(v));
+}
+
+#[test]
+fn a_pass_waits_for_the_encoder_too() {
+    let mut p = pair();
+    p.still();
+    p.ack_h264();
+    let views = p.eng.views();
+    let i = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.refine.burst.ladder)
+        .unwrap();
+    let c = &p.eng.cohorts[i];
+    assert!(c.drained(&views[i]));
+    c.shared.busy.fetch_add(1, Ordering::AcqRel);
+    assert!(!c.drained(&views[i]), "a pass is still being encoded");
+    c.shared.busy.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Motion it couldn't take: once its viewer answers it gets that first, under rate control,
+/// and then the whole ladder, once. The desktop stays still, so nothing starts it again.
+#[test]
+fn a_recovered_cohort_catches_up_then_refines_once() {
+    let mut p = pair();
+    p.finish();
+    p.seen.lock().unwrap().clear();
+    push(&mut p.eng);
+    p.ack_hevc();
+    p.stall_h264();
+    push(&mut p.eng);
+    p.ack_hevc();
+    assert!(p.cohort(Codec::H264).skipped.is_some());
+    assert_eq!(p.left(Codec::H264), 3);
+    let done = p.qps().len();
+    p.still();
+    p.ack_hevc();
+    assert_eq!(p.left(Codec::Hevc), 2, "the other cohort doesn't wait");
+    assert_eq!(p.left(Codec::H264), 3);
+    p.ack_h264();
+    p.still();
+    assert!(p.cohort(Codec::H264).skipped.is_none());
+    assert_eq!(p.left(Codec::H264), 3, "a catch-up is no pass");
+    assert_eq!(p.qps()[done..], [None]);
+    p.finish();
+    assert_eq!(p.qps()[done..], [None, Some(20), Some(16), Some(12)]);
+    let bytes = p.hub.stats.bytes.load(Ordering::Relaxed);
+    p.finish();
+    assert_eq!(p.hub.stats.bytes.load(Ordering::Relaxed), bytes);
+}
+
+/// A catch-up due exactly when the only pass of a burst is.
+#[test]
+fn a_catch_up_takes_no_pass_of_a_one_pass_burst() {
+    let mut cfg = config();
+    cfg.paintover_burst = 1;
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264], fakes(opts)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    eng.cohorts[0].skipped = Some(skip(None, &whole(W, H)));
+    seen.lock().unwrap().clear();
+    still(&mut eng, &mut t);
+    acked(&c, &mut rx);
+    assert_eq!(eng.cohorts[0].refine.burst.left, 1);
+    still(&mut eng, &mut t);
+    let qps: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.0.map(|r| r.qp))
+        .collect();
+    assert_eq!(qps, [None, Some(12)]);
+}
+
+#[test]
+fn a_job_that_found_no_room_changes_no_refinement() {
     let hub = Hub::new();
     let mut eng = engine(&hub, &[H264], Opts::default());
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
     push(&mut eng);
-    let views = eng.views();
-    assert!(!eng.drained(&views), "a frame is on its way");
-    for f in videos(&drain(&mut rx)) {
-        c.ack(None, f.2);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    let (tx, _) = mpsc::sync_channel::<Job>(1);
+    let queue = eng.cohorts[0].tx.replace(tx);
+    still(&mut eng, &mut t);
+    let r = &eng.cohorts[0].refine;
+    assert_eq!(r.burst.left, 3);
+    assert!(r.refiner.any_pending());
+    assert!(eng.cohorts[0].skipped.is_none(), "a pass is no damage");
+    eng.cohorts[0].tx = queue;
+    still(&mut eng, &mut t);
+    assert_eq!(eng.cohorts[0].refine.burst.left, 2);
+}
+
+/// The last pass went out, then its viewer fell behind and the picture moved: the ladder is
+/// on again, though the cohort took none of that motion.
+#[test]
+fn motion_a_blocked_cohort_missed_rearms_a_finished_ladder() {
+    let mut p = pair();
+    for _ in 0..2 {
+        p.still();
+        p.ack_h264();
+        p.ack_hevc();
     }
-    assert!(eng.drained(&views));
-    let busy = &eng.cohorts[0].shared.busy;
-    busy.fetch_add(1, Ordering::AcqRel);
-    assert!(!eng.drained(&views), "a pass is still being encoded");
-    eng.cohorts[0].shared.busy.fetch_sub(1, Ordering::AcqRel);
-    assert!(eng.drained(&views));
+    p.still();
+    p.ack_hevc();
+    assert_eq!(p.left(Codec::H264), 0);
+    p.stall_h264();
+    push(&mut p.eng);
+    p.ack_hevc();
+    assert!(p.cohort(Codec::H264).skipped.is_some());
+    assert_eq!(p.left(Codec::H264), 3);
+    p.ack_h264();
+    p.finish();
+    let qps = p.qps();
+    assert_eq!(qps[3..], [None, Some(20), Some(16), Some(12)]);
+}
+
+/// The last viewer left and the next joined between two looks: no sample ever saw it empty.
+#[test]
+fn a_viewer_that_replaces_the_last_inherits_nothing() {
+    let mut p = pair();
+    p.eng.cohorts.iter_mut().for_each(|c| {
+        c.refine.burst.backoff = REFINE_MAX_BACKOFF;
+        c.refine.burst.tokens = -1.0;
+        c.refine.burst.last_burst = Some(Instant::now());
+    });
+    let id = p.h264.id;
+    p.hub.remove_client(id);
+    let (next, mut rx) = client(&p.hub);
+    join_legacy(&p.hub, &next);
+    p.still();
+    let r = &p.cohort(Codec::H264).refine;
+    assert_eq!((r.burst.backoff, r.burst.left), (0, 3));
+    assert!(r.burst.tokens > 0.0);
+    assert!(r.refiner.any_pending());
+    let other = &p.cohort(Codec::Hevc).refine.burst;
+    assert_eq!(other.backoff, REFINE_MAX_BACKOFF, "its own stays");
+    acked(&next, &mut rx);
 }
 
 #[test]
-fn a_viewer_that_stopped_answering_holds_back_no_pass() {
-    let hub = Hub::new();
-    let mut eng = engine(&hub, &[H264], Opts::default());
-    let (c, _rx) = client(&hub);
-    join_legacy(&hub, &c);
-    push(&mut eng);
-    let views = eng.views();
-    assert!(!eng.drained(&views));
-    c.inflight.lock().front_mut().unwrap().sent -= Duration::from_millis(REFINE_DRAIN_MS as u64);
-    assert!(eng.drained(&views));
+fn a_cohort_that_leaves_changes_nothing_for_the_other() {
+    let mut p = pair();
+    p.still();
+    p.ack_h264();
+    p.ack_hevc();
+    assert_eq!(p.left(Codec::H264), 2);
+    let id = p.hevc.id;
+    p.hub.remove_client(id);
+    p.finish();
+    assert_eq!(p.qps(), [Some(20), Some(16), Some(12)]);
 }
 
 #[test]
-fn only_a_keyframe_that_went_out_starts_a_burst() {
+fn another_cohorts_keyframe_starts_no_ladder() {
+    let mut p = pair();
+    p.finish();
+    p.seen.lock().unwrap().clear();
+    let keys = |p: &Pair| {
+        p.cohort(Codec::Hevc)
+            .shared
+            .keyframes
+            .load(Ordering::Relaxed)
+    };
+    let before = keys(&p);
+    p.hevc.needs_keyframe.store(true, Ordering::Relaxed);
+    p.still();
+    assert_eq!(keys(&p), before + 1);
+    let id = p.hevc.id;
+    p.hub.remove_client(id);
+    p.finish();
+    assert_eq!(p.left(Codec::H264), 0);
+    assert_eq!(p.qps(), [] as [Option<u8>; 0]);
+}
+
+#[test]
+fn a_cohorts_own_keyframe_starts_its_ladder_over_and_only_a_landed_one() {
     let hub = Hub::new();
     let opts = Opts {
         h264_empty_keys: true,
@@ -1300,68 +1663,63 @@ fn only_a_keyframe_that_went_out_starts_a_burst() {
     for _ in 0..3 {
         push(&mut eng);
     }
-    let sent = hub.stats.keyframes.load(Ordering::Relaxed);
-    assert_eq!(sent, 0, "dropped by the encoder");
+    assert_eq!(hub.stats.keyframes.load(Ordering::Relaxed), 0, "dropped");
     assert!(eng.views()[0].want_key, "and asked for again");
-    let now = Instant::now();
-    let mut b = Burst::new(3, GAP, now);
-    b.moved(now);
-    let due = now + GAP;
-    let views = eng.views();
-    let sole = eng.sole_keyframes(&views);
-    assert_eq!(sole.map(|s| s.1), Some(0));
-    assert!(!b.keyframe_sent(sole, due));
-    assert!(!b.keyframe_sent(sole, due));
-    assert!(b.due(due), "the retries postpone nothing");
-    let id = sole.unwrap().0;
-    assert!(b.keyframe_sent(Some((id, 1)), due));
-    assert!(!b.due(due), "a real one is motion");
-    assert!(b.due(due + GAP));
-    assert!(!b.keyframe_sent(Some((id, 1)), due + GAP));
-}
-
-/// Takes the whole burst, as the capture loop does while `due`.
-fn passes(b: &mut Burst, now: Instant) -> Vec<Option<u8>> {
-    std::iter::from_fn(|| b.due(now).then(|| b.pass(now))).collect()
+    let motion = eng.cohorts[0].refine.burst.last_motion;
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    still(&mut eng, &mut t);
+    assert_eq!(eng.cohorts[0].refine.burst.last_motion, motion);
+    let sh = eng.cohorts[0].shared.clone();
+    sh.keyframes.fetch_add(1, Ordering::Release);
+    still(&mut eng, &mut t);
+    assert_eq!(eng.cohorts[0].refine.burst.last_motion, t);
 }
 
 #[test]
-fn one_cohort_takes_the_ladder() {
-    let now = Instant::now();
-    let mut b = Burst::new(3, NO_DELAY, now);
-    b.cohorts(1);
-    b.moved(now);
-    assert_eq!(passes(&mut b, now), [Some(20), Some(16), Some(12)]);
+fn a_keyframe_not_yet_looked_at_holds_back_a_pass() {
+    let mut p = pair();
+    let views = p.eng.views();
+    let i = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.refine.burst.ladder)
+        .unwrap();
+    p.ack_h264();
+    let later = p.t + Duration::from_secs(60);
+    assert!(p.eng.cohorts[i].pass_due(&views[i], later));
+    let sh = &p.eng.cohorts[i].shared;
+    sh.keyframes.fetch_add(1, Ordering::Release);
+    assert!(!p.eng.cohorts[i].pass_due(&views[i], later));
 }
 
+/// What the encoder finished for viewers now gone is nobody's: not the next viewer's budget,
+/// nor a keyframe it never saw.
 #[test]
-fn two_cohorts_take_plain_passes() {
-    let now = Instant::now();
-    let mut b = Burst::new(3, NO_DELAY, now);
-    b.cohorts(2);
-    b.moved(now);
-    assert_eq!(passes(&mut b, now), [None, None, None]);
-}
-
-#[test]
-fn a_second_cohort_ends_a_ladder_under_way_for_good() {
-    let now = Instant::now();
-    let mut b = Burst::new(3, NO_DELAY, now);
-    b.moved(now);
-    assert_eq!(b.pass(now), Some(20));
-    b.cohorts(2);
-    assert_eq!(b.pass(now), None);
-    b.cohorts(1);
-    assert_eq!(b.pass(now), None, "back to one: no fixed QP in this burst");
-    assert!(!b.due(now), "and no restart");
-    b.moved(now);
-    assert_eq!(passes(&mut b, now), [Some(20), Some(16), Some(12)]);
+fn a_cohort_starts_over_when_its_viewers_left() {
+    let mut p = pair();
+    p.still();
+    p.ack_h264();
+    p.still();
+    let id = p.h264.id;
+    p.hub.remove_client(id);
+    let sh = p.cohort(Codec::H264).shared.clone();
+    sh.keyframes.fetch_add(1, Ordering::Release);
+    sh.paintover_bytes.fetch_add(1_000_000, Ordering::Release);
+    p.still();
+    p.still();
+    let r = &p.cohort(Codec::H264).refine;
+    assert_eq!((r.burst.left, r.burst.backoff), (0, 0));
+    assert_eq!(r.keyframes, sh.keyframes.load(Ordering::Relaxed));
+    assert_eq!(r.burst.spent, sh.paintover_bytes.load(Ordering::Relaxed));
+    assert!(!r.refiner.any_pending());
 }
 
 /// None of what bounds a ladder touches plain passes: they wait for the shortest gap, whatever
 /// was spent and however often, and for nobody's acknowledgement.
 #[test]
-fn two_cohorts_have_no_budget() {
+fn plain_passes_have_no_budget_and_no_backoff() {
     let now = Instant::now();
     let mut b = Burst::new(3, GAP, now);
     b.account(now, 2000, 0);
@@ -1375,7 +1733,7 @@ fn two_cohorts_have_no_budget() {
     b.moved(now);
     assert!(b.gap(now) > GAP, "backed off");
     assert!(!b.funded(), "and over budget");
-    b.cohorts(2);
+    b.ladder = false;
     for i in 0..8 {
         let t = now + Duration::from_secs(i);
         assert_eq!(b.gap(t), GAP);
@@ -1385,160 +1743,23 @@ fn two_cohorts_have_no_budget() {
     }
 }
 
+/// Damage goes to whoever can take it; a capture made for another cohort sends this one nothing.
 #[test]
-fn only_the_sole_cohorts_keyframes_restart_a_burst() {
-    let now = Instant::now();
-    let mut b = Burst::new(3, NO_DELAY, now);
-    b.keyframe_sent(None, now);
-    assert!(
-        !b.keyframe_sent(Some((1, 1)), now),
-        "from before it was alone"
-    );
-    assert!(!b.due(now));
-    assert!(b.keyframe_sent(Some((1, 2)), now));
-    assert!(b.due(now));
-    b.stop();
-    assert!(!b.keyframe_sent(None, now), "two cohorts");
-    assert!(
-        !b.keyframe_sent(Some((1, 3)), now),
-        "sent while it wasn't alone"
-    );
-    assert!(!b.keyframe_sent(Some((2, 9)), now), "another cohort");
-    assert!(!b.due(now));
-}
-
-/// The other cohort's keyframe lands, unseen, just before its viewer leaves.
-#[test]
-fn another_cohorts_keyframe_starts_no_ladder_on_the_one_left() {
-    let hub = Hub::new();
-    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
-    let (a, mut ra) = client(&hub);
-    let (b, mut rb) = client(&hub);
-    join_v2(&hub, &a, &[Codec::Hevc]);
-    join_legacy(&hub, &b);
-    push(&mut eng);
-    ready(&a, &drain(&mut ra));
-    acked(&b, &mut rb);
-    let now = Instant::now();
-    let mut burst = Burst::new(3, NO_DELAY, now);
-    eng.replan();
-    let views = eng.views();
-    assert_eq!(eng.with_viewers(&views), 2);
-    burst.cohorts(2);
-    burst.keyframe_sent(eng.sole_keyframes(&views), now);
-    push(&mut eng);
-    assert!(
-        hub.stats.keyframes.load(Ordering::Relaxed) >= 2,
-        "HEVC's came in"
-    );
-    hub.remove_client(a.id);
-    eng.replan();
-    let views = eng.views();
-    assert_eq!(eng.with_viewers(&views), 1);
-    burst.cohorts(1);
-    assert!(!burst.keyframe_sent(eng.sole_keyframes(&views), now));
-    assert!(!burst.due(now));
-}
-
-/// The capture thread had dispatched the pass when the second cohort became ready.
-#[test]
-fn a_queued_pass_loses_its_qp_once_a_second_cohort_has_viewers() {
-    let run = |cohorts: usize| {
-        let seen = Refines::default();
-        let hub = Hub::new();
-        let opts = Opts {
-            refines: Some(seen.clone()),
-            ..Default::default()
-        };
-        let mut eng = engine(&hub, &[H264], opts);
-        let (c, _rx) = client(&hub);
-        join_legacy(&hub, &c);
-        push(&mut eng);
-        eng.replan();
-        let views = eng.views();
-        let takes = eng.takes(&views, 33.0);
-        hub.viewer_cohorts.store(cohorts, Ordering::Release);
-        let mut f = whole(W, H);
-        f.paintover = true;
-        f.refine_qp = Some(16);
-        eng.dispatch(&f, &views, &takes);
-        settle(&eng);
-        let got = seen.lock().unwrap().last().unwrap().0;
-        got.map(|r| r.qp)
-    };
-    assert_eq!(run(1), Some(16));
-    assert_eq!(run(2), None);
-}
-
-/// A recording is a protocol 1 viewer of the H.264 cohort, so beside an H.264 viewer it is
-/// no second cohort.
-#[test]
-fn a_recording_is_a_second_cohort_only_beside_another_codec() {
-    let with_viewers = |viewer_codec: Codec| {
-        let hub = Hub::new();
-        let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
-        let (viewer, mut rv) = client(&hub);
-        let (recording, _rr) = client(&hub);
-        join_v2(&hub, &viewer, &[viewer_codec]);
-        join_legacy(&hub, &recording);
-        push(&mut eng);
-        ready(&viewer, &drain(&mut rv));
-        eng.replan();
-        let views = eng.views();
-        eng.with_viewers(&views)
-    };
-    assert_eq!(with_viewers(Codec::H264), 1);
-    assert_eq!(with_viewers(Codec::Hevc), 2);
-}
-
-/// Two real cohorts through a burst and then nothing: every pass reaches the encoders at
-/// their usual rate, none carries a QP, and an idle desktop is left with nothing to send.
-#[test]
-fn two_cohorts_go_quiet_after_a_plain_burst() {
-    let seen = Refines::default();
-    let hub = Hub::new();
-    let opts = Opts {
-        refines: Some(seen.clone()),
-        ..Default::default()
-    };
-    let mut eng = engine(&hub, &[HEVC, H264], opts);
-    let (a, mut ra) = client(&hub);
-    let (b, mut rb) = client(&hub);
-    join_v2(&hub, &a, &[Codec::Hevc]);
-    join_legacy(&hub, &b);
-    push(&mut eng);
-    ready(&a, &drain(&mut ra));
-    acked(&b, &mut rb);
-    push(&mut eng);
-    acked(&a, &mut ra);
-    acked(&b, &mut rb);
-    eng.replan();
-    let views = eng.views();
-    let cohorts = eng.with_viewers(&views);
-    assert_eq!(cohorts, 2);
-    let now = Instant::now();
-    let mut burst = Burst::new(3, NO_DELAY, now);
-    burst.cohorts(cohorts);
-    burst.moved(now);
-    seen.lock().unwrap().clear();
-    let start = hub.stats.bytes.load(Ordering::Relaxed);
-    while burst.due(now) {
-        let takes = eng.takes(&views, 33.0);
-        let mut f = whole(W, H);
-        f.paintover = true;
-        f.refine_qp = burst.pass(now);
-        eng.dispatch(&f, &views, &takes);
-        settle(&eng);
-        acked(&a, &mut ra);
-        acked(&b, &mut rb);
-    }
-    assert!(hub.stats.bytes.load(Ordering::Relaxed) > start);
-    let got = seen.lock().unwrap().clone();
-    assert_eq!(got.len(), 3);
-    assert!(got.iter().all(|(r, _)| r.is_none()), "{got:?}");
-    assert!(!burst.due(now + Duration::from_secs(3600)));
-    assert!(!eng.catch_up_due(&views, 33.0));
-    assert_eq!(hub.stats.paintover_bytes.load(Ordering::Relaxed), 0);
+fn a_cohort_gets_no_job_for_anothers_pass() {
+    let mut p = pair();
+    p.finish();
+    let plain = p.cohort(Codec::Hevc).shared.clone();
+    let done = p.hub.stats.encoded.load(Ordering::Relaxed);
+    p.eng.cohorts.iter_mut().for_each(|c| {
+        if c.refine.burst.ladder {
+            c.refine.burst.moved(Instant::now());
+            c.refine.refiner.mark_all();
+        }
+    });
+    let before = plain.busy.load(Ordering::Relaxed);
+    p.still();
+    assert_eq!(plain.busy.load(Ordering::Relaxed), before);
+    assert_eq!(p.hub.stats.encoded.load(Ordering::Relaxed), done + 1);
 }
 
 #[test]
@@ -1673,7 +1894,7 @@ const GAP: Duration = Duration::from_millis(150);
 fn ladder(b: &mut Burst, now: Instant, spent: u64) -> Vec<u8> {
     b.account(now, 0, spent);
     b.moved(now);
-    std::iter::from_fn(|| b.due(now).then(|| b.pass(now).unwrap())).collect()
+    std::iter::from_fn(|| b.due(now).then(|| take(b, now).unwrap())).collect()
 }
 
 #[test]
@@ -1702,11 +1923,11 @@ fn new_damage_cancels_the_rest_and_starts_over() {
     let now = Instant::now();
     let mut b = Burst::new(3, NO_DELAY, now);
     b.moved(now);
-    assert_eq!(b.pass(now), Some(20));
+    assert_eq!(take(&mut b, now), Some(20));
     b.moved(now);
-    assert_eq!(b.pass(now), Some(20), "the finer rungs are gone");
-    assert_eq!(b.pass(now), Some(16));
-    assert_eq!(b.pass(now), Some(12));
+    assert_eq!(take(&mut b, now), Some(20), "the finer rungs are gone");
+    assert_eq!(take(&mut b, now), Some(16));
+    assert_eq!(take(&mut b, now), Some(12));
     assert!(!b.due(now));
 }
 
@@ -1928,19 +2149,14 @@ fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
             ..Default::default()
         },
     );
-    let (c, _rx) = client(&hub);
+    let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
     push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
     seen.lock().unwrap().clear();
-    eng.replan();
-    let views = eng.views();
-    eng.update_rates(&views);
-    let takes = eng.takes(&views, 33.0);
-    let mut f = whole(W, H);
-    f.paintover = true;
-    f.refine_qp = Some(16);
-    eng.dispatch(&f, &views, &takes);
-    settle(&eng);
+    still(&mut eng, &mut t);
     let got = seen.lock().unwrap().clone();
     got
 }
@@ -1953,7 +2169,7 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     assert_eq!(
         refine,
         Some(Refine {
-            qp: 16,
+            qp: 20,
             max_bytes: Some(start * REFINE_FRAME_MS / 8),
         })
     );
@@ -1991,17 +2207,11 @@ fn passes_through_openh264(break_switch: bool) -> (u64, u64, u32, bool) {
     };
     push(&mut eng);
     ack(&c, &mut rx);
+    let mut t = Instant::now();
     for _ in 0..3 {
-        for qp in REFINE_RUNGS {
-            eng.replan();
-            let views = eng.views();
-            eng.update_rates(&views);
-            let takes = eng.takes(&views, 33.0);
-            let mut f = whole(W, H);
-            f.paintover = true;
-            f.refine_qp = Some(qp);
-            eng.dispatch(&f, &views, &takes);
-            settle(&eng);
+        still(&mut eng, &mut t);
+        for _ in REFINE_RUNGS {
+            still(&mut eng, &mut t);
             ack(&c, &mut rx);
         }
         push(&mut eng);

@@ -12,7 +12,7 @@ use crate::encoder::{
     StreamConfig, VideoEncoder,
 };
 use crate::hub::wait_any;
-use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto};
+use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto, Stats};
 use crate::negotiate::{self, Candidate, Choice, DecodeCap, DecoderConfig, Offer, StripeOffer};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -116,8 +116,6 @@ fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
 }
 
 fn catch_up(s: Skipped, mut f: Frame) -> Frame {
-    // What was skipped has to go out, and a pass may send nothing.
-    f.refine_qp = None;
     f.band = union_opt(s.band, f.band);
     f.mb_dirty = match (s.mb, f.mb_dirty) {
         (Some(a), Some(b)) => Some(Arc::new(or_maps(&a, &b))),
@@ -225,6 +223,8 @@ struct Shared {
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
     keyframes: AtomicU64,
+    /// What this cohort's refining passes cost.
+    paintover_bytes: AtomicU64,
     w: u32,
     h: u32,
 }
@@ -295,6 +295,31 @@ struct Cohort {
     skipped: Option<Skipped>,
     /// Had viewers at the last frame.
     active: bool,
+    /// Who they were.
+    viewers: Vec<u64>,
+    refine: Refinement,
+}
+
+impl Cohort {
+    /// Whether what was encoded so far has reached this cohort's viewers. One that hasn't
+    /// answered for a while holds back nobody: flow control deals with it.
+    fn drained(&self, v: &View) -> bool {
+        self.shared.busy.load(Ordering::Acquire) == 0
+            && v.clients.iter().all(|c| {
+                let (n, age) = c.backlog();
+                n == 0 || age >= REFINE_DRAIN_MS
+            })
+    }
+
+    /// One pass in flight at most: what a viewer types next never waits behind two. Nor does
+    /// one go ahead of a keyframe that landed since the last look, which starts the ladder over.
+    fn pass_due(&self, v: &View, now: Instant) -> bool {
+        let r = &self.refine;
+        r.burst.due(now)
+            && (!r.burst.ladder
+                || (self.drained(v)
+                    && r.keyframes == self.shared.keyframes.load(Ordering::Acquire)))
+    }
 }
 
 impl Drop for Cohort {
@@ -667,6 +692,7 @@ impl Engine {
             failures: AtomicU32::new(0),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             keyframes: AtomicU64::new(0),
+            paintover_bytes: AtomicU64::new(0),
             w: self.w,
             h: self.h,
         });
@@ -694,6 +720,8 @@ impl Engine {
             rc,
             skipped: None,
             active: false,
+            viewers: Vec::new(),
+            refine: Refinement::new(&self.cfg, cand.backend.refines_by_qp(), self.w, self.h),
         })
     }
 
@@ -927,16 +955,29 @@ impl Engine {
     fn update_rates(&mut self, views: &[View]) {
         let mut shown = 0;
         for (c, v) in self.cohorts.iter_mut().zip(views) {
+            // All of them gone and others come since the last look is a leave and a join.
+            let replaced = c.active
+                && !v.clients.is_empty()
+                && !v.clients.iter().any(|x| c.viewers.contains(&x.id));
+            if c.active && (v.clients.is_empty() || replaced) {
+                c.rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
+                c.refine.reset();
+                c.skipped = None;
+            }
             if v.clients.is_empty() {
-                if c.active {
-                    c.rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
-                }
                 c.active = false;
                 c.skipped = None;
+                c.refine.baseline(&c.shared);
             } else {
                 c.active = true;
                 c.rc.update(&v.clients);
             }
+            if replaced {
+                c.refine.baseline(&c.shared);
+                c.refine.rearm();
+            }
+            c.viewers.clear();
+            c.viewers.extend(v.clients.iter().map(|x| x.id));
             c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
             if c.active {
                 shown = shown.max(c.rc.target as u32);
@@ -962,78 +1003,122 @@ impl Engine {
             .collect()
     }
 
-    /// How many cohorts have viewers; the encoders go by it too, for a pass already queued.
-    fn with_viewers(&self, views: &[View]) -> usize {
-        let n = views.iter().filter(|v| !v.clients.is_empty()).count();
-        self.hub.viewer_cohorts.store(n, Ordering::Release);
-        n
+    /// Brings each watched cohort's refinement up to date with what its encoder did.
+    fn update_refinement(&mut self, views: &[View], now: Instant) {
+        let capped = self.cfg.max_kbps != 0;
+        for (c, v) in self.cohorts.iter_mut().zip(views) {
+            if !v.clients.is_empty() {
+                // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
+                let kbps = if capped { c.rc.target as u32 } else { 0 };
+                c.refine.update(&c.shared, kbps, now);
+            }
+        }
     }
 
-    /// The only cohort with viewers, if there is one, and the keyframes it sent.
-    fn sole_keyframes(&self, views: &[View]) -> Option<(u64, u64)> {
-        let mut with = self
-            .cohorts
-            .iter()
-            .zip(views)
-            .filter(|(_, v)| !v.clients.is_empty());
-        let (c, _) = with.next()?;
-        with.next()
-            .is_none()
-            .then(|| (c.shared.id, c.shared.keyframes.load(Ordering::Acquire)))
-    }
-
-    /// Whether what was encoded so far has reached the viewers. One that hasn't answered
-    /// for a while holds back nobody: flow control deals with it.
-    fn drained(&self, views: &[View]) -> bool {
+    /// Which cohorts have a pass to take from this capture.
+    fn passes(&self, views: &[View], takes: &[bool], now: Instant) -> Vec<bool> {
         self.cohorts
             .iter()
-            .all(|c| c.shared.busy.load(Ordering::Acquire) == 0)
-            && views.iter().flat_map(|v| &v.clients).all(|c| {
-                let (n, age) = c.backlog();
-                n == 0 || age >= REFINE_DRAIN_MS
+            .zip(views)
+            .zip(takes)
+            .map(|((c, v), &take)| take && c.pass_due(v, now))
+            .collect()
+    }
+
+    /// How long until a cohort's pass can come due, in ms.
+    fn refine_wait_ms(&self, views: &[View], now: Instant) -> i32 {
+        self.cohorts
+            .iter()
+            .zip(views)
+            .filter(|(_, v)| !v.clients.is_empty())
+            .map(|(c, _)| match c.refine.burst.due(now) {
+                true => 100,
+                false => c.refine.burst.wait_ms(now),
             })
+            .min()
+            .unwrap_or(100)
+    }
+
+    /// What changed in this capture, for the cohorts with viewers (None: everything).
+    fn mark(&mut self, views: &[View], dirty: Option<&[u8]>) {
+        for (c, v) in self.cohorts.iter_mut().zip(views) {
+            if !v.clients.is_empty() {
+                match dirty {
+                    Some(m) => c.refine.refiner.mark(m),
+                    None => c.refine.refiner.mark_all(),
+                }
+            }
+        }
+    }
+
+    /// The picture moved: every watched cohort's next burst starts over.
+    fn moved(&mut self, views: &[View], now: Instant) {
+        for (c, v) in self.cohorts.iter_mut().zip(views) {
+            if !v.clients.is_empty() {
+                c.refine.burst.moved(now);
+            }
+        }
     }
 
     /// Whether a cohort that skipped damage has room for it now: worth a capture even
     /// when nothing else changed, or that cohort's viewers keep stale regions.
-    fn catch_up_due(&self, views: &[View], interval_ms: f64) -> bool {
+    fn catch_up_due(&self, takes: &[bool]) -> bool {
         self.cohorts
             .iter()
-            .zip(self.takes(views, interval_ms))
-            .any(|(c, take)| take && c.skipped.is_some())
+            .zip(takes)
+            .any(|(c, &take)| take && c.skipped.is_some())
     }
 
-    fn dispatch(&mut self, f: &Frame, views: &[View], takes: &[bool]) {
-        for ((c, v), &take) in self.cohorts.iter_mut().zip(views).zip(takes) {
+    /// Gives each cohort what this capture means for it; `f` is the capture itself.
+    fn dispatch(
+        &mut self,
+        f: &Frame,
+        views: &[View],
+        takes: &[bool],
+        passes: &[bool],
+        now: Instant,
+    ) {
+        let stats = &self.hub.stats;
+        for (((c, v), &take), &pass) in self.cohorts.iter_mut().zip(views).zip(takes).zip(passes) {
             if v.clients.is_empty() {
                 continue;
             }
             if !take {
-                c.skipped = Some(skip(c.skipped.take(), f));
+                if f.band.is_some() {
+                    c.skipped = Some(skip(c.skipped.take(), f));
+                }
                 continue;
             }
-            let frame = match c.skipped.take() {
-                Some(s) => catch_up(s, f.clone()),
-                None => f.clone(),
+            let force = v.want_key;
+            let Some((frame, step)) = c.refine.plan(f, force, c.skipped.is_some(), pass) else {
+                continue;
             };
             let Some(tx) = c.tx.as_ref() else { continue };
-            let force = v.want_key;
+            let frame = match c.skipped.take() {
+                Some(s) => catch_up(s, frame),
+                None => frame,
+            };
             if force {
                 c.shared.idr_inflight.store(true, Ordering::Release);
                 *c.shared.last_key.lock() = Instant::now();
             }
             c.shared.busy.fetch_add(1, Ordering::AcqRel);
-            if let Err(e) = tx.try_send(Job {
+            match tx.try_send(Job {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
             }) {
-                c.shared.busy.fetch_sub(1, Ordering::AcqRel);
-                if force {
-                    c.shared.idr_inflight.store(false, Ordering::Release);
+                Ok(()) => c.refine.sent(step, stats, now),
+                Err(e) => {
+                    c.shared.busy.fetch_sub(1, Ordering::AcqRel);
+                    if force {
+                        c.shared.idr_inflight.store(false, Ordering::Release);
+                    }
+                    let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
+                    if !matches!(step, Step::Pass) && j.frame.band.is_some() {
+                        c.skipped = Some(skip(None, &j.frame));
+                    }
                 }
-                let (mpsc::TrySendError::Full(j) | mpsc::TrySendError::Disconnected(j)) = e;
-                c.skipped = Some(skip(None, &j.frame));
             }
         }
     }
@@ -1296,12 +1381,11 @@ struct Refiner {
     cols: usize,
 }
 
-/// The paint-over after motion: a few passes once the picture has been still for a moment,
-/// none while it keeps changing. New damage starts them over. On a stream with one cohort
-/// the passes are a ladder of QPs; a burst then waits longer after costly ones close
-/// together, and for its share of the bitrate, but isn't dropped, so the picture still
-/// converges once the stops end. Cohorts keep no state of their own to take a ladder at
-/// their own pace, so with two or more a burst is plain passes.
+/// One cohort's paint-over after motion: a few passes once the picture has been still for a
+/// moment, none while it keeps changing. New damage starts them over. An encoder that refines
+/// by QP takes them as a ladder: a burst then waits longer after costly ones close together,
+/// and for its share of the bitrate, but isn't dropped, so the picture still converges once
+/// the stops end. Any other encoder takes plain passes after the fixed delay.
 struct Burst {
     len: u32,
     delay: Duration,
@@ -1316,11 +1400,7 @@ struct Burst {
     refilled: Instant,
     /// The bitrate cap in kbit/s; 0 is uncapped.
     target: u32,
-    /// The sole cohort at the last look, and the keyframes it had sent.
-    keyframes: Option<(u64, u64)>,
-    /// One cohort has viewers.
-    single: bool,
-    /// This burst is a ladder: it started on one cohort and none has joined since.
+    /// The encoder refines by QP.
     ladder: bool,
 }
 
@@ -1355,31 +1435,12 @@ impl Burst {
             tokens: f64::INFINITY,
             refilled: now,
             target: 0,
-            keyframes: None,
-            single: true,
             ladder: true,
         }
     }
     fn moved(&mut self, now: Instant) {
         self.left = self.len;
         self.last_motion = now;
-        self.ladder = self.single;
-    }
-    /// A second cohort ends the ladder for good; what follows the next motion is decided then.
-    fn cohorts(&mut self, with_viewers: usize) {
-        self.single = with_viewers <= 1;
-        self.ladder &= self.single;
-    }
-    /// A keyframe the sole cohort sent is squeezed into the rate cap, so it starts a burst.
-    /// One only asked for says nothing: an encoder that drops them is asked again and again.
-    /// Nor does one from before it was alone.
-    fn keyframe_sent(&mut self, sole: Option<(u64, u64)>, now: Instant) -> bool {
-        let new = matches!((self.keyframes, sole), (Some(a), Some(b)) if a.0 == b.0 && a.1 != b.1);
-        self.keyframes = sole;
-        if new {
-            self.moved(now);
-        }
-        new
     }
     /// Brings the byte budget up to date with what has been sent and the current cap.
     fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
@@ -1421,28 +1482,163 @@ impl Burst {
         if self.left == 0 || !self.funded() {
             return 100;
         }
-        let still = now.saturating_duration_since(self.last_motion);
-        self.gap(now).saturating_sub(still).as_millis() as i32 + 1
+        let still = now.saturating_duration_since(self.last_motion).as_millis();
+        (self.gap(now).as_millis().saturating_sub(still)) as i32 + 1
     }
     fn stop(&mut self) {
         self.left = 0;
     }
-    /// Takes a pass; the last ones of a ladder get the rungs, so any burst length ends at
-    /// the finest.
-    fn pass(&mut self, now: Instant) -> Option<u8> {
-        if !self.ladder {
-            self.left -= 1;
-            return None;
-        }
-        if self.left == self.len {
+    /// The next pass's QP; the last ones of a ladder get the rungs, so any burst length ends
+    /// at the finest.
+    fn rung(&self) -> Option<u8> {
+        let last = REFINE_RUNGS.len() - 1;
+        self.ladder
+            .then(|| REFINE_RUNGS[last.saturating_sub(self.left as usize - 1)])
+    }
+    /// Takes a pass.
+    fn pass(&mut self, now: Instant) {
+        if self.ladder && self.left == self.len {
             let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
             self.backoff = (self.level(now) + costly as u32).min(REFINE_MAX_BACKOFF);
             self.last_burst = Some(now);
             self.spent_at_start = self.spent;
         }
         self.left -= 1;
-        let last = REFINE_RUNGS.len() - 1;
-        Some(REFINE_RUNGS[last.saturating_sub(self.left as usize)])
+    }
+}
+
+/// What a cohort has left to sharpen and how far along it is. Only the capture thread touches
+/// it, and only for this cohort: what the others do can't reach it.
+struct Refinement {
+    burst: Burst,
+    refiner: Refiner,
+    /// The cohort's keyframes as of the last look.
+    keyframes: u64,
+}
+
+/// What a job does to the refinement once it is queued.
+enum Step {
+    Key,
+    Plain,
+    /// Motion that sharpens these blocks too.
+    Piggyback(Vec<u8>),
+    Pass,
+}
+
+impl Refinement {
+    fn new(cfg: &VideoConfig, ladder: bool, w: u32, h: u32) -> Self {
+        let (w, h) = (w as usize, h as usize);
+        let delay = Duration::from_millis(cfg.paintover_delay_ms);
+        Refinement {
+            burst: Burst {
+                ladder,
+                ..Burst::new(cfg.paintover_burst, delay, Instant::now())
+            },
+            refiner: Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16)),
+            keyframes: 0,
+        }
+    }
+
+    /// The last viewer left: the next one starts from nothing.
+    fn reset(&mut self) {
+        let b = &self.burst;
+        self.burst = Burst {
+            ladder: b.ladder,
+            ..Burst::new(b.len, b.delay, Instant::now())
+        };
+        self.refiner.clear_all();
+    }
+
+    /// A keyframe that landed unseen may be what the viewer started on.
+    fn rearm(&mut self) {
+        self.burst.moved(Instant::now());
+        self.refiner.mark_all();
+    }
+
+    /// With no viewers nothing the encoder still finishes counts for anyone.
+    fn baseline(&mut self, sh: &Shared) {
+        self.keyframes = sh.keyframes.load(Ordering::Acquire);
+        self.burst.spent = sh.paintover_bytes.load(Ordering::Acquire);
+        self.burst.spent_at_start = self.burst.spent;
+    }
+
+    /// A keyframe that went out is squeezed into the rate cap, so it starts a ladder. One only
+    /// asked for says nothing: an encoder that drops them is asked again and again.
+    fn update(&mut self, sh: &Shared, kbps: u32, now: Instant) {
+        if self.burst.ladder {
+            self.burst
+                .account(now, kbps, sh.paintover_bytes.load(Ordering::Acquire));
+            let sent = sh.keyframes.load(Ordering::Acquire);
+            if sent != self.keyframes {
+                self.keyframes = sent;
+                self.burst.moved(now);
+                self.refiner.mark_all();
+            }
+        }
+        // Nothing pending, nothing to send.
+        if self.burst.due(now) && !self.refiner.any_pending() {
+            self.burst.stop();
+        }
+    }
+
+    /// What capture `f` means for this cohort, if anything. Changes nothing: `sent` does, once
+    /// the job is queued.
+    fn plan(&self, f: &Frame, key: bool, skipped: bool, pass: bool) -> Option<(Frame, Step)> {
+        let mut out = f.clone();
+        if key {
+            out.mb_dirty = None;
+            return Some((out, Step::Key));
+        }
+        if skipped {
+            return Some((out, Step::Plain));
+        }
+        if let Some(b) = f.band {
+            // Piggyback sharpening of blocks that have gone still on this frame: it encodes
+            // what moved plus what is due, and everything else stays skipped.
+            let Some((due, band)) = self.refiner.due() else {
+                return Some((out, Step::Plain));
+            };
+            let mut m = f
+                .mb_dirty
+                .as_ref()
+                .map_or_else(|| vec![1; due.len()], |m| m.to_vec());
+            for (d, r) in m.iter_mut().zip(&due) {
+                *d |= r;
+            }
+            out.band = Some(union(Some(b), band));
+            out.mb_dirty = Some(Arc::new(m));
+            out.paintover = true;
+            return Some((out, Step::Piggyback(due)));
+        }
+        if !pass {
+            return None;
+        }
+        let (m, band) = self.refiner.pending_map()?;
+        out.band = Some(band);
+        out.mb_dirty = Some(Arc::new(m));
+        out.paintover = true;
+        out.paintover_final = self.burst.left == 1;
+        out.refine_qp = self.burst.rung();
+        Some((out, Step::Pass))
+    }
+
+    fn sent(&mut self, step: Step, stats: &Stats, now: Instant) {
+        match step {
+            // A keyframe is squeezed into the rate cap; sharpen all of it once still.
+            Step::Key => self.refiner.mark_all(),
+            Step::Plain => {}
+            Step::Piggyback(due) => {
+                self.refiner.taken(&due);
+                stats.refines.fetch_add(1, Ordering::Relaxed);
+            }
+            Step::Pass => {
+                self.burst.pass(now);
+                stats.paintovers.fetch_add(1, Ordering::Relaxed);
+                if self.burst.left == 0 {
+                    self.refiner.clear_all();
+                }
+            }
+        }
     }
 }
 
@@ -1504,8 +1700,11 @@ impl Refiner {
             )
         })
     }
+    fn any_pending(&self) -> bool {
+        self.pending.iter().any(|&p| p)
+    }
     /// Blocks due for sharpening (1 = refine) and the row band they span.
-    fn due(&mut self) -> Option<(Vec<u8>, Band)> {
+    fn due(&self) -> Option<(Vec<u8>, Band)> {
         if self.last_refine.elapsed() < REFINE_EVERY {
             return None;
         }
@@ -1515,24 +1714,28 @@ impl Refiner {
         for (i, m) in map.iter_mut().enumerate() {
             if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS {
                 *m = 1;
-                self.pending[i] = false;
                 let row = i / self.cols;
                 r0 = r0.min(row);
                 r1 = r1.max(row + 1);
                 any = true;
             }
         }
-        if !any {
-            return None;
+        any.then(|| {
+            (
+                map,
+                Band {
+                    y0: (r0 * 16) as u32,
+                    y1: (r1 * 16) as u32,
+                },
+            )
+        })
+    }
+    /// The blocks of `due` went out.
+    fn taken(&mut self, due: &[u8]) {
+        for (p, &d) in self.pending.iter_mut().zip(due) {
+            *p &= d == 0;
         }
         self.last_refine = Instant::now();
-        Some((
-            map,
-            Band {
-                y0: (r0 * 16) as u32,
-                y1: (r1 * 16) as u32,
-            },
-        ))
     }
 }
 
@@ -1557,14 +1760,8 @@ fn capture_loop(
     let min_interval = interval.mul_f64(0.85);
     let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
-    let mut burst = Burst::new(
-        cfg.paintover_burst,
-        Duration::from_millis(cfg.paintover_delay_ms),
-        Instant::now(),
-    );
     let mut had_clients = false;
     let mut full_next = true;
-    let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
     let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
 
     loop {
@@ -1614,29 +1811,16 @@ fn capture_loop(
             full_next = true;
         }
         let now = Instant::now();
-        burst.account(
-            now,
-            // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
-            match cfg.max_kbps {
-                0 => 0,
-                _ => hub.target_kbps.load(Ordering::Relaxed),
-            },
-            hub.stats.paintover_bytes.load(Ordering::Relaxed),
-        );
-        burst.cohorts(eng.with_viewers(&views));
-        if burst.keyframe_sent(eng.sole_keyframes(&views), now) {
-            refiner.mark_all();
-        }
-        // One pass in flight at most: what a viewer types next never waits behind two.
-        let mut paintover_due = burst.due(now) && (!burst.ladder || eng.drained(&views));
-        let catch_up = eng.catch_up_due(&views, interval_ms);
+        eng.update_refinement(&views, now);
+        let takes = eng.takes(&views, interval_ms);
+        let passes = eng.passes(&views, &takes, now);
+        let paintover_due = passes.iter().any(|&p| p);
+        let catch_up = eng.catch_up_due(&takes);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
-            let timeout = if burst.due(now) {
-                100
-            } else {
-                burst.wait_ms(now)
-            };
-            wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
+            wait_any(
+                &[cap.fd(), hub.waker.waitable()],
+                eng.refine_wait_ms(&views, now),
+            );
             continue;
         }
         let since = last_capture.elapsed();
@@ -1658,7 +1842,6 @@ fn capture_loop(
                 continue;
             }
         }
-        let takes = eng.takes(&views, interval_ms);
         if !takes.iter().any(|&t| t) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
@@ -1676,15 +1859,12 @@ fn capture_loop(
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
         let mut band = None;
-        let mut mb_dirty = (!full_next).then(|| cap.take_mb_map());
+        let mb_dirty = (!full_next).then(|| cap.take_mb_map());
         if full_next {
             cap.take_mb_map();
             full_next = false;
         }
-        match &mb_dirty {
-            Some(m) => refiner.mark(m),
-            None => refiner.mark_all(),
-        }
+        eng.mark(&views, mb_dirty.as_deref());
         if cap.damaged {
             band = cap.take_damage()?;
             if let Some(b) = band {
@@ -1709,22 +1889,6 @@ fn capture_loop(
             // Damage was empty after all.
             continue;
         }
-        // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
-        let paint_map = if paintover_due && !is_motion && !want_key {
-            match refiner.pending_map() {
-                Some(m) => Some(m),
-                None => {
-                    burst.stop();
-                    if !catch_up {
-                        continue;
-                    }
-                    paintover_due = false;
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let buf = pool.fill(idx, band, |b, t| {
             cap.convert(b, t.y0 as usize, t.y1 as usize, cfg.convert_threads)
         });
@@ -1737,68 +1901,25 @@ fn capture_loop(
             .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
-        let mut refine = None;
-        let mut refine_qp = None;
-        let paintover = if is_motion {
-            burst.moved(t0);
-            // Piggyback sharpening of blocks that have gone still on this frame.
-            refine = if want_key { None } else { refiner.due() };
-            refine.is_some()
-        } else if paintover_due {
-            refine_qp = burst.pass(t0);
-            hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        };
-        if want_key {
-            // A keyframe is squeezed into the rate cap; sharpen all of it once still.
-            refiner.mark_all();
+        if is_motion {
+            eng.moved(&views, Instant::now());
         }
-        let frame_paintover = paintover && refine.is_none();
-        let paintover_final = frame_paintover && burst.left == 0;
-        if paintover_final {
-            refiner.clear_all();
-        }
-        // A refinement frame encodes what moved plus what is due; everything else stays skipped.
-        let mb_map = if want_key {
-            None
-        } else if frame_paintover {
-            paint_map.map(|(m, b)| {
-                band = Some(match band {
-                    Some(x) => union(Some(x), b),
-                    None => b,
-                });
-                Arc::new(m)
-            })
-        } else if let Some((rmap, rband)) = refine.take() {
-            band = Some(match band {
-                Some(b) => union(Some(b), rband),
-                None => rband,
-            });
-            let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
-            for (d, r) in m.iter_mut().zip(rmap) {
-                *d |= r;
-            }
-            hub.stats.refines.fetch_add(1, Ordering::Relaxed);
-            Some(Arc::new(m))
-        } else {
-            mb_dirty.take().map(Arc::new)
-        };
         last_capture = t0;
         eng.dispatch(
             &Frame {
                 buf,
-                paintover,
-                paintover_final,
-                refine_qp,
-                mb_dirty: mb_map,
+                paintover: false,
+                paintover_final: false,
+                refine_qp: None,
+                mb_dirty: mb_dirty.map(Arc::new),
                 band,
                 captured_at: origin,
                 marker_ms,
             },
             &views,
             &takes,
+            &passes,
+            t0,
         );
     }
 }
@@ -2188,8 +2309,7 @@ fn encode_loop(
         // controller reins the total in if several stripes move at once.
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
-        let single = hub.viewer_cohorts.load(Ordering::Acquire) <= 1;
-        let refine = job.refine_qp.filter(|_| single).map(|qp| {
+        let refine = job.refine_qp.map(|qp| {
             let bytes = target as usize * REFINE_FRAME_MS / 8 / n;
             (qp, (!uncapped).then_some(bytes))
         });
@@ -2286,6 +2406,8 @@ fn encode_loop(
             hub.stats
                 .paintover_bytes
                 .fetch_add(total as u64, Ordering::Relaxed);
+            sh.paintover_bytes
+                .fetch_add(total as u64, Ordering::Release);
         }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
