@@ -4,7 +4,7 @@
 #   run.sh once <arm> <workload> <kbps> [preset] [crf]    one `bench` line + one `score` line
 #   run.sh search <arm> <workload> <target_db> [preset] [crf]    lowest rate reaching the target
 #   run.sh rounds <file> [n]    interleaved `once` lines
-# Env: FRAMES (300), THREADS (4), METRIC, LO, HI, DUMP_DIR, KEEP=<dir> for the per-frame logs. Needs ffmpeg and the arm's feature built:
+# Env: FRAMES (300), THREADS (4), METRIC, LO, HI, TOL (hi - lo stops under lo / TOL), DUMP_DIR, KEEP=<dir> for the per-frame logs. Needs ffmpeg and the arm's feature built:
 # BIN=$(cargo test --release --features <features> --lib --no-run ... ), see bench/arms/README.
 set -euo pipefail
 bin=${BIN:?the test binary}
@@ -53,7 +53,7 @@ once() {
 search() {
 	local arm=$1 workload=$2 target=$3 preset=${4:-} crf=${5:-10} lo=${LO:-250} hi=${HI:-64000} best=none got=none
 	local metric=${METRIC:-ssim_db} total=none
-	while ((hi - lo > lo / 8)); do
+	while ((hi - lo > lo / ${TOL:-8})); do
 		local mid=$(((lo + hi) / 2)) out db
 		out=$(once "$arm" "$workload" "$mid" "$preset" "$crf")
 		echo "$out"
