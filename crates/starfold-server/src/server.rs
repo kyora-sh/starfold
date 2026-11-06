@@ -445,6 +445,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
     }
     let input = |ev: InputEvent| {
         if let Some(tx) = s.hub.input.lock().as_ref() {
+            s.hub.note_input();
             let _ = tx.send(ev);
         }
     };

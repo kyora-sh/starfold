@@ -346,6 +346,7 @@ fn whole(w: u32, h: u32) -> Frame {
         paintover: false,
         paintover_final: false,
         refine_tail: false,
+        refine_idle: false,
         refine_qp: None,
         band: Some(Band { y0: 0, y1: h }),
         mb_dirty: None,
@@ -1388,6 +1389,7 @@ fn skipped_damage_is_caught_up() {
         paintover: false,
         paintover_final: false,
         refine_tail: false,
+        refine_idle: false,
         refine_qp: None,
         band,
         mb_dirty: mb.map(Arc::new),
@@ -2700,6 +2702,145 @@ fn a_picture_too_dense_for_a_ladder_pass_still_gets_its_tail() {
     let mut want = vec![(20, ladder), (16, ladder), (12, ladder)];
     want.extend([(12, tail); 6]);
     assert_eq!(passes, want);
+}
+
+/// A legacy viewer on OpenH264 with `left` passes' worth to sharpen (each step needing at
+/// least `step` bytes, if given), its keyframe acked; motion at the returned instant.
+fn refining_from(
+    left: usize,
+    step: Option<usize>,
+) -> (
+    Arc<Hub>,
+    Engine,
+    Arc<Client>,
+    UnboundedReceiver<Out>,
+    Refines,
+    Instant,
+) {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+        h264_step_bytes: step,
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let t = Instant::now();
+    capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+    acked(&c, &mut rx);
+    seen.lock().unwrap().clear();
+    (hub, eng, c, rx, seen, t)
+}
+
+/// Still turns 100 ms apart from `from` to `to`, each acked; the passes they took, and when.
+fn still_until(
+    eng: &mut Engine,
+    c: &Client,
+    rx: &mut UnboundedReceiver<Out>,
+    seen: &Refines,
+    from: Instant,
+    to: Instant,
+) -> Vec<(Duration, Option<usize>)> {
+    let mut out = Vec::new();
+    let mut t = from;
+    while t < to {
+        t += Duration::from_millis(100);
+        let before = seen.lock().unwrap().len();
+        capture(eng, W, H, None, t);
+        acked(c, rx);
+        for r in seen.lock().unwrap()[before..].iter().filter_map(|r| r.0) {
+            out.push((t - from, r.max_bytes));
+        }
+    }
+    out
+}
+
+/// What a viewer types next waits behind one pass at most: while input or damage is recent,
+/// every pass, tail ones included, keeps to the ladder's budget; only an idle screen gets the
+/// tail's.
+#[test]
+fn a_pass_while_input_or_damage_is_recent_stays_ladder_sized() {
+    let per_s = START_KBPS as usize * 1000 / 8;
+    let (ladder, tail) = (Some(per_s / 5 * 55 / 100), Some(per_s * 55 / 100));
+    let (hub, mut eng, c, mut rx, seen, t) = refining_from(200, None);
+    let busy = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t,
+        t + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert!(busy.len() > 3, "the tail ran while busy: {busy:?}");
+    assert!(busy.iter().all(|p| p.1 == ladder), "{busy:?}");
+    let idle = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t + REFINE_IDLE,
+        t + REFINE_IDLE * 2,
+    );
+    assert!(
+        !idle.is_empty() && idle.iter().all(|p| p.1 == tail),
+        "{idle:?}"
+    );
+    // Input with nothing on screen to show for it yet counts as much as damage.
+    let typed = t + REFINE_IDLE * 2;
+    *hub.input_at.lock() = Some(typed);
+    let after = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        typed,
+        typed + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert!(
+        !after.is_empty() && after.iter().all(|p| p.1 == ladder),
+        "{after:?}"
+    );
+}
+
+/// Dense text: no step fits a ladder pass. While busy no tail pass is taken at all; once the
+/// screen has been idle for REFINE_IDLE the tail runs at its budget until nothing is left.
+#[test]
+fn a_dense_picture_waits_for_idle_then_converges() {
+    let per_s = START_KBPS as usize * 1000 / 8;
+    let tail = Some(per_s * 55 / 100);
+    let (_hub, mut eng, c, mut rx, seen, t) = refining_from(6, Some(per_s / 2 * 55 / 100));
+    let busy = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t,
+        t + REFINE_IDLE - Duration::from_millis(100),
+    );
+    assert_eq!(
+        busy.len(),
+        3,
+        "the ladder, and no tail while busy: {busy:?}"
+    );
+    let idle = still_until(
+        &mut eng,
+        &c,
+        &mut rx,
+        &seen,
+        t + REFINE_IDLE - Duration::from_millis(100),
+        t + REFINE_IDLE * 3,
+    );
+    assert_eq!(idle.len(), 6, "{idle:?}");
+    assert!(idle.iter().all(|p| p.1 == tail), "{idle:?}");
+    assert!(
+        !eng.cohorts[0].refine.refiner.any_pending(),
+        "converged and quiet"
+    );
 }
 
 #[test]

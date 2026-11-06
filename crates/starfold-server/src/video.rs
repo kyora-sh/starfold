@@ -58,6 +58,8 @@ struct Frame {
     refine_qp: Option<u8>,
     /// A pass after the ladder: its bytes don't count against the refinement share.
     refine_tail: bool,
+    /// A tail pass on a screen idle for REFINE_IDLE: it may take the tail's budget.
+    refine_idle: bool,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -227,8 +229,10 @@ struct Shared {
     keyframes: AtomicU64,
     /// What this cohort's refining passes cost, tail passes left out.
     paintover_bytes: AtomicU64,
-    /// The last refining pass left something its successor could still sharpen.
+    /// The last refining pass left something a tail pass could still sharpen, at the tail's
+    /// budget and at the ladder's.
     refinable: AtomicBool,
+    refinable_small: AtomicBool,
     w: u32,
     h: u32,
 }
@@ -698,6 +702,7 @@ impl Engine {
             keyframes: AtomicU64::new(0),
             paintover_bytes: AtomicU64::new(0),
             refinable: AtomicBool::new(true),
+            refinable_small: AtomicBool::new(true),
             w: self.w,
             h: self.h,
         });
@@ -1026,11 +1031,12 @@ impl Engine {
     /// Brings each watched cohort's refinement up to date with what its encoder did.
     fn update_refinement(&mut self, views: &[View], now: Instant) {
         let capped = self.cfg.max_kbps != 0;
+        let input_at = *self.hub.input_at.lock();
         for (c, v) in self.cohorts.iter_mut().zip(views) {
             if !v.clients.is_empty() {
                 // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
                 let kbps = if capped { c.rc.target as u32 } else { 0 };
-                c.refine.update(&c.shared, kbps, now);
+                c.refine.update(&c.shared, kbps, now, input_at);
             }
         }
     }
@@ -1095,6 +1101,7 @@ impl Engine {
         if f.band.is_some() {
             self.moved(views, now);
         }
+        let input_at = *self.hub.input_at.lock();
         let stats = &self.hub.stats;
         let plans = turn.takes.iter().zip(&turn.passes);
         for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
@@ -1108,9 +1115,10 @@ impl Engine {
                 continue;
             }
             let force = v.want_key;
-            let Some((frame, step)) = c.refine.plan(f, force, c.skipped.is_some(), pass) else {
+            let Some((mut frame, step)) = c.refine.plan(f, force, c.skipped.is_some(), pass) else {
                 continue;
             };
+            frame.refine_idle = frame.refine_tail && !c.refine.active(now, input_at);
             let Some(tx) = c.tx.as_ref() else { continue };
             let frame = match c.skipped.take() {
                 Some(s) => catch_up(s, frame),
@@ -1449,8 +1457,11 @@ const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
 /// The most of the bitrate cap a ladder pass may take. Ladder passes count against the share,
 /// so a stop leaves little debt and the burst after the next one isn't kept waiting.
 const REFINE_LADDER_MS: usize = 200;
-/// The most of the bitrate cap a tail pass may take; the viewer waits for it.
+/// The most of the bitrate cap a tail pass may take on an idle screen; the viewer waits for it.
 const REFINE_FRAME_MS: usize = 1000;
+/// Input or damage this recent keeps tail passes to the ladder's size, so what is typed next
+/// never waits behind a large one.
+const REFINE_IDLE: Duration = Duration::from_secs(2);
 /// The share of that a pass is planned at: estimates of one picture's cost were off by up to
 /// 1.8x on dense text, so a pass stays within the cap unless one is off by more.
 const REFINE_PLAN_PCT: usize = 55;
@@ -1631,7 +1642,13 @@ impl Refinement {
 
     /// A keyframe that went out is squeezed into the rate cap, so it starts a ladder. One only
     /// asked for says nothing: an encoder that drops them is asked again and again.
-    fn update(&mut self, sh: &Shared, kbps: u32, now: Instant) {
+    /// Input or damage came within REFINE_IDLE of `now`.
+    fn active(&self, now: Instant, input_at: Option<Instant>) -> bool {
+        let last = input_at.map_or(self.burst.last_motion, |i| i.max(self.burst.last_motion));
+        now.saturating_duration_since(last) < REFINE_IDLE
+    }
+
+    fn update(&mut self, sh: &Shared, kbps: u32, now: Instant, input_at: Option<Instant>) {
         if self.burst.ladder {
             self.burst
                 .account(now, kbps, sh.paintover_bytes.load(Ordering::Acquire));
@@ -1647,12 +1664,20 @@ impl Refinement {
             self.burst.stop();
         }
         // The last pass has landed: another if the encoder has room for one, else done.
+        // While input or damage is recent, a tail pass gets only the ladder's budget: one that
+        // only the tail's would fit waits for the screen to go idle.
         self.settling &= self.burst.left == 0;
         if self.settling && sh.busy.load(Ordering::Acquire) == 0 {
-            self.settling = false;
-            match sh.refinable.load(Ordering::Acquire) && self.burst.tail < REFINE_TAIL_MAX {
-                true => self.burst.more(),
-                false => {
+            let more = sh.refinable.load(Ordering::Acquire) && self.burst.tail < REFINE_TAIL_MAX;
+            let fits = !self.active(now, input_at) || sh.refinable_small.load(Ordering::Acquire);
+            match (more, fits) {
+                (true, true) => {
+                    self.settling = false;
+                    self.burst.more();
+                }
+                (true, false) => {}
+                (false, _) => {
+                    self.settling = false;
                     self.burst.stop();
                     self.refiner.clear_all();
                 }
@@ -1985,6 +2010,7 @@ fn capture_loop(
                 paintover: false,
                 paintover_final: false,
                 refine_tail: false,
+                refine_idle: false,
                 refine_qp: None,
                 mb_dirty: mb_dirty.map(Arc::new),
                 band,
@@ -2050,10 +2076,19 @@ struct StripeJob {
     boost: bool,
     crf: f32,
     cap: u32,
-    /// The pass's QP, what its frame may cost, and what a tail pass after it may.
-    refine: Option<(u8, Option<usize>, Option<usize>)>,
+    refine: Option<PassBudget>,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
+}
+
+/// A refining pass's QP, what its frame may cost, and what a tail pass after it may on a busy
+/// and on an idle screen (None: uncapped).
+#[derive(Clone, Copy)]
+struct PassBudget {
+    qp: u8,
+    max_bytes: Option<usize>,
+    busy: Option<usize>,
+    idle: Option<usize>,
 }
 
 struct StripeResult {
@@ -2062,8 +2097,10 @@ struct StripeResult {
     out: Option<(bool, Vec<u8>)>,
     config: Option<StreamConfig>,
     failed: bool,
-    /// A refining pass left something the next one at the last rung could sharpen.
+    /// A refining pass left something a tail pass could still sharpen, at the tail's budget and
+    /// at the ladder's.
     refinable: bool,
+    refinable_small: bool,
 }
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
@@ -2216,7 +2253,10 @@ fn stripe_worker(
             EncodeOptions {
                 pts_ms: job.ts,
                 force_keyframe: job.force_idr,
-                refine: refine.map(|(qp, max_bytes, _)| Refine { qp, max_bytes }),
+                refine: refine.map(|b| Refine {
+                    qp: b.qp,
+                    max_bytes: b.max_bytes,
+                }),
                 static_mbs: info.as_deref_mut(),
             },
         );
@@ -2304,17 +2344,20 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
-        let refinable = refine.is_some_and(|(_, _, max_bytes)| {
+        let can = |max_bytes| {
             s.enc.refinable(Refine {
                 qp: REFINE_RUNGS[REFINE_RUNGS.len() - 1],
                 max_bytes,
             })
-        });
+        };
+        let (refinable, refinable_small) =
+            refine.map_or((false, false), |b| (can(b.idle), can(b.busy)));
         let r = StripeResult {
             i,
             out: res,
             config,
             refinable,
+            refinable_small,
             failed,
         };
         if done.send(r).is_err() {
@@ -2384,6 +2427,7 @@ fn encode_loop(
         if !selected.iter().any(|&x| x) {
             if job.refine_qp.is_some() {
                 sh.refinable.store(false, Ordering::Release);
+                sh.refinable_small.store(false, Ordering::Release);
             }
             drop(job);
             finish(force_idr);
@@ -2398,11 +2442,16 @@ fn encode_loop(
         let budget =
             |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);
         let refine = job.refine_qp.map(|qp| {
-            let ms = match job.refine_tail {
+            let ms = match job.refine_tail && job.refine_idle {
                 true => REFINE_FRAME_MS,
                 false => REFINE_LADDER_MS,
             };
-            (qp, budget(ms), budget(REFINE_FRAME_MS))
+            PassBudget {
+                qp,
+                max_bytes: budget(ms),
+                busy: budget(REFINE_LADDER_MS),
+                idle: budget(REFINE_FRAME_MS),
+            }
         });
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let mut pending = 0;
@@ -2431,10 +2480,12 @@ fn encode_loop(
         let mut configs: Vec<Option<StreamConfig>> = (0..n).map(|_| None).collect();
         let mut failed = false;
         let mut refinable = vec![false; n];
+        let mut refinable_small = false;
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
                 refinable[r.i] = r.refinable;
+                refinable_small |= r.refinable_small;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
                 results[r.i] = r.out;
                 configs[r.i] = r.config;
@@ -2443,6 +2494,7 @@ fn encode_loop(
         if job.refine_qp.is_some() {
             sh.refinable
                 .store(refinable.contains(&true), Ordering::Release);
+            sh.refinable_small.store(refinable_small, Ordering::Release);
         }
         let worst = fails.iter().copied().max().unwrap_or(0);
         sh.failures.store(worst, Ordering::Release);
