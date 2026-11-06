@@ -69,6 +69,8 @@ struct Fake {
     refines: Option<Refines>,
     /// A requested keyframe comes out as nothing at all.
     empty_keys: bool,
+    /// Refining passes this encoder still has something to sharpen with (None: none).
+    refinable: Option<Arc<AtomicUsize>>,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -99,6 +101,9 @@ impl VideoEncoder for Fake {
         self.n += 1;
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
+        }
+        if let (Some(left), Some(_)) = (&self.refinable, opts.refine) {
+            let _ = left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         }
         if let (Some(k), true) = (&self.keys, opts.force_keyframe) {
             k.0.fetch_add(1, Ordering::Relaxed);
@@ -137,6 +142,12 @@ impl VideoEncoder for Fake {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
     }
+
+    fn refinable(&self, _: Refine) -> bool {
+        self.refinable
+            .as_ref()
+            .is_some_and(|n| n.load(Ordering::Relaxed) > 0)
+    }
 }
 
 #[derive(Default)]
@@ -167,6 +178,8 @@ struct Opts {
     refines: Option<Refines>,
     /// H.264 cohorts' encoders drop every keyframe (the offer's sample encode still works).
     h264_empty_keys: bool,
+    /// Refining passes the first H.264 stripe's encoder has something to sharpen with.
+    h264_refinable: Option<Arc<AtomicUsize>>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -196,6 +209,7 @@ fn fakes(o: Opts) -> Open {
                 kbps: 0,
                 refines: o.refines.clone(),
                 empty_keys: false,
+                refinable: None,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -236,6 +250,7 @@ fn fakes(o: Opts) -> Open {
             kbps: 0,
             refines: o.refines.clone().filter(|_| !hevc),
             empty_keys: o.h264_empty_keys && !hevc && h264 > 0,
+            refinable: o.h264_refinable.clone().filter(|_| !hevc && h264 == 1),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -300,6 +315,7 @@ fn whole(w: u32, h: u32) -> Frame {
         buf: Arc::new(I420::new(w as usize, h as usize)),
         paintover: false,
         paintover_final: false,
+        refine_tail: false,
         refine_qp: None,
         band: Some(Band { y0: 0, y1: h }),
         mb_dirty: None,
@@ -1341,6 +1357,7 @@ fn skipped_damage_is_caught_up() {
         buf: Arc::new(I420::new(32, 32)),
         paintover: false,
         paintover_final: false,
+        refine_tail: false,
         refine_qp: None,
         band,
         mb_dirty: mb.map(Arc::new),
@@ -2355,13 +2372,144 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
         refine,
         Some(Refine {
             qp: 20,
-            max_bytes: Some(start * REFINE_FRAME_MS / 8),
+            max_bytes: Some(start * REFINE_FRAME_MS / 8 * REFINE_PLAN_PCT / 100),
         })
     );
     assert_ne!(
         kbps,
         stripe_share(START_KBPS as u32, 1) * 2,
         "paint-over rate applied"
+    );
+}
+
+/// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
+/// the QP of every pass over `turns` still turns, each acked.
+fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {
+    let seen = Refines::default();
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[H264],
+        Opts {
+            refines: Some(seen.clone()),
+            h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    seen.lock().unwrap().clear();
+    for i in 0..turns {
+        if motion_at == Some(i) {
+            t += Duration::from_secs(60);
+            capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+        } else {
+            still(&mut eng, &mut t);
+        }
+        acked(&c, &mut rx);
+    }
+    let got = seen.lock().unwrap();
+    got.iter().filter_map(|(r, _)| r.map(|r| r.qp)).collect()
+}
+
+#[test]
+fn a_still_picture_is_refined_until_the_encoder_has_nothing_left() {
+    assert_eq!(tail(6, 20, None), [20, 16, 12, 12, 12, 12]);
+    assert_eq!(tail(0, 20, None), [20, 16, 12], "the ladder still runs");
+}
+
+#[test]
+fn new_damage_cancels_the_tail() {
+    assert_eq!(tail(100, 8, Some(5)), [20, 16, 12, 12, 20, 16]);
+}
+
+#[test]
+fn the_tail_has_a_limit() {
+    let qps = tail(1000, 200, None);
+    assert_eq!(qps.len(), 3 + REFINE_TAIL_MAX as usize);
+    assert!(qps[2..].iter().all(|&q| q == 12));
+}
+
+/// A legacy viewer on OpenH264 over `cfg`, its first stripe's encoder with `left` refining
+/// passes' worth to sharpen, the keyframe acked and its ladder started.
+fn refining(
+    cfg: VideoConfig,
+    left: &Arc<AtomicUsize>,
+) -> (
+    Arc<Hub>,
+    Engine,
+    Arc<Client>,
+    UnboundedReceiver<Out>,
+    Instant,
+) {
+    let hub = Hub::new();
+    let opts = Opts {
+        h264_refinable: Some(left.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264], fakes(opts)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    acked(&c, &mut rx);
+    (hub, eng, c, rx, t)
+}
+
+#[test]
+fn tail_bytes_cost_the_next_burst_nothing() {
+    let left = Arc::new(AtomicUsize::new(10));
+    let (hub, mut eng, c, mut rx, mut t) = refining(config(), &left);
+    for _ in 0..3 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    let charged = eng.cohorts[0]
+        .shared
+        .paintover_bytes
+        .load(Ordering::Acquire);
+    let sent = hub.stats.paintover_bytes.load(Ordering::Relaxed);
+    assert!(charged > 0, "the ladder is charged");
+    for _ in 0..20 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    assert_eq!(left.load(Ordering::Relaxed), 0, "the tail ran");
+    assert!(hub.stats.paintover_bytes.load(Ordering::Relaxed) > sent);
+    assert_eq!(
+        eng.cohorts[0]
+            .shared
+            .paintover_bytes
+            .load(Ordering::Acquire),
+        charged,
+        "the tail is not"
+    );
+}
+
+/// The top stripe's blocks were sharpened on a motion frame (no longer pending), yet its
+/// encoder can still sharpen: the tail keeps reaching it until it can't.
+#[test]
+fn the_tail_reaches_every_stripe_that_can_still_sharpen() {
+    let left = Arc::new(AtomicUsize::new(8));
+    let (_hub, mut eng, c, mut rx, mut t) = refining(two_stripes(), &left);
+    let (cols, rows) = (W.div_ceil(16) as usize, H.div_ceil(16) as usize);
+    let r = &mut eng.cohorts[0].refine.refiner;
+    for (i, p) in r.pending.iter_mut().enumerate() {
+        *p &= i / cols >= rows / 2;
+    }
+    for _ in 0..30 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    assert_eq!(left.load(Ordering::Relaxed), 0);
+    assert!(
+        !eng.cohorts[0].refine.refiner.any_pending(),
+        "then it stops"
     );
 }
 

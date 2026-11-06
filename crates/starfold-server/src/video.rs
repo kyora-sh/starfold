@@ -56,6 +56,8 @@ struct Frame {
     paintover_final: bool,
     /// The QP a backend that refines by QP aims for: only once motion has stopped.
     refine_qp: Option<u8>,
+    /// A pass after the ladder: its bytes don't count against the refinement share.
+    refine_tail: bool,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -223,8 +225,10 @@ struct Shared {
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
     keyframes: AtomicU64,
-    /// What this cohort's refining passes cost.
+    /// What this cohort's refining passes cost, tail passes left out.
     paintover_bytes: AtomicU64,
+    /// The last refining pass left something its successor could still sharpen.
+    refinable: AtomicBool,
     w: u32,
     h: u32,
 }
@@ -693,6 +697,7 @@ impl Engine {
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             keyframes: AtomicU64::new(0),
             paintover_bytes: AtomicU64::new(0),
+            refinable: AtomicBool::new(true),
             w: self.w,
             h: self.h,
         });
@@ -1434,12 +1439,18 @@ struct Burst {
     target: u32,
     /// The encoder refines by QP.
     ladder: bool,
+    /// Last-rung passes after the ladder, while the encoder still has something one of them
+    /// could sharpen: they fill an idle link, so their bytes aren't counted in `spent`.
+    tail: u32,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
 const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
 /// The most of the bitrate cap one refining frame may take; the viewer waits for it.
-const REFINE_FRAME_MS: usize = 200;
+const REFINE_FRAME_MS: usize = 1000;
+/// The share of that a pass is planned at: estimates of one picture's cost were off by up to
+/// 1.8x on dense text, so a pass stays within the cap unless one is off by more.
+const REFINE_PLAN_PCT: usize = 55;
 /// A burst this cheap (a cursor, a typed glyph) doesn't count towards backing off.
 const REFINE_CHEAP_BYTES: u64 = 32 * 1024;
 const REFINE_MAX_BACKOFF: u32 = 4;
@@ -1452,6 +1463,9 @@ const REFINE_SHARE: f64 = 0.10;
 const REFINE_WINDOW_S: f64 = 10.0;
 /// The longest a pass waits for the last one to arrive.
 const REFINE_DRAIN_MS: u128 = 1000;
+/// The most last-rung passes one still picture gets: an estimate that never settles can't
+/// keep a link busy.
+const REFINE_TAIL_MAX: u32 = 64;
 
 impl Burst {
     fn new(len: u32, delay: Duration, now: Instant) -> Self {
@@ -1468,10 +1482,12 @@ impl Burst {
             refilled: now,
             target: 0,
             ladder: true,
+            tail: 0,
         }
     }
     fn moved(&mut self, now: Instant) {
         self.left = self.len;
+        self.tail = 0;
         self.last_motion = now;
     }
     /// Brings the byte budget up to date with what has been sent and the current cap.
@@ -1502,7 +1518,11 @@ impl Burst {
     }
     /// Only a burst's first pass waits for budget: one under way finishes.
     fn funded(&self) -> bool {
-        !self.ladder || self.left < self.len || self.target == 0 || self.tokens > 0.0
+        !self.ladder
+            || self.left < self.len
+            || self.tail > 0
+            || self.target == 0
+            || self.tokens > 0.0
     }
     fn due(&self, now: Instant) -> bool {
         self.left > 0
@@ -1519,6 +1539,7 @@ impl Burst {
     }
     fn stop(&mut self) {
         self.left = 0;
+        self.tail = 0;
     }
     /// The next pass's QP; the last ones of a ladder get the rungs, so any burst length ends
     /// at the finest.
@@ -1529,13 +1550,18 @@ impl Burst {
     }
     /// Takes a pass.
     fn pass(&mut self, now: Instant) {
-        if self.ladder && self.left == self.len {
+        if self.ladder && self.left == self.len && self.tail == 0 {
             let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
             self.backoff = (self.level(now) + costly as u32).min(REFINE_MAX_BACKOFF);
             self.last_burst = Some(now);
             self.spent_at_start = self.spent;
         }
         self.left -= 1;
+    }
+    /// One more pass at the last rung.
+    fn more(&mut self) {
+        self.left = 1;
+        self.tail += 1;
     }
 }
 
@@ -1546,6 +1572,8 @@ struct Refinement {
     refiner: Refiner,
     /// The cohort's keyframes as of the last look.
     keyframes: u64,
+    /// A ladder's last pass is with the encoder.
+    settling: bool,
 }
 
 /// What a job does to the refinement once it is queued.
@@ -1568,6 +1596,7 @@ impl Refinement {
             },
             refiner: Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16)),
             keyframes: 0,
+            settling: false,
         }
     }
 
@@ -1578,6 +1607,7 @@ impl Refinement {
             ladder: b.ladder,
             ..Burst::new(b.len, b.delay, Instant::now())
         };
+        self.settling = false;
         self.refiner.clear_all();
     }
 
@@ -1612,6 +1642,18 @@ impl Refinement {
         // Nothing pending, nothing to send.
         if self.burst.due(now) && !self.refiner.any_pending() {
             self.burst.stop();
+        }
+        // The last pass has landed: another if the encoder has room for one, else done.
+        self.settling &= self.burst.left == 0;
+        if self.settling && sh.busy.load(Ordering::Acquire) == 0 {
+            self.settling = false;
+            match sh.refinable.load(Ordering::Acquire) && self.burst.tail < REFINE_TAIL_MAX {
+                true => self.burst.more(),
+                false => {
+                    self.burst.stop();
+                    self.refiner.clear_all();
+                }
+            }
         }
     }
 
@@ -1653,6 +1695,7 @@ impl Refinement {
         out.paintover = true;
         out.paintover_final = self.burst.left == 1;
         out.refine_qp = self.burst.rung();
+        out.refine_tail = self.burst.tail > 0;
         Some((out, Step::Pass))
     }
 
@@ -1668,8 +1711,10 @@ impl Refinement {
             Step::Pass => {
                 self.burst.pass(now);
                 stats.paintovers.fetch_add(1, Ordering::Relaxed);
-                if self.burst.left == 0 {
-                    self.refiner.clear_all();
+                match (self.burst.left, self.burst.ladder) {
+                    (0, true) => self.settling = true,
+                    (0, false) => self.refiner.clear_all(),
+                    _ => {}
                 }
             }
         }
@@ -1936,6 +1981,7 @@ fn capture_loop(
                 buf,
                 paintover: false,
                 paintover_final: false,
+                refine_tail: false,
                 refine_qp: None,
                 mb_dirty: mb_dirty.map(Arc::new),
                 band,
@@ -2013,6 +2059,8 @@ struct StripeResult {
     out: Option<(bool, Vec<u8>)>,
     config: Option<StreamConfig>,
     failed: bool,
+    /// A refining pass left something the next one at the last rung could sharpen.
+    refinable: bool,
 }
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
@@ -2253,10 +2301,17 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
+        let refinable = refine.is_some_and(|(_, max_bytes)| {
+            s.enc.refinable(Refine {
+                qp: REFINE_RUNGS[REFINE_RUNGS.len() - 1],
+                max_bytes,
+            })
+        });
         let r = StripeResult {
             i,
             out: res,
             config,
+            refinable,
             failed,
         };
         if done.send(r).is_err() {
@@ -2324,6 +2379,9 @@ fn encode_loop(
             })
             .collect();
         if !selected.iter().any(|&x| x) {
+            if job.refine_qp.is_some() {
+                sh.refinable.store(false, Ordering::Release);
+            }
             drop(job);
             finish(force_idr);
             continue;
@@ -2335,7 +2393,7 @@ fn encode_loop(
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         let refine = job.refine_qp.map(|qp| {
-            let bytes = target as usize * REFINE_FRAME_MS / 8 / n;
+            let bytes = target as usize * REFINE_FRAME_MS / 8 / n * REFINE_PLAN_PCT / 100;
             (qp, (!uncapped).then_some(bytes))
         });
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
@@ -2364,13 +2422,19 @@ fn encode_loop(
         let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
         let mut configs: Vec<Option<StreamConfig>> = (0..n).map(|_| None).collect();
         let mut failed = false;
+        let mut refinable = vec![false; n];
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
+                refinable[r.i] = r.refinable;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
                 results[r.i] = r.out;
                 configs[r.i] = r.config;
             }
+        }
+        if job.refine_qp.is_some() {
+            sh.refinable
+                .store(refinable.contains(&true), Ordering::Release);
         }
         let worst = fails.iter().copied().max().unwrap_or(0);
         sh.failures.store(worst, Ordering::Release);
@@ -2390,13 +2454,22 @@ fn encode_loop(
             paintover,
             paintover_final,
             refine_qp,
+            refine_tail,
             band,
             captured_at,
             marker_ms,
             ..
         } = job;
         drop(buf);
-        for (y, h, touched) in stripes.iter_mut() {
+        for (i, (y, h, touched)) in stripes.iter_mut().enumerate() {
+            // A pass by QP keeps each stripe it reached as long as that stripe can still sharpen,
+            // whether or not its blocks are pending any more.
+            if refine_qp.is_some() {
+                if selected[i] {
+                    *touched = refinable[i];
+                }
+                continue;
+            }
             if paintover_final {
                 *touched = false;
             }
@@ -2431,8 +2504,10 @@ fn encode_loop(
             hub.stats
                 .paintover_bytes
                 .fetch_add(total as u64, Ordering::Relaxed);
-            sh.paintover_bytes
-                .fetch_add(total as u64, Ordering::Release);
+            if !refine_tail {
+                sh.paintover_bytes
+                    .fetch_add(total as u64, Ordering::Release);
+            }
         }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
