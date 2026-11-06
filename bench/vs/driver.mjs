@@ -236,6 +236,7 @@ async function run(arm, wl, readback = true) {
 		const vMid = await viewers(arm);
 		await sleep((win * 1000) / 2);
 		const dt = (Date.now() - t0) / 1000, c1 = chromeCpu(), s1 = await ctlJson('/cpu'), b1 = await ctlJson(`/bytes?port=${port}`);
+		const ticks = await p.evaluate(() => window.vs.ticks);
 		const f1 = await serverStats(arm);
 		assertCodec(arm, f1, 'at end');
 		const vEnd = await viewers(arm);
@@ -247,7 +248,7 @@ async function run(arm, wl, readback = true) {
 		});
 		const tr = swapsOf(await b.stopTracing());
 		const off = tr.sync === null ? null : tr.sync - r.sync;
-		const swaps = off === null ? [] : tr.raw.map((t) => t - off);
+		const swaps = off === null ? [] : tr.raw.map((t) => t - off).filter((t) => t >= r.sync && t - r.sync <= dt * 1000);
 		const swapIv = swaps.slice(1).map((t, i) => t - swaps[i]);
 		const f = r.frames.filter((x) => x[0] - r.sync <= dt * 1000);
 		const iv = f.slice(1).map((x, i) => x[0] - f[i][0]);
@@ -268,7 +269,7 @@ async function run(arm, wl, readback = true) {
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
 			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, stealPct: ((s1.host.steal - s0.host.steal) / (s1.host.all - s0.host.all)) * 100, browserCpu: ((c1 - c0) / dt) * 100,
 			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
-			rafHz: r.ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
+			rafHz: ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,
 			...(r.ws ? wsGaps(r.ws) : {}),
 		};

@@ -13,25 +13,31 @@ async def pipe(reader, writer, rate_bps, delay, cap=0):
     queued = 0
     room = asyncio.Event()
     async def sender():
-        while True:
-            t, data = await q.get()
-            if data is None:
-                break
-            dt = t - time.monotonic()
-            if dt > 0:
-                await asyncio.sleep(dt)
-            writer.write(data)
-            await writer.drain()
-            nonlocal queued
-            queued -= len(data)
-            room.set()
-        writer.close()
+        nonlocal queued
+        try:
+            while True:
+                t, data = await q.get()
+                if data is None:
+                    break
+                dt = t - time.monotonic()
+                if dt > 0:
+                    await asyncio.sleep(dt)
+                writer.write(data)
+                await writer.drain()
+                queued -= len(data)
+                room.set()
+        finally:
+            writer.close()
     task = asyncio.create_task(sender())
     last = time.monotonic()
     while True:
         while cap and queued > cap:
             room.clear()
-            await room.wait()
+            w = asyncio.ensure_future(room.wait())
+            await asyncio.wait([w, task], return_when=asyncio.FIRST_COMPLETED)
+            w.cancel()
+            if task.done():
+                return await task
         data = await reader.read(8192 if cap else 65536)
         queued += len(data)
         if not data:
@@ -47,7 +53,14 @@ async def pipe(reader, writer, rate_bps, delay, cap=0):
 
 async def handle(cr, cw):
     sr, sw = await asyncio.open_connection(th, int(tp))
-    await asyncio.gather(pipe(cr, sw, 0, rtt / 2000), pipe(sr, cw, mbps * 1e6, rtt / 2000, cap), return_exceptions=True)
+    up = asyncio.create_task(pipe(cr, sw, 0, rtt / 2000))
+    down = asyncio.create_task(pipe(sr, cw, mbps * 1e6, rtt / 2000, cap))
+    await asyncio.wait([up, down], return_when=asyncio.FIRST_EXCEPTION)
+    for t in (up, down):
+        t.cancel()
+    await asyncio.gather(up, down, return_exceptions=True)
+    sw.close()
+    cw.close()
 
 async def main():
     srv = await asyncio.start_server(handle, '127.0.0.1', listen)

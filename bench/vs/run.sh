@@ -7,6 +7,8 @@ source bench/vs/setup.sh
 openssl rand -hex 16 > /tmp/vs-pw
 "$CHROMIUM" --version; nproc; free -g | sed -n 2p; x11vnc -version 2>/dev/null | head -1; websockify --help 2>&1 | head -1; dpkg -s websockify 2>/dev/null | grep -i '^version'; dpkg -s x11vnc 2>/dev/null | grep -i '^version'; grep '"version"' /tmp/novnc/package.json
 node bench/vs/agent.mjs target/release/starfold /tmp/vs-source /tmp/novnc /tmp/vs-pw 1700 "$link" bench/shaper.py /tmp/vs-page.raw > /tmp/vs-agent.log 2>&1 &
+agent=$!
+trap 'kill "$agent" 2>/dev/null; wait "$agent"; exit 130' INT TERM
 for _ in $(seq 50); do curl -sf 127.0.0.1:6940/ >/dev/null && break; sleep 0.2; done
 LINK=$link ROUNDS=$rounds WIN=$win OUT=$out PW=/tmp/vs-pw node bench/vs/driver.mjs
 code=$?

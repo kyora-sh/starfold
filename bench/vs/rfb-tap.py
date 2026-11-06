@@ -1,18 +1,46 @@
 """rfb-tap.py <x11vnc socket> <listen socket> <log>: passes bytes through unchanged, logging when each
-FramebufferUpdateRequest (one or more leading a client write) went up and how much came down, so request spacing can be read at the relay."""
+FramebufferUpdateRequest went up (parsed from the client stream after the RFB 3.8 no-auth handshake) and how much came down,
+so request spacing can be read at the relay."""
 import asyncio, sys, time
 
 target, listen, log = sys.argv[1:4]
 
+HANDSHAKE = 12 + 1 + 1
+FIXED = {0: 20, 3: 10, 4: 8, 5: 6}
+
+def length(buf, i):
+    t = buf[i]
+    if t in FIXED:
+        return FIXED[t]
+    if t == 2 and len(buf) - i >= 4:
+        return 4 + 4 * int.from_bytes(buf[i + 2:i + 4], 'big')
+    if t == 6 and len(buf) - i >= 8:
+        return 8 + int.from_bytes(buf[i + 4:i + 8], 'big')
+    return None if t in (2, 6) else -1
+
 async def up(r, w, out):
+    buf, skip, lost = bytearray(), HANDSHAKE, False
     while data := await r.read(65536):
         w.write(data)
         await w.drain()
+        if lost:
+            continue
         now = time.time()
-        for i in range(0, len(data) - 9, 10):
-            if data[i] != 3:
+        buf += data
+        if skip:
+            n = min(skip, len(buf))
+            del buf[:n]
+            skip -= n
+        i = 0
+        while i < len(buf) and (n := length(buf, i)) is not None and len(buf) - i >= n:
+            if n < 0:
+                out.write(f'{now:.4f} desync {buf[i]}\n')
+                lost = True
                 break
-            out.write(f'{now:.4f} req {data[i + 1]}\n')
+            if buf[i] == 3:
+                out.write(f'{now:.4f} req {buf[i + 1]}\n')
+            i += n
+        del buf[:i]
     w.close()
 
 async def down(r, w, out):

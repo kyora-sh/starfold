@@ -58,14 +58,26 @@ uds = socket.socket(socket.AF_UNIX)
 uds.bind(SOCK)
 uds.listen(8)
 threading.Thread(target=serve, args=(uds,), daemon=True).start()
-ws = subprocess.Popen(['websockify', f'--unix-target={SOCK}', '127.0.0.1:7102'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-wait_port(7102)
-for mbps in (20, 2):
-    procs = [subprocess.Popen(['python3', shaper, str(l), f'127.0.0.1:{t}', str(mbps), '50', '250000'], start_new_session=True) for l, t in ((7201, 7101), (7202, 7102))]
-    wait_port(7201)
-    wait_port(7202)
-    for i in range(3):
-        print(f'LINK {mbps} Mbit/s tcp {measure(7201, False):.2f} websocket {measure(7202, True):.2f}', flush=True)
+def stop(procs):
     for p in procs:
-        os.killpg(p.pid, 15)
-os.killpg(ws.pid, 15)
+        try:
+            os.killpg(p.pid, 15)
+        except ProcessLookupError:
+            pass
+    for p in procs:
+        p.wait()
+
+ws = subprocess.Popen(['websockify', f'--unix-target={SOCK}', '127.0.0.1:7102'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+procs = []
+try:
+    wait_port(7102)
+    for mbps in (20, 2):
+        procs = [subprocess.Popen(['python3', shaper, str(l), f'127.0.0.1:{t}', str(mbps), '50', '250000'], start_new_session=True) for l, t in ((7201, 7101), (7202, 7102))]
+        wait_port(7201)
+        wait_port(7202)
+        for i in range(3):
+            print(f'LINK {mbps} Mbit/s tcp {measure(7201, False):.2f} websocket {measure(7202, True):.2f}', flush=True)
+        stop(procs)
+        procs = []
+finally:
+    stop(procs + [ws])

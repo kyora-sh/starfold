@@ -117,6 +117,7 @@ const quit = async () => {
 	await kill([xvfb, ...shapers]);
 	process.exit(0);
 };
+for (const s of ['SIGINT', 'SIGTERM']) process.on(s, quit);
 http.createServer(async (req, res) => {
 	const u = new URL(req.url, 'http://x');
 	try {
