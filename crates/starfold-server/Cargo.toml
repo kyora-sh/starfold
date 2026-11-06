@@ -25,6 +25,14 @@ path = "src/main.rs"
 default = []
 # libx264 (GPL-2.0) as an optional encoder, picked with --encoder x264.
 x264 = ["dep:bindgen"]
+# Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
+sw-arm = ["dep:bindgen"]
+libvpx = ["sw-arm"]
+libaom = ["sw-arm"]
+svt-av1 = ["sw-arm"]
+kvazaar = ["sw-arm"]
+# GPL-2.0, measurement only.
+x265 = ["sw-arm"]
 
 [dependencies]
 tokio = { version = "1", features = [

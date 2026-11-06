@@ -1,24 +1,37 @@
 //! The video encoder boundary: a backend turns I420 frames into access units, and
 //! callers only see the types here.
 
+#[cfg(feature = "libaom")]
+mod aom;
+#[cfg(any(feature = "libaom", feature = "svt-av1", test))]
+#[cfg_attr(not(any(feature = "libaom", feature = "svt-av1")), allow(dead_code))]
+mod av1;
 pub mod caps;
 mod h264;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test, feature = "kvazaar", feature = "x265"))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hevc;
+#[cfg(feature = "kvazaar")]
+mod kvazaar;
 #[cfg(windows)]
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
 pub(crate) mod openh264;
+#[cfg(feature = "svt-av1")]
+mod svt;
 #[cfg(test)]
 mod tests;
 #[cfg(target_os = "linux")]
 mod vaapi;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
+#[cfg(feature = "libvpx")]
+mod vpx;
 #[cfg(feature = "x264")]
 mod x264;
+#[cfg(feature = "x265")]
+mod x265;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,12 +39,18 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    #[cfg(feature = "libvpx")]
+    Vp8,
+    #[cfg(feature = "libvpx")]
+    Vp9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitstreamFormat {
     AnnexB,
     Av1LowOverhead,
+    #[cfg(feature = "libvpx")]
+    Vpx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +203,16 @@ pub enum Backend {
     OpenH264,
     #[cfg(feature = "x264")]
     X264,
+    #[cfg(feature = "libvpx")]
+    Libvpx,
+    #[cfg(feature = "libaom")]
+    Libaom,
+    #[cfg(feature = "svt-av1")]
+    SvtAv1,
+    #[cfg(feature = "kvazaar")]
+    Kvazaar,
+    #[cfg(feature = "x265")]
+    X265,
     VideoToolbox,
     Vaapi,
     Nvenc,
@@ -222,6 +251,16 @@ impl Backend {
             Backend::OpenH264 => "openh264",
             #[cfg(feature = "x264")]
             Backend::X264 => "x264",
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => "libvpx",
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => "libaom",
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => "svt-av1",
+            #[cfg(feature = "kvazaar")]
+            Backend::Kvazaar => "kvazaar",
+            #[cfg(feature = "x265")]
+            Backend::X265 => "x265",
             Backend::VideoToolbox => "videotoolbox",
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
@@ -235,6 +274,16 @@ impl Backend {
             Backend::OpenH264 => codec == Codec::H264,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => matches!(codec, Codec::Vp8 | Codec::Vp9),
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => codec == Codec::Av1,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => codec == Codec::Av1,
+            #[cfg(feature = "kvazaar")]
+            Backend::Kvazaar => codec == Codec::Hevc,
+            #[cfg(feature = "x265")]
+            Backend::X265 => codec == Codec::Hevc,
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
@@ -248,6 +297,16 @@ impl Backend {
             Backend::OpenH264 => Some(openh264::MAX_MBS),
             #[cfg(feature = "x264")]
             Backend::X264 => None,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => None,
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => None,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => None,
+            #[cfg(feature = "kvazaar")]
+            Backend::Kvazaar => None,
+            #[cfg(feature = "x265")]
+            Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(openh264::MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
@@ -260,6 +319,16 @@ impl Backend {
             Backend::OpenH264 => 16,
             #[cfg(feature = "x264")]
             Backend::X264 => 2,
+            #[cfg(feature = "libvpx")]
+            Backend::Libvpx => 16,
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => 16,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => 64,
+            #[cfg(feature = "kvazaar")]
+            Backend::Kvazaar => 64,
+            #[cfg(feature = "x265")]
+            Backend::X265 => 64,
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
@@ -282,20 +351,66 @@ impl Backend {
 pub enum Selection {
     Auto,
     Pinned(Backend),
+    /// A bench arm: this encoder, with the OpenH264 cohort beside it.
+    #[cfg(feature = "sw-arm")]
+    Arm(&'static str, Backend, Codec),
 }
+
+/// A bench arm's speed from `--preset`: a number, or `default` for an empty preset and
+/// for x264's preset name, which the server passes when none is given.
+#[cfg(any(feature = "libvpx", feature = "libaom", feature = "svt-av1"))]
+fn arm_speed(arm: &str, preset: &str, default: i32) -> Result<std::os::raw::c_int, EncodeError> {
+    match preset {
+        "" | "ultrafast" => Ok(default),
+        p => p
+            .parse()
+            .map_err(|_| EncodeError(format!("{arm} speed {p:?} is not a number"))),
+    }
+}
+
+/// The `--encoder` names of this build's bench arms.
+#[cfg(feature = "sw-arm")]
+pub const ARMS: &[(&str, Backend, Codec)] = &[
+    #[cfg(feature = "libvpx")]
+    ("libvpx-vp8", Backend::Libvpx, Codec::Vp8),
+    #[cfg(feature = "libvpx")]
+    ("libvpx-vp9", Backend::Libvpx, Codec::Vp9),
+    #[cfg(feature = "libaom")]
+    ("libaom", Backend::Libaom, Codec::Av1),
+    #[cfg(feature = "svt-av1")]
+    ("svt-av1", Backend::SvtAv1, Codec::Av1),
+    #[cfg(feature = "kvazaar")]
+    ("kvazaar", Backend::Kvazaar, Codec::Hevc),
+    #[cfg(feature = "x265")]
+    ("x265", Backend::X265, Codec::Hevc),
+];
 
 impl Selection {
     pub fn parse(s: &str) -> Result<Self, String> {
+        #[cfg(feature = "sw-arm")]
+        if let Some(&(name, backend, codec)) = ARMS.iter().find(|a| a.0 == s) {
+            return Ok(Selection::Arm(name, backend, codec));
+        }
         match s {
             "auto" => Ok(Selection::Auto),
             _ => Backend::parse(s).map(Selection::Pinned),
         }
     }
 
+    pub fn is_arm(self) -> bool {
+        #[cfg(feature = "sw-arm")]
+        if matches!(self, Selection::Arm(..)) {
+            return true;
+        }
+        false
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Selection::Auto => "auto",
             Selection::Pinned(b) => b.name(),
+            #[cfg(feature = "sw-arm")]
+            Selection::Arm(name, ..) => name,
         }
     }
 }
@@ -311,7 +426,7 @@ pub struct EncoderConfig {
     pub rate: RateConfig,
     /// OpenH264's lowest QP: its bitrate mode otherwise spends the whole cap.
     pub best_quality: f32,
-    /// x264's preset.
+    /// x264's preset; a bench arm's preset or speed.
     pub preset: String,
 }
 
@@ -351,6 +466,16 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
+        #[cfg(feature = "libvpx")]
+        Backend::Libvpx => Box::new(vpx::Vpx::new(&coded)?),
+        #[cfg(feature = "libaom")]
+        Backend::Libaom => Box::new(aom::Aom::new(&coded)?),
+        #[cfg(feature = "svt-av1")]
+        Backend::SvtAv1 => Box::new(svt::Svt::new(&coded)?),
+        #[cfg(feature = "kvazaar")]
+        Backend::Kvazaar => Box::new(kvazaar::Kvazaar::new(&coded)?),
+        #[cfg(feature = "x265")]
+        Backend::X265 => Box::new(x265::X265::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
