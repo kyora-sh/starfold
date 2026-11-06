@@ -20,10 +20,23 @@ format_of() {
 	esac
 }
 
+# The host's steal over a window, from two /proc/stat "cpu" lines.
+steal_pct() {
+	awk -v a="$1" -v b="$2" 'BEGIN {
+		n = split(a, x); split(b, y)
+		for (i = 2; i <= 9 && i <= n; i++) { d = y[i] - x[i]; t += d; if (i == 9) s = d }
+		printf "steal_pct=%.2f", (t > 0 ? 100 * s / t : 0)
+	}'
+}
+
 once() {
 	local arm=$1 workload=$2 kbps=$3 preset=${4:-} crf=${5:-10} size=$((1920 * 1080 * 3 / 2))
+	local before after
+	before=$(head -1 /proc/stat)
 	ARM=$arm WORKLOAD=$workload KBPS=$kbps PRESET=$preset CRF=$crf DUMP=$dump FRAMES=$frames THREADS=${THREADS:-4} \
 		"$bin" arm_bench --ignored --nocapture --test-threads=1 | grep -o 'bench arm=.*'
+	after=$(head -1 /proc/stat)
+	echo "steal arm=$arm workload=$workload $(steal_pct "$before" "$after")"
 	local bs="$dump/$arm-$workload.bin" src="$dump/$arm-$workload.yuv" units="$dump/$arm-$workload.units"
 	local dec="$dump/decoded.yuv" held="$dump/held.yuv" decoded skipped
 	ffmpeg -nostdin -v error -y -f "$(format_of "$arm")" -i "$bs" -fps_mode passthrough -f rawvideo -pix_fmt yuv420p "$dec"
