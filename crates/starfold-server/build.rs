@@ -81,6 +81,12 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             "#include <EbSvtAv1Enc.h>\n",
             "(svt|Svt|Eb|EB|PredStructure|PrivDataType).*",
         ),
+        (
+            cfg!(feature = "kvazaar"),
+            "kvazaar",
+            "#include <kvazaar.h>\n",
+            "(kvz|KVZ).*",
+        ),
     ];
     arms.into_iter()
         .filter(|a| a.0)
