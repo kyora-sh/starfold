@@ -15,7 +15,7 @@ def length(buf, i):
     if t == 2 and len(buf) - i >= 4:
         return 4 + 4 * int.from_bytes(buf[i + 2:i + 4], 'big')
     if t == 6 and len(buf) - i >= 8:
-        return 8 + int.from_bytes(buf[i + 4:i + 8], 'big')
+        return 8 + abs(int.from_bytes(buf[i + 4:i + 8], 'big', signed=True))
     return None if t in (2, 6) else -1
 
 async def up(r, w, out):
