@@ -5,6 +5,7 @@
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
+import { answer, KEY_CAP_MS } from './match.mjs';
 import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
@@ -171,21 +172,6 @@ async function typeKeys(p, wl, until) {
 		await sleep(gap[0] + Math.random() * gap[1]);
 	}
 	return sent;
-}
-const KEY_CAP_MS = 5000;
-/** Each key's first visible frame: tags appear in order, so a tag only answers its own key. A key with no tag inside the cap is missed. */
-function answer(keys, tags) {
-	const i2p = [];
-	let at = 0, missing = 0;
-	for (const [t, key] of keys) {
-		const v = key.charCodeAt(0) - 97;
-		let i = at;
-		while (i < tags.length && tags[i][0] < t + KEY_CAP_MS && !(tags[i][0] >= t && tags[i][1] === v)) i++;
-		if (i === tags.length || tags[i][0] >= t + KEY_CAP_MS) { missing++; continue; }
-		at = i + 1;
-		i2p.push(tags[i][0] - t);
-	}
-	return { i2p, missing };
 }
 let diagRuns = 0;
 /** Every stage's record of one run, for diag-ledger.py: what the source painted, what the server sent, what the page read. */
