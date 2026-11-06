@@ -3,8 +3,8 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
-#[cfg(any(feature = "libaom", test))]
-#[cfg_attr(not(feature = "libaom"), allow(dead_code))]
+#[cfg(any(feature = "libaom", feature = "svt-av1", test))]
+#[cfg_attr(not(any(feature = "libaom", feature = "svt-av1")), allow(dead_code))]
 mod av1;
 pub mod caps;
 mod h264;
@@ -16,6 +16,8 @@ mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
 mod openh264;
+#[cfg(feature = "svt-av1")]
+mod svt;
 #[cfg(test)]
 mod tests;
 #[cfg(target_os = "linux")]
@@ -186,6 +188,8 @@ pub enum Backend {
     Libvpx,
     #[cfg(feature = "libaom")]
     Libaom,
+    #[cfg(feature = "svt-av1")]
+    SvtAv1,
     VideoToolbox,
     Vaapi,
     Nvenc,
@@ -228,6 +232,8 @@ impl Backend {
             Backend::Libvpx => "libvpx",
             #[cfg(feature = "libaom")]
             Backend::Libaom => "libaom",
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => "svt-av1",
             Backend::VideoToolbox => "videotoolbox",
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
@@ -245,6 +251,8 @@ impl Backend {
             Backend::Libvpx => matches!(codec, Codec::Vp8 | Codec::Vp9),
             #[cfg(feature = "libaom")]
             Backend::Libaom => codec == Codec::Av1,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => codec == Codec::Av1,
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
@@ -262,6 +270,8 @@ impl Backend {
             Backend::Libvpx => None,
             #[cfg(feature = "libaom")]
             Backend::Libaom => None,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(openh264::MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
@@ -278,6 +288,8 @@ impl Backend {
             Backend::Libvpx => 16,
             #[cfg(feature = "libaom")]
             Backend::Libaom => 16,
+            #[cfg(feature = "svt-av1")]
+            Backend::SvtAv1 => 64,
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
@@ -321,6 +333,8 @@ pub const ARMS: &[(&str, Backend, Codec)] = &[
     ("libvpx-vp9", Backend::Libvpx, Codec::Vp9),
     #[cfg(feature = "libaom")]
     ("libaom", Backend::Libaom, Codec::Av1),
+    #[cfg(feature = "svt-av1")]
+    ("svt-av1", Backend::SvtAv1, Codec::Av1),
 ];
 
 impl Selection {
@@ -408,6 +422,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Libvpx => Box::new(vpx::Vpx::new(&coded)?),
         #[cfg(feature = "libaom")]
         Backend::Libaom => Box::new(aom::Aom::new(&coded)?),
+        #[cfg(feature = "svt-av1")]
+        Backend::SvtAv1 => Box::new(svt::Svt::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
