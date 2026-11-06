@@ -801,6 +801,109 @@ fn a_slow_viewer_holds_back_only_its_cohort() {
     assert!(!eng.catch_up_due(&eng.takes(&eng.views(), 33.0)));
 }
 
+/// A viewer on H.264 (protocol 2 or 1) with its first keyframe acked.
+fn watching(v2: bool) -> (Arc<Hub>, Engine, Arc<Client>, UnboundedReceiver<Out>) {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    if v2 {
+        join_v2(&hub, &c, &[Codec::H264]);
+        push(&mut eng);
+        ready(&c, &drain(&mut rx));
+    } else {
+        join_legacy(&hub, &c);
+    }
+    push(&mut eng);
+    let first = videos(&acked(&c, &mut rx));
+    assert!(first.len() == 1 && first[0].1, "{first:?}");
+    (hub, eng, c, rx)
+}
+
+/// Lets `ms` pass for `c`'s frames in flight and its last ack.
+fn wait(c: &Client, ms: u64) {
+    let d = Duration::from_millis(ms);
+    for f in c.inflight.lock().iter_mut() {
+        f.sent = f.sent.checked_sub(d).unwrap();
+    }
+    let mut at = c.acked_at.lock();
+    *at = at.checked_sub(d).unwrap();
+}
+
+fn ack_one(c: &Client, v: (u8, bool, u32, Option<u32>)) {
+    assert!(c.ack(v.3, v.2));
+}
+
+fn keyframes(m: &[Msg]) -> usize {
+    videos(m).iter().filter(|v| v.1).count()
+}
+
+#[test]
+fn a_slow_link_that_keeps_acking_is_not_resynced() {
+    for v2 in [true, false] {
+        let (_hub, mut eng, c, mut rx) = watching(v2);
+        for _ in 0..4 {
+            push(&mut eng);
+        }
+        let mut sent = videos(&drain(&mut rx));
+        assert!(sent.len() >= 3, "{sent:?}");
+        // A frame acked every second until one is left: it is 5 s old, the last ack 2 s.
+        for _ in 0..5 {
+            wait(&c, 1000);
+            if sent.len() > 1 {
+                ack_one(&c, sent.remove(0));
+            }
+            push(&mut eng);
+            push(&mut eng);
+        }
+        assert!(c.backlog().1 > 4000, "v2={v2}");
+        assert!(!c.needs_keyframe.load(Ordering::Relaxed), "v2={v2}");
+        assert_eq!(keyframes(&drain(&mut rx)), 0, "v2={v2}");
+        assert!(!c.inflight.lock().is_empty(), "v2={v2}");
+    }
+}
+
+#[test]
+fn a_viewer_that_stops_acking_is_resynced() {
+    for v2 in [true, false] {
+        let (_hub, mut eng, c, mut rx) = watching(v2);
+        push(&mut eng);
+        assert_eq!(videos(&drain(&mut rx)).len(), 1);
+        wait(&c, 4100);
+        push(&mut eng);
+        assert!(c.needs_keyframe.load(Ordering::Relaxed), "v2={v2}");
+        push_band(&mut eng, W, H, None);
+        let v = videos(&drain(&mut rx));
+        assert!(v.len() == 1 && v[0].1, "v2={v2}: {v:?}");
+    }
+}
+
+/// The bound: a viewer whose acks stop while a keyframe is on its way is resynced in the
+/// first capture turn more than STALL_MS after its last ack or that keyframe, whichever is later.
+#[test]
+fn acks_that_stop_during_a_keyframe_resync_within_the_bound() {
+    for v2 in [true, false] {
+        let (_hub, mut eng, c, mut rx) = watching(v2);
+        push(&mut eng);
+        let p = videos(&drain(&mut rx));
+        wait(&c, 1000);
+        ack_one(&c, p[0]);
+        assert!(c.request_keyframe(v2.then(|| c.route.lock().epoch)));
+        push_band(&mut eng, W, H, None);
+        let k = videos(&drain(&mut rx));
+        assert!(k.len() == 1 && k[0].1, "v2={v2}: {k:?}");
+        wait(&c, STALL_MS as u64 - 100);
+        push(&mut eng);
+        push(&mut eng);
+        assert!(!c.needs_keyframe.load(Ordering::Relaxed), "v2={v2}: early");
+        assert_eq!(keyframes(&drain(&mut rx)), 0, "v2={v2}: early");
+        wait(&c, 200);
+        push(&mut eng);
+        assert!(c.needs_keyframe.load(Ordering::Relaxed), "v2={v2}: late");
+        push_band(&mut eng, W, H, None);
+        assert_eq!(keyframes(&drain(&mut rx)), 1, "v2={v2}");
+    }
+}
+
 #[test]
 fn an_encoder_that_keeps_failing_falls_back() {
     let hub = Hub::new();

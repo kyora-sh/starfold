@@ -1233,6 +1233,9 @@ fn build(
     Ok(Pipeline { cap, engine })
 }
 
+/// No ack for this long with frames in flight: the client is gone, not slow.
+const STALL_MS: u128 = 4000;
+
 fn flow_ok(clients: &[Arc<Client>], interval_ms: f64) -> bool {
     for c in clients {
         let (n, age) = c.backlog();
@@ -1246,13 +1249,14 @@ fn flow_ok(clients: &[Arc<Client>], interval_ms: f64) -> bool {
         // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
         let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
         let max_age = rtt as u128 + 120;
-        if age > 4000 {
+        let silence = c.ack_silence_ms();
+        if silence > STALL_MS {
             // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
             log::warn!(
-                "client {} stalled ({} frames, {} ms); resyncing",
+                "client {} stalled ({} frames, {} ms without an ack); resyncing",
                 c.id,
                 n,
-                age
+                silence
             );
             c.inflight.lock().clear();
             c.needs_keyframe.store(true, Ordering::Relaxed);
