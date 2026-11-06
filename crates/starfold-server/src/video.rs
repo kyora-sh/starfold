@@ -1446,7 +1446,10 @@ struct Burst {
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
 const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
-/// The most of the bitrate cap one refining frame may take; the viewer waits for it.
+/// The most of the bitrate cap a ladder pass may take. Ladder passes count against the share,
+/// so a stop leaves little debt and the burst after the next one isn't kept waiting.
+const REFINE_LADDER_MS: usize = 200;
+/// The most of the bitrate cap a tail pass may take; the viewer waits for it.
 const REFINE_FRAME_MS: usize = 1000;
 /// The share of that a pass is planned at: estimates of one picture's cost were off by up to
 /// 1.8x on dense text, so a pass stays within the cap unless one is off by more.
@@ -2047,8 +2050,8 @@ struct StripeJob {
     boost: bool,
     crf: f32,
     cap: u32,
-    /// The pass's QP, and what its frame may cost.
-    refine: Option<(u8, Option<usize>)>,
+    /// The pass's QP, what its frame may cost, and what a tail pass after it may.
+    refine: Option<(u8, Option<usize>, Option<usize>)>,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -2213,7 +2216,7 @@ fn stripe_worker(
             EncodeOptions {
                 pts_ms: job.ts,
                 force_keyframe: job.force_idr,
-                refine: refine.map(|(qp, max_bytes)| Refine { qp, max_bytes }),
+                refine: refine.map(|(qp, max_bytes, _)| Refine { qp, max_bytes }),
                 static_mbs: info.as_deref_mut(),
             },
         );
@@ -2301,7 +2304,7 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
-        let refinable = refine.is_some_and(|(_, max_bytes)| {
+        let refinable = refine.is_some_and(|(_, _, max_bytes)| {
             s.enc.refinable(Refine {
                 qp: REFINE_RUNGS[REFINE_RUNGS.len() - 1],
                 max_bytes,
@@ -2392,9 +2395,14 @@ fn encode_loop(
         // controller reins the total in if several stripes move at once.
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
+        let budget =
+            |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);
         let refine = job.refine_qp.map(|qp| {
-            let bytes = target as usize * REFINE_FRAME_MS / 8 / n * REFINE_PLAN_PCT / 100;
-            (qp, (!uncapped).then_some(bytes))
+            let ms = match job.refine_tail {
+                true => REFINE_FRAME_MS,
+                false => REFINE_LADDER_MS,
+            };
+            (qp, budget(ms), budget(REFINE_FRAME_MS))
         });
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let mut pending = 0;
