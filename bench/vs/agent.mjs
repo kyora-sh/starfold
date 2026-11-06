@@ -44,7 +44,14 @@ async function start(arm, wl) {
 		run.push(group('x11vnc', ['-display', DISPLAY, ...X11VNC_ARGS, '-unixsock', SOCK]));
 		for (let i = 0; i < 100 && !fs.existsSync(SOCK); i++) await sleep(50);
 		if (!fs.existsSync(SOCK)) throw new Error('x11vnc did not open its socket');
-		run.push(group('websockify', ['--web', web, `--unix-target=${SOCK}`, `127.0.0.1:${NOVNC_PORT}`]));
+		let relay = SOCK;
+		if (process.env.VS_TAP) {
+			relay = `${SOCK}.tap`;
+			fs.rmSync(relay, { force: true });
+			run.push(group('python3', ['bench/vs/rfb-tap.py', SOCK, relay, process.env.VS_TAP]));
+			for (let i = 0; i < 100 && !fs.existsSync(relay); i++) await sleep(50);
+		}
+		run.push(group('websockify', ['--web', web, `--unix-target=${relay}`, `127.0.0.1:${NOVNC_PORT}`]));
 		await listening(NOVNC_PORT);
 	} else {
 		const log = fs.openSync('/tmp/vs-starfold.log', 'a');
