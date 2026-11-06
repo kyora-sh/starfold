@@ -4,7 +4,7 @@ use crate::negotiate::{Choice, DecodeCap, Offer};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -373,6 +373,9 @@ pub struct Stats {
     pub convert_us: AtomicU64,
     pub flow_blocked: AtomicU64,
     pub paintovers: AtomicU64,
+    /// Frames of a burst that came out, and their bytes.
+    pub paintover_frames: AtomicU64,
+    pub paintover_bytes: AtomicU64,
     pub keyframes: AtomicU64,
     pub refines: AtomicU64,
     pub damage_wait_us: AtomicU64,
@@ -389,6 +392,8 @@ pub struct Hub {
     pub stripes: Mutex<Vec<(u32, u32)>>,
     /// Adaptive bitrate cap applied by the encoder (kbit/s).
     pub target_kbps: AtomicU32,
+    /// Cohorts with viewers at the capture thread's last look.
+    pub viewer_cohorts: AtomicUsize,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
     /// Wakes the capture thread (acks, joins, keyframe requests).
@@ -411,6 +416,8 @@ pub struct Hub {
     pub offer_gen: AtomicU64,
     /// Viewers changed: the video thread routes them again.
     pub replan: AtomicBool,
+    /// Test hook: the video thread treats the H.264 encoder as failed.
+    pub fail_h264: AtomicBool,
     pub next_cohort: AtomicU64,
     /// The running encoder cohorts, for /stats.
     pub cohorts: Mutex<serde_json::Value>,
@@ -427,6 +434,7 @@ impl Hub {
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
             target_kbps: AtomicU32::new(0),
+            viewer_cohorts: AtomicUsize::new(0),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
             waker: Wake::new().expect("wake"),
@@ -440,6 +448,7 @@ impl Hub {
             offers: Mutex::new(Vec::new()),
             offer_gen: AtomicU64::new(0),
             replan: AtomicBool::new(false),
+            fail_h264: AtomicBool::new(false),
             next_cohort: AtomicU64::new(1),
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
             encoder: Mutex::new(serde_json::Value::Null),

@@ -8,15 +8,15 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{
-    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, StreamConfig,
-    VideoEncoder,
+    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, Refine,
+    StreamConfig, VideoEncoder,
 };
 use crate::hub::wait_any;
 use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto};
 use crate::negotiate::{self, Candidate, Choice, DecodeCap, DecoderConfig, Offer, StripeOffer};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +54,8 @@ struct Frame {
     paintover: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
+    /// The QP a backend that refines by QP aims for: only once motion has stopped.
+    refine_qp: Option<u8>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -114,6 +116,8 @@ fn skip(prev: Option<Skipped>, f: &Frame) -> Skipped {
 }
 
 fn catch_up(s: Skipped, mut f: Frame) -> Frame {
+    // What was skipped has to go out, and a pass may send nothing.
+    f.refine_qp = None;
     f.band = union_opt(s.band, f.band);
     f.mb_dirty = match (s.mb, f.mb_dirty) {
         (Some(a), Some(b)) => Some(Arc::new(or_maps(&a, &b))),
@@ -219,6 +223,8 @@ struct Shared {
     failures: AtomicU32,
     /// When the capture thread last sent this cohort a keyframe job.
     last_key: Mutex<Instant>,
+    /// Keyframes this cohort sent.
+    keyframes: AtomicU64,
     w: u32,
     h: u32,
 }
@@ -660,6 +666,7 @@ impl Engine {
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
+            keyframes: AtomicU64::new(0),
             w: self.w,
             h: self.h,
         });
@@ -718,6 +725,9 @@ impl Engine {
                 );
                 self.failed.push(sh.cand);
             }
+        }
+        if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
+            self.failed.push(self.h264);
         }
         if self.failed.contains(&self.h264) {
             self.replace_h264();
@@ -950,6 +960,38 @@ impl Engine {
                     && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, interval_ms))
             })
             .collect()
+    }
+
+    /// How many cohorts have viewers; the encoders go by it too, for a pass already queued.
+    fn with_viewers(&self, views: &[View]) -> usize {
+        let n = views.iter().filter(|v| !v.clients.is_empty()).count();
+        self.hub.viewer_cohorts.store(n, Ordering::Release);
+        n
+    }
+
+    /// The only cohort with viewers, if there is one, and the keyframes it sent.
+    fn sole_keyframes(&self, views: &[View]) -> Option<(u64, u64)> {
+        let mut with = self
+            .cohorts
+            .iter()
+            .zip(views)
+            .filter(|(_, v)| !v.clients.is_empty());
+        let (c, _) = with.next()?;
+        with.next()
+            .is_none()
+            .then(|| (c.shared.id, c.shared.keyframes.load(Ordering::Acquire)))
+    }
+
+    /// Whether what was encoded so far has reached the viewers. One that hasn't answered
+    /// for a while holds back nobody: flow control deals with it.
+    fn drained(&self, views: &[View]) -> bool {
+        self.cohorts
+            .iter()
+            .all(|c| c.shared.busy.load(Ordering::Acquire) == 0)
+            && views.iter().flat_map(|v| &v.clients).all(|c| {
+                let (n, age) = c.backlog();
+                n == 0 || age >= REFINE_DRAIN_MS
+            })
     }
 
     /// Whether a cohort that skipped damage has room for it now: worth a capture even
@@ -1254,6 +1296,156 @@ struct Refiner {
     cols: usize,
 }
 
+/// The paint-over after motion: a few passes once the picture has been still for a moment,
+/// none while it keeps changing. New damage starts them over. On a stream with one cohort
+/// the passes are a ladder of QPs; a burst then waits longer after costly ones close
+/// together, and for its share of the bitrate, but isn't dropped, so the picture still
+/// converges once the stops end. Cohorts keep no state of their own to take a ladder at
+/// their own pace, so with two or more a burst is plain passes.
+struct Burst {
+    len: u32,
+    delay: Duration,
+    left: u32,
+    last_motion: Instant,
+    backoff: u32,
+    last_burst: Option<Instant>,
+    /// Paint-over bytes sent so far, and when the last burst started.
+    spent: u64,
+    spent_at_start: u64,
+    tokens: f64,
+    refilled: Instant,
+    /// The bitrate cap in kbit/s; 0 is uncapped.
+    target: u32,
+    /// The sole cohort at the last look, and the keyframes it had sent.
+    keyframes: Option<(u64, u64)>,
+    /// One cohort has viewers.
+    single: bool,
+    /// This burst is a ladder: it started on one cohort and none has joined since.
+    ladder: bool,
+}
+
+/// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
+const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+/// The most of the bitrate cap one refining frame may take; the viewer waits for it.
+const REFINE_FRAME_MS: usize = 200;
+/// A burst this cheap (a cursor, a typed glyph) doesn't count towards backing off.
+const REFINE_CHEAP_BYTES: u64 = 32 * 1024;
+const REFINE_MAX_BACKOFF: u32 = 4;
+/// Each step of backing off wears off after this long without a burst, so a stream that
+/// keeps stopping still gets one about this often.
+const REFINE_QUIET: Duration = Duration::from_secs(5);
+/// Bursts may take this share of the cap, averaged over the window: enough for a whole
+/// ladder after a single stop, even on a thin link.
+const REFINE_SHARE: f64 = 0.10;
+const REFINE_WINDOW_S: f64 = 10.0;
+/// The longest a pass waits for the last one to arrive.
+const REFINE_DRAIN_MS: u128 = 1000;
+
+impl Burst {
+    fn new(len: u32, delay: Duration, now: Instant) -> Self {
+        Burst {
+            len,
+            delay,
+            left: 0,
+            last_motion: now,
+            backoff: 0,
+            last_burst: None,
+            spent: 0,
+            spent_at_start: 0,
+            tokens: f64::INFINITY,
+            refilled: now,
+            target: 0,
+            keyframes: None,
+            single: true,
+            ladder: true,
+        }
+    }
+    fn moved(&mut self, now: Instant) {
+        self.left = self.len;
+        self.last_motion = now;
+        self.ladder = self.single;
+    }
+    /// A second cohort ends the ladder for good; what follows the next motion is decided then.
+    fn cohorts(&mut self, with_viewers: usize) {
+        self.single = with_viewers <= 1;
+        self.ladder &= self.single;
+    }
+    /// A keyframe the sole cohort sent is squeezed into the rate cap, so it starts a burst.
+    /// One only asked for says nothing: an encoder that drops them is asked again and again.
+    /// Nor does one from before it was alone.
+    fn keyframe_sent(&mut self, sole: Option<(u64, u64)>, now: Instant) -> bool {
+        let new = matches!((self.keyframes, sole), (Some(a), Some(b)) if a.0 == b.0 && a.1 != b.1);
+        self.keyframes = sole;
+        if new {
+            self.moved(now);
+        }
+        new
+    }
+    /// Brings the byte budget up to date with what has been sent and the current cap.
+    fn account(&mut self, now: Instant, target_kbps: u32, spent: u64) {
+        let rate = target_kbps as f64 * 1000.0 / 8.0 * REFINE_SHARE;
+        let dt = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.tokens = match target_kbps {
+            0 => f64::INFINITY,
+            _ => (self.tokens + dt * rate - spent.saturating_sub(self.spent) as f64)
+                .min(rate * REFINE_WINDOW_S),
+        };
+        self.refilled = now;
+        self.spent = spent;
+        self.target = target_kbps;
+    }
+    fn level(&self, now: Instant) -> u32 {
+        let quiet = self.last_burst.map_or(0, |t| {
+            (now.saturating_duration_since(t).as_secs_f64() / REFINE_QUIET.as_secs_f64()) as u32
+        });
+        self.backoff.saturating_sub(quiet)
+    }
+    /// How long the picture must stay still before a burst.
+    fn gap(&self, now: Instant) -> Duration {
+        match self.ladder {
+            true => self.delay * (1 << self.level(now)),
+            false => self.delay,
+        }
+    }
+    /// Only a burst's first pass waits for budget: one under way finishes.
+    fn funded(&self) -> bool {
+        !self.ladder || self.left < self.len || self.target == 0 || self.tokens > 0.0
+    }
+    fn due(&self, now: Instant) -> bool {
+        self.left > 0
+            && now.saturating_duration_since(self.last_motion) >= self.gap(now)
+            && self.funded()
+    }
+    /// How long until `due` can change, in ms.
+    fn wait_ms(&self, now: Instant) -> i32 {
+        if self.left == 0 || !self.funded() {
+            return 100;
+        }
+        let still = now.saturating_duration_since(self.last_motion);
+        self.gap(now).saturating_sub(still).as_millis() as i32 + 1
+    }
+    fn stop(&mut self) {
+        self.left = 0;
+    }
+    /// Takes a pass; the last ones of a ladder get the rungs, so any burst length ends at
+    /// the finest.
+    fn pass(&mut self, now: Instant) -> Option<u8> {
+        if !self.ladder {
+            self.left -= 1;
+            return None;
+        }
+        if self.left == self.len {
+            let costly = self.spent - self.spent_at_start >= REFINE_CHEAP_BYTES;
+            self.backoff = (self.level(now) + costly as u32).min(REFINE_MAX_BACKOFF);
+            self.last_burst = Some(now);
+            self.spent_at_start = self.spent;
+        }
+        self.left -= 1;
+        let last = REFINE_RUNGS.len() - 1;
+        Some(REFINE_RUNGS[last.saturating_sub(self.left as usize)])
+    }
+}
+
 const REFINE_STILL_MS: u32 = 300;
 const REFINE_EVERY: Duration = Duration::from_millis(250);
 
@@ -1365,8 +1557,11 @@ fn capture_loop(
     let min_interval = interval.mul_f64(0.85);
     let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
-    let mut last_motion = Instant::now();
-    let mut paintover_left = 0u32;
+    let mut burst = Burst::new(
+        cfg.paintover_burst,
+        Duration::from_millis(cfg.paintover_delay_ms),
+        Instant::now(),
+    );
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -1418,16 +1613,28 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        let mut paintover_due = paintover_left > 0
-            && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
+        let now = Instant::now();
+        burst.account(
+            now,
+            // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
+            match cfg.max_kbps {
+                0 => 0,
+                _ => hub.target_kbps.load(Ordering::Relaxed),
+            },
+            hub.stats.paintover_bytes.load(Ordering::Relaxed),
+        );
+        burst.cohorts(eng.with_viewers(&views));
+        if burst.keyframe_sent(eng.sole_keyframes(&views), now) {
+            refiner.mark_all();
+        }
+        // One pass in flight at most: what a viewer types next never waits behind two.
+        let mut paintover_due = burst.due(now) && (!burst.ladder || eng.drained(&views));
         let catch_up = eng.catch_up_due(&views, interval_ms);
         if !cap.damaged && !want_key && !paintover_due && !catch_up {
-            let timeout = if paintover_left == 0 {
+            let timeout = if burst.due(now) {
                 100
             } else {
-                cfg.paintover_delay_ms
-                    .saturating_sub(last_motion.elapsed().as_millis() as u64) as i32
-                    + 1
+                burst.wait_ms(now)
             };
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
             continue;
@@ -1507,7 +1714,7 @@ fn capture_loop(
             match refiner.pending_map() {
                 Some(m) => Some(m),
                 None => {
-                    paintover_left = 0;
+                    burst.stop();
                     if !catch_up {
                         continue;
                     }
@@ -1531,14 +1738,14 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         let mut refine = None;
+        let mut refine_qp = None;
         let paintover = if is_motion {
-            last_motion = Instant::now();
-            paintover_left = cfg.paintover_burst;
+            burst.moved(t0);
             // Piggyback sharpening of blocks that have gone still on this frame.
             refine = if want_key { None } else { refiner.due() };
             refine.is_some()
         } else if paintover_due {
-            paintover_left -= 1;
+            refine_qp = burst.pass(t0);
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1549,7 +1756,8 @@ fn capture_loop(
             refiner.mark_all();
         }
         let frame_paintover = paintover && refine.is_none();
-        if frame_paintover && paintover_left == 0 {
+        let paintover_final = frame_paintover && burst.left == 0;
+        if paintover_final {
             refiner.clear_all();
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
@@ -1582,7 +1790,8 @@ fn capture_loop(
             &Frame {
                 buf,
                 paintover,
-                paintover_final: frame_paintover && paintover_left == 0,
+                paintover_final,
+                refine_qp,
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
@@ -1646,6 +1855,8 @@ struct StripeJob {
     boost: bool,
     crf: f32,
     cap: u32,
+    /// The pass's QP, and what its frame may cost.
+    refine: Option<(u8, Option<usize>)>,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -1759,7 +1970,13 @@ fn stripe_worker(
     };
     while let Ok(job) = rx.recv() {
         let buf = &*job.buf;
-        let rate = if job.force_idr && job.boost {
+        // A frame at a fixed QP is outside rate control; leave its budget alone.
+        let refine = job
+            .refine
+            .filter(|_| !job.force_idr && s.cfg.backend.refines_by_qp());
+        let rate = if refine.is_some() {
+            None
+        } else if job.force_idr && job.boost {
             s.applied_kbps = None;
             Some(keyframe_rate(job.crf, job.cap, s.cfg.fps))
         } else {
@@ -1802,6 +2019,7 @@ fn stripe_worker(
             EncodeOptions {
                 pts_ms: job.ts,
                 force_keyframe: job.force_idr,
+                refine: refine.map(|(qp, max_bytes)| Refine { qp, max_bytes }),
                 static_mbs: info.as_deref_mut(),
             },
         );
@@ -1970,6 +2188,11 @@ fn encode_loop(
         // controller reins the total in if several stripes move at once.
         let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
+        let single = hub.viewer_cohorts.load(Ordering::Acquire) <= 1;
+        let refine = job.refine_qp.filter(|_| single).map(|qp| {
+            let bytes = target as usize * REFINE_FRAME_MS / 8 / n;
+            (qp, (!uncapped).then_some(bytes))
+        });
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
@@ -1986,6 +2209,7 @@ fn encode_loop(
                     boost,
                     crf: want_crf,
                     cap,
+                    refine,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
@@ -2020,6 +2244,7 @@ fn encode_loop(
             buf,
             paintover,
             paintover_final,
+            refine_qp,
             band,
             captured_at,
             marker_ms,
@@ -2056,8 +2281,15 @@ fn encode_loop(
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
+        if refine_qp.is_some() && !all_key {
+            hub.stats.paintover_frames.fetch_add(1, Ordering::Relaxed);
+            hub.stats
+                .paintover_bytes
+                .fetch_add(total as u64, Ordering::Relaxed);
+        }
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
+            sh.keyframes.fetch_add(1, Ordering::Release);
         }
         frame_id = frame_id.wrapping_add(1);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.

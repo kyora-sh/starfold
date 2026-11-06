@@ -164,10 +164,12 @@ pub fn router(state: AppState) -> Router {
         .route("/wait", get(crate::wait::wait))
         .with_state(state.hub.clone());
     // VOXL_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
-    // epoch (a codec switch, even to the same codec), for end-to-end tests.
+    // epoch (a codec switch, even to the same codec), and POST /debug/fail-h264 makes the
+    // H.264 encoder fall back to the next one, for end-to-end tests.
     let debug_routes: Router = if std::env::var_os("VOXL_TEST_HOOKS").is_some() {
         Router::new()
             .route("/debug/renegotiate", axum::routing::post(renegotiate))
+            .route("/debug/fail-h264", axum::routing::post(fail_h264))
             .with_state(state.hub.clone())
     } else {
         Router::new()
@@ -209,6 +211,12 @@ async fn renegotiate(State(hub): State<Arc<Hub>>) -> Response {
         serde_json::json!({ "renegotiated": n }).to_string(),
     )
         .into_response()
+}
+
+async fn fail_h264(State(hub): State<Arc<Hub>>) -> axum::http::StatusCode {
+    hub.fail_h264.store(true, Ordering::Release);
+    hub.replan();
+    axum::http::StatusCode::NO_CONTENT
 }
 
 /// A client's protocol and codec, for /stats.
@@ -261,6 +269,8 @@ async fn stats(State(s): State<AppState>) -> Response {
         "paintovers": st.paintovers.load(Ordering::Relaxed),
         "keyframes": st.keyframes.load(Ordering::Relaxed),
         "refines": st.refines.load(Ordering::Relaxed),
+        "paintover_frames": st.paintover_frames.load(Ordering::Relaxed),
+        "paintover_bytes": st.paintover_bytes.load(Ordering::Relaxed),
         "target_kbps": s.hub.target_kbps.load(Ordering::Relaxed),
         "damage_events": crate::capture::DAMAGE_EVENTS.load(Ordering::Relaxed),
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
