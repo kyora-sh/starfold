@@ -45,6 +45,7 @@ def one(d):
             elif any(s[1] in {f['n'] for f in carry} for s in samples): row['stage'] = 'sampled, tag not parsed'
             else: row['stage'] = 'decoded, never sampled'
         out.append(row)
+    json.dump(out, open(f'{d}/ledger.json', 'w'))
     return out, page
 root = sys.argv[1]
 arms = collections.defaultdict(lambda: collections.Counter())
