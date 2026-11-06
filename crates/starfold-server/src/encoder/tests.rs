@@ -643,6 +643,10 @@ fn cpu_per_stream() {
             .unwrap_or(d)
     };
     let (frames, threads) = (env("FRAMES", 300), env("THREADS", 1));
+    let codec = match std::env::var("CODEC").as_deref() {
+        Ok("hevc") => Codec::Hevc,
+        _ => Codec::H264,
+    };
     let (w, h, fps) = (1920usize, 1080usize, 30u32);
     let cols = w.div_ceil(16);
     let mbs = cols * h.div_ceil(16);
@@ -654,6 +658,7 @@ fn cpu_per_stream() {
     };
     for workload in ["typing", "scrolling", "video"] {
         let mut cfg = config(backend, w as u32, h as u32, 30_000);
+        cfg.codec = codec;
         cfg.fps = fps;
         cfg.threads = threads as u32;
         cfg.best_quality = cfg.rate.quality;
@@ -706,7 +711,7 @@ fn cpu_per_stream() {
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench backend={} workload={workload} threads={threads} cpu_s_per_s={:.4} kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
+            "bench backend={} codec={codec:?} workload={workload} threads={threads} cpu_s_per_s={:.4} kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
             backend.name(),
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
