@@ -116,14 +116,22 @@ fn bad_pictures_are_errors() {
     });
 }
 
-#[cfg(feature = "libvpx")]
 #[test]
 fn a_speed_that_is_not_a_number_is_an_error() {
-    let c = EncoderConfig {
-        preset: "fast".into(),
-        ..arm_config(Backend::Libvpx, Codec::Vp9, 320, 240, 4000)
-    };
-    assert!(open(&c).is_err());
+    each_arm(|name, backend, codec| {
+        let c = EncoderConfig {
+            preset: "fast".into(),
+            ..arm_config(backend, codec, 320, 240, 4000)
+        };
+        assert!(open(&c).is_err(), "{name}");
+    });
+}
+
+#[test]
+fn the_servers_sample_encode_passes() {
+    each_arm(|name, backend, codec| {
+        caps::sample_encode(backend, codec).unwrap_or_else(|e| panic!("{name}: {e}"));
+    });
 }
 
 #[test]
@@ -264,6 +272,7 @@ fn arm_bench() {
         }
         let mut p = Picture::new(w, h);
         let reel = (workload == "video").then(|| film(w, h, num("GRAIN", 4) as u32));
+        let mut codec_string = String::from("none");
         let (mut bytes, mut total, mut lat, mut cpu_s, mut units) =
             (0usize, 0usize, Vec::new(), 0.0, 0usize);
         for f in 0..frames {
@@ -288,6 +297,9 @@ fn arm_bench() {
             let aus = encode_one(&mut *enc, p, f as i64 * 1000 / fps as i64, f == 0);
             let (dt, dc) = (t0.elapsed().as_secs_f64() * 1e3, cpu() - c0);
             for a in &aus {
+                if let Some(c) = &a.config {
+                    codec_string.clone_from(&c.codec_string);
+                }
                 total += a.data.len();
                 if let Some(s) = stream.as_mut() {
                     ivf_frame(s, codec, units as u64, &a.data);
@@ -331,7 +343,7 @@ fn arm_bench() {
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} total_kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
+            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} codec={codec_string} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} total_kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
             var("PRESET", "default"),
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
@@ -342,13 +354,14 @@ fn arm_bench() {
     }
 }
 
-/// VP8 and VP9 need a container for ffmpeg; the others are self-delimiting.
+/// VP8, VP9 and AV1 go in IVF for ffmpeg; H.264 and HEVC are self-delimiting.
 fn ivf_fourcc(codec: Codec) -> Option<&'static [u8; 4]> {
     match codec {
         #[cfg(feature = "libvpx")]
         Codec::Vp8 => Some(b"VP80"),
         #[cfg(feature = "libvpx")]
         Codec::Vp9 => Some(b"VP90"),
+        Codec::Av1 => Some(b"AV01"),
         _ => None,
     }
 }

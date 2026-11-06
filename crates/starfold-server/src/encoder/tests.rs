@@ -3,6 +3,7 @@ use super::*;
 
 #[cfg(feature = "sw-arm")]
 mod arms;
+mod av1;
 
 fn backends() -> Vec<Backend> {
     vec![

@@ -69,6 +69,12 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             "#include <vpx/vpx_encoder.h>\n#include <vpx/vp8cx.h>\nstatic const int STARFOLD_VPX_ABI = VPX_ENCODER_ABI_VERSION;\n",
             "(vpx|vp8|vp9|VPX|VP8|VP9|STARFOLD).*",
         ),
+        (
+            cfg!(feature = "libaom"),
+            "aom",
+            "#include <aom/aom_encoder.h>\n#include <aom/aomcx.h>\nstatic const int STARFOLD_AOM_ABI = AOM_ENCODER_ABI_VERSION;\n",
+            "(aom|aome|av1|AOM|AV1|STARFOLD).*",
+        ),
     ];
     arms.into_iter()
         .filter(|a| a.0)

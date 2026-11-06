@@ -1,6 +1,11 @@
 //! The video encoder boundary: a backend turns I420 frames into access units, and
 //! callers only see the types here.
 
+#[cfg(feature = "libaom")]
+mod aom;
+#[cfg(any(feature = "libaom", test))]
+#[cfg_attr(not(feature = "libaom"), allow(dead_code))]
+mod av1;
 pub mod caps;
 mod h264;
 #[cfg(any(target_os = "macos", test))]
@@ -179,6 +184,8 @@ pub enum Backend {
     X264,
     #[cfg(feature = "libvpx")]
     Libvpx,
+    #[cfg(feature = "libaom")]
+    Libaom,
     VideoToolbox,
     Vaapi,
     Nvenc,
@@ -219,6 +226,8 @@ impl Backend {
             Backend::X264 => "x264",
             #[cfg(feature = "libvpx")]
             Backend::Libvpx => "libvpx",
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => "libaom",
             Backend::VideoToolbox => "videotoolbox",
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
@@ -234,6 +243,8 @@ impl Backend {
             Backend::X264 => codec == Codec::H264,
             #[cfg(feature = "libvpx")]
             Backend::Libvpx => matches!(codec, Codec::Vp8 | Codec::Vp9),
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => codec == Codec::Av1,
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
@@ -249,6 +260,8 @@ impl Backend {
             Backend::X264 => None,
             #[cfg(feature = "libvpx")]
             Backend::Libvpx => None,
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(openh264::MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
@@ -263,6 +276,8 @@ impl Backend {
             Backend::X264 => 2,
             #[cfg(feature = "libvpx")]
             Backend::Libvpx => 16,
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => 16,
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
@@ -285,6 +300,18 @@ pub enum Selection {
     Arm(&'static str, Backend, Codec),
 }
 
+/// A bench arm's speed from `--preset`: a number, or `default` for an empty preset and
+/// for x264's preset name, which the server passes when none is given.
+#[cfg(feature = "sw-arm")]
+fn arm_speed(arm: &str, preset: &str, default: i32) -> Result<std::os::raw::c_int, EncodeError> {
+    match preset {
+        "" | "ultrafast" => Ok(default),
+        p => p
+            .parse()
+            .map_err(|_| EncodeError(format!("{arm} speed {p:?} is not a number"))),
+    }
+}
+
 /// The `--encoder` names of this build's bench arms.
 #[cfg(feature = "sw-arm")]
 pub const ARMS: &[(&str, Backend, Codec)] = &[
@@ -292,6 +319,8 @@ pub const ARMS: &[(&str, Backend, Codec)] = &[
     ("libvpx-vp8", Backend::Libvpx, Codec::Vp8),
     #[cfg(feature = "libvpx")]
     ("libvpx-vp9", Backend::Libvpx, Codec::Vp9),
+    #[cfg(feature = "libaom")]
+    ("libaom", Backend::Libaom, Codec::Av1),
 ];
 
 impl Selection {
@@ -377,6 +406,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
         #[cfg(feature = "libvpx")]
         Backend::Libvpx => Box::new(vpx::Vpx::new(&coded)?),
+        #[cfg(feature = "libaom")]
+        Backend::Libaom => Box::new(aom::Aom::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),

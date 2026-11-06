@@ -69,12 +69,7 @@ impl Vpx {
                 other => return Err(EncodeError(format!("libvpx can't encode {other:?}"))),
             }
         };
-        let speed: c_int = match c.preset.as_str() {
-            "" => speed,
-            p => p
-                .parse()
-                .map_err(|_| EncodeError(format!("libvpx speed {p:?} is not a number")))?,
-        };
+        let speed = super::arm_speed("libvpx", &c.preset, speed)?;
         unsafe {
             let mut cfg: Box<ffi::vpx_codec_enc_cfg_t> = Box::new(std::mem::zeroed());
             let r = ffi::vpx_codec_enc_config_default(iface, &mut *cfg, 0);

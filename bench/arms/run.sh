@@ -14,8 +14,7 @@ here=$(dirname "$0")
 
 format_of() {
 	case $1 in
-		libvpx-*) echo ivf ;;
-		libaom | svt-av1) echo obu ;;
+		libvpx-* | libaom | svt-av1) echo ivf ;;
 		kvazaar | x265) echo hevc ;;
 		*) echo h264 ;;
 	esac
