@@ -194,32 +194,96 @@ fn film(w: usize, h: usize, grain: u32) -> Vec<Picture> {
                     }
                 }
             }
-            let mut p = Picture::new(w, h);
-            let cw = w.div_ceil(2);
-            for (i, c) in rgb.iter_mut().enumerate() {
-                c.iter_mut().for_each(|v| *v = (*v).clamp(0, 255));
-                p.y[i] = (16 + ((66 * c[0] + 129 * c[1] + 25 * c[2] + 128) >> 8)) as u8;
-            }
-            for (i, (u, v)) in p.u.iter_mut().zip(p.v.iter_mut()).enumerate() {
-                let (x, y) = (i % cw * 2, i / cw * 2);
-                let mut sum = [0i32; 3];
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let c = rgb[(y + dy).min(h - 1) * w + (x + dx).min(w - 1)];
-                    sum.iter_mut().zip(c).for_each(|(a, b)| *a += b);
-                }
-                let [r, g, b] = sum.map(|v| v / 4);
-                *u = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)) as u8;
-                *v = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)) as u8;
-            }
-            p
+            i420(&mut rgb, w, h)
         })
         .collect()
 }
 
+/// RGB to BT.601 limited-range 4:2:0, chroma averaged over each 2x2 block.
+fn i420(rgb: &mut [[i32; 3]], w: usize, h: usize) -> Picture {
+    let mut p = Picture::new(w, h);
+    let cw = w.div_ceil(2);
+    for (i, c) in rgb.iter_mut().enumerate() {
+        c.iter_mut().for_each(|v| *v = (*v).clamp(0, 255));
+        p.y[i] = (16 + ((66 * c[0] + 129 * c[1] + 25 * c[2] + 128) >> 8)) as u8;
+    }
+    for (i, (u, v)) in p.u.iter_mut().zip(p.v.iter_mut()).enumerate() {
+        let (x, y) = (i % cw * 2, i / cw * 2);
+        let mut sum = [0i32; 3];
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let c = rgb[(y + dy).min(h - 1) * w + (x + dx).min(w - 1)];
+            sum.iter_mut().zip(c).for_each(|(a, b)| *a += b);
+        }
+        let [r, g, b] = sum.map(|v| v / 4);
+        *u = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)) as u8;
+        *v = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)) as u8;
+    }
+    p
+}
+
+/// `bench/scroll.html` as Chrome renders it: raw BGRX, `w` wide (`bench/vs/setup.sh`'s page).
+fn page(path: &str, w: usize) -> Picture {
+    let raw = std::fs::read(path).unwrap_or_else(|e| panic!("PAGE {path}: {e}"));
+    assert!(
+        raw.len().is_multiple_of(w * 4),
+        "PAGE {path} is not {w} BGRX pixels wide"
+    );
+    let h = (raw.len() / (w * 4)) & !1;
+    let mut rgb: Vec<[i32; 3]> = raw[..w * h * 4]
+        .chunks_exact(4)
+        .map(|px| [px[2] as i32, px[1] as i32, px[0] as i32])
+        .collect();
+    i420(&mut rgb, w, h)
+}
+
+/// Rows [y0, y0 + rows) and columns [x0, x0 + cols) of `from`, at (x, y) in `to`; even origins.
+#[allow(clippy::too_many_arguments)]
+fn blit(
+    to: &mut Picture,
+    x: usize,
+    y: usize,
+    from: &Picture,
+    x0: usize,
+    y0: usize,
+    cols: usize,
+    rows: usize,
+) {
+    for r in 0..rows {
+        let (d, s) = ((y + r) * to.w + x, (y0 + r) * from.w + x0);
+        to.y[d..d + cols].copy_from_slice(&from.y[s..s + cols]);
+    }
+    let (tcw, fcw, cc) = (to.w.div_ceil(2), from.w.div_ceil(2), cols.div_ceil(2));
+    for r in 0..rows.div_ceil(2) {
+        let (d, s) = ((y / 2 + r) * tcw + x / 2, (y0 / 2 + r) * fcw + x0 / 2);
+        to.u[d..d + cc].copy_from_slice(&from.u[s..s + cc]);
+        to.v[d..d + cc].copy_from_slice(&from.v[s..s + cc]);
+    }
+}
+
+/// The 22-row band below the first screen with the most ink: where typed glyphs come from.
+fn inkiest_line(page: &Picture, h: usize) -> usize {
+    (h..page.h - 22)
+        .step_by(2)
+        .max_by_key(|&y| {
+            (y..y + 22)
+                .map(|r| {
+                    page.y[r * page.w + 80..r * page.w + page.w - 100]
+                        .iter()
+                        .filter(|&&v| v < 128)
+                        .count()
+                })
+                .sum::<usize>()
+        })
+        .unwrap()
+}
+
 /// One arm through typing, scrolling, settled and video, for `bench/arms/run.sh`: ARM, PRESET,
-/// KBPS, CRF, FRAMES, THREADS, WORKLOAD, GRAIN; DUMP=<dir> writes the bitstream, the source and
-/// `<arm>-<workload>.units` (source frame, bytes, keyframe per unit) for ffmpeg to score. One
-/// `bench` line per workload. `settled` scrolls for two seconds, then holds still.
+/// KBPS, CRF, FRAMES, THREADS, WORKLOAD, GRAIN, PAGE; DUMP=<dir> writes the bitstream, the source
+/// and `<arm>-<workload>.units` (source frame, bytes, keyframe per unit) for ffmpeg to score. One
+/// `bench` line per workload. With PAGE (Chrome's render of `bench/scroll.html`), the text
+/// workloads use its anti-aliased text as the bench source does: scrolling 20 rows a frame, typing
+/// a 10x22 cell of a real text line every third frame; without it, two-level synthetic text.
+/// `settled` scrolls for two seconds, then holds still.
 #[cfg(unix)]
 #[test]
 #[ignore]
@@ -243,6 +307,7 @@ fn arm_bench() {
             + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 / 1e6
     };
     let workloads = var("WORKLOAD", "typing,scrolling,settled,video");
+    let real = std::env::var("PAGE").ok().map(|p| page(&p, 1920));
     let frame_of = |pts: i64| (pts as f64 * fps as f64 / 1000.0).round() as u64;
     for workload in workloads.split(',') {
         let mut enc = open(&EncoderConfig {
@@ -272,20 +337,45 @@ fn arm_bench() {
         }
         let mut p = Picture::new(w, h);
         let reel = (workload == "video").then(|| film(w, h, num("GRAIN", 4) as u32));
+        let typed_from = real.as_ref().map(|pg| inkiest_line(pg, h));
+        let mut blank = Picture::new(w, 24);
+        blank.y.fill(235);
+        if let Some(pg) = &real {
+            blit(&mut p, 0, 0, pg, 0, 0, w, h);
+            if workload == "typing" {
+                blit(&mut p, 0, 72, &blank, 0, 0, w, 24);
+            }
+        }
+        let (mut cx, mut cy) = (80usize, 74usize);
         let mut codec_string = String::from("none");
         let (mut bytes, mut total, mut lat, mut cpu_s, mut units) =
             (0usize, 0usize, Vec::new(), 0.0, 0usize);
         for f in 0..frames {
-            match workload {
-                "typing" => {
+            let scrolls =
+                workload == "scrolling" || (workload == "settled" && f < 2 * fps as usize);
+            match (workload, &real) {
+                ("typing", Some(pg)) if f % 3 == 0 => {
+                    blit(&mut p, cx, cy, pg, cx, typed_from.unwrap(), 10, 22);
+                    cx += 10;
+                    if cx > w - 100 {
+                        (cx, cy) = (80, if cy + 22 > h - 60 { 74 } else { cy + 22 });
+                        blit(&mut p, 0, cy, &blank, 0, 0, w, 22);
+                    }
+                }
+                ("typing", Some(_)) => {}
+                ("typing", None) => {
                     let (x, y) = (200 + (f % 120) * 12, 300 + (f / 120) * 22);
                     p.texture(f as u32 + 1, x, y, x + 12, y + 22, 0);
                 }
-                "scrolling" => p.texture(0, 300, 90, 1500, 990, f * 8),
-                "settled" if f < 2 * fps as usize => p.texture(0, 300, 90, 1500, 990, f * 8),
-                "settled" => {}
-                "video" => {}
-                other => panic!("no workload {other}"),
+                ("scrolling" | "settled", Some(pg)) if scrolls => {
+                    blit(&mut p, 0, 0, pg, 0, ((f + 1) * 20 % (pg.h - h)) & !1, w, h)
+                }
+                ("scrolling" | "settled", None) if scrolls => {
+                    p.texture(0, 300, 90, 1500, 990, f * 8)
+                }
+                ("settled", _) => {}
+                ("video", _) => {}
+                (other, _) => panic!("no workload {other}"),
             }
             let p = reel.as_ref().map_or(&p, |r| &r[f % r.len()]);
             if let Some(s) = source.as_mut() {
@@ -343,8 +433,9 @@ fn arm_bench() {
         let secs = lat.len() as f64 / fps as f64;
         let pct = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
         println!(
-            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} codec={codec_string} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} total_kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
+            "bench arm={arm} preset={} crf={crf} target_kbps={kbps} workload={workload} text={} codec={codec_string} threads={threads} frames={frames} units={units} cpu_s_per_s={:.4} kbps={:.0} total_kbps={:.0} p50_ms={:.2} p95_ms={:.2}",
             var("PRESET", "default"),
+            if real.is_some() { "page" } else { "synthetic" },
             cpu_s / secs,
             bytes as f64 * 8.0 / secs / 1000.0,
             total as f64 * 8.0 * fps as f64 / frames as f64 / 1000.0,

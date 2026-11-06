@@ -29,7 +29,7 @@ once() {
 	ffmpeg -nostdin -v error -y -f "$(format_of "$arm")" -i "$bs" -fps_mode passthrough -f rawvideo -pix_fmt yuv420p "$dec"
 	decoded=$(($(stat -c %s "$dec") / size))
 	[[ $decoded == $(wc -l < "$units") ]] || { echo "$arm $workload: decoded $decoded of $(wc -l < "$units") units" >&2; return 1; }
-	skipped=$(python3 -I "$here/score.py" "$dec" "$units" "$frames" "$size" "$held")
+	skipped=$(python3 -I "$here/score.py" "$dec" "$units" "$frames" "$src" "$held" 1920 1080)
 	ffmpeg -nostdin -v error -y -f rawvideo -pix_fmt yuv420p -s 1920x1080 -r 30 -i "$held" \
 		-f rawvideo -pix_fmt yuv420p -s 1920x1080 -r 30 -i "$src" \
 		-lavfi "[0:v]split[a1][a2];[1:v]split[b1][b2];[a1][b1]ssim=stats_file=$dump/ssim.log;[a2][b2]psnr=stats_file=$dump/psnr.log" \
@@ -48,7 +48,7 @@ once() {
 	rm -f "$bs" "$src" "$units" "$dec" "$held" "$dump/ssim.log" "$dump/psnr.log"
 }
 
-# METRIC picks the score field to reach: ssim_db for motion, ssim_last30_db for settled text.
+# METRIC picks the score field to reach: psnr_db for motion, text_psnr_last30_db for text.
 search() {
 	local arm=$1 workload=$2 target=$3 preset=${4:-} crf=${5:-10} lo=${LO:-250} hi=${HI:-64000} best=none got=none
 	local metric=${METRIC:-ssim_db} total=none
