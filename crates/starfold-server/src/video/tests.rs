@@ -2958,6 +2958,42 @@ fn the_encoder_budgets_for_the_rate_a_cohort_takes_frames_at() {
     assert!(rates.lock().unwrap().iter().all(|&f| f >= FPS_FLOOR));
 }
 
+/// A key typed within REFINE_IDLE keeps frames at the full rate's budget, so it never waits
+/// behind a frame sized for a slower one; wheel and pointer input keep the rate frames are taken at.
+#[test]
+fn typing_keeps_the_full_rate_budget_and_the_wheel_does_not() {
+    let rates = Arc::new(StdMutex::new(Vec::new()));
+    let hub = Hub::new();
+    let opts = Opts {
+        h264_rates: Some(rates.clone()),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    let mut motion = |eng: &mut Engine, t: &mut Instant, frames: usize| {
+        for _ in 0..frames {
+            *t += Duration::from_millis(100);
+            capture(eng, W, H, Some(Band { y0: 0, y1: H }), *t);
+            acked(&c, &mut rx);
+        }
+    };
+    let last = |rates: &Arc<StdMutex<Vec<u32>>>| *rates.lock().unwrap().last().unwrap();
+    motion(&mut eng, &mut t, 30);
+    assert_eq!(last(&rates), 10);
+    *hub.key_at.lock() = Some(t);
+    *hub.input_at.lock() = Some(t);
+    motion(&mut eng, &mut t, 1);
+    assert_eq!(last(&rates), 30, "a key: the full rate's budget");
+    t += Duration::from_secs(3);
+    *hub.input_at.lock() = Some(t);
+    motion(&mut eng, &mut t, 3);
+    assert_eq!(last(&rates), 10, "the wheel: the rate frames are taken at");
+}
+
 #[test]
 fn a_pass_stays_a_rate_change_for_other_encoders() {
     let seen = refines_through(H264_HW);

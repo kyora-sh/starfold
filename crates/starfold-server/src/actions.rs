@@ -432,8 +432,9 @@ pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -
         for step in steps {
             match step {
                 Step::Event(e) => {
-                    hub.note_input();
-                    tx.send(e.event()).ok()?;
+                    let ev = e.event();
+                    hub.note_input(&ev);
+                    tx.send(ev).ok()?;
                     events += 1;
                 }
                 Step::Pause(d) => {

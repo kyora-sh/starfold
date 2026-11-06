@@ -1161,6 +1161,13 @@ impl Engine {
         }
         let input_at = *self.hub.input_at.lock();
         let max_fps = self.cfg.fps;
+        // While someone types, frames keep the full rate's budget: a key never waits behind a
+        // frame sized for a slower rate. Pointer and wheel motion keep the rate frames are taken at.
+        let typing = self
+            .hub
+            .key_at
+            .lock()
+            .is_some_and(|k| now.saturating_duration_since(k) < REFINE_IDLE);
         let stats = &self.hub.stats;
         let plans = turn.takes.iter().zip(&turn.passes);
         for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
@@ -1193,7 +1200,7 @@ impl Engine {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
-                fps: c.pace.fps,
+                fps: if typing { max_fps } else { c.pace.fps },
             }) {
                 Ok(()) => {
                     if motion {
