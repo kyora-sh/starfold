@@ -2586,6 +2586,10 @@ fn stop_start(b: Busy) -> BusyRun {
     join_legacy(&hub, &c);
     push(&mut eng);
     acked(&c, &mut rx);
+    // The target holds still unless the case drops it: a run slow enough to cross the
+    // controller's wall-clock windows would otherwise ramp it.
+    let rc = &mut eng.cohorts[0].rc;
+    (rc.max, rc.target) = (START_KBPS, START_KBPS);
     let passes = || {
         seen.lock()
             .unwrap()
