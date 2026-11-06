@@ -122,7 +122,9 @@ static void key(XEvent *e) {
 	KeySym s = XLookupKeysym(&e->xkey, 0);
 	if (s < 'a' || s > 'z') return;
 	tag = s - 'a';
+	XGrabServer(d);
 	draw_tag();
+	XUngrabServer(d);
 	XSetBackground(d, g, 0xffffff);
 	XSetForeground(d, g, 0x202020);
 	char c = (char)s;
@@ -250,8 +252,10 @@ int main(int argc, char **argv) {
 			XShmPutImage(d, w, g, img, STRIP_W, top, STRIP_W, 0, W - STRIP_W, STRIP_H, False);
 		}
 		if (paged ? phase < 6 : !mixed || phase < 6 || (phase >= 20 && phase < 26)) {
+			XGrabServer(d);
 			draw_frame(n);
 			draw_tag();
+			XUngrabServer(d);
 		}
 		XSync(d, False);
 		t.tv_nsec += ns;

@@ -89,7 +89,7 @@ function reader({ cell, w, h, readback }) {
 		}
 		return own.get(el);
 	};
-	let last = -1, lastTag = -1, pending = false;
+	let last = -1, lastTag = -1, pending = false, badV = -1, badCk = -1;
 	const decode = (t, on) => {
 		let v = 0, ck = 0;
 		for (let b = 0; b < 32; b++) v = (v | (on(b % 20, b >= 20 ? 1 : 0) << b)) >>> 0;
@@ -103,7 +103,7 @@ function reader({ cell, w, h, readback }) {
 				if (lat < -500000) lat += 0x100000;
 				vs.frames.push([t, n, lat]);
 			}
-		} else vs.bad++;
+		} else if (v !== badV || ck !== badCk) { badV = v; badCk = ck; vs.bad++; }
 		let tag = 0, inv = 0;
 		for (let b = 0; b < 5; b++) { tag |= on(b, 2) << b; inv |= on(b + 5, 2) << b; }
 		if ((tag ^ inv) === 31 && tag !== lastTag) { lastTag = tag; vs.tags.push([t, tag]); }
