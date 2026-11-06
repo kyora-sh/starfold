@@ -1456,11 +1456,36 @@ fn a_viewer_that_stopped_answering_holds_back_no_pass() {
     let mut q = p.h264.inflight.lock();
     q.front_mut().unwrap().sent -= Duration::from_millis(REFINE_DRAIN_MS as u64);
     drop(q);
-    let c = p.cohort(Codec::H264);
     let views = p.eng.views();
-    let v = views.iter().zip(&p.eng.cohorts);
-    let v = v.find(|(_, x)| x.shared.id == c.shared.id).unwrap().0;
-    assert!(c.drained(v));
+    let i = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.refine.burst.ladder)
+        .unwrap();
+    assert!(p.eng.cohorts[i].drained(&views[i]));
+}
+
+/// Flow control has it, and it's old enough for the drain gate to let it by: no capture for it.
+#[test]
+fn a_blocked_cohort_has_no_pass_to_take() {
+    let mut p = pair();
+    p.still();
+    let mut q = p.h264.inflight.lock();
+    q.front_mut().unwrap().sent -= Duration::from_millis(REFINE_DRAIN_MS as u64 + 500);
+    drop(q);
+    let views = p.eng.views();
+    let i = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.refine.burst.ladder)
+        .unwrap();
+    let later = p.t + Duration::from_secs(60);
+    assert!(p.eng.cohorts[i].pass_due(&views[i], later));
+    let takes = p.eng.takes(&views, 33.0);
+    assert!(!takes[i]);
+    assert!(!p.eng.passes(&views, &takes, later)[i]);
 }
 
 #[test]
@@ -1613,6 +1638,38 @@ fn a_viewer_that_replaces_the_last_inherits_nothing() {
     let other = &p.cohort(Codec::Hevc).refine.burst;
     assert_eq!(other.backoff, REFINE_MAX_BACKOFF, "its own stays");
     acked(&next, &mut rx);
+}
+
+/// Blocks gone still ride on one cohort's motion frame; the other's stay as they are.
+#[test]
+fn a_cohort_piggybacks_only_its_own_blocks() {
+    let mut p = pair();
+    p.finish();
+    push(&mut p.eng);
+    p.ack_hevc();
+    p.ack_h264();
+    let i = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.refine.burst.ladder)
+        .unwrap();
+    let old = Duration::from_secs(1);
+    let r = &mut p.eng.cohorts[i].refine.refiner;
+    r.epoch -= old;
+    r.last_refine -= old;
+    let views = p.eng.views();
+    let takes = p.eng.takes(&views, 33.0);
+    let none = vec![false; takes.len()];
+    let mut f = whole(W, H);
+    let blocks = (W.div_ceil(16) * H.div_ceil(16)) as usize;
+    f.band = Some(Band { y0: 0, y1: 16 });
+    f.mb_dirty = Some(Arc::new(vec![0; blocks]));
+    p.eng.dispatch(&f, &views, &takes, &none, Instant::now());
+    settle(&p.eng);
+    assert_eq!(p.hub.stats.refines.load(Ordering::Relaxed), 1);
+    assert!(!p.cohort(Codec::H264).refine.refiner.any_pending());
+    assert!(p.cohort(Codec::Hevc).refine.refiner.any_pending());
 }
 
 #[test]
