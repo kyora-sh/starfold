@@ -87,6 +87,12 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             "#include <kvazaar.h>\n",
             "(kvz|KVZ).*",
         ),
+        (
+            cfg!(feature = "x265"),
+            "x265",
+            "#include <stdint.h>\n#include <x265.h>\n",
+            "(x265|X265).*",
+        ),
     ];
     arms.into_iter()
         .filter(|a| a.0)
@@ -101,7 +107,17 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             for p in &lib.include_paths {
                 b = b.clang_arg(format!("-I{}", p.display()));
             }
-            let code = b.generate().expect("bindgen").to_string();
+            let mut code = b.generate().expect("bindgen").to_string();
+            // x265.h renames x265_api_get after the library's build number, as x264.h does.
+            if let Some(get) = code
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .find(|w| {
+                    w.strip_prefix("x265_api_get_")
+                        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                })
+            {
+                code.push_str(&format!("\npub use {get} as x265_api_get;\n"));
+            }
             std::fs::write(out.join(format!("{name}.rs")), code).unwrap();
             lib
         })

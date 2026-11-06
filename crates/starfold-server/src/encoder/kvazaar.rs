@@ -14,11 +14,10 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/kvazaar.rs"));
 }
 
-use super::h264::nal_units;
-use super::hevc::{codec_string, is_random_access, is_slice, nal_type, NAL_SPS};
+use super::hevc::Units;
 use super::{
-    AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig,
-    FrameView, RateConfig, StreamConfig, VideoEncoder,
+    AccessUnit, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
+    VideoEncoder,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -38,7 +37,7 @@ pub struct Kvazaar {
     preset: &'static str,
     kbps: u32,
     pts: i64,
-    sps: Option<Vec<u8>>,
+    units: Units,
 }
 
 unsafe impl Send for Kvazaar {}
@@ -74,7 +73,7 @@ impl Kvazaar {
             preset,
             kbps: kbps(c.rate),
             pts: -1,
-            sps: None,
+            units: Units::new(c.width, c.height),
         };
         k.reopen()?;
         Ok(k)
@@ -183,39 +182,6 @@ impl Kvazaar {
         }
         Ok((!data.is_empty()).then(|| (data, pts.unwrap_or(self.pts))))
     }
-
-    fn unit(&mut self, data: Vec<u8>, pts_ms: i64) -> Option<AccessUnit> {
-        let (mut keyframe, mut slice, mut sps) = (false, false, None);
-        for n in nal_units(&data).filter(|n| n.len() >= 2) {
-            let t = nal_type(n);
-            keyframe |= is_random_access(t);
-            slice |= is_slice(t);
-            if t == NAL_SPS {
-                sps = Some(n.to_vec());
-            }
-        }
-        if !slice {
-            return None;
-        }
-        let config = sps.filter(|s| Some(s) != self.sps.as_ref()).and_then(|s| {
-            let c = codec_string(&s)?;
-            self.sps = Some(s);
-            Some(StreamConfig {
-                codec: Codec::Hevc,
-                codec_string: c,
-                coded: (self.width, self.height),
-                display: (self.width, self.height),
-                format: BitstreamFormat::AnnexB,
-                color: ColorInfo::SRGB_BT601_LIMITED,
-            })
-        });
-        Some(AccessUnit {
-            pts_ms,
-            keyframe,
-            data,
-            config,
-        })
-    }
 }
 
 impl VideoEncoder for Kvazaar {
@@ -278,7 +244,7 @@ impl VideoEncoder for Kvazaar {
         let res = self.call(pic);
         unsafe { (api.picture_free.unwrap())(pic) };
         if let Some((data, pts)) = res? {
-            out.extend(self.unit(data, pts));
+            out.extend(self.units.unit(data, pts));
         }
         Ok(out)
     }
@@ -286,7 +252,7 @@ impl VideoEncoder for Kvazaar {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         let mut out = Vec::new();
         while let Some((data, pts)) = self.call(ptr::null_mut())? {
-            out.extend(self.unit(data, pts));
+            out.extend(self.units.unit(data, pts));
         }
         Ok(out)
     }

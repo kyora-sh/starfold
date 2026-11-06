@@ -62,3 +62,56 @@ pub fn codec_string(sps: &[u8]) -> Option<String> {
     }
     Some(s)
 }
+
+/// Annex-B encoder output to access units: keyframe from the NAL types, the stream config
+/// whenever a new SPS arrives.
+#[cfg(any(feature = "kvazaar", feature = "x265"))]
+pub struct Units {
+    size: (u32, u32),
+    sps: Option<Vec<u8>>,
+}
+
+#[cfg(any(feature = "kvazaar", feature = "x265"))]
+impl Units {
+    pub fn new(width: u32, height: u32) -> Self {
+        Units {
+            size: (width, height),
+            sps: None,
+        }
+    }
+
+    /// `None` for output with no slice in it.
+    pub fn unit(&mut self, data: Vec<u8>, pts_ms: i64) -> Option<super::AccessUnit> {
+        use super::{BitstreamFormat, Codec, ColorInfo, StreamConfig};
+        let (mut keyframe, mut slice, mut sps) = (false, false, None);
+        for n in super::h264::nal_units(&data).filter(|n| n.len() >= 2) {
+            let t = nal_type(n);
+            keyframe |= is_random_access(t);
+            slice |= is_slice(t);
+            if t == NAL_SPS {
+                sps = Some(n.to_vec());
+            }
+        }
+        if !slice {
+            return None;
+        }
+        let config = sps.filter(|s| Some(s) != self.sps.as_ref()).and_then(|s| {
+            let codec_string = codec_string(&s)?;
+            self.sps = Some(s);
+            Some(StreamConfig {
+                codec: Codec::Hevc,
+                codec_string,
+                coded: self.size,
+                display: self.size,
+                format: BitstreamFormat::AnnexB,
+                color: ColorInfo::SRGB_BT601_LIMITED,
+            })
+        });
+        Some(super::AccessUnit {
+            pts_ms,
+            keyframe,
+            data,
+            config,
+        })
+    }
+}

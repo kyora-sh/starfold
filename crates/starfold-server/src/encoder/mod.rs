@@ -8,7 +8,7 @@ mod aom;
 mod av1;
 pub mod caps;
 mod h264;
-#[cfg(any(target_os = "macos", test, feature = "kvazaar"))]
+#[cfg(any(target_os = "macos", test, feature = "kvazaar", feature = "x265"))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hevc;
 #[cfg(feature = "kvazaar")]
@@ -30,6 +30,8 @@ mod videotoolbox;
 mod vpx;
 #[cfg(feature = "x264")]
 mod x264;
+#[cfg(feature = "x265")]
+mod x265;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -194,6 +196,8 @@ pub enum Backend {
     SvtAv1,
     #[cfg(feature = "kvazaar")]
     Kvazaar,
+    #[cfg(feature = "x265")]
+    X265,
     VideoToolbox,
     Vaapi,
     Nvenc,
@@ -240,6 +244,8 @@ impl Backend {
             Backend::SvtAv1 => "svt-av1",
             #[cfg(feature = "kvazaar")]
             Backend::Kvazaar => "kvazaar",
+            #[cfg(feature = "x265")]
+            Backend::X265 => "x265",
             Backend::VideoToolbox => "videotoolbox",
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
@@ -261,6 +267,8 @@ impl Backend {
             Backend::SvtAv1 => codec == Codec::Av1,
             #[cfg(feature = "kvazaar")]
             Backend::Kvazaar => codec == Codec::Hevc,
+            #[cfg(feature = "x265")]
+            Backend::X265 => codec == Codec::Hevc,
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
@@ -282,6 +290,8 @@ impl Backend {
             Backend::SvtAv1 => None,
             #[cfg(feature = "kvazaar")]
             Backend::Kvazaar => None,
+            #[cfg(feature = "x265")]
+            Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(openh264::MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
@@ -302,6 +312,8 @@ impl Backend {
             Backend::SvtAv1 => 64,
             #[cfg(feature = "kvazaar")]
             Backend::Kvazaar => 64,
+            #[cfg(feature = "x265")]
+            Backend::X265 => 64,
             Backend::VideoToolbox => 64,
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
         }
@@ -349,6 +361,8 @@ pub const ARMS: &[(&str, Backend, Codec)] = &[
     ("svt-av1", Backend::SvtAv1, Codec::Av1),
     #[cfg(feature = "kvazaar")]
     ("kvazaar", Backend::Kvazaar, Codec::Hevc),
+    #[cfg(feature = "x265")]
+    ("x265", Backend::X265, Codec::Hevc),
 ];
 
 impl Selection {
@@ -440,6 +454,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::SvtAv1 => Box::new(svt::Svt::new(&coded)?),
         #[cfg(feature = "kvazaar")]
         Backend::Kvazaar => Box::new(kvazaar::Kvazaar::new(&coded)?),
+        #[cfg(feature = "x265")]
+        Backend::X265 => Box::new(x265::X265::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
