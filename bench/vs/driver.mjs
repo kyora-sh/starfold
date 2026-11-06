@@ -237,7 +237,7 @@ async function run(arm, wl, readback = true) {
 			keys: r.keys.length, keysSeen: i2p.length, keysMissing: missing,
 			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p),
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
-			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, browserCpu: ((c1 - c0) / dt) * 100,
+			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, stealPct: ((s1.host.steal - s0.host.steal) / (s1.host.all - s0.host.all)) * 100, browserCpu: ((c1 - c0) / dt) * 100,
 			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
 			rafHz: r.ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,

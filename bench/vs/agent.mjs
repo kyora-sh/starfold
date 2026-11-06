@@ -93,6 +93,11 @@ function cpu(pgid) {
 	}
 	return j / 100;
 }
+/** Host jiffies from /proc/stat: all and stolen by the hypervisor. */
+function hostCpu() {
+	const f = fs.readFileSync('/proc/stat', 'latin1').split('\n')[0].trim().split(/\s+/).slice(1, 9).map(Number);
+	return { all: f.reduce((a, b) => a + b, 0), steal: f[7] };
+}
 /** TCP payload acked by the peer per connection of a server port: the same count for every arm. */
 function bytes(port) {
 	const out = {};
@@ -117,7 +122,7 @@ http.createServer(async (req, res) => {
 	try {
 		if (u.pathname === '/start') { await start(u.searchParams.get('arm'), u.searchParams.get('wl')); res.end('ok'); }
 		else if (u.pathname === '/stop') { await stop(); res.end('ok'); }
-		else if (u.pathname === '/cpu') res.end(JSON.stringify({ server: run.reduce((n, c) => n + cpu(c.pid), 0), x: cpu(xvfb.pid), source: cpu(src?.pid) }));
+		else if (u.pathname === '/cpu') res.end(JSON.stringify({ server: run.reduce((n, c) => n + cpu(c.pid), 0), x: cpu(xvfb.pid), source: cpu(src?.pid), host: hostCpu() }));
 		else if (u.pathname === '/bytes') res.end(JSON.stringify(bytes(Number(u.searchParams.get('port')))));
 		else if (u.pathname === '/freeze') { await freeze(); res.end('ok'); }
 		else if (u.pathname === '/truth') { await truth(u.searchParams.get('out')); res.end('ok'); }
