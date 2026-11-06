@@ -229,6 +229,9 @@ jobs:
         run: |
           import json, os, signal, subprocess, sys, time, urllib.request
           driver = subprocess.Popen(["/usr/bin/safaridriver", "-p", "4444"], start_new_session=True)
+          os.makedirs("/tmp/probe", exist_ok=True)
+          open("/tmp/probe/index.html", "w").write("<!doctype html><title>probe</title>")
+          server = subprocess.Popen([sys.executable, "-m", "http.server", "8123", "-b", "127.0.0.1", "-d", "/tmp/probe"], start_new_session=True)
           def call(method, path, body=None):
               req = urllib.request.Request("http://127.0.0.1:4444" + path, method=method,
                   data=None if body is None else json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -246,7 +249,7 @@ jobs:
                         "libaom / SVT-AV1 (full)": "av01.0.08M.08.0.110.01.13.06.0", "AV1 (short form)": "av01.0.08M.08",
                         "x265": "hvc1.1.6.L153.90", "Kvazaar": "hvc1.1.6.L186.80"}
               script = """const [codecs, done] = arguments; (async () => {
-                if (typeof VideoDecoder === 'undefined') return done({ua: navigator.userAgent, rows: 'no VideoDecoder'});
+                if (typeof VideoDecoder === 'undefined') return done({ua: navigator.userAgent, secure: isSecureContext, rows: 'no VideoDecoder'});
                 const rows = [];
                 for (const [arm, codec] of Object.entries(codecs)) for (const hardwareAcceleration of ['prefer-hardware', 'no-preference']) {
                   let s; try { s = (await VideoDecoder.isConfigSupported({codec, codedWidth: 1920, codedHeight: 1080, hardwareAcceleration})).supported; }
@@ -255,9 +258,10 @@ jobs:
                 }
                 done({ua: navigator.userAgent, rows});
               })();"""
-              call("POST", f"/session/{sid}/url", {"url": "about:blank"})
+              call("POST", f"/session/{sid}/url", {"url": "http://127.0.0.1:8123/"})
               print(json.dumps({"browser": "safari", **call("POST", f"/session/{sid}/execute/async", {"script": script, "args": [codecs]})}))
               call("DELETE", f"/session/{sid}")
           finally:
-              os.killpg(driver.pid, signal.SIGTERM)
-              driver.wait(timeout=10)
+              for p in (driver, server):
+                  os.killpg(p.pid, signal.SIGTERM)
+                  p.wait(timeout=10)
