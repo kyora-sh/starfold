@@ -61,8 +61,14 @@ fn preflight_runs_a_child_once_per_session_and_device() {
     c.rate.max_kbps = 4000;
     assert!(
         preflight(&c, node, |_| unreachable!()).is_ok(),
-        "the rate itself is not"
+        "the bitrate itself is not"
     );
+    c.rate.fps = 60;
+    assert!(
+        preflight(&c, node, |_| Some(Found::failed(Backend::Vaapi, "crash"))).is_err(),
+        "the rate's frame rate is"
+    );
+    c.rate.fps = 24;
     assert!(
         preflight(&c, "/dev/dri/renderD129", |_| Some(Found::failed(
             Backend::Vaapi,

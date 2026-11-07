@@ -139,15 +139,16 @@ pub fn spec(cfg: &EncoderConfig, device: &str) -> String {
 }
 
 /// What decides whether a session opens: the backend, device and the parameters its
-/// session setup sees (the rate control mode, not the rate).
+/// session setup sees (the frame rates and rate control mode, not the bitrate).
 fn key(cfg: &EncoderConfig, device: &str) -> String {
     format!(
-        "{} {}:{}x{}@{},{},{device}",
+        "{} {}:{}x{}@{}/{},{},{device}",
         cfg.backend.name(),
         codec_name(cfg.codec),
         cfg.width,
         cfg.height,
         cfg.fps,
+        cfg.rate.fps,
         if cfg.rate.max_kbps > 0 {
             "capped"
         } else {

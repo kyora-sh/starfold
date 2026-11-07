@@ -129,6 +129,16 @@ enum Units {
     Av1(Option<Vec<u8>>),
 }
 
+impl Units {
+    fn new(codec: Codec, (w, h): (u32, u32)) -> Units {
+        match codec {
+            Codec::Hevc => Units::Hevc(hevc::Units::new(w, h)),
+            Codec::Av1 => Units::Av1(None),
+            _ => Units::H264(ParamSets::default()),
+        }
+    }
+}
+
 pub struct Session {
     drv: Box<dyn Driver>,
     codec: Codec,
@@ -150,16 +160,14 @@ pub struct Session {
 
 impl Session {
     pub fn new(mut drv: Box<dyn Driver>, cfg: &EncoderConfig) -> Result<Session, EncodeError> {
-        let (guid, units) = match cfg.codec {
-            Codec::H264 => (ffi::CODEC_H264, Units::H264(ParamSets::default())),
-            Codec::Hevc => (
-                ffi::CODEC_HEVC,
-                Units::Hevc(hevc::Units::new(cfg.width, cfg.height)),
-            ),
-            Codec::Av1 => (ffi::CODEC_AV1, Units::Av1(None)),
+        let guid = match cfg.codec {
+            Codec::H264 => ffi::CODEC_H264,
+            Codec::Hevc => ffi::CODEC_HEVC,
+            Codec::Av1 => ffi::CODEC_AV1,
             #[allow(unreachable_patterns)]
             c => return Err(EncodeError(format!("NVENC has no {c:?} encoder"))),
         };
+        let units = Units::new(cfg.codec, (cfg.width, cfg.height));
         let color = ColorInfo::SRGB_BT601_LIMITED;
         let rc = Rc::new(cfg.codec, &cfg.rate, None);
         let mut c = drv.preset(guid)?;
@@ -194,7 +202,22 @@ impl Session {
         })
     }
 
+    /// The access unit in `data`, checked against what was asked for. A rejected one
+    /// leaves the parameter-set readers as new, so the next IDR carries a config.
     fn unit(
+        &mut self,
+        data: Vec<u8>,
+        pts_ms: i64,
+        idr: bool,
+    ) -> Result<Option<AccessUnit>, EncodeError> {
+        let r = self.check_unit(data, pts_ms, idr);
+        if r.is_err() {
+            self.units = Units::new(self.codec, self.size);
+        }
+        r
+    }
+
+    fn check_unit(
         &mut self,
         data: Vec<u8>,
         pts_ms: i64,
@@ -228,7 +251,7 @@ impl Session {
     }
 }
 
-fn av1_unit(
+pub fn av1_unit(
     seq: &mut Option<Vec<u8>>,
     data: Vec<u8>,
     pts_ms: i64,
@@ -244,6 +267,14 @@ fn av1_unit(
         tu.extend_from_slice(&TD);
     }
     tu.extend(data);
+    let kind =
+        av1::frame_type(&tu).ok_or_else(|| EncodeError("NVENC AV1 output has no frame".into()))?;
+    if (kind == 0) != key {
+        return Err(EncodeError(format!(
+            "NVENC AV1 asked for {}, got frame type {kind}",
+            if key { "a key frame" } else { "an inter frame" }
+        )));
+    }
     let sh = av1::sequence_header(&tu).map(<[u8]>::to_vec);
     let config = match (&sh, key) {
         (None, true) => {

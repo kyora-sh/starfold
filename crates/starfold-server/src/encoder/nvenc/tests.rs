@@ -53,6 +53,8 @@ struct Fake {
     fail_encode: Option<usize>,
     /// Codes a P frame whatever it is asked for.
     no_idr: bool,
+    /// Leaves the PPS out of the first IDR.
+    first_without_pps: bool,
 }
 
 impl Fake {
@@ -63,6 +65,7 @@ impl Fake {
             codec,
             fail_encode: None,
             no_idr: false,
+            first_without_pps: false,
         };
         (fake, log)
     }
@@ -109,6 +112,9 @@ impl Driver for Fake {
         log.flags.push(flags);
         if self.fail_encode == Some(log.flags.len() - 1) {
             return Err(EncodeError("injected".into()));
+        }
+        if self.first_without_pps && log.flags.len() == 1 {
+            return Ok(annexb(&[H264_SPS, &[0x65, 0x88, 0x84]]));
         }
         Ok(bitstream(
             self.codec,
@@ -370,6 +376,38 @@ fn a_p_frame_for_an_idr_is_an_error() {
             "{codec:?}: {e}"
         );
     }
+}
+
+#[test]
+fn a_rejected_first_idr_does_not_hide_the_next_config() {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.first_without_pps = true;
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240, 2000)).unwrap();
+    assert!(try_encode(enc.as_mut(), 320, 240, false).is_err());
+    let k = encode(enc.as_mut(), 320, 240, false);
+    assert!(k[0].keyframe);
+    assert_eq!(k[0].config.as_ref().unwrap().codec_string, "avc1.42c01f");
+}
+
+#[test]
+fn av1_output_needs_a_frame_of_the_asked_type() {
+    let size = (320, 240);
+    let color = crate::encoder::ColorInfo::SRGB_BT601_LIMITED;
+    let mut seq_only = vec![0x0a, AV1_SEQ.len() as u8];
+    seq_only.extend_from_slice(AV1_SEQ);
+    let e = session::av1_unit(&mut None, seq_only, 0, true, size, color)
+        .err()
+        .unwrap();
+    assert!(e.0.contains("no frame"), "{e}");
+    let e = session::av1_unit(&mut None, vec![0x12, 0x00], 0, false, size, color)
+        .err()
+        .unwrap();
+    assert!(e.0.contains("no frame"), "{e}");
+    let key = bitstream(Codec::Av1, true);
+    let e = session::av1_unit(&mut None, key, 0, false, size, color)
+        .err()
+        .unwrap();
+    assert!(e.0.contains("frame type 0"), "{e}");
 }
 
 #[test]
