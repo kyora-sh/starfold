@@ -369,6 +369,7 @@ pub fn host_probe(hardware: bool, experimental: bool) -> Registry {
 
 /// This platform's hardware probes, run in-process: the experimental ones only with
 /// `experimental`.
+#[cfg_attr(target_os = "macos", allow(clippy::vec_init_then_push))]
 pub fn hardware_providers(experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
     #[cfg(target_os = "macos")]

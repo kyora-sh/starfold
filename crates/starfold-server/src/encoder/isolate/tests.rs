@@ -1,7 +1,7 @@
 use super::*;
-use crate::encoder::caps::{
-    Acceleration, Chroma, ProbeStatus, ProfileCapability, Registry, Software,
-};
+use crate::encoder::caps::{Acceleration, Chroma, ProbeStatus, ProfileCapability};
+#[cfg(unix)]
+use crate::encoder::caps::{Registry, Software};
 use crate::encoder::Codec;
 
 fn good(backend: Backend) -> EncoderCapability {
