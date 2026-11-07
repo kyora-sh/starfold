@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# run.sh <lan|wan> <rounds> <window s> <results file>: one set on this VM. Env: CHROME_ZIP, NOVNC_TGZ, CONTROL_ROUNDS, QUALITY_ROUNDS, ARMS, WORKLOADS, CROPS, PROBE_BUILDS, VOXL_TGZ.
+# run.sh <lan|wan> <rounds> <window s> <results file>: one set on this VM. Env: CHROME_ZIP, NOVNC_TGZ, CONTROL_ROUNDS, QUALITY_ROUNDS, ARMS, WORKLOADS, CROPS, PROBE_BUILDS, VOXL_TGZ,
+# AA (0: no A/A twin of the first arm), RUN (this run's index in a set of runs, for the arm rotation; see set.sh).
 set -u
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 link=${1:-lan} rounds=${2:-5} win=${3:-10} out=${4:-/tmp/vs-results.jsonl}

@@ -54,6 +54,11 @@ sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
 - `cpu.sh <pid> <secs>`, `rate.sh <secs>` (voxl `/stats`), `srcfps.py` (true
   source frame rate from the Xvfb framebuffer), `measure.mjs` (in-browser unique FPS; `VIEWPORT=WxH`).
 - `inputtest.mjs`, `keytest.sh`: input and clipboard checks through the web client.
+- `vs/set.sh <link> <rounds> <run> <results>`: one run of a `bench/vs` set on a VM, CALIB before and after.
+  Every set includes an A/A: the first arm in `ARMS` also runs as `<arm>~aa`, the same binary and
+  settings, interleaved and rotated with the others (`AA=0` turns it off). Pass the run's index as `<run>`
+  so the arm order carries on across runs. `vs/aa.py <run logs...>` judges each arm against the first:
+  its spread S is the A/A's CI, and only a shift beyond S with a CI that excludes 0 counts.
 
 ## Feature tests
 
