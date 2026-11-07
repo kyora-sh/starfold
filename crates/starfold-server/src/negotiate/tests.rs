@@ -563,7 +563,10 @@ fn client_messages() {
         {"codec":"av01.0.13M.08","codedWidth":2560,"codedHeight":1600,"implementation":"dav1d-wasm"},
         {"codec":"vp8","codedWidth":2560,"codedHeight":1600,"implementation":"libvpx-wasm"},
         {"codec":"avc1.42c034"}]}"#;
-    let Some(ClientMsg::Hello { v, offer, decode }) = ClientMsg::parse(caps) else {
+    let Some(ClientMsg::Hello {
+        v, offer, decode, ..
+    }) = ClientMsg::parse(caps)
+    else {
         panic!("not a hello");
     };
     assert_eq!((v, offer), (2, Some(3)));

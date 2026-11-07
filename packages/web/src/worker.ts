@@ -14,6 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
 import {
@@ -49,8 +50,8 @@ const noDraw = query.has('nodraw');
 const noHardware = query.has('nohwdecode');
 /** Frames waiting for their stripes before the decoders are taken as stuck. */
 const MAX_PENDING = 32;
-/** Chunks a stripe decoder may hold before it is taken as falling behind. */
-const MAX_QUEUED = 16;
+/** How long the capability hello waits for the page's display rate. */
+const HZ_WAIT_MS = 1000;
 
 let presentToMain = false;
 let surface: 'video' | 'canvas' | null = null;
@@ -100,6 +101,17 @@ interface StripeState {
 	/** Decoder timestamp -> frame id. */
 	ids: Map<number, number>;
 }
+/** The display's refresh rate the page measured, once it has. */
+let hz: number | undefined;
+let hzKnown: () => void = () => {};
+const hzWait = new Promise<void>((r) => {
+	hzKnown = r;
+	setTimeout(r, HZ_WAIT_MS);
+});
+/** A hello went out on this connection before the display rate was known. */
+let hzOwed = false;
+let rate = new StreamRate();
+let behind = new FellBehind();
 let layout: Stripe[] = [];
 let width = 0;
 const stripes: StripeState[] = [];
@@ -126,6 +138,9 @@ function connect() {
 	const sock = new WebSocket(url);
 	ws = sock;
 	conn++;
+	rate = new StreamRate();
+	behind = new FellBehind();
+	hzOwed = false;
 	sock.binaryType = 'arraybuffer';
 	sock.addEventListener('open', () => {
 		post({ t: 'status', s: 'open' });
@@ -257,9 +272,11 @@ async function answer(
 		dav1dDecodes,
 		noHardware,
 	});
+	await hzWait;
 	if (c !== conn || seq !== helloSeq || proto !== 2) return;
 	for (const [k, a] of r.accepted) accepted.set(k, a);
-	send(msg.hello(offer, r.decode));
+	send(msg.hello(offer, r.decode, hz));
+	hzOwed = hz === undefined;
 	sendVideo();
 }
 
@@ -491,10 +508,14 @@ function onVideo(b: Uint8Array) {
 	st.bytes += b.length;
 	const first = !frames.has(h.frame);
 	if (!frames.open(h.frame, h.parts, performance.now())) {
+		if (behind.note(performance.now())) send(msg.slow());
 		dropAll();
 		return;
 	}
-	if (first) st.pipeMs += h.pipe / 10;
+	if (first) {
+		st.pipeMs += h.pipe / 10;
+		rate.note(performance.now());
+	}
 	const sd = stripeState(h.stripe);
 	if (sd.waitingKey && !h.key) {
 		frames.skip(h.frame);
@@ -521,8 +542,9 @@ function onVideo(b: Uint8Array) {
 		sd.waitingKey = false;
 	}
 	const dec = sd.dec!;
-	if (dec.queued >= MAX_QUEUED) {
+	if (dec.queued >= rate.maxQueued()) {
 		post({ t: 'log', s: `stripe ${h.stripe} decoder fell behind` });
+		if (behind.note(performance.now())) send(msg.slow());
 		dropAll();
 		return;
 	}
@@ -636,6 +658,12 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 				}
 				if (videoSent) send(cmd.video(m.on));
 			}
+			break;
+		case 'hz':
+			hz = m.hz;
+			hzKnown();
+			if (hzOwed) send(msg.hz(m.hz));
+			hzOwed = false;
 			break;
 		case 'audioPort':
 			audioPort = m.port;

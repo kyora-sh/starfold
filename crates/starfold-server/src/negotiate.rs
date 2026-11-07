@@ -330,6 +330,10 @@ pub enum ClientMsg {
         offer: Option<u64>,
         #[serde(default)]
         decode: Vec<serde_json::Value>,
+        /// The display's refresh rate the page measured (frames per second); anything but
+        /// a number is ignored, not the hello.
+        #[serde(default)]
+        hz: Option<serde_json::Value>,
     },
     #[serde(rename = "codec-ready")]
     Ready { epoch: u32 },
@@ -343,6 +347,15 @@ pub enum ClientMsg {
     Ack { epoch: u32, frame: u32 },
     #[serde(rename = "keyframe")]
     Keyframe { epoch: u32 },
+    /// The decoder fell behind twice within 10 s: no more than the base rate for this viewer.
+    #[serde(rename = "slow")]
+    Slow,
+    /// The display's refresh rate, measured after the hello went out.
+    #[serde(rename = "hz")]
+    Hz {
+        #[serde(default)]
+        hz: Option<serde_json::Value>,
+    },
 }
 
 impl ClientMsg {

@@ -386,11 +386,24 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
 /// microphone, resizing) and is dropped. The web client keeps the same list.
 const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
+/// The display rate a client measured, if it is a sensible number.
+fn set_hz(c: &Client, hz: Option<serde_json::Value>) {
+    if let Some(hz) = hz.and_then(|v| v.as_f64()).filter(|h| *h >= 1.0) {
+        c.hz.store(hz.round().min(1000.0) as u32, Ordering::Relaxed);
+    }
+}
+
 /// Protocol 2's JSON messages. All of them are about watching (capabilities, decoder
 /// state, acks and keyframe requests), so read-only viewers send them too.
 fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
     match m {
-        ClientMsg::Hello { v, offer, decode } if v >= crate::negotiate::PROTOCOL => {
+        ClientMsg::Hello {
+            v,
+            offer,
+            decode,
+            hz,
+        } if v >= crate::negotiate::PROTOCOL => {
+            set_hz(c, hz);
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
             if offer.is_some_and(|o| o != gen) {
@@ -424,6 +437,18 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
         ClientMsg::Keyframe { epoch } => {
             if c.request_keyframe(Some(epoch)) {
                 s.hub.wake();
+            }
+        }
+        ClientMsg::Hz { hz } => {
+            set_hz(c, hz);
+            s.hub.wake();
+        }
+        ClientMsg::Slow => {
+            if !c.slow.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "client {}: its decoder keeps falling behind; no more than 60 fps for it",
+                    c.id
+                );
             }
         }
     }
@@ -670,6 +695,33 @@ mod tests {
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    #[test]
+    fn the_hello_says_the_display_rate_and_slow_takes_it_back() {
+        let hub = Hub::new();
+        let s = app(&hub, true, None);
+        let mut rtts = Default::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let c = hub.add_client(tx);
+        assert_eq!(c.display_hz(), None);
+        let hello = |hz: &str| format!(r#"{{"t":"hello","v":2,"offer":0,"decode":[],"hz":{hz}}}"#);
+        handle_text(&s, &c, &hello("119.88"), &mut rtts);
+        assert_eq!(c.display_hz(), Some(120));
+        handle_text(&s, &c, &hello("-5"), &mut rtts);
+        assert_eq!(c.display_hz(), Some(120), "nonsense is ignored");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let odd = hub.add_client(tx);
+        for hz in [r#""120""#, "null", "{}"] {
+            odd.route.lock().proto = Proto::Unknown;
+            handle_text(&s, &odd, &hello(hz), &mut rtts);
+            assert_eq!(odd.route.lock().proto, Proto::V2, "the hello stands: {hz}");
+            assert_eq!(odd.display_hz(), None, "{hz}");
+        }
+        handle_text(&s, &odd, r#"{"t":"hz","hz":143.9}"#, &mut rtts);
+        assert_eq!(odd.display_hz(), Some(144), "measured after the hello");
+        handle_text(&s, &c, r#"{"t":"slow"}"#, &mut rtts);
+        assert_eq!(c.display_hz(), None);
     }
 
     #[test]
