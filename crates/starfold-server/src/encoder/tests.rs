@@ -470,7 +470,11 @@ fn unknown_encoder_names() {
     assert!(Backend::parse("videotoolbox")
         .unwrap_err()
         .contains("macOS"));
-    assert!(Backend::parse("nvenc")
+    #[cfg(any(target_os = "linux", windows))]
+    assert_eq!(Backend::parse("nvenc"), Ok(Backend::Nvenc));
+    #[cfg(not(any(target_os = "linux", windows)))]
+    assert!(Backend::parse("nvenc").unwrap_err().contains("Windows"));
+    assert!(Backend::parse("mediafoundation")
         .unwrap_err()
         .contains("no encoder yet"));
 }
@@ -480,7 +484,7 @@ fn backends_without_the_codec_refuse_to_open() {
     let mut cfg = config(Backend::OpenH264, 64, 64, 1000);
     cfg.codec = Codec::Hevc;
     assert!(open(&cfg).is_err());
-    cfg.backend = Backend::Nvenc;
+    cfg.backend = Backend::MediaFoundation;
     cfg.codec = Codec::H264;
     assert!(open(&cfg).is_err());
 }

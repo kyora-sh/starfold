@@ -62,8 +62,9 @@ pub fn child(backend: Backend, experimental: bool, timeout: Duration) -> Option<
     })
 }
 
-/// Opens and runs a VA-API session for `spec` in a child, if this executable takes [`FLAG`].
-pub fn session(spec: &str, timeout: Duration) -> Option<Probe> {
+/// Opens and runs a `backend` session for `spec` in a child, if this executable takes
+/// [`FLAG`].
+pub fn session(backend: Backend, spec: &str, timeout: Duration) -> Option<Probe> {
     if !SELF_EXEC.load(Ordering::Relaxed) {
         return None;
     }
@@ -71,17 +72,14 @@ pub fn session(spec: &str, timeout: Duration) -> Option<Probe> {
         Ok(e) => e,
         Err(e) => {
             return Some(Probe::failed(
-                Backend::Vaapi,
+                backend,
                 format!("no path to this executable: {e}"),
             ))
         }
     };
     let mut cmd = Command::new(exe);
-    cmd.arg(FLAG)
-        .arg(Backend::Vaapi.name())
-        .arg(SESSION)
-        .arg(spec);
-    Some(run(cmd, Backend::Vaapi, timeout))
+    cmd.arg(FLAG).arg(backend.name()).arg(SESSION).arg(spec);
+    Some(run(cmd, backend, timeout))
 }
 
 /// After [`FLAG`] and a backend: open one session (`<codec>:<w>x<h>@<fps>`) and encode a
@@ -116,23 +114,32 @@ pub fn child_main(args: &[String]) -> i32 {
     print_report(&mut out, p.backend(), found)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn session_main(backend: Option<&str>, spec: Option<&String>) -> i32 {
-    let (Some("vaapi"), Some(spec)) = (backend, spec) else {
-        eprintln!("{FLAG}: {SESSION} takes vaapi and a session");
+    let open: fn(&str) -> Result<(), String> = match backend {
+        #[cfg(target_os = "linux")]
+        Some("vaapi") => super::vaapi::child_session,
+        Some("nvenc") => super::nvenc::child_session,
+        _ => {
+            eprintln!("{FLAG}: {SESSION} takes vaapi or nvenc and a session");
+            return 2;
+        }
+    };
+    let (Some(backend), Some(spec)) = (backend.and_then(|b| Backend::parse(b).ok()), spec) else {
+        eprintln!("{FLAG}: {SESSION} takes a backend and a session");
         return 2;
     };
     let mut out = report_sink();
-    let found = match super::vaapi::child_session(spec) {
+    let found = match open(spec) {
         Ok(()) => Probe::default(),
-        Err(e) => Probe::failed(Backend::Vaapi, e),
+        Err(e) => Probe::failed(backend, e),
     };
-    print_report(&mut out, Backend::Vaapi, found)
+    print_report(&mut out, backend, found)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn session_main(_: Option<&str>, _: Option<&String>) -> i32 {
-    eprintln!("{FLAG}: {SESSION} is Linux-only");
+    eprintln!("{FLAG}: {SESSION} is Linux and Windows only");
     2
 }
 

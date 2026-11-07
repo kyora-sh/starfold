@@ -2,6 +2,7 @@
 //! against a fake on hosts without a GPU.
 
 use super::ffi::{self, VAConfigAttrib, VADisplay, VAImage, Va, VaId};
+use crate::encoder::hw::write_nv12;
 use crate::encoder::{EncodeError, FrameView};
 use std::ffi::{c_int, c_void};
 use std::os::fd::AsRawFd;
@@ -45,50 +46,6 @@ pub trait Driver: Send {
     fn coded(&mut self, buf: VaId) -> Result<Vec<u8>, EncodeError>;
     fn destroy_buffer(&mut self, buf: VaId);
     fn destroy(&mut self, config: VaId, ctx: VaId, surfaces: &[VaId]);
-}
-
-/// Writes `f` as NV12 into an image of `size` with the given pitches and offsets.
-pub fn write_nv12(
-    dst: &mut [u8],
-    pitches: [usize; 2],
-    offsets: [usize; 2],
-    size: (u32, u32),
-    f: &FrameView<'_>,
-) -> Result<(), EncodeError> {
-    f.check()?;
-    let (aw, ah) = (size.0 as usize, size.1 as usize);
-    let (w, h) = (f.width as usize, f.height as usize);
-    let need = |off: usize, pitch: usize, rows: usize, cols: usize| {
-        pitch >= cols && off + (rows.max(1) - 1) * pitch + cols <= dst.len()
-    };
-    if aw < w
-        || ah < h
-        || !need(offsets[0], pitches[0], ah, aw)
-        || !need(offsets[1], pitches[1], ah.div_ceil(2), aw.div_ceil(2) * 2)
-    {
-        return Err(EncodeError(format!(
-            "NV12 image of {}x{} doesn't hold a {w}x{h} picture",
-            aw, ah
-        )));
-    }
-    for r in 0..ah {
-        let s = &f.y[r.min(h - 1) * f.stride_y..][..w];
-        let d = &mut dst[offsets[0] + r * pitches[0]..][..aw];
-        d[..w].copy_from_slice(s);
-        d[w..].fill(s[w - 1]);
-    }
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    for r in 0..ah.div_ceil(2) {
-        let row = r.min(ch - 1) * f.stride_uv;
-        let (u, v) = (&f.u[row..][..cw], &f.v[row..][..cw]);
-        let d = &mut dst[offsets[1] + r * pitches[1]..][..aw.div_ceil(2) * 2];
-        for (i, px) in d.chunks_exact_mut(2).enumerate() {
-            let c = i.min(cw - 1);
-            px[0] = u[c];
-            px[1] = v[c];
-        }
-    }
-    Ok(())
 }
 
 /// A render node's VA display.
