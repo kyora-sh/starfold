@@ -10,6 +10,7 @@ use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(unix))]
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -26,9 +27,17 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 static SELF_EXEC: AtomicBool = AtomicBool::new(false);
+/// Killed children that outlived [`KILL_GRACE`] and got no reaper thread.
+static STUCK: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
 
-/// Marks the current executable as one that answers [`FLAG`].
+/// Marks the current executable as one that answers [`FLAG`]. Call it before any other
+/// thread starts: it also gives `SIGCHLD` its default action back, as an ignored one
+/// inherited across exec would have exited children reaped behind the server's back.
 pub fn enable() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
     SELF_EXEC.store(true, Ordering::Relaxed);
 }
 
@@ -140,6 +149,13 @@ impl ProbeProvider for Child {
 /// On Unix the child leads its own process group, and whatever is left in that group is
 /// killed while the child is known to be unreaped, so its pid can't have been reused.
 pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
+    reap_stuck();
+    if auto_reaps() {
+        return Probe::failed(
+            backend,
+            "probe not run: SIGCHLD is ignored, so its child couldn't be killed safely",
+        );
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -152,7 +168,7 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
     let mut out = match Output::new(child.stdout.take()) {
         Ok(o) => o,
         Err(e) => {
-            if finished(&mut child).is_ok() {
+            if !finished(&mut child).as_ref().err().is_some_and(lost) {
                 kill(&mut child);
             }
             let _ = reap(child);
@@ -174,7 +190,8 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
                 ))
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Probe::failed(backend, format!("probe wait failed: {e}")),
+            Err(e) if lost(&e) => return Probe::failed(backend, format!("probe wait failed: {e}")),
+            Err(e) => break Some(format!("probe wait failed: {e}")),
         }
     };
     kill(&mut child);
@@ -198,7 +215,8 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
 }
 
 /// Reaps a child that exited or was killed, waiting at most [`KILL_GRACE`]: one stuck in
-/// the kernel past that is left to a thread that reaps it whenever it does exit.
+/// the kernel past that is left to a thread that reaps it whenever it does exit, and one
+/// that can't be waited for now is held for the next probe to reap.
 fn reap(mut child: std::process::Child) -> Result<ExitStatus, String> {
     let end = Instant::now() + KILL_GRACE;
     loop {
@@ -206,19 +224,64 @@ fn reap(mut child: std::process::Child) -> Result<ExitStatus, String> {
             Ok(Some(s)) => return Ok(s),
             Ok(None) if Instant::now() >= end => break,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("probe wait failed: {e}")),
+            Err(e) => {
+                if !lost(&e) {
+                    STUCK.lock().unwrap_or_else(|e| e.into_inner()).push(child);
+                }
+                return Err(format!("probe wait failed: {e}"));
+            }
         }
     }
     let pid = child.id();
-    let _ = std::thread::Builder::new()
+    let held = std::sync::Arc::new(Mutex::new(Some(child)));
+    let theirs = held.clone();
+    let spawned = std::thread::Builder::new()
         .name("probe-reap".into())
         .spawn(move || {
-            let _ = child.wait();
+            if let Some(mut c) = theirs.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = c.wait();
+            }
         });
+    if spawned.is_err() {
+        if let Some(c) = held.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            STUCK.lock().unwrap_or_else(|e| e.into_inner()).push(c);
+        }
+    }
     Err(format!(
         "probe {pid} was killed but did not exit in {} s",
         KILL_GRACE.as_secs()
     ))
+}
+
+/// Whether a wait error means the child is no longer ours to signal: something else
+/// reaped it and its pid may be in use again.
+#[cfg(unix)]
+fn lost(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD)
+}
+
+#[cfg(not(unix))]
+fn lost(_: &std::io::Error) -> bool {
+    false
+}
+
+/// Whether exited children are reaped without a wait, so a pid stops being ours.
+#[cfg(unix)]
+fn auto_reaps() -> bool {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    r != 0 || old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0
+}
+
+#[cfg(not(unix))]
+fn auto_reaps() -> bool {
+    false
+}
+
+/// Reaps whichever held children have exited since.
+fn reap_stuck() {
+    let mut stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner());
+    stuck.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
 }
 
 #[derive(Debug)]

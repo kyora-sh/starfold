@@ -282,13 +282,25 @@ fn flooding_child_is_cut_off() {
 #[cfg(target_os = "linux")]
 #[test]
 fn output_held_open_by_an_escaped_process() {
+    let dir = std::env::temp_dir().join(format!("starfold-probe-escape-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ready = dir.join("ready");
     let line = report(Backend::Vaapi, vec![good(Backend::Vaapi)]);
-    let t = Instant::now();
-    let p = run(
-        sh(&format!("setsid sleep 4 & echo '{line}'")),
-        Backend::Vaapi,
-        Duration::from_secs(10),
+    let script = format!(
+        "setsid sh -c 'echo $$ > {r}.tmp; mv {r}.tmp {r}; exec sleep 4' & \
+         while [ ! -s {r} ]; do sleep 0.01; done; echo '{line}'",
+        r = ready.display()
     );
+    let t = Instant::now();
+    let p = run(sh(&script), Backend::Vaapi, Duration::from_secs(10));
+    let took = t.elapsed();
+    let pid: libc::pid_t = std::fs::read_to_string(&ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(reason(&p), "probe output stayed open after it exited");
-    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert_ne!(unsafe { libc::getsid(pid) }, unsafe { libc::getsid(0) });
+    std::fs::remove_dir_all(&dir).unwrap();
 }
