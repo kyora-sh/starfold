@@ -676,18 +676,70 @@ fn choose_prefers_low_power_and_the_best_profile() {
 
 #[test]
 fn levels() {
-    assert_eq!(h264::level(120, 68, 30), 40);
-    assert_eq!(h264::level(120, 68, 60), 42);
-    assert_eq!(h264::level(240, 135, 30), 51);
+    let m = 4_000_000;
+    assert_eq!(h264::level(120, 68, 30, m, true), Some((40, 25_000_000)));
+    assert_eq!(h264::level(120, 68, 60, m, true).unwrap().0, 42);
+    assert_eq!(h264::level(240, 135, 30, m, true).unwrap().0, 51);
     assert_eq!(
-        h264::level(240, 8, 30),
+        h264::level(240, 8, 30, m, true).unwrap().0,
         40,
         "a 3840x128 stripe is too wide for 3.1"
     );
-    assert_eq!(hevc::level(1920, 1080, 60), 123);
-    assert_eq!(hevc::level(3840, 128, 30), 120, "too wide for 3.1");
-    assert_eq!(av1::level(3840, 2160, 30), 12);
-    assert_eq!(av1::level(3000, 64, 30), 4, "too wide for 2.1");
+    assert_eq!(
+        h264::level(20, 15, 30, 12_000_000, false).unwrap().0,
+        31,
+        "bitrate"
+    );
+    assert_eq!(h264::level(20, 15, 30, 2_000_000_000, true), None);
+    assert_eq!(hevc::level(1920, 1080, 60, m).unwrap().0, 123);
+    assert_eq!(
+        hevc::level(3840, 128, 30, m).unwrap().0,
+        120,
+        "too wide for 3.1"
+    );
+    assert_eq!(
+        hevc::level(320, 240, 30, m),
+        Some((90, 6_000_000)),
+        "4 Mbit/s is past 2"
+    );
+    assert_eq!(hevc::level(128, 17_000, 30, m), None);
+    assert_eq!(av1::level(3840, 2160, 30, m).unwrap().0, 12);
+    assert_eq!(
+        av1::level(3000, 64, 30, m).unwrap().0,
+        4,
+        "too wide for 2.1"
+    );
+    assert_eq!(av1::level(128, 9000, 30, m), None, "taller than any level");
+    let (fake, _) = Fake::new(ffi::PROFILE_AV1_0, av1_tile_group);
+    let e = session(Box::new(fake), &sample_config(Codec::Av1, 4096, 4096, 300))
+        .err()
+        .unwrap();
+    assert!(e.0.contains("no AV1 level"), "{e}");
+}
+
+#[test]
+fn a_higher_rate_raises_the_level_at_an_idr() {
+    let (fake, log) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    let first = encode(enc.as_mut(), 320, 240, false).unwrap().remove(0);
+    assert_eq!(first.config.unwrap().codec_string, "avc1.64001e");
+    assert!(!encode(enc.as_mut(), 320, 240, false).unwrap()[0].keyframe);
+    enc.set_rate(RateConfig::new(24.0, 20_000, 30)).unwrap();
+    let au = encode(enc.as_mut(), 320, 240, false).unwrap().remove(0);
+    assert!(au.keyframe, "a new level takes an IDR");
+    assert_eq!(au.config.unwrap().codec_string, "avc1.640020");
+    enc.set_rate(RateConfig::new(24.0, 2_000_000, 30)).unwrap();
+    assert!(encode(enc.as_mut(), 320, 240, false).unwrap()[0].keyframe);
+    let log = log.lock().unwrap();
+    let seq = |i: usize| -> ffi::VAEncSequenceParameterBufferH264 {
+        ffi::read(&find(&log.frames[i], ffi::BUF_SEQUENCE)[0])
+    };
+    assert_eq!((seq(2).level_idc, seq(2).bits_per_second), (32, 20_000_000));
+    assert_eq!(
+        (seq(3).level_idc, seq(3).bits_per_second),
+        (62, 1_000_000_000),
+        "past every level: the highest, at its cap"
+    );
 }
 
 #[test]

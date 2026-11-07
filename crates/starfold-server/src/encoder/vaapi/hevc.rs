@@ -16,25 +16,33 @@ const ALL: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE | ffi::PACKED_SLICE;
 const NAL_IDR_W_RADL: u8 = 19;
 const NAL_TRAIL_R: u8 = 1;
 
-/// `general_level_idc` (30 x the level) for a `w`x`h` picture at `fps`.
-pub fn level(w: u64, h: u64, fps: u64) -> u8 {
-    let ps = w * h;
-    const LEVELS: &[(u8, u64, u64)] = &[
-        (60, 122_880, 3_686_400),
-        (90, 552_960, 16_588_800),
-        (93, 983_040, 33_177_600),
-        (120, 2_228_224, 66_846_720),
-        (123, 2_228_224, 133_693_440),
-        (150, 8_912_896, 267_386_880),
-        (153, 8_912_896, 534_773_760),
-        (156, 8_912_896, 1_069_547_520),
-        (180, 35_651_584, 1_069_547_520),
-        (183, 35_651_584, 2_139_095_040),
+/// `general_level_idc` (30 x the level) of the lowest Main-tier level that holds a
+/// `w`x`h` picture at `fps` and `bps`, and the bitrate it allows.
+pub fn level(w: u64, h: u64, fps: u64, bps: u64) -> Option<(u8, u64)> {
+    const LEVELS: &[(u8, u64, u64, u64)] = &[
+        (60, 122_880, 3_686_400, 1_500),
+        (90, 552_960, 16_588_800, 6_000),
+        (93, 983_040, 33_177_600, 10_000),
+        (120, 2_228_224, 66_846_720, 12_000),
+        (123, 2_228_224, 133_693_440, 20_000),
+        (150, 8_912_896, 267_386_880, 25_000),
+        (153, 8_912_896, 534_773_760, 40_000),
+        (156, 8_912_896, 1_069_547_520, 60_000),
+        (180, 35_651_584, 1_069_547_520, 60_000),
+        (183, 35_651_584, 2_139_095_040, 120_000),
+        (186, 35_651_584, 4_278_190_080, 240_000),
     ];
+    let ps = w * h;
     LEVELS
         .iter()
-        .find(|l| ps <= l.1 && ps * fps <= l.2 && w * w <= 8 * l.1 && h * h <= 8 * l.1)
-        .map_or(186, |l| l.0)
+        .find(|l| {
+            ps <= l.1
+                && ps * fps <= l.2
+                && w * w <= 8 * l.1
+                && h * h <= 8 * l.1
+                && bps <= l.3 * 1000
+        })
+        .map(|l| (l.0, l.3 * 1000))
 }
 
 /// Coding tools, from what the driver supports or requires.
@@ -98,6 +106,7 @@ pub struct Hevc {
     size: (u32, u32),
     pic: (u32, u32),
     level: u8,
+    fps: u32,
     tools: Tools,
     color: ColorInfo,
     packed: bool,
@@ -107,7 +116,7 @@ pub struct Hevc {
 }
 
 impl Hevc {
-    pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> Hevc {
+    pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> Result<Hevc, EncodeError> {
         let tools = Tools::new(
             choice.extra.first().copied().flatten(),
             choice.extra.get(1).copied().flatten(),
@@ -116,17 +125,28 @@ impl Hevc {
         );
         let cb = 1 << tools.log2_min_cb;
         let pic = (cfg.width.div_ceil(cb) * cb, cfg.height.div_ceil(cb) * cb);
-        Hevc {
+        let fps = cfg.fps.max(1);
+        let (level, _) =
+            level(pic.0 as u64, pic.1 as u64, fps as u64, rc.bps as u64).ok_or_else(|| {
+                EncodeError(format!(
+                    "no HEVC level holds {}x{}@{fps} at {} kbit/s",
+                    pic.0,
+                    pic.1,
+                    rc.bps / 1000
+                ))
+            })?;
+        Ok(Hevc {
             size: (cfg.width, cfg.height),
             pic,
-            level: level(pic.0 as u64, pic.1 as u64, cfg.fps.max(1) as u64),
+            level,
+            fps,
             tools,
             color: ColorInfo::SRGB_BT601_LIMITED,
             packed: choice.packed == Some(ALL),
             pps_qp: rc.qp,
             units: Units::new(cfg.width, cfg.height),
             announced: false,
-        }
+        })
     }
 
     pub fn packed(driver: Option<u32>) -> Option<u32> {
@@ -413,6 +433,22 @@ impl Params for Hevc {
         });
         out.push(Buffer::new(ffi::BUF_SLICE, sl));
         out
+    }
+
+    fn rate(&mut self, bps: u32) -> (u32, bool) {
+        match level(
+            self.pic.0 as u64,
+            self.pic.1 as u64,
+            self.fps as u64,
+            bps as u64,
+        ) {
+            Some((l, _)) if l > self.level => {
+                self.level = l;
+                (bps, true)
+            }
+            Some(_) => (bps, false),
+            None => self.rate(bps.min(240_000_000)),
+        }
     }
 
     fn unit(

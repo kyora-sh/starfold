@@ -15,26 +15,35 @@ pub const PROFILES: &[i32] = &[
 const LOG2_MAX_FRAME_NUM: u32 = 8;
 const BOTH: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
 
-/// The lowest level whose frame size, frame dimensions and macroblock rate hold a
-/// `w`x`h` macroblock stream at `fps`.
-pub fn level(w: u64, h: u64, fps: u64) -> u8 {
-    let mbs = w * h;
-    const LEVELS: &[(u8, u64, u64)] = &[
-        (30, 1620, 40_500),
-        (31, 3600, 108_000),
-        (32, 5120, 216_000),
-        (40, 8192, 245_760),
-        (42, 8704, 522_240),
-        (50, 22_080, 589_824),
-        (51, 36_864, 983_040),
-        (52, 36_864, 2_073_600),
-        (60, 139_264, 4_177_920),
-        (61, 139_264, 8_355_840),
+/// The lowest level that holds a `w`x`h` macroblock stream at `fps` and `bps` (frame
+/// size, frame dimensions, macroblock rate, bitrate), and the bitrate it allows.
+pub fn level(w: u64, h: u64, fps: u64, bps: u64, high: bool) -> Option<(u8, u64)> {
+    const LEVELS: &[(u8, u64, u64, u64)] = &[
+        (30, 1620, 40_500, 10_000),
+        (31, 3600, 108_000, 14_000),
+        (32, 5120, 216_000, 20_000),
+        (40, 8192, 245_760, 20_000),
+        (41, 8192, 245_760, 50_000),
+        (42, 8704, 522_240, 50_000),
+        (50, 22_080, 589_824, 135_000),
+        (51, 36_864, 983_040, 240_000),
+        (52, 36_864, 2_073_600, 240_000),
+        (60, 139_264, 4_177_920, 240_000),
+        (61, 139_264, 8_355_840, 480_000),
+        (62, 139_264, 16_711_680, 800_000),
     ];
+    let mbs = w * h;
+    let factor = if high { 1250 } else { 1000 };
     LEVELS
         .iter()
-        .find(|l| mbs <= l.1 && mbs * fps <= l.2 && w * w <= 8 * l.1 && h * h <= 8 * l.1)
-        .map_or(62, |l| l.0)
+        .find(|l| {
+            mbs <= l.1
+                && mbs * fps <= l.2
+                && w * w <= 8 * l.1
+                && h * h <= 8 * l.1
+                && bps <= l.3 * factor
+        })
+        .map(|l| (l.0, l.3 * factor))
 }
 
 pub struct H264 {
@@ -42,6 +51,7 @@ pub struct H264 {
     size: (u32, u32),
     mbs: (u32, u32),
     level: u8,
+    fps: u32,
     color: ColorInfo,
     packed: bool,
     pps_qp: u8,
@@ -49,18 +59,40 @@ pub struct H264 {
 }
 
 impl H264 {
-    pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> H264 {
+    pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> Result<H264, EncodeError> {
         let mbs = (cfg.width.div_ceil(16), cfg.height.div_ceil(16));
-        H264 {
+        let mut h = H264 {
             profile: choice.profile,
             size: (cfg.width, cfg.height),
             mbs,
-            level: level(mbs.0 as u64, mbs.1 as u64, cfg.fps.max(1) as u64),
+            level: 0,
+            fps: cfg.fps.max(1),
             color: ColorInfo::SRGB_BT601_LIMITED,
             packed: choice.packed == Some(BOTH),
             pps_qp: rc.qp,
             units: ParamSets::default(),
-        }
+        };
+        let (level, _) = h.level_for(rc.bps).ok_or_else(|| {
+            EncodeError(format!(
+                "no H.264 level holds {}x{}@{} at {} kbit/s",
+                cfg.width,
+                cfg.height,
+                h.fps,
+                rc.bps / 1000
+            ))
+        })?;
+        h.level = level;
+        Ok(h)
+    }
+
+    fn level_for(&self, bps: u32) -> Option<(u8, u64)> {
+        level(
+            self.mbs.0 as u64,
+            self.mbs.1 as u64,
+            self.fps as u64,
+            bps as u64,
+            self.high(),
+        )
     }
 
     /// SPS and PPS packed together or not at all.
@@ -260,6 +292,21 @@ impl Params for H264 {
         });
         out.push(Buffer::new(ffi::BUF_SLICE, sl));
         out
+    }
+
+    fn rate(&mut self, bps: u32) -> (u32, bool) {
+        match self.level_for(bps) {
+            Some((l, _)) if l > self.level => {
+                self.level = l;
+                (bps, true)
+            }
+            Some(_) => (bps, false),
+            None => self.rate(bps.min(if self.high() {
+                1_000_000_000
+            } else {
+                800_000_000
+            })),
+        }
     }
 
     fn unit(

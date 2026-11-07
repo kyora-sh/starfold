@@ -5,7 +5,7 @@
 
 use super::bits::{leb128_fixed, Bits};
 use super::ffi;
-use super::session::{Buffer, Choice, Params, Picture, RcMode};
+use super::session::{Buffer, Choice, Params, Picture, Rc, RcMode};
 use crate::encoder::{
     av1, AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncoderConfig, StreamConfig,
 };
@@ -18,26 +18,28 @@ const NEED: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
 const TD: [u8; 2] = [0x12, 0x00];
 const CDEF: (u8, u8) = (2, 1);
 
-/// `seq_level_idx` for a `w`x`h` picture at `fps`.
-pub fn level(w: u64, h: u64, fps: u64) -> u8 {
-    const LEVELS: &[(u8, u64, u64, u64, u64)] = &[
-        (0, 147_456, 4_423_680, 2048, 1152),
-        (1, 278_784, 8_363_520, 2816, 1584),
-        (4, 665_856, 19_975_680, 4352, 2448),
-        (5, 1_065_024, 31_950_720, 5504, 3096),
-        (8, 2_359_296, 70_778_880, 6144, 3456),
-        (9, 2_359_296, 141_557_760, 6144, 3456),
-        (12, 8_912_896, 267_386_880, 8192, 4352),
-        (13, 8_912_896, 534_773_760, 8192, 4352),
-        (14, 8_912_896, 1_069_547_520, 8192, 4352),
-        (16, 35_651_584, 1_069_547_520, 16384, 8704),
-        (17, 35_651_584, 2_139_095_040, 16384, 8704),
+/// `seq_level_idx` of the lowest Main-tier level that holds a `w`x`h` picture at `fps`
+/// and `bps`, and the bitrate it allows.
+pub fn level(w: u64, h: u64, fps: u64, bps: u64) -> Option<(u8, u64)> {
+    const LEVELS: &[(u8, u64, u64, u64, u64, u64)] = &[
+        (0, 147_456, 4_423_680, 2048, 1152, 1_500),
+        (1, 278_784, 8_363_520, 2816, 1584, 3_000),
+        (4, 665_856, 19_975_680, 4352, 2448, 6_000),
+        (5, 1_065_024, 31_950_720, 5504, 3096, 10_000),
+        (8, 2_359_296, 70_778_880, 6144, 3456, 12_000),
+        (9, 2_359_296, 141_557_760, 6144, 3456, 20_000),
+        (12, 8_912_896, 267_386_880, 8192, 4352, 30_000),
+        (13, 8_912_896, 534_773_760, 8192, 4352, 40_000),
+        (14, 8_912_896, 1_069_547_520, 8192, 4352, 60_000),
+        (16, 35_651_584, 1_069_547_520, 16384, 8704, 60_000),
+        (17, 35_651_584, 2_139_095_040, 16384, 8704, 100_000),
+        (18, 35_651_584, 4_278_190_080, 16384, 8704, 160_000),
     ];
     let ps = w * h;
     LEVELS
         .iter()
-        .find(|l| ps <= l.1 && ps * fps <= l.2 && w <= l.3 && h <= l.4)
-        .map_or(18, |l| l.0)
+        .find(|l| ps <= l.1 && ps * fps <= l.2 && w <= l.3 && h <= l.4 && bps <= l.5 * 1000)
+        .map(|l| (l.0, l.5 * 1000))
 }
 
 fn tile_log2(blk: u32, target: u32) -> u32 {
@@ -128,6 +130,7 @@ pub struct Offsets {
 pub struct Av1 {
     size: (u32, u32),
     level: u8,
+    fps: u32,
     tiles: Tiles,
     color: ColorInfo,
     /// The `interpolation_filter` value, 4 for switchable.
@@ -139,7 +142,7 @@ pub struct Av1 {
 }
 
 impl Av1 {
-    pub fn new(choice: &Choice, cfg: &EncoderConfig) -> Result<Av1, EncodeError> {
+    pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> Result<Av1, EncodeError> {
         if choice.packed.is_none_or(|p| p & NEED != NEED) {
             return Err(EncodeError(
                 "the driver doesn't take packed AV1 sequence and frame headers".into(),
@@ -157,9 +160,25 @@ impl Av1 {
             Some(v) => ((v & 3) + 1, ((v >> 2) & 3) as usize + 1, (v >> 4) & 7),
             None => (4, 4, 4),
         };
+        let fps = cfg.fps.max(1);
+        let (level, _) = level(
+            cfg.width as u64,
+            cfg.height as u64,
+            fps as u64,
+            rc.bps as u64,
+        )
+        .ok_or_else(|| {
+            EncodeError(format!(
+                "no AV1 level holds {}x{}@{fps} at {} kbit/s",
+                cfg.width,
+                cfg.height,
+                rc.bps / 1000
+            ))
+        })?;
         Ok(Av1 {
             size: (cfg.width, cfg.height),
-            level: level(cfg.width as u64, cfg.height as u64, cfg.fps.max(1) as u64),
+            level,
+            fps,
             tiles: Tiles::new(cfg.width, cfg.height),
             color: ColorInfo::SRGB_BT601_LIMITED,
             filter,
@@ -420,6 +439,22 @@ impl Params for Av1 {
         });
         out.push(Buffer::new(ffi::BUF_SLICE, tg));
         out
+    }
+
+    fn rate(&mut self, bps: u32) -> (u32, bool) {
+        match level(
+            self.size.0 as u64,
+            self.size.1 as u64,
+            self.fps as u64,
+            bps as u64,
+        ) {
+            Some((l, _)) if l > self.level => {
+                self.level = l;
+                (bps, true)
+            }
+            Some(_) => (bps, false),
+            None => self.rate(bps.min(160_000_000)),
+        }
     }
 
     fn unit(

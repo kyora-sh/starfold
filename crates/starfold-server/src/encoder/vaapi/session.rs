@@ -232,6 +232,9 @@ pub trait Params: Send {
     /// Every buffer for one picture, in render order; `misc` goes right after the
     /// sequence parameters, which IDRs carry.
     fn buffers(&mut self, p: &Picture, misc: Vec<Buffer>) -> Vec<Buffer>;
+    /// Raises the declared level if `bps` needs it: the bitrate the stream may use
+    /// (capped at the highest level's cap) and whether the level changed, which takes an IDR.
+    fn rate(&mut self, bps: u32) -> (u32, bool);
     fn unit(
         &mut self,
         data: Vec<u8>,
@@ -349,7 +352,10 @@ impl<P: Params> Drop for Session<P> {
 
 impl<P: Params> VideoEncoder for Session<P> {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
-        let rc = Rc::new(self.rc.mode, &rate, Some(&self.rc));
+        let mut rc = Rc::new(self.rc.mode, &rate, Some(&self.rc));
+        let (bps, relevel) = self.params.rate(rc.bps);
+        rc.bps = bps;
+        self.need_idr |= relevel;
         if rc != self.rc {
             self.rc_changed |= rc.mode != RcMode::Cqp || rc.fps != self.rc.fps;
             self.rc = rc;

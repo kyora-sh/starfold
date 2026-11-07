@@ -385,20 +385,22 @@ pub(super) fn session(
             let mut c = choose(drv.as_mut(), h264::PROFILES, size, &[])?;
             c.packed = h264::H264::packed(c.packed);
             Box::new(Session::new(drv, &c, cfg, |c, rc| {
-                Ok(h264::H264::new(c, cfg, rc))
+                h264::H264::new(c, cfg, rc)
             })?)
         }
         Codec::Hevc => {
             let mut c = choose(drv.as_mut(), hevc::PROFILES, size, hevc::EXTRA)?;
             c.packed = hevc::Hevc::packed(c.packed);
             Box::new(Session::new(drv, &c, cfg, |c, rc| {
-                Ok(hevc::Hevc::new(c, cfg, rc))
+                hevc::Hevc::new(c, cfg, rc)
             })?)
         }
         Codec::Av1 => {
             let mut c = choose(drv.as_mut(), av1::PROFILES, size, av1::EXTRA)?;
             c.packed = av1::Av1::packed(c.packed);
-            Box::new(Session::new(drv, &c, cfg, |c, _| av1::Av1::new(c, cfg))?)
+            Box::new(Session::new(drv, &c, cfg, |c, rc| {
+                av1::Av1::new(c, cfg, rc)
+            })?)
         }
         #[allow(unreachable_patterns)]
         c => return Err(EncodeError(format!("VA-API has no {c:?} encoder"))),
