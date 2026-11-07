@@ -1233,12 +1233,14 @@ impl Engine {
         let ready = self.takes(views, interval_ms);
         let early = self.early(views, now);
         let takes: Vec<bool> = ready.iter().zip(&early).map(|(&r, &e)| r && !e).collect();
-        let passes = self.passes(views, &takes, now);
+        let due = self.passes(views, &ready, now);
+        let passes: Vec<bool> = due.iter().zip(&early).map(|(&p, &e)| p && !e).collect();
         let catch_up = self.catch_up_due(&ready);
         Turn {
             want_key: views.iter().any(|v| v.want_key),
             catch_up,
             paced: ready.iter().zip(&early).any(|(&r, &e)| r && e),
+            pass_paced: due.iter().zip(&early).any(|(&p, &e)| p && e),
             takes,
             passes,
             at: now,
@@ -1395,13 +1397,15 @@ struct Turn {
     catch_up: bool,
     /// A cohort would take this capture but for its cap.
     paced: bool,
+    /// A cohort has a pass due but for its cap.
+    pass_paced: bool,
     at: Instant,
 }
 
 impl Turn {
     /// Something is due even if nothing changed on screen.
     fn work(&self) -> bool {
-        self.want_key || self.catch_up || self.passes.contains(&true)
+        self.want_key || self.catch_up || self.pass_paced || self.passes.contains(&true)
     }
 }
 

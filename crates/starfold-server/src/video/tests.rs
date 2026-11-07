@@ -1679,6 +1679,7 @@ fn a_pass_is_work_for_the_capture_loop() {
         want_key: false,
         catch_up: false,
         paced: false,
+        pass_paced: false,
         at: Instant::now(),
     };
     assert!(turn(true).work());
@@ -3458,4 +3459,28 @@ fn keyframes_an_encoder_makes_by_itself_are_not_timed() {
         }
     }
     assert_eq!(eng.cohorts[0].fps(), 120);
+}
+
+#[test]
+fn a_pass_held_back_by_the_cap_is_still_work() {
+    let mut p = pair();
+    p.still();
+    p.ack_hevc();
+    p.ack_h264();
+    let later = p.t + Duration::from_secs(60);
+    let views = p.eng.views();
+    assert!(p
+        .eng
+        .passes(&views, &p.eng.takes(&views, 33.0), later)
+        .contains(&true));
+    p.eng.cfg.source_fps = 120;
+    for c in &mut p.eng.cohorts {
+        c.last_take = Some(later - Duration::from_millis(5));
+    }
+    let turn = p.eng.turn(&views, 33.0, later);
+    assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
+    assert!(
+        turn.work(),
+        "the loop waits for the cap, not the idle timeout"
+    );
 }
