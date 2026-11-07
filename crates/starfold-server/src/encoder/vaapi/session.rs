@@ -15,21 +15,20 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn of<T: Copy>(kind: c_int, t: &T) -> Buffer {
-        Buffer {
-            kind,
-            data: ffi::bytes(t),
-        }
+    pub fn new(kind: c_int, data: Vec<u8>) -> Buffer {
+        Buffer { kind, data }
     }
 
     /// A packed header's parameter and data buffers.
     pub fn packed(kind: u32, data: Vec<u8>) -> [Buffer; 2] {
-        let mut p: ffi::VAEncPackedHeaderParameterBuffer = ffi::zeroed();
-        p.kind = kind;
-        p.bit_length = (data.len() * 8) as u32;
-        p.has_emulation_bytes = 1;
+        let bits = (data.len() * 8) as u32;
+        let p = ffi::param(|p: &mut ffi::VAEncPackedHeaderParameterBuffer| {
+            p.kind = kind;
+            p.bit_length = bits;
+            p.has_emulation_bytes = 1;
+        });
         [
-            Buffer::of(ffi::BUF_PACKED_PARAM, &p),
+            Buffer::new(ffi::BUF_PACKED_PARAM, p),
             Buffer {
                 kind: ffi::BUF_PACKED_DATA,
                 data,
@@ -103,26 +102,29 @@ impl Rc {
 
     /// The frame rate, rate control and HRD buffers, `reset` after a change mid-stream.
     pub fn misc(&self, reset: bool) -> Vec<Buffer> {
-        let mut fr: ffi::Misc<ffi::VAEncMiscParameterFrameRate> = ffi::zeroed();
-        fr.kind = ffi::MISC_FRAME_RATE;
-        fr.data.framerate = self.fps;
-        let mut out = vec![Buffer::of(ffi::BUF_MISC, &fr)];
+        let fr = ffi::param(|f: &mut ffi::Misc<ffi::VAEncMiscParameterFrameRate>| {
+            f.kind = ffi::MISC_FRAME_RATE;
+            f.data.framerate = self.fps;
+        });
+        let mut out = vec![Buffer::new(ffi::BUF_MISC, fr)];
         if self.mode == RcMode::Cqp {
             return out;
         }
-        let mut rc: ffi::Misc<ffi::VAEncMiscParameterRateControl> = ffi::zeroed();
-        rc.kind = ffi::MISC_RATE_CONTROL;
-        rc.data.bits_per_second = self.bps;
-        rc.data.target_percentage = if self.mode == RcMode::Cbr { 100 } else { 95 };
-        rc.data.window_size =
-            ((self.buffer_bits as u64 * 1000 / self.bps.max(1) as u64) as u32).max(1);
-        rc.data.rc_flags = reset as u32 | 1 << 1;
-        let mut hrd: ffi::Misc<ffi::VAEncMiscParameterHRD> = ffi::zeroed();
-        hrd.kind = ffi::MISC_HRD;
-        hrd.data.buffer_size = self.buffer_bits;
-        hrd.data.initial_buffer_fullness = self.buffer_bits / 2;
-        out.push(Buffer::of(ffi::BUF_MISC, &rc));
-        out.push(Buffer::of(ffi::BUF_MISC, &hrd));
+        let rc = ffi::param(|r: &mut ffi::Misc<ffi::VAEncMiscParameterRateControl>| {
+            r.kind = ffi::MISC_RATE_CONTROL;
+            r.data.bits_per_second = self.bps;
+            r.data.target_percentage = if self.mode == RcMode::Cbr { 100 } else { 95 };
+            r.data.window_size =
+                ((self.buffer_bits as u64 * 1000 / self.bps.max(1) as u64) as u32).max(1);
+            r.data.rc_flags = reset as u32 | 1 << 1;
+        });
+        let hrd = ffi::param(|h: &mut ffi::Misc<ffi::VAEncMiscParameterHRD>| {
+            h.kind = ffi::MISC_HRD;
+            h.data.buffer_size = self.buffer_bits;
+            h.data.initial_buffer_fullness = self.buffer_bits / 2;
+        });
+        out.push(Buffer::new(ffi::BUF_MISC, rc));
+        out.push(Buffer::new(ffi::BUF_MISC, hrd));
         out
     }
 }

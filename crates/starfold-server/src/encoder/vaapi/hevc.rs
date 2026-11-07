@@ -16,9 +16,9 @@ const ALL: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE | ffi::PACKED_SLICE;
 const NAL_IDR_W_RADL: u8 = 19;
 const NAL_TRAIL_R: u8 = 1;
 
-/// `general_level_idc` (30 x the level) for a picture of `ps` luma samples at `rate`
-/// samples per second.
-pub fn level(ps: u64, rate: u64) -> u8 {
+/// `general_level_idc` (30 x the level) for a `w`x`h` picture at `fps`.
+pub fn level(w: u64, h: u64, fps: u64) -> u8 {
+    let ps = w * h;
     const LEVELS: &[(u8, u64, u64)] = &[
         (60, 122_880, 3_686_400),
         (90, 552_960, 16_588_800),
@@ -33,7 +33,7 @@ pub fn level(ps: u64, rate: u64) -> u8 {
     ];
     LEVELS
         .iter()
-        .find(|l| ps <= l.1 && rate <= l.2)
+        .find(|l| ps <= l.1 && ps * fps <= l.2 && w * w <= 8 * l.1 && h * h <= 8 * l.1)
         .map_or(186, |l| l.0)
 }
 
@@ -116,11 +116,10 @@ impl Hevc {
         );
         let cb = 1 << tools.log2_min_cb;
         let pic = (cfg.width.div_ceil(cb) * cb, cfg.height.div_ceil(cb) * cb);
-        let ps = pic.0 as u64 * pic.1 as u64;
         Hevc {
             size: (cfg.width, cfg.height),
             pic,
-            level: level(ps, ps * cfg.fps.max(1) as u64),
+            level: level(pic.0 as u64, pic.1 as u64, cfg.fps.max(1) as u64),
             tools,
             color: ColorInfo::SRGB_BT601_LIMITED,
             packed: choice.packed == Some(ALL),
@@ -326,56 +325,58 @@ impl Params for Hevc {
             if p.rc.mode == RcMode::Cqp {
                 self.pps_qp = p.rc.qp;
             }
-            let mut s: ffi::VAEncSequenceParameterBufferHEVC = ffi::zeroed();
-            s.general_profile_idc = 1;
-            s.general_level_idc = self.level;
-            s.intra_period = p.rc.fps.saturating_mul(60);
-            s.intra_idr_period = s.intra_period;
-            s.ip_period = 1;
-            s.bits_per_second = if p.rc.mode == RcMode::Cqp {
-                0
-            } else {
-                p.rc.bps
-            };
-            s.pic_width_in_luma_samples = self.pic.0 as u16;
-            s.pic_height_in_luma_samples = self.pic.1 as u16;
-            s.seq_fields = 1
-                | (t.strong_intra as u32) << 10
-                | (t.amp as u32) << 11
-                | (t.sao as u32) << 12
-                | (t.tmvp as u32) << 15
-                | 1 << 16;
-            s.log2_min_luma_coding_block_size_minus3 = (t.log2_min_cb - 3) as u8;
-            s.log2_diff_max_min_luma_coding_block_size = (t.log2_ctb - t.log2_min_cb) as u8;
-            s.log2_min_transform_block_size_minus2 = (t.log2_min_tb - 2) as u8;
-            s.log2_diff_max_min_transform_block_size = (t.log2_max_tb - t.log2_min_tb) as u8;
-            s.max_transform_hierarchy_depth_inter = t.depth_inter as u8;
-            s.max_transform_hierarchy_depth_intra = t.depth_intra as u8;
-            out.push(Buffer::of(ffi::BUF_SEQUENCE, &s));
+            let s = ffi::param(|s: &mut ffi::VAEncSequenceParameterBufferHEVC| {
+                s.general_profile_idc = 1;
+                s.general_level_idc = self.level;
+                s.intra_period = p.rc.fps.saturating_mul(60);
+                s.intra_idr_period = s.intra_period;
+                s.ip_period = 1;
+                s.bits_per_second = if p.rc.mode == RcMode::Cqp {
+                    0
+                } else {
+                    p.rc.bps
+                };
+                s.pic_width_in_luma_samples = self.pic.0 as u16;
+                s.pic_height_in_luma_samples = self.pic.1 as u16;
+                s.seq_fields = 1
+                    | (t.strong_intra as u32) << 10
+                    | (t.amp as u32) << 11
+                    | (t.sao as u32) << 12
+                    | (t.tmvp as u32) << 15
+                    | 1 << 16;
+                s.log2_min_luma_coding_block_size_minus3 = (t.log2_min_cb - 3) as u8;
+                s.log2_diff_max_min_luma_coding_block_size = (t.log2_ctb - t.log2_min_cb) as u8;
+                s.log2_min_transform_block_size_minus2 = (t.log2_min_tb - 2) as u8;
+                s.log2_diff_max_min_transform_block_size = (t.log2_max_tb - t.log2_min_tb) as u8;
+                s.max_transform_hierarchy_depth_inter = t.depth_inter as u8;
+                s.max_transform_hierarchy_depth_intra = t.depth_intra as u8;
+            });
+            out.push(Buffer::new(ffi::BUF_SEQUENCE, s));
         }
         out.extend(misc);
         let refs = |r: VaId| Self::picture(r, p.n - 1, 0);
-        let mut pic: ffi::VAEncPictureParameterBufferHEVC = ffi::zeroed();
-        pic.decoded_curr_pic = Self::picture(p.recon, p.n, 0);
-        pic.reference_frames = [Self::invalid(); 15];
-        if let Some(r) = p.reference {
-            pic.reference_frames[0] = refs(r);
-        }
-        pic.coded_buf = p.coded;
-        pic.collocated_ref_pic_index = if p.reference.is_some() && t.tmvp {
-            0
-        } else {
-            0xff
-        };
-        pic.pic_init_qp = self.pps_qp;
-        pic.nal_unit_type = if p.idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R };
-        pic.pic_fields = p.idr as u32
-            | (if p.idr { 1 } else { 2 }) << 1
-            | 1 << 4
-            | (t.sign_hiding as u32) << 6
-            | (t.transform_skip as u32) << 8
-            | (t.cu_qp_delta as u32) << 9;
-        out.push(Buffer::of(ffi::BUF_PICTURE, &pic));
+        let pic = ffi::param(|pic: &mut ffi::VAEncPictureParameterBufferHEVC| {
+            pic.decoded_curr_pic = Self::picture(p.recon, p.n, 0);
+            pic.reference_frames = [Self::invalid(); 15];
+            if let Some(r) = p.reference {
+                pic.reference_frames[0] = refs(r);
+            }
+            pic.coded_buf = p.coded;
+            pic.collocated_ref_pic_index = if p.reference.is_some() && t.tmvp {
+                0
+            } else {
+                0xff
+            };
+            pic.pic_init_qp = self.pps_qp;
+            pic.nal_unit_type = if p.idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R };
+            pic.pic_fields = p.idr as u32
+                | (if p.idr { 1 } else { 2 }) << 1
+                | 1 << 4
+                | (t.sign_hiding as u32) << 6
+                | (t.transform_skip as u32) << 8
+                | (t.cu_qp_delta as u32) << 9;
+        });
+        out.push(Buffer::new(ffi::BUF_PICTURE, pic));
         let qp_delta = if p.rc.mode == RcMode::Cqp {
             p.rc.qp as i32 - self.pps_qp as i32
         } else {
@@ -393,23 +394,24 @@ impl Params for Hevc {
                 self.slice_header(p.idr, p.n, qp_delta),
             ));
         }
-        let mut sl: ffi::VAEncSliceParameterBufferHEVC = ffi::zeroed();
-        sl.num_ctu_in_slice = self.ctbs();
-        sl.slice_type = if p.idr { 2 } else { 1 };
-        sl.ref_pic_list0 = [Self::invalid(); 15];
-        sl.ref_pic_list1 = [Self::invalid(); 15];
-        if let Some(r) = p.reference {
-            sl.ref_pic_list0[0] = refs(r);
-        }
-        sl.max_num_merge_cand = 5;
-        sl.slice_qp_delta = qp_delta as i8;
-        let tmvp = t.tmvp && !p.idr;
-        sl.slice_fields = 1
-            | (tmvp as u32) << 4
-            | (t.sao as u32) << 5
-            | (t.sao as u32) << 6
-            | (tmvp as u32) << 13;
-        out.push(Buffer::of(ffi::BUF_SLICE, &sl));
+        let sl = ffi::param(|sl: &mut ffi::VAEncSliceParameterBufferHEVC| {
+            sl.num_ctu_in_slice = self.ctbs();
+            sl.slice_type = if p.idr { 2 } else { 1 };
+            sl.ref_pic_list0 = [Self::invalid(); 15];
+            sl.ref_pic_list1 = [Self::invalid(); 15];
+            if let Some(r) = p.reference {
+                sl.ref_pic_list0[0] = refs(r);
+            }
+            sl.max_num_merge_cand = 5;
+            sl.slice_qp_delta = qp_delta as i8;
+            let tmvp = t.tmvp && !p.idr;
+            sl.slice_fields = 1
+                | (tmvp as u32) << 4
+                | (t.sao as u32) << 5
+                | (t.sao as u32) << 6
+                | (tmvp as u32) << 13;
+        });
+        out.push(Buffer::new(ffi::BUF_SLICE, sl));
         out
     }
 

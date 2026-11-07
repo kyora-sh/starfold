@@ -13,9 +13,12 @@ pub const PROFILES: &[i32] = &[
     ffi::PROFILE_H264_CB,
 ];
 const LOG2_MAX_FRAME_NUM: u32 = 8;
+const BOTH: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
 
-/// The lowest level whose frame size and macroblock rate hold the stream.
-pub fn level(mbs: u64, mbs_per_sec: u64) -> u8 {
+/// The lowest level whose frame size, frame dimensions and macroblock rate hold a
+/// `w`x`h` macroblock stream at `fps`.
+pub fn level(w: u64, h: u64, fps: u64) -> u8 {
+    let mbs = w * h;
     const LEVELS: &[(u8, u64, u64)] = &[
         (30, 1620, 40_500),
         (31, 3600, 108_000),
@@ -30,7 +33,7 @@ pub fn level(mbs: u64, mbs_per_sec: u64) -> u8 {
     ];
     LEVELS
         .iter()
-        .find(|l| mbs <= l.1 && mbs_per_sec <= l.2)
+        .find(|l| mbs <= l.1 && mbs * fps <= l.2 && w * w <= 8 * l.1 && h * h <= 8 * l.1)
         .map_or(62, |l| l.0)
 }
 
@@ -48,22 +51,21 @@ pub struct H264 {
 impl H264 {
     pub fn new(choice: &Choice, cfg: &EncoderConfig, rc: &Rc) -> H264 {
         let mbs = (cfg.width.div_ceil(16), cfg.height.div_ceil(16));
-        let n = mbs.0 as u64 * mbs.1 as u64;
         H264 {
             profile: choice.profile,
             size: (cfg.width, cfg.height),
             mbs,
-            level: level(n, n * cfg.fps.max(1) as u64),
+            level: level(mbs.0 as u64, mbs.1 as u64, cfg.fps.max(1) as u64),
             color: ColorInfo::SRGB_BT601_LIMITED,
-            packed: choice.packed.is_some_and(|p| p & ffi::PACKED_SEQUENCE != 0),
+            packed: choice.packed == Some(BOTH),
             pps_qp: rc.qp,
             units: ParamSets::default(),
         }
     }
 
-    /// The packed headers this codec sends, of what the driver takes.
+    /// SPS and PPS packed together or not at all.
     pub fn packed(driver: Option<u32>) -> Option<u32> {
-        driver.map(|p| p & (ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE))
+        driver.map(|p| if p & BOTH == BOTH { BOTH } else { 0 })
     }
 
     fn high(&self) -> bool {
@@ -197,60 +199,66 @@ impl Params for H264 {
             if p.rc.mode == RcMode::Cqp {
                 self.pps_qp = p.rc.qp;
             }
-            let mut s: ffi::VAEncSequenceParameterBufferH264 = ffi::zeroed();
-            s.level_idc = self.level;
-            s.intra_period = p.rc.fps.saturating_mul(60);
-            s.intra_idr_period = s.intra_period;
-            s.ip_period = 1;
-            s.bits_per_second = if p.rc.mode == RcMode::Cqp {
-                0
-            } else {
-                p.rc.bps
-            };
-            s.max_num_ref_frames = 1;
-            s.picture_width_in_mbs = self.mbs.0 as u16;
-            s.picture_height_in_mbs = self.mbs.1 as u16;
-            s.seq_fields = 1 | 1 << 2 | 1 << 5 | (LOG2_MAX_FRAME_NUM - 4) << 6 | 2 << 10;
-            let (cx, cy) = self.crop();
-            s.frame_cropping_flag = (cx > 0 || cy > 0) as u8;
-            s.frame_crop_right_offset = cx;
-            s.frame_crop_bottom_offset = cy;
-            s.vui_parameters_present_flag = 1;
-            s.vui_fields = 1 << 2 | 15 << 3 | 15 << 8 | 1 << 15;
-            out.push(Buffer::of(ffi::BUF_SEQUENCE, &s));
+            let s = ffi::param(|s: &mut ffi::VAEncSequenceParameterBufferH264| {
+                s.level_idc = self.level;
+                s.intra_period = p.rc.fps.saturating_mul(60);
+                s.intra_idr_period = s.intra_period;
+                s.ip_period = 1;
+                s.bits_per_second = if p.rc.mode == RcMode::Cqp {
+                    0
+                } else {
+                    p.rc.bps
+                };
+                s.max_num_ref_frames = 1;
+                s.picture_width_in_mbs = self.mbs.0 as u16;
+                s.picture_height_in_mbs = self.mbs.1 as u16;
+                s.seq_fields = 1 | 1 << 2 | 1 << 5 | (LOG2_MAX_FRAME_NUM - 4) << 6 | 2 << 10;
+                let (cx, cy) = self.crop();
+                s.frame_cropping_flag = (cx > 0 || cy > 0) as u8;
+                s.frame_crop_right_offset = cx;
+                s.frame_crop_bottom_offset = cy;
+                s.vui_parameters_present_flag = 1;
+                s.vui_fields = 1 << 2 | 15 << 3 | 15 << 8 | 1 << 15;
+            });
+            out.push(Buffer::new(ffi::BUF_SEQUENCE, s));
         }
         out.extend(misc);
-        let mut pic: ffi::VAEncPictureParameterBufferH264 = ffi::zeroed();
-        pic.curr_pic = Self::picture(p.recon, p.n);
-        pic.reference_frames = [Self::invalid(); 16];
-        if let Some(r) = p.reference {
-            pic.reference_frames[0] = Self::picture(r, p.n - 1);
-        }
-        pic.coded_buf = p.coded;
-        pic.frame_num = (p.n % (1 << LOG2_MAX_FRAME_NUM)) as u16;
-        pic.pic_init_qp = self.pps_qp;
-        pic.pic_fields =
-            p.idr as u32 | 1 << 1 | (self.cabac() as u32) << 3 | (self.high() as u32) << 8 | 1 << 9;
-        out.push(Buffer::of(ffi::BUF_PICTURE, &pic));
+        let pic = ffi::param(|pic: &mut ffi::VAEncPictureParameterBufferH264| {
+            pic.curr_pic = Self::picture(p.recon, p.n);
+            pic.reference_frames = [Self::invalid(); 16];
+            if let Some(r) = p.reference {
+                pic.reference_frames[0] = Self::picture(r, p.n - 1);
+            }
+            pic.coded_buf = p.coded;
+            pic.frame_num = (p.n % (1 << LOG2_MAX_FRAME_NUM)) as u16;
+            pic.pic_init_qp = self.pps_qp;
+            pic.pic_fields = p.idr as u32
+                | 1 << 1
+                | (self.cabac() as u32) << 3
+                | (self.high() as u32) << 8
+                | 1 << 9;
+        });
+        out.push(Buffer::new(ffi::BUF_PICTURE, pic));
         if p.idr && self.packed {
             out.extend(Buffer::packed(ffi::PACKED_TYPE_SEQUENCE, self.sps()));
             out.extend(Buffer::packed(ffi::PACKED_TYPE_PICTURE, self.pps()));
         }
-        let mut sl: ffi::VAEncSliceParameterBufferH264 = ffi::zeroed();
-        sl.num_macroblocks = self.mbs.0 * self.mbs.1;
-        sl.macroblock_info = ffi::INVALID_ID;
-        sl.slice_type = if p.idr { 2 } else { 0 };
-        sl.idr_pic_id = (p.idrs % 65536) as u16;
-        sl.direct_spatial_mv_pred_flag = 1;
-        sl.ref_pic_list0 = [Self::invalid(); 32];
-        sl.ref_pic_list1 = [Self::invalid(); 32];
-        if let Some(r) = p.reference {
-            sl.ref_pic_list0[0] = Self::picture(r, p.n - 1);
-        }
-        if p.rc.mode == RcMode::Cqp {
-            sl.slice_qp_delta = (p.rc.qp as i32 - self.pps_qp as i32) as i8;
-        }
-        out.push(Buffer::of(ffi::BUF_SLICE, &sl));
+        let sl = ffi::param(|sl: &mut ffi::VAEncSliceParameterBufferH264| {
+            sl.num_macroblocks = self.mbs.0 * self.mbs.1;
+            sl.macroblock_info = ffi::INVALID_ID;
+            sl.slice_type = if p.idr { 2 } else { 0 };
+            sl.idr_pic_id = (p.idrs % 65536) as u16;
+            sl.direct_spatial_mv_pred_flag = 1;
+            sl.ref_pic_list0 = [Self::invalid(); 32];
+            sl.ref_pic_list1 = [Self::invalid(); 32];
+            if let Some(r) = p.reference {
+                sl.ref_pic_list0[0] = Self::picture(r, p.n - 1);
+            }
+            if p.rc.mode == RcMode::Cqp {
+                sl.slice_qp_delta = (p.rc.qp as i32 - self.pps_qp as i32) as i8;
+            }
+        });
+        out.push(Buffer::new(ffi::BUF_SLICE, sl));
         out
     }
 

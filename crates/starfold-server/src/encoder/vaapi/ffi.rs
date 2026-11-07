@@ -34,6 +34,7 @@ pub const ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 
 pub const RT_FORMAT_YUV420: u32 = 0x1;
 pub const RT_FORMAT_YUV420_10: u32 = 0x100;
+pub const CODED_BAD_BITSTREAM: u32 = 0x8000;
 pub const RC_CBR: u32 = 0x2;
 pub const RC_VBR: u32 = 0x4;
 pub const RC_CQP: u32 = 0x10;
@@ -503,15 +504,19 @@ pub struct VAEncTileGroupBufferAV1 {
     pub va_reserved: [u32; 4],
 }
 
-/// A parameter struct with every byte zero, which is how libva wants unused fields.
+/// A zeroed value, for out-parameters and padding-free structs.
 pub fn zeroed<T: Copy>() -> T {
     unsafe { std::mem::zeroed() }
 }
 
-/// A parameter struct's bytes, for `vaCreateBuffer`.
-pub fn bytes<T: Copy>(t: &T) -> Vec<u8> {
-    unsafe { std::slice::from_raw_parts(t as *const T as *const u8, std::mem::size_of::<T>()) }
-        .to_vec()
+/// A parameter struct's bytes for `vaCreateBuffer`, built in place in zeroed memory, so
+/// unused fields and padding are zero, as libva wants them.
+pub fn param<T: Copy>(build: impl FnOnce(&mut T)) -> Vec<u8> {
+    let n = std::mem::size_of::<T>();
+    assert!(std::mem::align_of::<T>() <= 8);
+    let mut words = vec![0u64; n.div_ceil(8)];
+    build(unsafe { &mut *(words.as_mut_ptr() as *mut T) });
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, n) }.to_vec()
 }
 
 /// Reads a parameter struct back from its bytes.

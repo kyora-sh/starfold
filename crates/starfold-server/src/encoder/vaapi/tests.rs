@@ -676,37 +676,88 @@ fn choose_prefers_low_power_and_the_best_profile() {
 
 #[test]
 fn levels() {
-    assert_eq!(h264::level(8160, 8160 * 30), 40);
-    assert_eq!(h264::level(8160, 8160 * 60), 42);
-    assert_eq!(h264::level(32400, 32400 * 30), 51);
-    assert_eq!(hevc::level(1920 * 1080, 1920 * 1080 * 60), 123);
-    assert_eq!(av1::level(3840 * 2160, 3840 * 2160 * 30), 12);
+    assert_eq!(h264::level(120, 68, 30), 40);
+    assert_eq!(h264::level(120, 68, 60), 42);
+    assert_eq!(h264::level(240, 135, 30), 51);
+    assert_eq!(
+        h264::level(240, 8, 30),
+        40,
+        "a 3840x128 stripe is too wide for 3.1"
+    );
+    assert_eq!(hevc::level(1920, 1080, 60), 123);
+    assert_eq!(hevc::level(3840, 128, 30), 120, "too wide for 3.1");
+    assert_eq!(av1::level(3840, 2160, 30), 12);
+    assert_eq!(av1::level(3000, 64, 30), 4, "too wide for 2.1");
 }
 
 #[test]
-fn preflight_runs_a_child_once_per_configuration() {
-    let c = cfg(Codec::Hevc, 1234, 567);
-    assert_eq!(spec(&c), "hevc:1234x567@30");
+fn h264_packs_both_parameter_sets_or_neither() {
+    let both = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
     assert_eq!(
-        parse_spec(&spec(&c)).map(|p| (p.codec, p.width, p.height)),
-        Some((Codec::Hevc, 1234, 567))
+        h264::H264::packed(Some(both | ffi::PACKED_SLICE)),
+        Some(both)
     );
-    assert!(parse_spec("vp9:1x1@1").is_none());
-    assert!(parse_spec("h264:0x1@1").is_none());
+    assert_eq!(h264::H264::packed(Some(ffi::PACKED_SEQUENCE)), Some(0));
+    assert_eq!(h264::H264::packed(Some(ffi::PACKED_PICTURE)), Some(0));
+    assert_eq!(h264::H264::packed(None), None);
+    let (mut fake, log) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.packed = Some(ffi::PACKED_SEQUENCE);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    assert!(
+        encode(enc.as_mut(), 320, 240, false).is_err(),
+        "no SPS from this driver"
+    );
+    let log = log.lock().unwrap();
+    assert!(find(&log.frames[0], ffi::BUF_PACKED_DATA).is_empty());
+    assert!(log.config[0].2.contains(&(ffi::ATTRIB_PACKED_HEADERS, 0)));
+}
+
+#[test]
+fn preflight_runs_a_child_once_per_session_and_node() {
+    let node = Path::new("/dev/dri/renderD128");
+    let mut c = cfg(Codec::Hevc, 1234, 567);
+    c.rate = RateConfig::new(26.5, 0, 24);
+    let s = spec(&c, node);
+    assert_eq!(s, "hevc:1234x567@30,0,0,24,26.5,/dev/dri/renderD128");
+    let (back, n) = parse_spec(&s).unwrap();
+    assert_eq!(
+        (back.codec, back.width, back.height, back.fps),
+        (Codec::Hevc, 1234, 567, 30)
+    );
+    assert_eq!(back.rate, c.rate, "the child opens the same rate control");
+    assert_eq!(n, node);
+    assert!(parse_spec("vp9:1x1@1,0,0,1,1,/dev/x").is_none());
+    assert!(parse_spec("h264:0x1@1,0,0,1,1,/dev/x").is_none());
+    assert!(parse_spec("h264:1x1@1,0,0,1,1,dev").is_none());
     let mut runs = 0;
-    for _ in 0..2 {
-        let r = preflight(&c, |s| {
+    for kbps in [0, 0] {
+        c.rate.max_kbps = kbps;
+        let r = preflight(&c, node, |s| {
             runs += 1;
-            assert_eq!(s, "hevc:1234x567@30");
+            assert!(s.starts_with("hevc:1234x567@30,0,"));
             Some(Found::failed(Backend::Vaapi, "probe exited with signal 11"))
         });
         assert!(r.unwrap_err().0.contains("signal 11"));
     }
     assert_eq!(runs, 1, "a crash is remembered");
-    let ok = cfg(Codec::Av1, 1234, 567);
-    assert!(preflight(&ok, |_| Some(Found::default())).is_ok());
-    assert!(preflight(&ok, |_| unreachable!()).is_ok());
-    assert!(preflight(&cfg(Codec::H264, 99, 99), |_| None).is_ok());
+    c.rate = RateConfig::new(26.5, 9000, 24);
+    assert!(
+        preflight(&c, node, |_| Some(Found::default())).is_ok(),
+        "capped is another session"
+    );
+    c.rate.max_kbps = 4000;
+    assert!(
+        preflight(&c, node, |_| unreachable!()).is_ok(),
+        "the rate itself is not"
+    );
+    assert!(
+        preflight(&c, Path::new("/dev/dri/renderD129"), |_| Some(
+            Found::failed(Backend::Vaapi, "hang")
+        ))
+        .is_err(),
+        "each node is pre-flighted"
+    );
+    assert!(preflight(&cfg(Codec::H264, 99, 99), node, |_| None).is_ok());
 }
 
 /// The parameter structs against libva's own headers, where they're installed.
@@ -875,7 +926,7 @@ fn hardware_smoke() {
     }
     for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
         let c = cfg(codec, 1280, 720);
-        match open_here(&c) {
+        match open_on(&render_nodes().unwrap()[0], &c) {
             Ok(mut enc) => {
                 sample(enc.as_mut(), 1280, 720).unwrap();
                 eprintln!("{codec:?}: ok");

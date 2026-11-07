@@ -405,12 +405,96 @@ pub(super) fn session(
     })
 }
 
-/// Opens `cfg` on the first render node that takes it, in-process.
-fn open_here(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+fn open_on(node: &Path, cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    VaDriver::open(node).and_then(|d| session(Box::new(d), cfg))
+}
+
+/// Sessions a child has already opened (or failed to), so a driver that crashes on one
+/// costs a child, not the server.
+static PREFLIGHT: Mutex<Vec<(String, Result<(), String>)>> = Mutex::new(Vec::new());
+
+fn codec_name(c: Codec) -> &'static str {
+    match c {
+        Codec::H264 => "h264",
+        Codec::Hevc => "hevc",
+        Codec::Av1 => "av1",
+        #[allow(unreachable_patterns)]
+        _ => "other",
+    }
+}
+
+/// The `--session` argument for `cfg` on `node`:
+/// `<codec>:<w>x<h>@<fps>,<max kbps>,<buffer kbit>,<rate fps>,<quality>,<node>`.
+pub fn spec(cfg: &EncoderConfig, node: &Path) -> String {
+    let r = &cfg.rate;
+    format!(
+        "{}:{}x{}@{},{},{},{},{},{}",
+        codec_name(cfg.codec),
+        cfg.width,
+        cfg.height,
+        cfg.fps,
+        r.max_kbps,
+        r.buf_kbit,
+        r.fps,
+        r.quality,
+        node.display()
+    )
+}
+
+/// What decides whether a session opens: the parameters `vaCreateConfig`,
+/// `vaCreateSurfaces` and `vaCreateContext` see (the rate control mode, not the rate).
+fn key(cfg: &EncoderConfig, node: &Path) -> String {
+    format!(
+        "{}:{}x{}@{},{},{}",
+        codec_name(cfg.codec),
+        cfg.width,
+        cfg.height,
+        cfg.fps,
+        if cfg.rate.max_kbps > 0 {
+            "capped"
+        } else {
+            "uncapped"
+        },
+        node.display()
+    )
+}
+
+pub fn parse_spec(s: &str) -> Option<(EncoderConfig, PathBuf)> {
+    let (codec, rest) = s.split_once(':')?;
+    let mut f = rest.splitn(6, ',');
+    let (size, fps) = f.next()?.split_once('@')?;
+    let (w, h) = size.split_once('x')?;
+    let codec = match codec {
+        "h264" => Codec::H264,
+        "hevc" => Codec::Hevc,
+        "av1" => Codec::Av1,
+        _ => return None,
+    };
+    let (w, h, fps): (u32, u32, u32) = (w.parse().ok()?, h.parse().ok()?, fps.parse().ok()?);
+    let mut cfg = sample_config(codec, w, h, fps);
+    cfg.rate = RateConfig {
+        max_kbps: f.next()?.parse().ok()?,
+        buf_kbit: f.next()?.parse().ok()?,
+        fps: f.next()?.parse().ok()?,
+        quality: f.next()?.parse().ok()?,
+    };
+    let node = PathBuf::from(f.next()?);
+    (w > 0 && h > 0 && fps > 0 && node.is_absolute()).then_some((cfg, node))
+}
+
+/// Opens a VA-API encoder for `cfg` on the first render node that takes it. On each
+/// node, each new session is first opened and run in a child process (when this
+/// executable takes `--probe-encoders`); one that crashes, hangs or fails there is never
+/// opened here, and the caller falls back to its next encoder.
+pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
     let nodes = render_nodes().map_err(EncodeError)?;
     let mut why = Vec::new();
     for node in nodes {
-        match VaDriver::open(&node).and_then(|d| session(Box::new(d), cfg)) {
+        let r = preflight(cfg, &node, |spec| {
+            super::isolate::session(spec, super::caps::PROBE_TIMEOUT)
+        })
+        .and_then(|()| open_on(&node, cfg));
+        match r {
             Ok(e) => return Ok(e),
             Err(e) => why.push(format!("{}: {e}", node.display())),
         }
@@ -422,58 +506,19 @@ fn open_here(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> 
     }))
 }
 
-/// Configurations a child has already opened (or failed to), so a driver that crashes on
-/// one costs a child, not the server.
-static PREFLIGHT: Mutex<Vec<(String, Result<(), String>)>> = Mutex::new(Vec::new());
-
-/// The `--session` argument for `cfg`: `<codec>:<w>x<h>@<fps>`.
-pub fn spec(cfg: &EncoderConfig) -> String {
-    let codec = match cfg.codec {
-        Codec::H264 => "h264",
-        Codec::Hevc => "hevc",
-        Codec::Av1 => "av1",
-        #[allow(unreachable_patterns)]
-        _ => "other",
-    };
-    format!("{codec}:{}x{}@{}", cfg.width, cfg.height, cfg.fps)
-}
-
-pub fn parse_spec(s: &str) -> Option<EncoderConfig> {
-    let (codec, rest) = s.split_once(':')?;
-    let (size, fps) = rest.split_once('@')?;
-    let (w, h) = size.split_once('x')?;
-    let codec = match codec {
-        "h264" => Codec::H264,
-        "hevc" => Codec::Hevc,
-        "av1" => Codec::Av1,
-        _ => return None,
-    };
-    let (w, h, fps): (u32, u32, u32) = (w.parse().ok()?, h.parse().ok()?, fps.parse().ok()?);
-    (w > 0 && h > 0 && fps > 0).then(|| sample_config(codec, w, h, fps))
-}
-
-/// Opens a VA-API encoder for `cfg`. Each new configuration is first opened and run in a
-/// child process (when this executable takes `--probe-encoders`); if that crashes, hangs
-/// or fails, so does this, and the caller falls back to its next encoder.
-pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-    preflight(cfg, |spec| {
-        super::isolate::session(spec, super::caps::PROBE_TIMEOUT)
-    })?;
-    open_here(cfg)
-}
-
-/// Runs `child` once per configuration and remembers what it said; `None` from it (no
+/// Runs `child` once per session [`key`] and remembers what it said; `None` from it (no
 /// child possible here) passes.
 pub(super) fn preflight(
     cfg: &EncoderConfig,
+    node: &Path,
     child: impl FnOnce(&str) -> Option<Found>,
 ) -> Result<(), EncodeError> {
-    let key = spec(cfg);
+    let key = key(cfg, node);
     let mut done = PREFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, r)) = done.iter().find(|(k, _)| *k == key) {
         return r.clone().map_err(EncodeError);
     }
-    let Some(found) = child(&key) else {
+    let Some(found) = child(&spec(cfg, node)) else {
         return Ok(());
     };
     let r = if found.diagnostics.is_empty() {
@@ -493,9 +538,10 @@ pub(super) fn preflight(
     r.map_err(EncodeError)
 }
 
-/// The child's side of [`open`]: opens `spec` and encodes a sample, in-process.
+/// The child's side of [`open`]: opens the session `spec` names on its node and encodes
+/// a sample, in-process.
 pub fn child_session(spec: &str) -> Result<(), String> {
-    let cfg = parse_spec(spec).ok_or_else(|| format!("bad session {spec:?}"))?;
-    let mut enc = open_here(&cfg)?;
+    let (cfg, node) = parse_spec(spec).ok_or_else(|| format!("bad session {spec:?}"))?;
+    let mut enc = open_on(&node, &cfg)?;
     sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
 }

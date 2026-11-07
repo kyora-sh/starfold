@@ -18,24 +18,25 @@ const NEED: u32 = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
 const TD: [u8; 2] = [0x12, 0x00];
 const CDEF: (u8, u8) = (2, 1);
 
-/// `seq_level_idx` for a picture of `ps` samples at `rate` samples per second.
-pub fn level(ps: u64, rate: u64) -> u8 {
-    const LEVELS: &[(u8, u64, u64)] = &[
-        (0, 147_456, 4_423_680),
-        (1, 278_784, 8_363_520),
-        (4, 665_856, 19_975_680),
-        (5, 1_065_024, 31_950_720),
-        (8, 2_359_296, 70_778_880),
-        (9, 2_359_296, 141_557_760),
-        (12, 8_912_896, 267_386_880),
-        (13, 8_912_896, 534_773_760),
-        (14, 8_912_896, 1_069_547_520),
-        (16, 35_651_584, 1_069_547_520),
-        (17, 35_651_584, 2_139_095_040),
+/// `seq_level_idx` for a `w`x`h` picture at `fps`.
+pub fn level(w: u64, h: u64, fps: u64) -> u8 {
+    const LEVELS: &[(u8, u64, u64, u64, u64)] = &[
+        (0, 147_456, 4_423_680, 2048, 1152),
+        (1, 278_784, 8_363_520, 2816, 1584),
+        (4, 665_856, 19_975_680, 4352, 2448),
+        (5, 1_065_024, 31_950_720, 5504, 3096),
+        (8, 2_359_296, 70_778_880, 6144, 3456),
+        (9, 2_359_296, 141_557_760, 6144, 3456),
+        (12, 8_912_896, 267_386_880, 8192, 4352),
+        (13, 8_912_896, 534_773_760, 8192, 4352),
+        (14, 8_912_896, 1_069_547_520, 8192, 4352),
+        (16, 35_651_584, 1_069_547_520, 16384, 8704),
+        (17, 35_651_584, 2_139_095_040, 16384, 8704),
     ];
+    let ps = w * h;
     LEVELS
         .iter()
-        .find(|l| ps <= l.1 && rate <= l.2)
+        .find(|l| ps <= l.1 && ps * fps <= l.2 && w <= l.3 && h <= l.4)
         .map_or(18, |l| l.0)
 }
 
@@ -156,10 +157,9 @@ impl Av1 {
             Some(v) => ((v & 3) + 1, ((v >> 2) & 3) as usize + 1, (v >> 4) & 7),
             None => (4, 4, 4),
         };
-        let ps = cfg.width as u64 * cfg.height as u64;
         Ok(Av1 {
             size: (cfg.width, cfg.height),
-            level: level(ps, ps * cfg.fps.max(1) as u64),
+            level: level(cfg.width as u64, cfg.height as u64, cfg.fps.max(1) as u64),
             tiles: Tiles::new(cfg.width, cfg.height),
             color: ColorInfo::SRGB_BT601_LIMITED,
             filter,
@@ -342,70 +342,72 @@ impl Params for Av1 {
         let brc = p.rc.mode != RcMode::Cqp;
         let mut out = Vec::new();
         if p.idr {
-            let mut s: ffi::VAEncSequenceParameterBufferAV1 = ffi::zeroed();
-            s.seq_level_idx = self.level;
-            s.intra_period = p.rc.fps.saturating_mul(60);
-            s.ip_period = 1;
-            s.bits_per_second = if brc { p.rc.bps } else { 0 };
-            s.seq_fields = 1 << 8 | 1 << 12 | 1 << 17 | 1 << 18;
-            s.order_hint_bits_minus_1 = (ORDER_HINT_BITS - 1) as u8;
-            out.push(Buffer::of(ffi::BUF_SEQUENCE, &s));
+            let s = ffi::param(|s: &mut ffi::VAEncSequenceParameterBufferAV1| {
+                s.seq_level_idx = self.level;
+                s.intra_period = p.rc.fps.saturating_mul(60);
+                s.ip_period = 1;
+                s.bits_per_second = if brc { p.rc.bps } else { 0 };
+                s.seq_fields = 1 << 8 | 1 << 12 | 1 << 17 | 1 << 18;
+                s.order_hint_bits_minus_1 = (ORDER_HINT_BITS - 1) as u8;
+            });
+            out.push(Buffer::new(ffi::BUF_SEQUENCE, s));
         }
         out.extend(misc);
         let q = qindex(p.rc.qp);
         let (header, off) = self.frame_header(p.idr, p.n, q);
-        let mut pic: ffi::VAEncPictureParameterBufferAV1 = ffi::zeroed();
-        pic.frame_width_minus_1 = (self.size.0 - 1) as u16;
-        pic.frame_height_minus_1 = (self.size.1 - 1) as u16;
-        pic.reconstructed_frame = p.recon;
-        pic.coded_buf = p.coded;
-        pic.reference_frames = [ffi::INVALID_ID; 8];
-        if let Some(r) = p.reference {
-            pic.reference_frames[0] = r;
-            pic.ref_frame_ctrl_l0 = 1;
-        }
-        pic.primary_ref_frame = PRIMARY_REF_NONE as u8;
-        pic.order_hint = (p.n % (1 << ORDER_HINT_BITS)) as u8;
-        pic.refresh_frame_flags = if p.idr { 0xff } else { 0x01 };
-        pic.picture_flags = if p.idr { 1 << 2 } else { 1 };
-        let lf = filter_level(q);
-        pic.filter_level = [lf, lf];
-        pic.filter_level_u = lf;
-        pic.filter_level_v = lf;
-        pic.interpolation_filter = self.filter;
-        pic.base_qindex = q;
-        pic.min_base_qindex = 1;
-        pic.max_base_qindex = 255;
-        pic.mode_control_flags = (if self.tx_select { 2 } else { 1 }) << 7;
-        pic.tile_cols = self.tiles.widths.len() as u8;
-        pic.tile_rows = self.tiles.heights.len() as u8;
-        for (d, s) in pic.width_in_sbs_minus_1.iter_mut().zip(&self.tiles.widths) {
-            *d = *s;
-        }
-        for (d, s) in pic
-            .height_in_sbs_minus_1
-            .iter_mut()
-            .zip(&self.tiles.heights)
-        {
-            *d = *s;
-        }
-        pic.cdef_y_strengths[0] = CDEF.0 << 2 | CDEF.1;
-        pic.cdef_uv_strengths[0] = CDEF.0 << 2 | CDEF.1;
-        for wm in &mut pic.wm {
-            wm.wmmat[2] = 1 << 16;
-            wm.wmmat[5] = 1 << 16;
-        }
-        if brc {
-            pic.bit_offset_qindex = off.qindex;
-            pic.bit_offset_segmentation = off.segmentation;
-            pic.bit_offset_loopfilter_params = off.loop_filter;
-            pic.bit_offset_cdef_params = off.cdef;
-            pic.size_in_bits_cdef_params = off.cdef_bits;
-            pic.byte_offset_frame_hdr_obu_size = 1;
-            pic.size_in_bits_frame_hdr_obu = off.header_bits;
-        }
-        pic.tile_group_obu_hdr_info = 1 << 1;
-        out.push(Buffer::of(ffi::BUF_PICTURE, &pic));
+        let pic = ffi::param(|pic: &mut ffi::VAEncPictureParameterBufferAV1| {
+            pic.frame_width_minus_1 = (self.size.0 - 1) as u16;
+            pic.frame_height_minus_1 = (self.size.1 - 1) as u16;
+            pic.reconstructed_frame = p.recon;
+            pic.coded_buf = p.coded;
+            pic.reference_frames = [ffi::INVALID_ID; 8];
+            if let Some(r) = p.reference {
+                pic.reference_frames[0] = r;
+                pic.ref_frame_ctrl_l0 = 1;
+            }
+            pic.primary_ref_frame = PRIMARY_REF_NONE as u8;
+            pic.order_hint = (p.n % (1 << ORDER_HINT_BITS)) as u8;
+            pic.refresh_frame_flags = if p.idr { 0xff } else { 0x01 };
+            pic.picture_flags = if p.idr { 1 << 2 } else { 1 };
+            let lf = filter_level(q);
+            pic.filter_level = [lf, lf];
+            pic.filter_level_u = lf;
+            pic.filter_level_v = lf;
+            pic.interpolation_filter = self.filter;
+            pic.base_qindex = q;
+            pic.min_base_qindex = 1;
+            pic.max_base_qindex = 255;
+            pic.mode_control_flags = (if self.tx_select { 2 } else { 1 }) << 7;
+            pic.tile_cols = self.tiles.widths.len() as u8;
+            pic.tile_rows = self.tiles.heights.len() as u8;
+            for (d, s) in pic.width_in_sbs_minus_1.iter_mut().zip(&self.tiles.widths) {
+                *d = *s;
+            }
+            for (d, s) in pic
+                .height_in_sbs_minus_1
+                .iter_mut()
+                .zip(&self.tiles.heights)
+            {
+                *d = *s;
+            }
+            pic.cdef_y_strengths[0] = CDEF.0 << 2 | CDEF.1;
+            pic.cdef_uv_strengths[0] = CDEF.0 << 2 | CDEF.1;
+            for wm in &mut pic.wm {
+                wm.wmmat[2] = 1 << 16;
+                wm.wmmat[5] = 1 << 16;
+            }
+            if brc {
+                pic.bit_offset_qindex = off.qindex;
+                pic.bit_offset_segmentation = off.segmentation;
+                pic.bit_offset_loopfilter_params = off.loop_filter;
+                pic.bit_offset_cdef_params = off.cdef;
+                pic.size_in_bits_cdef_params = off.cdef_bits;
+                pic.byte_offset_frame_hdr_obu_size = 1;
+                pic.size_in_bits_frame_hdr_obu = off.header_bits;
+            }
+            pic.tile_group_obu_hdr_info = 1 << 1;
+        });
+        out.push(Buffer::new(ffi::BUF_PICTURE, pic));
         if p.idr {
             out.extend(Buffer::packed(
                 ffi::PACKED_TYPE_SEQUENCE,
@@ -413,9 +415,10 @@ impl Params for Av1 {
             ));
         }
         out.extend(Buffer::packed(ffi::PACKED_TYPE_PICTURE, header));
-        let mut tg: ffi::VAEncTileGroupBufferAV1 = ffi::zeroed();
-        tg.tg_end = (self.tiles.count() - 1) as u8;
-        out.push(Buffer::of(ffi::BUF_SLICE, &tg));
+        let tg = ffi::param(|tg: &mut ffi::VAEncTileGroupBufferAV1| {
+            tg.tg_end = (self.tiles.count() - 1) as u8;
+        });
+        out.push(Buffer::new(ffi::BUF_SLICE, tg));
         out
     }
 

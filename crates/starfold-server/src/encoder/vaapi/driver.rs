@@ -406,10 +406,12 @@ impl Driver for VaDriver {
             (self.va.map_buffer)(self.dpy, buf, &mut p)
         })?;
         let mut out = Vec::new();
+        let mut bad = false;
         let mut seg = p as *const ffi::VACodedBufferSegment;
         let mut n = 0;
         while !seg.is_null() && n < 1024 {
             let s = unsafe { &*seg };
+            bad |= s.status & ffi::CODED_BAD_BITSTREAM != 0;
             if !s.buf.is_null() && s.size > 0 {
                 out.extend_from_slice(unsafe {
                     std::slice::from_raw_parts(s.buf as *const u8, s.size as usize)
@@ -419,6 +421,11 @@ impl Driver for VaDriver {
             n += 1;
         }
         unsafe { (self.va.unmap_buffer)(self.dpy, buf) };
+        if bad {
+            return Err(EncodeError(
+                "the driver marked its output a bad bitstream".into(),
+            ));
+        }
         Ok(out)
     }
 
