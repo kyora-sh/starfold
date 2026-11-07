@@ -47,8 +47,8 @@ fn leb128(d: &[u8], mut i: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// The payload of the first sequence header OBU in a temporal unit.
-pub fn sequence_header(d: &[u8]) -> Option<&[u8]> {
+/// The kind and payload of the first OBU in a temporal unit that `want` takes.
+fn first_obu(d: &[u8], want: impl Fn(u8) -> bool) -> Option<(u8, &[u8])> {
     let mut i = 0;
     while i < d.len() {
         let h = d[i];
@@ -59,12 +59,27 @@ pub fn sequence_header(d: &[u8]) -> Option<&[u8]> {
             (size, j) = leb128(d, j)?;
         }
         let end = j.checked_add(size).filter(|&e| e <= d.len())?;
-        if kind == 1 {
-            return Some(&d[j..end]);
+        if want(kind) {
+            return Some((kind, &d[j..end]));
         }
         i = end;
     }
     None
+}
+
+/// The payload of the first sequence header OBU in a temporal unit.
+pub fn sequence_header(d: &[u8]) -> Option<&[u8]> {
+    first_obu(d, |k| k == 1).map(|(_, p)| p)
+}
+
+/// The frame_type (0 key, 1 inter, 2 intra-only, 3 switch) of the first frame in a
+/// temporal unit of a stream without a reduced still-picture header; `None` without a
+/// frame or for one that only shows an existing frame.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub fn frame_type(d: &[u8]) -> Option<u8> {
+    let (_, p) = first_obu(d, |k| k == 3 || k == 6)?;
+    let b = *p.first()?;
+    (b & 0x80 == 0).then_some((b >> 5) & 3)
 }
 
 pub fn codec_string(temporal_unit: &[u8]) -> Option<String> {

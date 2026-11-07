@@ -114,17 +114,21 @@ fn denied_device_skips_only_that_device() {
 
 #[test]
 fn unimplemented_backends_are_never_eligible() {
-    let mut f = Fake::new(Backend::Nvenc);
+    let mut f = Fake::new(Backend::MediaFoundation);
     f.caps = vec![
-        good(Codec::Av1, Backend::Nvenc),
-        good(Codec::H264, Backend::Nvenc),
+        good(Codec::Av1, Backend::MediaFoundation),
+        good(Codec::H264, Backend::MediaFoundation),
     ];
     let r = registry(vec![f]);
-    for c in r.encoders.iter().filter(|c| c.backend == Backend::Nvenc) {
+    for c in r
+        .encoders
+        .iter()
+        .filter(|c| c.backend == Backend::MediaFoundation)
+    {
         assert!(!c.implemented && !c.eligible(), "{c:?}");
     }
     assert_eq!(r.eligible(Codec::Av1).count(), 0);
-    let e = r.check(Backend::Nvenc, Codec::H264).unwrap_err();
+    let e = r.check(Backend::MediaFoundation, Codec::H264).unwrap_err();
     assert!(e.contains("no encoder in this build"), "{e}");
 }
 
