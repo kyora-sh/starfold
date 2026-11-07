@@ -305,11 +305,15 @@ async function quality(arm, wl, round) {
 		else if (wl === 'mixed' || wl === 'paged') await typeKeys(p, wl, Date.now() + Number(process.env.MIXED_S || 30) * 1000);
 		else {
 			// WHEEL: wheel input reaches the desktop throughout the motion, as a user scrolling would send it.
-			let wheeling = !!process.env.WHEEL;
-			const wheel = (async () => { while (wheeling) { await p.mouse.wheel(0, 120); await sleep(100); } })();
-			for (let i = 0; i < 6; i++) { await p.screenshot({ path: `${dir}/motion-${i}.png`, animations: 'allow' }); await sleep(800); }
-			wheeling = false;
-			await wheel;
+			let wheeling = !!process.env.WHEEL, wheelErr;
+			const wheel = (async () => { while (wheeling) { await p.mouse.wheel(0, 120); await sleep(100); } })().catch((e) => { wheelErr = e; });
+			try {
+				for (let i = 0; i < 6; i++) { await p.screenshot({ path: `${dir}/motion-${i}.png`, animations: 'allow' }); await sleep(800); }
+			} finally {
+				wheeling = false;
+				await wheel;
+			}
+			if (wheelErr) throw wheelErr;
 		}
 		const s1 = await serverStats(arm);
 		assertCodec(arm, s1, 'at end');

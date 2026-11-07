@@ -110,8 +110,6 @@ pub struct OpenH264 {
     info: Box<sys::SFrameBSInfo>,
     params: ParamSets,
     bps: c_int,
-    /// Frames OpenH264 budgets per second over frames that arrive per second.
-    rate_scale: f64,
     /// The frame rate rate control budgets each frame for.
     fps: u32,
     pts: i64,
@@ -134,10 +132,13 @@ fn check(what: &str, r: c_int) -> Result<(), EncodeError> {
     }
 }
 
-fn bps(max_kbps: u32, scale: f64) -> c_int {
+/// The bitrate to give OpenH264 so that frames arriving at `fps` share `max_kbps`: it
+/// budgets per second over at most MAX_FPS frames.
+fn bps(max_kbps: u32, fps: u32) -> c_int {
     if max_kbps == 0 {
         UNCAPPED_BPS
     } else {
+        let scale = (MAX_FPS as f64 / fps.max(1) as f64).min(1.0);
         (max_kbps as f64 * 1000.0 * scale).clamp(1000.0, UNCAPPED_BPS as f64) as c_int
     }
 }
@@ -149,13 +150,11 @@ impl OpenH264 {
         if r != 0 || enc.is_null() {
             return Err(EncodeError(format!("WelsCreateSVCEncoder failed ({r})")));
         }
-        let rate_scale = (MAX_FPS as f64 / cfg.fps.max(1) as f64).min(1.0);
         let mut me = OpenH264 {
             enc,
             info: Box::default(),
             params: ParamSets::default(),
-            bps: bps(cfg.rate.max_kbps, rate_scale),
-            rate_scale,
+            bps: bps(cfg.rate.max_kbps, cfg.fps),
             fps: cfg.fps.clamp(1, MAX_FPS),
             pts: -1,
             width: cfg.width,
@@ -310,7 +309,7 @@ impl VideoEncoder for OpenH264 {
             self.option(sys::ENCODER_OPTION_FRAME_RATE, &mut f)?;
             self.fps = fps;
         }
-        let b = bps(rate.max_kbps, self.rate_scale);
+        let b = bps(rate.max_kbps, rate.fps);
         if b == self.bps {
             return Ok(());
         }

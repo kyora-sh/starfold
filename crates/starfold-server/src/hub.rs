@@ -480,7 +480,10 @@ impl Hub {
     }
 
     pub fn note_input(&self, ev: &crate::input::InputEvent) {
-        let now = Instant::now();
+        self.note_input_at(ev, Instant::now());
+    }
+
+    pub fn note_input_at(&self, ev: &crate::input::InputEvent, now: Instant) {
         *self.input_at.lock() = Some(now);
         if matches!(ev, crate::input::InputEvent::Key { .. }) {
             *self.key_at.lock() = Some(now);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo};
+use crate::input::InputEvent;
 use crate::negotiate::Implementation;
 use std::sync::{Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -2984,12 +2985,27 @@ fn typing_keeps_the_full_rate_budget_and_the_wheel_does_not() {
     let last = |rates: &Arc<StdMutex<Vec<u32>>>| *rates.lock().unwrap().last().unwrap();
     motion(&mut eng, &mut t, 30);
     assert_eq!(last(&rates), 10);
-    *hub.key_at.lock() = Some(t);
-    *hub.input_at.lock() = Some(t);
+    hub.note_input_at(
+        &InputEvent::Key {
+            keysym: 0x61,
+            down: true,
+        },
+        t,
+    );
     motion(&mut eng, &mut t, 1);
     assert_eq!(last(&rates), 30, "a key: the full rate's budget");
     t += Duration::from_secs(3);
-    *hub.input_at.lock() = Some(t);
+    for ev in [
+        InputEvent::Scroll { dx: 0, dy: 1 },
+        InputEvent::ScrollPx { dx: 0.0, dy: 12.0 },
+        InputEvent::Move { x: 1, y: 2 },
+        InputEvent::Button {
+            button: 1,
+            down: true,
+        },
+    ] {
+        hub.note_input_at(&ev, t);
+    }
     motion(&mut eng, &mut t, 3);
     assert_eq!(last(&rates), 10, "the wheel: the rate frames are taken at");
 }

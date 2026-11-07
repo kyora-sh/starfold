@@ -1145,6 +1145,41 @@ fn refine_soak() {
     }
 }
 
+/// A stream opened for more frames a second than OpenH264 budgets over, once told frames come
+/// at 30, gives each the bytes a stream opened at 30 does.
+#[test]
+fn a_stream_opened_past_the_frame_cap_budgets_like_one_opened_at_its_new_rate() {
+    let (w, h) = (640usize, 480usize);
+    let mut fast = config(Backend::OpenH264, w as u32, h as u32, 2000);
+    fast.fps = 120;
+    fast.rate = RateConfig::new(24.0, 2000, 120);
+    let mut fast = open(&fast).unwrap();
+    fast.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
+    let mut at30 = open(&config(Backend::OpenH264, w as u32, h as u32, 2000)).unwrap();
+    let mut p = Picture::new(w, h);
+    let mut per_frame = |enc: &mut Box<dyn VideoEncoder>| {
+        let bytes: Vec<usize> = (0..45)
+            .map(|f| {
+                p.video(f);
+                let opts = EncodeOptions {
+                    pts_ms: (f * 1000 / 30) as i64,
+                    force_keyframe: false,
+                    static_mbs: None,
+                    refine: None,
+                };
+                let aus = enc.encode(&p.view(), opts).unwrap();
+                aus.iter().map(|a| a.data.len()).sum::<usize>()
+            })
+            .collect();
+        bytes[15..].iter().sum::<usize>() / 30
+    };
+    let (slowed, opened) = (per_frame(&mut fast), per_frame(&mut at30));
+    assert!(
+        slowed * 10 >= opened * 8,
+        "{slowed} bytes a frame slowed to 30 fps, {opened} opened at 30"
+    );
+}
+
 /// Told frames now come at a third of the rate, rate control gives each about three times the
 /// bytes, and the stream carries on without an IDR.
 #[test]

@@ -675,6 +675,28 @@ mod tests {
     const CLICK: &str = r#"{"type":"click","x":1,"y":2}"#;
 
     #[tokio::test]
+    async fn only_keys_count_as_typing() {
+        let (s, _seen) = state(false, Duration::ZERO);
+        s.hub.activity.reset(64, 64);
+        let pointer = r#"[{"type":"click","x":1,"y":2},{"type":"scroll","dy":3}]"#;
+        assert_eq!(
+            post(&s, "application/json", pointer).await.0,
+            StatusCode::OK
+        );
+        assert!(
+            s.hub.input_at.lock().is_some(),
+            "pointer input went unnoted"
+        );
+        assert!(
+            s.hub.key_at.lock().is_none(),
+            "pointer input counted as typing"
+        );
+        let key = r#"{"type":"key","key":"a"}"#;
+        assert_eq!(post(&s, "application/json", key).await.0, StatusCode::OK);
+        assert!(s.hub.key_at.lock().is_some(), "a key went unnoted");
+    }
+
+    #[tokio::test]
     async fn read_only_servers_refuse_input() {
         let (s, seen) = state(true, Duration::ZERO);
         let (code, body) = post(&s, "application/json", CLICK).await;
