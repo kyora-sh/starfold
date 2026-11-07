@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(unix))]
-use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -95,8 +93,22 @@ pub struct Report {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// The child's side, given the arguments after [`FLAG`]; returns the exit code.
+/// What the parent writes on a child's stdin once the child can't outlive it.
+pub const GO: u8 = b'g';
+/// The exit code of a child whose stdin closed without [`GO`].
+pub const NO_GO: i32 = 3;
+
+/// The child's side, given the arguments after [`FLAG`]; returns the exit code. It does
+/// nothing before [`GO`] arrives: no probing, spawning or library loading.
 pub fn child_main(args: &[String]) -> i32 {
+    let mut go = [0u8];
+    if std::io::stdin().read_exact(&mut go).is_err() || go != [GO] {
+        return NO_GO;
+    }
+    probe_main(args)
+}
+
+fn probe_main(args: &[String]) -> i32 {
     if let Some(i) = args.iter().position(|a| a == SESSION) {
         return session_main(args.first().map(String::as_str), args.get(i + 1));
     }
@@ -209,7 +221,8 @@ impl ProbeProvider for Child {
 /// leaves a diagnostic in place of encoders. Returns within `timeout` plus a few seconds.
 ///
 /// On Unix the child leads its own process group, and whatever is left in that group is
-/// killed while the child is known to be unreaped, so its pid can't have been reused.
+/// killed while the child is known to be unreaped, so its pid can't have been reused. On
+/// Windows the child starts in a job object, and everything in the job is killed.
 pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
     reap_stuck();
     if auto_reaps() {
@@ -218,12 +231,8 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
             "probe not run: SIGCHLD is ignored, so its child couldn't be killed safely",
         );
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = match cmd.spawn() {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let (mut child, group) = match Group::spawn(&mut cmd) {
         Ok(c) => c,
         Err(e) => return Probe::failed(backend, format!("probe didn't start: {e}")),
     };
@@ -231,7 +240,7 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
         Ok(o) => o,
         Err(e) => {
             if !finished(&mut child).as_ref().err().is_some_and(lost) {
-                kill(&mut child);
+                group.kill(&mut child);
             }
             let _ = reap(child);
             return Probe::failed(backend, e);
@@ -256,7 +265,7 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
             Err(e) => break Some(format!("probe wait failed: {e}")),
         }
     };
-    kill(&mut child);
+    group.kill(&mut child);
     let status = reap(child);
     if let Some(e) = late {
         return Probe::failed(backend, e);
@@ -365,26 +374,16 @@ impl std::fmt::Display for OutputError {
 
 /// The child's stdout, read without blocking from the waiting loop, so a child never
 /// blocks on a full pipe and nothing is left reading once [`run`] returns.
-#[cfg(unix)]
-struct Output {
-    pipe: Option<ChildStdout>,
+struct Output<P: Pipe = ChildStdout> {
+    pipe: Option<P>,
     buf: Vec<u8>,
     err: Option<OutputError>,
 }
 
-#[cfg(unix)]
-impl Output {
-    fn new(pipe: Option<ChildStdout>) -> Result<Output, String> {
+impl<P: Pipe> Output<P> {
+    fn new(pipe: Option<P>) -> Result<Output<P>, String> {
         if let Some(p) = &pipe {
-            use std::os::fd::AsRawFd;
-            let fd = p.as_raw_fd();
-            let ok = unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
-            };
-            if !ok {
-                return Err(format!("probe output: {}", std::io::Error::last_os_error()));
-            }
+            p.nonblocking().map_err(|e| format!("probe output: {e}"))?;
         }
         Ok(Output {
             pipe,
@@ -404,16 +403,16 @@ impl Output {
         };
         let mut chunk = [0u8; 8192];
         loop {
-            match p.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
+            match p.read_ready(&mut chunk) {
+                Ok(Some(0)) => break,
+                Ok(Some(n)) => {
                     self.buf.extend_from_slice(&chunk[..n]);
                     if self.buf.len() as u64 > MAX_OUTPUT {
                         self.err = Some(OutputError::TooLong);
                         break;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Ok(None) => return false,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     self.err = Some(OutputError::Read(e));
@@ -440,45 +439,66 @@ impl Output {
     }
 }
 
-/// The child's stdout, read on a thread (Windows pipes don't poll).
-#[cfg(not(unix))]
-struct Output(Option<mpsc::Receiver<std::io::Result<Vec<u8>>>>);
+/// The read end of a pipe that [`Output`] polls.
+trait Pipe: Read {
+    fn nonblocking(&self) -> std::io::Result<()>;
+    /// Reads what is there without waiting: `None` when nothing is, `Some(0)` at the end.
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>>;
+}
 
-#[cfg(not(unix))]
-impl Output {
-    fn new(pipe: Option<ChildStdout>) -> Result<Output, String> {
-        let Some(pipe) = pipe else {
-            return Ok(Output(None));
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsRawFd> Pipe for T {
+    fn nonblocking(&self) -> std::io::Result<()> {
+        let fd = self.as_raw_fd();
+        let ok = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
         };
-        let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("probe-output".into())
-            .spawn(move || {
-                let mut buf = Vec::new();
-                let r = pipe.take(MAX_OUTPUT + 1).read_to_end(&mut buf);
-                let _ = tx.send(r.map(|_| buf));
-            })
-            .map_err(|e| format!("no probe output thread: {e}"))?;
-        Ok(Output(Some(rx)))
+        if ok {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
-    fn pump(&mut self) -> bool {
-        false
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        match self.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            r => r.map(Some),
+        }
+    }
+}
+
+/// Windows pipes have no non-blocking reads: only what `PeekNamedPipe` says is there
+/// is read, so a pipe that a process outside the job still holds can't block the reader.
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> Pipe for T {
+    fn nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
     }
 
-    fn too_long(&self) -> bool {
-        false
-    }
-
-    fn finish(self, grace: Duration) -> Result<Vec<u8>, OutputError> {
-        let Some(rx) = self.0 else {
-            return Ok(Vec::new());
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
+        use windows::Win32::System::Pipes::PeekNamedPipe;
+        let mut ready = 0u32;
+        let peeked = unsafe {
+            PeekNamedPipe(
+                HANDLE(self.as_raw_handle()),
+                None,
+                0,
+                None,
+                Some(&mut ready),
+                None,
+            )
         };
-        match rx.recv_timeout(grace) {
-            Ok(Ok(b)) if b.len() as u64 <= MAX_OUTPUT => Ok(b),
-            Ok(Ok(_)) => Err(OutputError::TooLong),
-            Ok(Err(e)) => Err(OutputError::Read(e)),
-            Err(_) => Err(OutputError::Open),
+        match peeked {
+            Err(e) if e.code() == ERROR_BROKEN_PIPE.to_hresult() => Ok(Some(0)),
+            Err(e) => Err(std::io::Error::other(e)),
+            Ok(()) if ready == 0 => Ok(None),
+            Ok(()) => {
+                let n = buf.len().min(ready as usize);
+                self.read(&mut buf[..n]).map(Some)
+            }
         }
     }
 }
@@ -547,19 +567,94 @@ fn finished(child: &mut std::process::Child) -> std::io::Result<bool> {
     child.try_wait().map(|s| s.is_some())
 }
 
-/// Kills the child's process group; the unreaped child keeps its id from being reused.
+/// Spawns `cmd` and sends it [`GO`] only once `confine` has made sure it can't outlive
+/// this process. A child that is never confined (this process died first, or `confine`
+/// failed) reads the end of its stdin and exits without doing anything. `cmd` keeps a
+/// read end of that pipe, so writing [`GO`] to a child that already exited can't fail
+/// with `SIGPIPE`.
+fn start(
+    cmd: &mut Command,
+    confine: impl FnOnce(&std::process::Child) -> Result<(), String>,
+) -> Result<std::process::Child, String> {
+    let (stdin, mut go) = std::io::pipe().map_err(|e| format!("no pipe for its stdin: {e}"))?;
+    cmd.stdin(stdin);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    if let Err(e) = confine(&child) {
+        drop(go);
+        let _ = child.kill();
+        let _ = reap(child);
+        return Err(e);
+    }
+    let _ = go.write_all(&[GO]);
+    Ok(child)
+}
+
+/// The child and whatever it starts, killed together.
 #[cfg(unix)]
-fn kill(child: &mut std::process::Child) {
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+struct Group;
+
+#[cfg(unix)]
+impl Group {
+    fn spawn(cmd: &mut Command) -> Result<(std::process::Child, Group), String> {
+        std::os::unix::process::CommandExt::process_group(cmd, 0);
+        start(cmd, |_| Ok(())).map(|c| (c, Group))
+    }
+
+    /// Kills the child's process group; the unreaped child keeps its id from being reused.
+    fn kill(&self, child: &mut std::process::Child) {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
     }
 }
 
-#[cfg(not(unix))]
-fn kill(child: &mut std::process::Child) {
-    let _ = child.kill();
+/// A job object that kills what is in it once its last handle closes, so the child's
+/// descendants go with it, also when the server itself dies.
+#[cfg(windows)]
+struct Group(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl Group {
+    fn spawn(cmd: &mut Command) -> Result<(std::process::Child, Group), String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
+            .map_err(|e| format!("no job object: {e}"))?;
+        let group = Group(unsafe { OwnedHandle::from_raw_handle(job.0) });
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        }
+        .map_err(|e| format!("job object limits: {e}"))?;
+        let child = start(cmd, |c| {
+            unsafe { AssignProcessToJobObject(job, HANDLE(c.as_raw_handle())) }
+                .map_err(|e| format!("couldn't put it in a job object: {e}"))
+        })?;
+        Ok((child, group))
+    }
+
+    fn kill(&self, child: &mut std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        let job = HANDLE(self.0.as_raw_handle());
+        if unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) }.is_err() {
+            let _ = child.kill();
+        }
+    }
 }
 
 #[cfg(unix)]

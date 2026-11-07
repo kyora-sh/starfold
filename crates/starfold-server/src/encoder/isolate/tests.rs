@@ -69,8 +69,8 @@ fn no_child_unless_the_executable_takes_the_flag() {
 
 #[test]
 fn unknown_backend_exits_2() {
-    assert_eq!(child_main(&["bogus".into()]), 2);
-    assert_eq!(child_main(&[]), 2);
+    assert_eq!(probe_main(&["bogus".into()]), 2);
+    assert_eq!(probe_main(&[]), 2);
 }
 
 #[test]
@@ -302,5 +302,199 @@ fn output_held_open_by_an_escaped_process() {
     assert_eq!(reason(&p), "probe output stayed open after it exited");
     assert!(took < Duration::from_secs(3), "{took:?}");
     assert_ne!(unsafe { libc::getsid(pid) }, unsafe { libc::getsid(0) });
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+const FAKE: &str = "STARFOLD_FAKE_PROBE";
+
+/// This test binary again, as [`fake_child`] in `mode`.
+fn fake(mode: &str, dir: &std::path::Path) -> Command {
+    let mut c = Command::new(std::env::current_exe().unwrap());
+    c.args([
+        "--exact",
+        "encoder::isolate::tests::fake_child",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(FAKE, mode)
+    .env("STARFOLD_FAKE_DIR", dir);
+    c
+}
+
+/// A probe child that waits for [`GO`] as the real one does, then (`gate`) records that it
+/// went and reports, or starts a process holding its stdout, waits for it to record its id,
+/// and reports or hangs. Does nothing unless run by [`fake`].
+#[test]
+fn fake_child() {
+    let Ok(mode) = std::env::var(FAKE) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(std::env::var_os("STARFOLD_FAKE_DIR").unwrap());
+    if mode == "sleep" {
+        std::fs::write(dir.join("pid.tmp"), std::process::id().to_string()).unwrap();
+        std::fs::rename(dir.join("pid.tmp"), dir.join("pid")).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+    let mut go = [0u8];
+    if std::io::stdin().read_exact(&mut go).is_err() || go != [GO] {
+        std::process::exit(NO_GO);
+    }
+    if mode == "gate" {
+        std::fs::write(dir.join("went"), "").unwrap();
+        std::process::exit(0);
+    }
+    let _held = fake("sleep", &dir).stdin(Stdio::null()).spawn().unwrap();
+    while !dir.join("pid").exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if mode == "hang" {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "\n{}",
+        report(Backend::Vaapi, vec![good(Backend::Vaapi)])
+    )
+    .unwrap();
+    out.flush().unwrap();
+    std::process::exit(0);
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("starfold-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn held_pid(dir: &std::path::Path) -> u32 {
+    std::fs::read_to_string(dir.join("pid"))
+        .expect("the fake probe never started its descendant")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn exits_soon(pid: u32) -> bool {
+    gone_soon(pid as libc::pid_t)
+}
+
+#[cfg(windows)]
+fn exits_soon(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    let Ok(h) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+        return true;
+    };
+    let r = unsafe { WaitForSingleObject(h, 5000) };
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    r == WAIT_OBJECT_0
+}
+
+/// A descendant that keeps the child's stdout dies with the child, so the report it
+/// printed is read rather than lost to a pipe that stays open.
+#[test]
+fn descendant_holding_the_output_goes_with_the_child() {
+    let dir = scratch("probe-held");
+    let p = run(
+        fake("report", &dir),
+        Backend::Vaapi,
+        Duration::from_secs(30),
+    );
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    assert_eq!(p.caps, vec![good(Backend::Vaapi)]);
+    let pid = held_pid(&dir);
+    assert!(exits_soon(pid), "pid {pid} outlived the probe");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn hung_childs_descendants_are_killed() {
+    let dir = scratch("probe-hung");
+    let p = run(fake("hang", &dir), Backend::Nvenc, Duration::from_secs(5));
+    assert!(reason(&p).contains("was killed"), "{:?}", p.diagnostics);
+    let pid = held_pid(&dir);
+    assert!(exits_soon(pid), "pid {pid} survived the probe timeout");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A pipe whose writer stays open costs the grace period, never a blocked read.
+#[test]
+fn output_held_open_costs_the_grace() {
+    let (r, mut w) = std::io::pipe().unwrap();
+    w.write_all(b"partial").unwrap();
+    let mut out = Output::new(Some(r)).unwrap();
+    assert!(!out.pump());
+    let t = Instant::now();
+    assert!(matches!(
+        out.finish(Duration::from_millis(300)),
+        Err(OutputError::Open)
+    ));
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    drop(w);
+}
+
+#[test]
+fn output_is_read_to_its_end() {
+    let (r, mut w) = std::io::pipe().unwrap();
+    w.write_all(b"one\ntwo").unwrap();
+    drop(w);
+    let out = Output::new(Some(r)).unwrap();
+    assert_eq!(out.finish(Duration::from_secs(5)).unwrap(), b"one\ntwo");
+}
+
+/// The child gets [`GO`] only after it was confined, and runs on once it has.
+#[test]
+fn go_follows_confinement() {
+    let dir = scratch("probe-go");
+    let mut cmd = fake("gate", &dir);
+    cmd.stdout(Stdio::null());
+    let went = dir.join("went");
+    let mut c = start(&mut cmd, |_| {
+        std::thread::sleep(Duration::from_millis(500));
+        match went.exists() {
+            true => Err("went before it was confined".into()),
+            false => Ok(()),
+        }
+    })
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match c.try_wait().unwrap() {
+            Some(s) => break Some(s),
+            None if Instant::now() >= end => break None,
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if status.is_none() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
+    assert!(went.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A child that can't be confined never gets [`GO`] and is gone when `start` returns.
+#[test]
+fn unconfined_child_never_goes() {
+    let dir = scratch("probe-nogo");
+    let mut cmd = fake("gate", &dir);
+    cmd.stdout(Stdio::null());
+    let pid = std::cell::Cell::new(0);
+    let e = start(&mut cmd, |c| {
+        pid.set(c.id());
+        Err("no job".into())
+    })
+    .unwrap_err();
+    assert_eq!(e, "no job");
+    assert!(exits_soon(pid.get()));
+    assert!(!dir.join("went").exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
