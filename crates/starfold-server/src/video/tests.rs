@@ -3215,6 +3215,7 @@ fn mixed(hub: &Arc<Hub>, o: Opts) -> (Engine, Viewer, Viewer) {
     let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[HEVC, H264], fakes(o)).unwrap();
     let (a, mut ra) = client(hub);
     let (b, mut rb) = client(hub);
+    a.hz.store(120, Ordering::Relaxed);
     join_v2(hub, &a, &[Codec::Hevc]);
     join_legacy(hub, &b);
     push(&mut eng);
@@ -3305,6 +3306,7 @@ fn the_capture_follows_the_fastest_watched_cohort() {
         Engine::new(high_fps(), hub.clone(), W, H, &[HEVC_SW, H264_HW], fakes(o)).unwrap();
     let (a, _ra) = client(&hub);
     let (b, mut rb) = client(&hub);
+    a.hz.store(120, Ordering::Relaxed);
     join_legacy(&hub, &a);
     join_v2(&hub, &b, &[Codec::Hevc]);
     push(&mut eng);
@@ -3397,6 +3399,7 @@ fn the_encode_loop_watches_motion_encode_times() {
     };
     let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
     let (c, mut rx) = client(&hub);
+    c.hz.store(120, Ordering::Relaxed);
     join_legacy(&hub, &c);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(20) && eng.cohorts[0].fps() == 120 {
@@ -3450,6 +3453,7 @@ fn keyframes_an_encoder_makes_by_itself_are_not_timed() {
     };
     let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
     let (c, mut rx) = client(&hub);
+    c.hz.store(120, Ordering::Relaxed);
     join_legacy(&hub, &c);
     let start = Instant::now();
     while start.elapsed() < SLOW_FOR + Duration::from_millis(500) {
@@ -3483,4 +3487,52 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         turn.work(),
         "the loop waits for the cap, not the idle timeout"
     );
+}
+
+#[test]
+fn the_slowest_viewer_holds_a_120_cohort_down_to_60_not_below() {
+    let hub = Hub::new();
+    let (mut eng, (a, _ra), _b) = mixed(&hub, Opts::default());
+    let hevc = |eng: &Engine| {
+        let c = eng.cohorts.iter().find(|c| c.shared.cand == HEVC).unwrap();
+        (c.fps(), c.shared.fps.load(Ordering::Acquire))
+    };
+    let at = |eng: &mut Engine, hz: u32| {
+        a.hz.store(hz, Ordering::Relaxed);
+        push(eng);
+        hevc(eng).0
+    };
+    assert_eq!(at(&mut eng, 120), 120);
+    assert_eq!(at(&mut eng, 90), 90);
+    assert_eq!(at(&mut eng, 30), 60, "not below the base rate");
+    assert_eq!(at(&mut eng, 0), 60, "a viewer that didn't say");
+    assert_eq!(at(&mut eng, 144), 120, "not above the cap");
+    let (c, mut rc) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&c, &drain(&mut rc));
+    push(&mut eng);
+    assert_eq!(hevc(&eng).0, 60, "a second viewer that didn't say");
+    assert_eq!(eng.capture_fps(&eng.views()), 60);
+    hub.remove_client(c.id);
+    push(&mut eng);
+    assert_eq!(hevc(&eng).0, 120);
+    a.slow.store(true, Ordering::Relaxed);
+    push(&mut eng);
+    assert_eq!(hevc(&eng), (60, 120), "slow holds it down; the cap stays");
+}
+
+#[test]
+fn viewers_change_nothing_without_high_fps() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
+    let (a, mut ra) = client(&hub);
+    join_v2(&hub, &a, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&a, &drain(&mut ra));
+    for hz in [0, 20, 144] {
+        a.hz.store(hz, Ordering::Relaxed);
+        push(&mut eng);
+        assert!(eng.cohorts.iter().all(|c| c.fps() == 30), "{hz}");
+    }
 }

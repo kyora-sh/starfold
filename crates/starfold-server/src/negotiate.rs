@@ -326,6 +326,9 @@ pub enum ClientMsg {
         offer: Option<u64>,
         #[serde(default)]
         decode: Vec<serde_json::Value>,
+        /// The display's refresh rate the page measured (frames per second).
+        #[serde(default)]
+        hz: Option<f64>,
     },
     #[serde(rename = "codec-ready")]
     Ready { epoch: u32 },
@@ -339,6 +342,9 @@ pub enum ClientMsg {
     Ack { epoch: u32, frame: u32 },
     #[serde(rename = "keyframe")]
     Keyframe { epoch: u32 },
+    /// The decoder fell behind twice within 10 s: no more than the base rate for this viewer.
+    #[serde(rename = "slow")]
+    Slow,
 }
 
 impl ClientMsg {

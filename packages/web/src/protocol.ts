@@ -127,8 +127,9 @@ export const cmd = {
 
 /** Protocol 2 messages to the server (JSON; acks and keyframe requests carry the epoch). */
 export const msg = {
-	hello: (offer: number | undefined, decode: DecodeEntry[]) =>
-		JSON.stringify({ t: 'hello', v: 2, offer, decode }),
+	hello: (offer: number | undefined, decode: DecodeEntry[], hz?: number) =>
+		JSON.stringify({ t: 'hello', v: 2, offer, decode, hz }),
+	slow: () => JSON.stringify({ t: 'slow' }),
 	ready: (epoch: number) => JSON.stringify({ t: 'codec-ready', epoch }),
 	error: (epoch: number, reason: string) =>
 		JSON.stringify({ t: 'codec-error', epoch, reason }),
@@ -226,6 +227,7 @@ export type ToWorker =
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }
+	| { t: 'hz'; hz: number }
 	| { t: 'audioPort'; port: MessagePort };
 
 /** Worker -> desktop audio worklet: one decoded chunk, planar. */

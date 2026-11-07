@@ -92,6 +92,10 @@ pub struct Client {
     pub started: AtomicBool,
     pub delay: Mutex<DelayEst>,
     pub route: Mutex<Route>,
+    /// The display's refresh rate from the capability hello (0: not said).
+    pub hz: AtomicU32,
+    /// Its decoder fell behind twice within 10 s.
+    pub slow: AtomicBool,
 }
 
 /// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
@@ -188,6 +192,12 @@ impl Client {
         r.detach();
         self.started.store(false, Ordering::Relaxed);
         self.needs_keyframe.store(false, Ordering::Relaxed);
+    }
+
+    /// The rate this viewer can show: None when it didn't say or can't keep up.
+    pub fn display_hz(&self) -> Option<u32> {
+        let hz = self.hz.load(Ordering::Relaxed);
+        (hz > 0 && !self.slow.load(Ordering::Relaxed)).then_some(hz)
     }
 
     /// codec-ready for `epoch`: false unless it is the epoch announced last.
@@ -518,6 +528,8 @@ impl Hub {
                 queue_ms: 0.0,
             }),
             route: Mutex::new(Route::default()),
+            hz: AtomicU32::new(0),
+            slow: AtomicBool::new(false),
         });
         self.clients.lock().push(c.clone());
         c

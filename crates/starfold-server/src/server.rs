@@ -390,7 +390,15 @@ const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 /// state, acks and keyframe requests), so read-only viewers send them too.
 fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
     match m {
-        ClientMsg::Hello { v, offer, decode } if v >= crate::negotiate::PROTOCOL => {
+        ClientMsg::Hello {
+            v,
+            offer,
+            decode,
+            hz,
+        } if v >= crate::negotiate::PROTOCOL => {
+            if let Some(hz) = hz.filter(|h| h.is_finite() && *h >= 1.0) {
+                c.hz.store(hz.round().min(1000.0) as u32, Ordering::Relaxed);
+            }
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
             if offer.is_some_and(|o| o != gen) {
@@ -424,6 +432,14 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
         ClientMsg::Keyframe { epoch } => {
             if c.request_keyframe(Some(epoch)) {
                 s.hub.wake();
+            }
+        }
+        ClientMsg::Slow => {
+            if !c.slow.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "client {}: its decoder keeps falling behind; no more than 60 fps for it",
+                    c.id
+                );
             }
         }
     }
@@ -670,6 +686,23 @@ mod tests {
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    #[test]
+    fn the_hello_says_the_display_rate_and_slow_takes_it_back() {
+        let hub = Hub::new();
+        let s = app(&hub, true, None);
+        let mut rtts = Default::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let c = hub.add_client(tx);
+        assert_eq!(c.display_hz(), None);
+        let hello = |hz: &str| format!(r#"{{"t":"hello","v":2,"offer":0,"decode":[],"hz":{hz}}}"#);
+        handle_text(&s, &c, &hello("119.88"), &mut rtts);
+        assert_eq!(c.display_hz(), Some(120));
+        handle_text(&s, &c, &hello("-5"), &mut rtts);
+        assert_eq!(c.display_hz(), Some(120), "nonsense is ignored");
+        handle_text(&s, &c, r#"{"t":"slow"}"#, &mut rtts);
+        assert_eq!(c.display_hz(), None);
     }
 
     #[test]
