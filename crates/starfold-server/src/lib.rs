@@ -215,7 +215,11 @@ async fn serve(a: HashMap<String, String>) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
+        high_fps: truthy(a.get("high-fps"), false),
     };
+    if let Some(w) = video::fps_warning(vcfg.fps, vcfg.high_fps, encoder.name()) {
+        log::warn!("{w}");
+    }
     let clip = a
         .get("enable-clipboard")
         .map(|s| s.as_str())
