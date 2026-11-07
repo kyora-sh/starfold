@@ -77,10 +77,6 @@ pub fn init(a: &HashMap<String, String>) {
         {
             s.fps = (f as u32).clamp(1, 240);
         }
-        // The stream can't follow a cohort's cap without a reconfigure, so it runs at the most.
-        if crate::truthy(a.get("high-fps"), false) {
-            s.fps = s.fps.max(crate::video::HIGH_FPS);
-        }
     }
     unsafe {
         if !CGPreflightScreenCaptureAccess() {
@@ -159,6 +155,12 @@ pub fn active_displays() -> Vec<u32> {
 
 pub fn display() -> u32 {
     SETTINGS.lock().display
+}
+
+/// The stream can't follow a cohort's cap without a reconfigure, so it runs at the most any
+/// cohort may take.
+pub fn set_fps(fps: u32) {
+    SETTINGS.lock().fps = fps.clamp(1, 240);
 }
 
 pub fn fps() -> u32 {

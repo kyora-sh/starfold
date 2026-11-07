@@ -42,6 +42,9 @@ pub struct VideoConfig {
     pub stripes: u32,
     pub adaptive_threads: bool,
     pub high_fps: bool,
+    /// The rate the screen source delivers pictures at by itself (0: as fast as the capture
+    /// loop asks).
+    pub source_fps: u32,
 }
 
 /// With --high-fps, the rate a cohort may take frames at on a hardware encoder measured there.
@@ -70,6 +73,15 @@ fn fps_cap(cfg: &VideoConfig, cand: Candidate) -> u32 {
     } else {
         base_fps(cfg)
     }
+}
+
+/// The rate a source that paces itself should deliver at: the most any of `cands` takes.
+pub fn source_fps(cfg: &VideoConfig, cands: &[Candidate]) -> u32 {
+    cands
+        .iter()
+        .map(|&c| fps_cap(cfg, c))
+        .max()
+        .unwrap_or(cfg.fps)
 }
 
 /// The startup warning for a --framerate nobody measured.
@@ -1163,6 +1175,11 @@ impl Engine {
         self.hub.target_kbps.store(shown, Ordering::Relaxed);
     }
 
+    /// The rate captures can come at: the capture's own, or the source's when faster.
+    fn arrival_fps(&self, views: &[View]) -> u32 {
+        self.capture_fps(views).max(self.cfg.source_fps)
+    }
+
     /// The rate the capture runs at: the highest cap of a cohort with viewers.
     fn capture_fps(&self, views: &[View]) -> u32 {
         self.cohorts
@@ -1178,7 +1195,7 @@ impl Engine {
     /// and either a keyframe owed or their viewers keeping up. A cohort capped below the
     /// capture's `interval_ms` keeps up at its own cap's interval.
     fn takes(&self, views: &[View], interval_ms: f64) -> Vec<bool> {
-        let capture = self.capture_fps(views);
+        let capture = self.arrival_fps(views);
         self.cohorts
             .iter()
             .zip(views)
@@ -1197,7 +1214,7 @@ impl Engine {
     /// Cohorts capped below the capture rate whose last frame is too recent for their cap
     /// (with the capture's early allowance).
     fn early(&self, views: &[View], now: Instant) -> Vec<bool> {
-        let capture = self.capture_fps(views);
+        let capture = self.arrival_fps(views);
         self.cohorts
             .iter()
             .map(|c| {
@@ -2310,6 +2327,8 @@ struct StripeJob {
     cap: u32,
     refine: Option<PassBudget>,
     fps: u32,
+    /// The cohort's cap: the encoder's opening rate and the governor's frame budget.
+    max_fps: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -2436,6 +2455,11 @@ fn stripe_worker(
         predicted_ms: 0.0,
     };
     while let Ok(job) = rx.recv() {
+        if job.max_fps != s.cfg.fps {
+            s.cfg.fps = job.max_fps;
+            s.cfg.rate.fps = job.max_fps;
+            gov.budget_ms = 1000.0 / job.max_fps.max(1) as f64;
+        }
         let buf = &*job.buf;
         // A frame at a fixed QP is outside rate control; leave its budget alone.
         let refine = job
@@ -2650,7 +2674,6 @@ fn encode_loop(
     }) = rx.recv()
     {
         let t0 = Instant::now();
-        let motion = !force_idr && !job.paintover && job.refine_qp.is_none();
         let selected: Vec<bool> = stripes
             .iter()
             .map(|&(y, h, touched)| {
@@ -2708,6 +2731,7 @@ fn encode_loop(
                     cap,
                     refine,
                     fps,
+                    max_fps: sh.fps.load(Ordering::Acquire),
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
@@ -2793,7 +2817,7 @@ fn encode_loop(
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
-        if motion {
+        if !force_idr && !paintover && refine_qp.is_none() && !parts.iter().any(|p| p.1) {
             sh.encoded(&mut slow, enc_us as f64 / 1000.0, Instant::now());
         }
         let total: usize = parts.iter().map(|p| p.2.len()).sum();
