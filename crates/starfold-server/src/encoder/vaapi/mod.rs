@@ -17,7 +17,7 @@ use super::caps::{
     Acceleration, Chroma, EncoderCapability, EncoderLimits, PixelFormat, Probe as Found,
     ProbeProvider, ProbeStatus, ProfileCapability,
 };
-use super::{Backend, Codec, EncodeError, EncoderConfig, FrameView, RateConfig, VideoEncoder};
+use super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
 use driver::{Driver, VaDriver};
 use ffi::{
     VAConfigAttrib, VADisplay, VAStatus, Va, ATTRIB_MAX_HEIGHT, ATTRIB_MAX_WIDTH,
@@ -28,7 +28,6 @@ use session::{choose, Session};
 use std::ffi::c_int;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// More than any driver reports; bounds what we allocate for its lists.
 const MAX_LIST: c_int = 256;
@@ -304,65 +303,15 @@ fn render_nodes() -> Result<Vec<PathBuf>, String> {
 /// The side of the picture a probe encodes: the smallest `open` codes.
 const SAMPLE_SIDE: u32 = 128;
 
-fn sample_config(codec: Codec, width: u32, height: u32, fps: u32) -> EncoderConfig {
-    EncoderConfig {
-        backend: Backend::Vaapi,
-        codec,
-        width,
-        height,
-        fps,
-        threads: 1,
-        rate: RateConfig::new(24.0, 4000, fps),
-        best_quality: 24.0,
-        preset: String::new(),
-    }
-}
-
-/// Encodes an IDR and a P frame of flat grey with `enc`.
-fn sample(enc: &mut dyn VideoEncoder, width: u32, height: u32) -> Result<(), EncodeError> {
-    let (w, h) = (width as usize, height as usize);
-    let (y, uv) = (
-        vec![128u8; w * h],
-        vec![128u8; w.div_ceil(2) * h.div_ceil(2)],
-    );
-    let frame = FrameView {
-        width,
-        height,
-        y: &y,
-        u: &uv,
-        v: &uv,
-        stride_y: w,
-        stride_uv: w.div_ceil(2),
-    };
-    for (i, key) in [true, false].into_iter().enumerate() {
-        let aus = enc.encode(
-            &frame,
-            super::EncodeOptions {
-                pts_ms: i as i64,
-                force_keyframe: key,
-                ..Default::default()
-            },
-        )?;
-        if aus.len() != 1 || aus[0].keyframe != key || (key && aus[0].config.is_none()) {
-            return Err(EncodeError(format!(
-                "sample {} came out as {} unit(s)",
-                if key { "IDR" } else { "P frame" },
-                aus.len()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Marks `c` verified if a session on `node` encodes a sample, unavailable if not.
 fn verify(c: &mut EncoderCapability, node: &Path) {
     if !Backend::Vaapi.implements(c.codec) {
         return;
     }
-    let cfg = sample_config(c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
+    let cfg = hw::sample_config(Backend::Vaapi, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
     let r = VaDriver::open(node).and_then(|d| {
         let mut enc = session(Box::new(d), &cfg)?;
-        sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE)
+        hw::sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE)
     });
     match r {
         Ok(()) => {
@@ -411,79 +360,6 @@ fn open_on(node: &Path, cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, En
     VaDriver::open(node).and_then(|d| session(Box::new(d), cfg))
 }
 
-/// Sessions a child has already opened (or failed to), so a driver that crashes on one
-/// costs a child, not the server.
-static PREFLIGHT: Mutex<Vec<(String, Result<(), String>)>> = Mutex::new(Vec::new());
-
-fn codec_name(c: Codec) -> &'static str {
-    match c {
-        Codec::H264 => "h264",
-        Codec::Hevc => "hevc",
-        Codec::Av1 => "av1",
-        #[allow(unreachable_patterns)]
-        _ => "other",
-    }
-}
-
-/// The `--session` argument for `cfg` on `node`:
-/// `<codec>:<w>x<h>@<fps>,<max kbps>,<buffer kbit>,<rate fps>,<quality>,<node>`.
-pub fn spec(cfg: &EncoderConfig, node: &Path) -> String {
-    let r = &cfg.rate;
-    format!(
-        "{}:{}x{}@{},{},{},{},{},{}",
-        codec_name(cfg.codec),
-        cfg.width,
-        cfg.height,
-        cfg.fps,
-        r.max_kbps,
-        r.buf_kbit,
-        r.fps,
-        r.quality,
-        node.display()
-    )
-}
-
-/// What decides whether a session opens: the parameters `vaCreateConfig`,
-/// `vaCreateSurfaces` and `vaCreateContext` see (the rate control mode, not the rate).
-fn key(cfg: &EncoderConfig, node: &Path) -> String {
-    format!(
-        "{}:{}x{}@{},{},{}",
-        codec_name(cfg.codec),
-        cfg.width,
-        cfg.height,
-        cfg.fps,
-        if cfg.rate.max_kbps > 0 {
-            "capped"
-        } else {
-            "uncapped"
-        },
-        node.display()
-    )
-}
-
-pub fn parse_spec(s: &str) -> Option<(EncoderConfig, PathBuf)> {
-    let (codec, rest) = s.split_once(':')?;
-    let mut f = rest.splitn(6, ',');
-    let (size, fps) = f.next()?.split_once('@')?;
-    let (w, h) = size.split_once('x')?;
-    let codec = match codec {
-        "h264" => Codec::H264,
-        "hevc" => Codec::Hevc,
-        "av1" => Codec::Av1,
-        _ => return None,
-    };
-    let (w, h, fps): (u32, u32, u32) = (w.parse().ok()?, h.parse().ok()?, fps.parse().ok()?);
-    let mut cfg = sample_config(codec, w, h, fps);
-    cfg.rate = RateConfig {
-        max_kbps: f.next()?.parse().ok()?,
-        buf_kbit: f.next()?.parse().ok()?,
-        fps: f.next()?.parse().ok()?,
-        quality: f.next()?.parse().ok()?,
-    };
-    let node = PathBuf::from(f.next()?);
-    (w > 0 && h > 0 && fps > 0 && node.is_absolute()).then_some((cfg, node))
-}
-
 /// Opens a VA-API encoder for `cfg` on the first render node that takes it. On each
 /// node, each new session is first opened and run in a child process (when this
 /// executable takes `--probe-encoders`); one that crashes, hangs or fails there is never
@@ -492,8 +368,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
     let nodes = render_nodes().map_err(EncodeError)?;
     let mut why = Vec::new();
     for node in nodes {
-        let r = preflight(cfg, &node, |spec| {
-            super::isolate::session(spec, super::caps::PROBE_TIMEOUT)
+        let r = hw::preflight(cfg, &node.display().to_string(), |spec| {
+            super::isolate::session(Backend::Vaapi, spec, super::caps::PROBE_TIMEOUT)
         })
         .and_then(|()| open_on(&node, cfg));
         match r {
@@ -508,42 +384,12 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
     }))
 }
 
-/// Runs `child` once per session [`key`] and remembers what it said; `None` from it (no
-/// child possible here) passes.
-pub(super) fn preflight(
-    cfg: &EncoderConfig,
-    node: &Path,
-    child: impl FnOnce(&str) -> Option<Found>,
-) -> Result<(), EncodeError> {
-    let key = key(cfg, node);
-    let mut done = PREFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, r)) = done.iter().find(|(k, _)| *k == key) {
-        return r.clone().map_err(EncodeError);
-    }
-    let Some(found) = child(&spec(cfg, node)) else {
-        return Ok(());
-    };
-    let r = if found.diagnostics.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "VA-API {key} failed in a child process: {}",
-            found
-                .diagnostics
-                .iter()
-                .map(|d| d.reason.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))
-    };
-    done.push((key, r.clone()));
-    r.map_err(EncodeError)
-}
-
 /// The child's side of [`open`]: opens the session `spec` names on its node and encodes
 /// a sample, in-process.
 pub fn child_session(spec: &str) -> Result<(), String> {
-    let (cfg, node) = parse_spec(spec).ok_or_else(|| format!("bad session {spec:?}"))?;
-    let mut enc = open_on(&node, &cfg)?;
-    sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
+    let (cfg, node) = hw::parse_spec(Backend::Vaapi, spec)
+        .filter(|(_, n)| Path::new(n).is_absolute())
+        .ok_or_else(|| format!("bad session {spec:?}"))?;
+    let mut enc = open_on(Path::new(&node), &cfg)?;
+    hw::sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
 }

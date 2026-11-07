@@ -1,69 +1,33 @@
-//! NVENC discovery through the driver's own libraries, loaded at runtime: the API
+//! NVENC: discovery through the driver's own libraries, loaded at runtime (the API
 //! version, then per CUDA device an encode session and its codecs, profiles, input
-//! formats and limits.
+//! formats and limits), and EXPERIMENTAL H.264, HEVC and AV1 encoders (8-bit 4:2:0,
+//! IDR + P, one reference, ultra-low-latency tuning). None of this has run on real
+//! hardware yet: `--encoder auto` never picks it, only `--encoder nvenc` does.
+
+mod driver;
+mod ffi;
+mod session;
+#[cfg(test)]
+mod tests;
 
 use super::caps::{
     Acceleration, Chroma, EncoderCapability, EncoderLimits, PixelFormat, Probe as Found,
     ProbeProvider, ProbeStatus, ProfileCapability,
 };
-use super::{Backend, Codec};
-use libloading::Library;
-use std::ffi::{c_char, c_int, c_void};
-use std::mem::{offset_of, size_of};
-use std::ptr;
+use super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
+use driver::{Driver, NvDriver};
+use ffi::guid;
+use ffi::{
+    Api, CapsParam, Cuda, Enc, FunctionList, Status, CAPS_PARAM_VER, FMT_IYUV, FMT_NV12,
+    FMT_YUV420_10BIT, FMT_YUV444,
+};
+pub use ffi::{Guid, CODEC_AV1, CODEC_H264, CODEC_HEVC};
+use session::Session;
+use std::ffi::c_int;
 
-#[cfg(windows)]
-const LIB_ENCODE: &str = "nvEncodeAPI64.dll";
-#[cfg(not(windows))]
-const LIB_ENCODE: &str = "libnvidia-encode.so.1";
-#[cfg(windows)]
-const LIB_CUDA: &str = "nvcuda.dll";
-#[cfg(not(windows))]
-const LIB_CUDA: &str = "libcuda.so.1";
-
-/// The SDK 12.1 headers these structs follow.
-const API_MAJOR: u32 = 12;
-const API_MINOR: u32 = 1;
-const API_VERSION: u32 = API_MAJOR | (API_MINOR << 24);
-const fn struct_version(v: u32) -> u32 {
-    API_VERSION | (v << 16) | (0x7 << 28)
-}
-const DEVICE_TYPE_CUDA: u32 = 1;
 /// More than any driver reports; bounds what we allocate for its lists.
 const MAX_LIST: u32 = 64;
 const MAX_DEVICES: c_int = 16;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Guid {
-    d1: u32,
-    d2: u16,
-    d3: u16,
-    d4: [u8; 8],
-}
-
-const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Guid {
-    Guid { d1, d2, d3, d4 }
-}
-
-pub const CODEC_H264: Guid = guid(
-    0x6bc82762,
-    0x4e63,
-    0x4ca4,
-    [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
-);
-pub const CODEC_HEVC: Guid = guid(
-    0x790cdc88,
-    0x4522,
-    0x4d7b,
-    [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
-);
-pub const CODEC_AV1: Guid = guid(
-    0x0a352289,
-    0x0aa7,
-    0x4759,
-    [0x86, 0x2d, 0x5d, 0x15, 0xcd, 0x16, 0xd2, 0x54],
-);
 
 /// Profile GUIDs and what they encode.
 pub const PROFILES: [(Guid, &str, u8, Chroma); 10] = [
@@ -179,11 +143,6 @@ pub const PROFILES: [(Guid, &str, u8, Chroma); 10] = [
     ),
 ];
 
-const FMT_NV12: u32 = 0x1;
-const FMT_IYUV: u32 = 0x100;
-const FMT_YUV444: u32 = 0x1000;
-const FMT_YUV420_10BIT: u32 = 0x10000;
-
 const CAPS_WIDTH_MAX: u32 = 16;
 const CAPS_HEIGHT_MAX: u32 = 17;
 const CAPS_MB_NUM_MAX: u32 = 31;
@@ -267,122 +226,13 @@ pub fn caps(device: &str, reports: &[CodecReport]) -> Vec<EncoderCapability> {
         .collect()
 }
 
-type Status = c_int;
-type Enc = *mut c_void;
-
-#[repr(C)]
-struct CapsParam {
-    version: u32,
-    caps: u32,
-    reserved: [u32; 62],
-}
-
-#[repr(C)]
-struct OpenParams {
-    version: u32,
-    device_type: u32,
-    device: *mut c_void,
-    reserved: *mut c_void,
-    api_version: u32,
-    reserved1: [u32; 253],
-    reserved2: [*mut c_void; 64],
-}
-
-type Unused = Option<unsafe extern "system" fn()>;
-type Count = Option<unsafe extern "system" fn(Enc, *mut u32) -> Status>;
-type CodecCount = Option<unsafe extern "system" fn(Enc, Guid, *mut u32) -> Status>;
-type Guids = Option<unsafe extern "system" fn(Enc, *mut Guid, u32, *mut u32) -> Status>;
-type CodecGuids = Option<unsafe extern "system" fn(Enc, Guid, *mut Guid, u32, *mut u32) -> Status>;
-type Formats = Option<unsafe extern "system" fn(Enc, Guid, *mut u32, u32, *mut u32) -> Status>;
-type Caps = Option<unsafe extern "system" fn(Enc, Guid, *mut CapsParam, *mut c_int) -> Status>;
-type Destroy = Option<unsafe extern "system" fn(Enc) -> Status>;
-type OpenEx = Option<unsafe extern "system" fn(*mut OpenParams, *mut Enc) -> Status>;
-
-/// NV_ENCODE_API_FUNCTION_LIST: the entries the probe calls, by name.
-#[repr(C)]
-struct FunctionList {
-    version: u32,
-    reserved: u32,
-    open_encode_session: Unused,
-    get_encode_guid_count: Count,
-    get_encode_profile_guid_count: CodecCount,
-    get_encode_profile_guids: CodecGuids,
-    get_encode_guids: Guids,
-    get_input_format_count: CodecCount,
-    get_input_formats: Formats,
-    get_encode_caps: Caps,
-    unused1: [Unused; 19],
-    destroy_encoder: Destroy,
-    invalidate_ref_frames: Unused,
-    open_encode_session_ex: OpenEx,
-    rest: [Unused; 288],
-}
-
-#[cfg(target_pointer_width = "64")]
-const _: () = {
-    assert!(size_of::<CapsParam>() == 256);
-    assert!(size_of::<OpenParams>() == 1552);
-    assert!(size_of::<FunctionList>() == 2552);
-    assert!(offset_of!(FunctionList, get_encode_caps) == 64);
-    assert!(offset_of!(FunctionList, destroy_encoder) == 224);
-    assert!(offset_of!(FunctionList, open_encode_session_ex) == 240);
-};
-
-struct Cuda {
-    init: unsafe extern "system" fn(u32) -> c_int,
-    device_get_count: unsafe extern "system" fn(*mut c_int) -> c_int,
-    device_get: unsafe extern "system" fn(*mut c_int, c_int) -> c_int,
-    device_get_name: unsafe extern "system" fn(*mut c_char, c_int, c_int) -> c_int,
-    ctx_create: unsafe extern "system" fn(*mut *mut c_void, u32, c_int) -> c_int,
-    ctx_destroy: unsafe extern "system" fn(*mut c_void) -> c_int,
-    _lib: Library,
-}
-
-macro_rules! sym {
-    ($lib:expr, $name:literal) => {
-        *$lib
-            .get(concat!($name, "\0").as_bytes())
-            .map_err(|e| format!("{}: {e}", $name))?
-    };
-}
-
-impl Cuda {
-    fn load() -> Result<Cuda, String> {
-        unsafe {
-            let lib = Library::new(LIB_CUDA).map_err(|e| format!("{LIB_CUDA}: {e}"))?;
-            Ok(Cuda {
-                init: sym!(lib, "cuInit"),
-                device_get_count: sym!(lib, "cuDeviceGetCount"),
-                device_get: sym!(lib, "cuDeviceGet"),
-                device_get_name: sym!(lib, "cuDeviceGetName"),
-                ctx_create: sym!(lib, "cuCtxCreate_v2"),
-                ctx_destroy: sym!(lib, "cuCtxDestroy_v2"),
-                _lib: lib,
-            })
-        }
-    }
-
-    unsafe fn name(&self, dev: c_int) -> String {
-        let mut buf = [0 as c_char; 256];
-        if (self.device_get_name)(buf.as_mut_ptr(), buf.len() as c_int, dev) != 0 {
-            return String::new();
-        }
-        let bytes: Vec<u8> = buf
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
 /// An open encode session on one CUDA context, closed on drop.
-struct Session<'a> {
+struct Probing<'a> {
     nv: &'a FunctionList,
     enc: Enc,
 }
 
-impl Drop for Session<'_> {
+impl Drop for Probing<'_> {
     fn drop(&mut self) {
         if let Some(f) = self.nv.destroy_encoder {
             unsafe { f(self.enc) };
@@ -390,7 +240,7 @@ impl Drop for Session<'_> {
     }
 }
 
-impl Session<'_> {
+impl Probing<'_> {
     /// A bounded list: `count` says how many, `fill` writes at most that many.
     unsafe fn list<T: Copy + Default>(
         count: impl FnOnce(*mut u32) -> Status,
@@ -417,7 +267,7 @@ impl Session<'_> {
     unsafe fn cap(&self, codec: Guid, which: u32) -> Option<i32> {
         let f = self.nv.get_encode_caps?;
         let mut p = CapsParam {
-            version: struct_version(1),
+            version: CAPS_PARAM_VER,
             caps: which,
             reserved: [0; 62],
         };
@@ -476,83 +326,100 @@ impl ProbeProvider for Probe {
 }
 
 unsafe fn probe() -> Result<Found, String> {
-    let lib = Library::new(LIB_ENCODE).map_err(|e| format!("{LIB_ENCODE}: {e}"))?;
-    let max_version: unsafe extern "system" fn(*mut u32) -> Status =
-        sym!(lib, "NvEncodeAPIGetMaxSupportedVersion");
-    let create: unsafe extern "system" fn(*mut FunctionList) -> Status =
-        sym!(lib, "NvEncodeAPICreateInstance");
-    let mut v = 0u32;
-    let r = max_version(&mut v);
-    if r != 0 {
-        return Err(format!("NvEncodeAPIGetMaxSupportedVersion failed ({r})"));
-    }
-    if (v >> 4, v & 0xf) < (API_MAJOR, API_MINOR) {
-        return Err(format!(
-            "the driver has NVENC API {}.{}, the probe needs {API_MAJOR}.{API_MINOR}",
-            v >> 4,
-            v & 0xf
-        ));
-    }
-    let mut nv: Box<FunctionList> = Box::new(std::mem::zeroed());
-    nv.version = struct_version(2);
-    let r = create(&mut *nv);
-    if r != 0 {
-        return Err(format!("NvEncodeAPICreateInstance failed ({r})"));
-    }
-    let Some(open) = nv.open_encode_session_ex else {
-        return Err("the driver's function list is incomplete".into());
-    };
+    let api = Api::load()?;
+    let nv = &api.nv;
     let cuda = Cuda::load()?;
-    let r = (cuda.init)(0);
-    if r != 0 {
-        return Err(format!("cuInit failed ({r})"));
-    }
-    let mut n: c_int = 0;
-    let r = (cuda.device_get_count)(&mut n);
-    if r != 0 {
-        return Err(format!("cuDeviceGetCount failed ({r})"));
-    }
+    let n = cuda.count()?;
     let mut found = Found::default();
     if n <= 0 {
         found.note(Backend::Nvenc, None, "no CUDA devices");
     }
     for i in 0..n.min(MAX_DEVICES) {
-        let mut dev: c_int = 0;
-        if (cuda.device_get)(&mut dev, i) != 0 {
-            continue;
-        }
-        let id = format!("cuda:{i} {}", cuda.name(dev));
-        let mut ctx = ptr::null_mut();
-        let r = (cuda.ctx_create)(&mut ctx, 0, dev);
-        if r != 0 || ctx.is_null() {
-            found.note(
-                Backend::Nvenc,
-                Some(&id),
-                format!("cuCtxCreate failed ({r})"),
-            );
-            continue;
-        }
-        let mut params: Box<OpenParams> = Box::new(std::mem::zeroed());
-        params.version = struct_version(1);
-        params.device_type = DEVICE_TYPE_CUDA;
-        params.device = ctx;
-        params.api_version = API_VERSION;
-        let mut enc = ptr::null_mut();
-        let r = open(&mut *params, &mut enc);
-        if r != 0 || enc.is_null() {
-            found.note(
-                Backend::Nvenc,
-                Some(&id),
-                format!("nvEncOpenEncodeSessionEx failed ({r}; all sessions in use?)"),
-            );
-        } else {
-            let s = Session { nv: &nv, enc };
-            match s.report() {
-                Ok(r) => found.caps.extend(caps(&id, &r)),
-                Err(e) => found.note(Backend::Nvenc, Some(&id), e),
+        let id = format!("cuda:{i} {}", cuda.name(i));
+        let ctx = match cuda.context(i) {
+            Ok(c) => c,
+            Err(e) => {
+                found.note(Backend::Nvenc, Some(&id), e);
+                continue;
             }
-        }
+        };
+        let mut caps = match api.open(ctx) {
+            Ok(enc) => {
+                let s = Probing { nv, enc };
+                s.report().map(|r| caps(&id, &r))
+            }
+            Err(e) => Err(e),
+        };
         (cuda.ctx_destroy)(ctx);
+        match &mut caps {
+            Ok(caps) => {
+                for c in caps
+                    .iter_mut()
+                    .filter(|c| c.status == ProbeStatus::Discovered)
+                {
+                    verify(c, i);
+                }
+                found.caps.append(caps);
+            }
+            Err(e) => found.note(Backend::Nvenc, Some(&id), e.clone()),
+        }
     }
     Ok(found)
+}
+
+/// The side of the picture a probe encodes: the smallest `open` codes.
+const SAMPLE_SIDE: u32 = 160;
+
+/// Marks `c` verified if a session on `device` encodes a sample, unavailable if not.
+fn verify(c: &mut EncoderCapability, device: c_int) {
+    if !Backend::Nvenc.implements(c.codec) {
+        return;
+    }
+    let cfg = hw::sample_config(Backend::Nvenc, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
+    let r = open_on(device, &cfg)
+        .and_then(|mut enc| hw::sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE));
+    match r {
+        Ok(()) => {
+            c.status = ProbeStatus::Verified;
+            c.low_latency = Some(true);
+            c.keyframe_control = Some(true);
+        }
+        Err(e) => c.status = ProbeStatus::Unavailable(format!("sample encode: {e}")),
+    }
+}
+
+/// A session for `cfg` on `drv`.
+pub(super) fn session(
+    drv: Box<dyn Driver>,
+    cfg: &EncoderConfig,
+) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    Ok(Box::new(Session::new(drv, cfg)?))
+}
+
+fn open_on(device: c_int, cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    NvDriver::open(device).and_then(|d| session(Box::new(d), cfg))
+}
+
+/// The CUDA device sessions open on.
+const DEVICE: c_int = 0;
+
+/// Opens an NVENC encoder for `cfg` on the first CUDA device. Each new session is first
+/// opened and run in a child process (when this executable takes `--probe-encoders`);
+/// one that crashes, hangs or fails there is never opened here, and the caller falls back
+/// to its next encoder.
+pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    hw::preflight(cfg, &DEVICE.to_string(), |spec| {
+        super::isolate::session(Backend::Nvenc, spec, super::caps::PROBE_TIMEOUT)
+    })?;
+    open_on(DEVICE, cfg)
+}
+
+/// The child's side of [`open`]: opens the session `spec` names on its device and
+/// encodes a sample, in-process.
+pub fn child_session(spec: &str) -> Result<(), String> {
+    let (cfg, device) = hw::parse_spec(Backend::Nvenc, spec)
+        .and_then(|(c, d)| Some((c, d.parse::<c_int>().ok().filter(|&d| d >= 0)?)))
+        .ok_or_else(|| format!("bad session {spec:?}"))?;
+    let mut enc = open_on(device, &cfg)?;
+    hw::sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
 }

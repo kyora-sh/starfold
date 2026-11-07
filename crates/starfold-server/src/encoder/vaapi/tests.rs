@@ -1,9 +1,10 @@
 use super::bits::{leb128_fixed, nal, Bits};
-use super::driver::{write_nv12, Driver};
+use super::driver::Driver;
 use super::ffi::{self, VaId};
 use super::session::{choose, Rc, RcMode};
 use super::*;
-use crate::encoder::{caps::Probe as Found, h264 as h264_nal, AccessUnit, EncodeOptions};
+use crate::encoder::hw::{sample, sample_config, write_nv12};
+use crate::encoder::{h264 as h264_nal, AccessUnit, EncodeOptions, FrameView, RateConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -81,30 +82,6 @@ fn exp_golomb_and_emulation_prevention() {
     );
     assert_eq!(leb128_fixed(5, 4), vec![0x85, 0x80, 0x80, 0x00]);
     assert_eq!(leb128_fixed(300, 2), vec![0xac, 0x02]);
-}
-
-#[test]
-fn nv12_upload_pads_with_the_last_column_and_row() {
-    let (y, u, v) = ([1, 2, 3, 4, 5, 6], [7, 8], [9, 10]);
-    let f = FrameView {
-        width: 3,
-        height: 2,
-        y: &y,
-        u: &u,
-        v: &v,
-        stride_y: 3,
-        stride_uv: 2,
-    };
-    let mut dst = vec![0u8; 64];
-    write_nv12(&mut dst, [5, 6], [0, 40], (4, 4), &f).unwrap();
-    assert_eq!(&dst[0..4], &[1, 2, 3, 3]);
-    assert_eq!(&dst[5..9], &[4, 5, 6, 6]);
-    assert_eq!(&dst[15..19], &[4, 5, 6, 6]);
-    assert_eq!(&dst[40..44], &[7, 9, 8, 10]);
-    assert_eq!(&dst[46..50], &[7, 9, 8, 10]);
-    let mut small = vec![0u8; 20];
-    assert!(write_nv12(&mut small, [5, 6], [0, 40], (4, 4), &f).is_err());
-    assert!(write_nv12(&mut dst, [5, 6], [0, 40], (2, 4), &f).is_err());
 }
 
 type Config = (i32, i32, Vec<(i32, u32)>);
@@ -266,7 +243,7 @@ fn av1_tile_group(_: bool) -> Vec<u8> {
 }
 
 fn cfg(codec: Codec, w: u32, h: u32) -> EncoderConfig {
-    sample_config(codec, w, h, 30)
+    sample_config(Backend::Vaapi, codec, w, h, 30)
 }
 
 fn grey(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
@@ -711,9 +688,12 @@ fn levels() {
     );
     assert_eq!(av1::level(128, 9000, 30, m), None, "taller than any level");
     let (fake, _) = Fake::new(ffi::PROFILE_AV1_0, av1_tile_group);
-    let e = session(Box::new(fake), &sample_config(Codec::Av1, 4096, 4096, 300))
-        .err()
-        .unwrap();
+    let e = session(
+        Box::new(fake),
+        &sample_config(Backend::Vaapi, Codec::Av1, 4096, 4096, 300),
+    )
+    .err()
+    .unwrap();
     assert!(e.0.contains("no AV1 level"), "{e}");
 }
 
@@ -765,51 +745,10 @@ fn h264_packs_both_parameter_sets_or_neither() {
 }
 
 #[test]
-fn preflight_runs_a_child_once_per_session_and_node() {
-    let node = Path::new("/dev/dri/renderD128");
-    let mut c = cfg(Codec::Hevc, 1234, 567);
-    c.rate = RateConfig::new(26.5, 0, 24);
-    let s = spec(&c, node);
-    assert_eq!(s, "hevc:1234x567@30,0,0,24,26.5,/dev/dri/renderD128");
-    let (back, n) = parse_spec(&s).unwrap();
-    assert_eq!(
-        (back.codec, back.width, back.height, back.fps),
-        (Codec::Hevc, 1234, 567, 30)
-    );
-    assert_eq!(back.rate, c.rate, "the child opens the same rate control");
-    assert_eq!(n, node);
-    assert!(parse_spec("vp9:1x1@1,0,0,1,1,/dev/x").is_none());
-    assert!(parse_spec("h264:0x1@1,0,0,1,1,/dev/x").is_none());
-    assert!(parse_spec("h264:1x1@1,0,0,1,1,dev").is_none());
-    let mut runs = 0;
-    for kbps in [0, 0] {
-        c.rate.max_kbps = kbps;
-        let r = preflight(&c, node, |s| {
-            runs += 1;
-            assert!(s.starts_with("hevc:1234x567@30,0,"));
-            Some(Found::failed(Backend::Vaapi, "probe exited with signal 11"))
-        });
-        assert!(r.unwrap_err().0.contains("signal 11"));
-    }
-    assert_eq!(runs, 1, "a crash is remembered");
-    c.rate = RateConfig::new(26.5, 9000, 24);
-    assert!(
-        preflight(&c, node, |_| Some(Found::default())).is_ok(),
-        "capped is another session"
-    );
-    c.rate.max_kbps = 4000;
-    assert!(
-        preflight(&c, node, |_| unreachable!()).is_ok(),
-        "the rate itself is not"
-    );
-    assert!(
-        preflight(&c, Path::new("/dev/dri/renderD129"), |_| Some(
-            Found::failed(Backend::Vaapi, "hang")
-        ))
-        .is_err(),
-        "each node is pre-flighted"
-    );
-    assert!(preflight(&cfg(Codec::H264, 99, 99), node, |_| None).is_ok());
+fn child_sessions_need_an_absolute_node() {
+    assert!(child_session("h264:64x64@30,0,0,30,24,dev")
+        .unwrap_err()
+        .contains("bad session"));
 }
 
 /// The parameter structs against libva's own headers, where they're installed.

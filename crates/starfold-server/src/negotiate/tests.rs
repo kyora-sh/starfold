@@ -236,6 +236,42 @@ fn experimental_backends_only_when_pinned() {
 }
 
 #[test]
+fn nvenc_only_when_pinned() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::Nvenc, true),
+        cap(Codec::Hevc, Backend::Nvenc, true),
+        cap(Codec::Av1, Backend::Nvenc, true),
+        cap(Codec::H264, Backend::OpenH264, false),
+    ]);
+    let h264 = h264_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(h264, Backend::OpenH264, "auto never picks NVENC");
+    assert!(candidates(&r, h264)
+        .iter()
+        .all(|c| c.backend != Backend::Nvenc));
+    let h264 = h264_backend(&r, Selection::Pinned(Backend::Nvenc)).unwrap();
+    assert_eq!(h264, Backend::Nvenc);
+    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
+        .iter()
+        .map(|c| (c.codec, c.backend))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Codec::Av1, Backend::Nvenc),
+            (Codec::Hevc, Backend::Nvenc),
+            (Codec::H264, Backend::Nvenc),
+            (Codec::H264, Backend::OpenH264),
+        ]
+    );
+    let mut off = r.encoders.clone();
+    for c in off.iter_mut().filter(|c| c.backend == Backend::Nvenc) {
+        c.status = ProbeStatus::Disabled;
+    }
+    let e = h264_backend(&reg(off), Selection::Pinned(Backend::Nvenc)).unwrap_err();
+    assert!(e.contains("--experimental-hw-probes"), "{e}");
+}
+
+#[test]
 fn chosen_is_each_codecs_first_candidate() {
     let r = reg(vec![
         cap(Codec::H264, Backend::OpenH264, false),
@@ -270,7 +306,14 @@ fn selection_parse() {
     );
     #[cfg(not(target_os = "linux"))]
     assert!(Selection::parse("vaapi").is_err());
+    #[cfg(any(target_os = "linux", windows))]
+    assert_eq!(
+        Selection::parse("nvenc"),
+        Ok(Selection::Pinned(Backend::Nvenc))
+    );
+    #[cfg(not(any(target_os = "linux", windows)))]
     assert!(Selection::parse("nvenc").is_err());
+    assert!(Selection::parse("mediafoundation").is_err());
     assert!(Selection::parse("h265").unwrap_err().contains("auto"));
     assert_eq!(Selection::Auto.name(), "auto");
 }

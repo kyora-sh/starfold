@@ -3,9 +3,15 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
-#[cfg(any(feature = "libaom", feature = "svt-av1", target_os = "linux", test))]
+#[cfg(any(
+    feature = "libaom",
+    feature = "svt-av1",
+    target_os = "linux",
+    windows,
+    test
+))]
 #[cfg_attr(
-    not(any(feature = "libaom", feature = "svt-av1", target_os = "linux")),
+    not(any(feature = "libaom", feature = "svt-av1", target_os = "linux", windows)),
     allow(dead_code)
 )]
 mod av1;
@@ -14,12 +20,15 @@ mod h264;
 #[cfg(any(
     target_os = "macos",
     target_os = "linux",
+    windows,
     test,
     feature = "kvazaar",
     feature = "x265"
 ))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hevc;
+#[cfg(any(target_os = "linux", windows))]
+mod hw;
 pub mod isolate;
 #[cfg(feature = "kvazaar")]
 mod kvazaar;
@@ -248,16 +257,20 @@ impl Backend {
             "vaapi" => Ok(Backend::Vaapi),
             #[cfg(not(target_os = "linux"))]
             "vaapi" => Err("vaapi is Linux-only".into()),
-            "nvenc" | "mediafoundation" => {
-                Err(format!("{s} is probed (see /stats) but has no encoder yet"))
-            }
+            #[cfg(any(target_os = "linux", windows))]
+            "nvenc" => Ok(Backend::Nvenc),
+            #[cfg(not(any(target_os = "linux", windows)))]
+            "nvenc" => Err("nvenc is Linux and Windows only".into()),
+            "mediafoundation" => Err(format!("{s} is probed (see /stats) but has no encoder yet")),
             _ => Err(format!(
                 "unknown encoder {s:?} (auto, openh264{}{})",
                 if cfg!(feature = "x264") { ", x264" } else { "" },
                 if cfg!(target_os = "macos") {
                     ", videotoolbox"
                 } else if cfg!(target_os = "linux") {
-                    ", vaapi"
+                    ", vaapi, nvenc"
+                } else if cfg!(windows) {
+                    ", nvenc"
                 } else {
                     ""
                 }
@@ -309,7 +322,11 @@ impl Backend {
             Backend::Vaapi => {
                 cfg!(target_os = "linux") && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
-            Backend::Nvenc | Backend::MediaFoundation => false,
+            Backend::Nvenc => {
+                cfg!(any(target_os = "linux", windows))
+                    && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
+            }
+            Backend::MediaFoundation => false,
         }
     }
 
@@ -353,7 +370,8 @@ impl Backend {
             Backend::X265 => 64,
             Backend::VideoToolbox => 64,
             Backend::Vaapi => 128,
-            Backend::Nvenc | Backend::MediaFoundation => 16,
+            Backend::Nvenc => 160,
+            Backend::MediaFoundation => 16,
         }
     }
 
@@ -512,6 +530,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
         #[cfg(target_os = "linux")]
         Backend::Vaapi => vaapi::open(&coded)?,
+        #[cfg(any(target_os = "linux", windows))]
+        Backend::Nvenc => nvenc::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {
