@@ -6,6 +6,7 @@ struct Fake {
     caps: Vec<EncoderCapability>,
     diagnostics: Vec<(Option<&'static str>, &'static str)>,
     delay: Duration,
+    bounded: bool,
 }
 
 impl Fake {
@@ -15,6 +16,7 @@ impl Fake {
             caps: Vec::new(),
             diagnostics: Vec::new(),
             delay: Duration::ZERO,
+            bounded: false,
         }
     }
 }
@@ -22,6 +24,10 @@ impl Fake {
 impl ProbeProvider for Fake {
     fn backend(&self) -> Backend {
         self.backend
+    }
+
+    fn bounded(&self) -> bool {
+        self.bounded
     }
 
     fn probe(&self) -> Probe {
@@ -462,4 +468,28 @@ fn nvenc_codecs_profiles_and_limits() {
     assert_eq!(a.profiles.len(), 2);
     assert_eq!(a.status, ProbeStatus::ProbeOnly, "10-bit input only");
     assert_eq!(a.limits.max_width, None);
+}
+
+/// A provider that ends on its own is waited for past the deadline; one that doesn't is
+/// still left behind.
+#[test]
+fn bounded_providers_are_waited_for() {
+    let mut child = Fake::new(Backend::Vaapi);
+    child.caps = vec![good(Codec::H264, Backend::Vaapi)];
+    child.delay = Duration::from_millis(800);
+    child.bounded = true;
+    let mut hung = Fake::new(Backend::Nvenc);
+    hung.delay = Duration::from_secs(5);
+    let v: Vec<Box<dyn ProbeProvider>> = vec![
+        Box::new(Software(Backend::OpenH264)),
+        Box::new(child),
+        Box::new(hung),
+    ];
+    let t = Instant::now();
+    let r = Registry::probe(v, Duration::from_millis(200));
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    openh264_left(&r);
+    assert!(r.encoders.iter().any(|c| c.backend == Backend::Vaapi));
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);
 }

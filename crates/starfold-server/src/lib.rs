@@ -1,8 +1,8 @@
 //! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
 //! X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
-//! The `voxl` binary calls [`run`] with its command line; other programs (the Tembo CLI's
-//! `tembo voxl`) embed the server the same way.
+//! The `voxl` binary calls [`main`]; other programs (the Tembo CLI's `tembo voxl`) embed
+//! the server by calling [`run`] with a command line, or [`main`] from their own `main`.
 
 mod access;
 mod actions;
@@ -79,8 +79,22 @@ fn truthy(v: Option<&String>, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// The `starfold` binary's `main`: [`run`] with the process's arguments, probing the
+/// hardware encoders in child processes that run this executable again. A program that
+/// embeds the server can call it from its own `main` to get the same isolation.
+pub fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
+        std::process::exit(encoder::isolate::child_main(&args[1..]));
+    }
+    encoder::isolate::enable();
+    run(args);
+}
+
 /// Runs the server with these command-line flags (without the program name) until it's
 /// told to stop. Takes over the calling thread, which on macOS has to be the main thread.
+/// Called directly (not through [`main`]), it probes the hardware encoders in-process, so
+/// a driver that crashes there takes the server with it.
 pub fn run(args: impl IntoIterator<Item = String>) {
     let args: Vec<String> = args.into_iter().collect();
     // --help and --version print and return instead of starting the server.
@@ -152,12 +166,9 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    let encoders = std::sync::Arc::new(encoder::caps::Registry::probe(
-        encoder::caps::host_providers(
-            truthy(a.get("encoder-probe"), true),
-            truthy(a.get("experimental-hw-probes"), false),
-        ),
-        encoder::caps::PROBE_TIMEOUT,
+    let encoders = std::sync::Arc::new(encoder::caps::host_probe(
+        truthy(a.get("encoder-probe"), true),
+        truthy(a.get("experimental-hw-probes"), false),
     ));
     encoders.log();
     let encoder = match negotiate::h264_backend(&encoders, selection) {

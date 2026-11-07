@@ -2,14 +2,14 @@
 //! (never a table of GPU names), and the result is read-only from then on.
 
 use super::{Backend, Codec, EncoderConfig, FrameView, RateConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Acceleration {
     Hardware,
@@ -17,7 +17,7 @@ pub enum Acceleration {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "reason")]
 pub enum ProbeStatus {
     /// An encode session opened (and, where the probe can, encoded a sample).
@@ -31,7 +31,7 @@ pub enum ProbeStatus {
     Unavailable(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PixelFormat {
     I420,
@@ -40,7 +40,7 @@ pub enum PixelFormat {
     Yuv444,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Chroma {
     #[serde(rename = "4:2:0")]
     Yuv420,
@@ -50,7 +50,7 @@ pub enum Chroma {
     Yuv444,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileCapability {
     pub name: String,
     pub bit_depth: u8,
@@ -75,7 +75,7 @@ impl ProfileCapability {
 /// What the encoder reported; `None` is unknown, never "unlimited". Widths and heights
 /// are separate ranges, so a width and a height that are each in range need not fit
 /// together: `max_mbs` and `max_mbs_per_sec` say what does.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderLimits {
     pub min_width: Option<u32>,
     pub max_width: Option<u32>,
@@ -115,7 +115,7 @@ impl EncoderLimits {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderCapability {
     pub codec: Codec,
     pub backend: Backend,
@@ -166,9 +166,8 @@ impl EncoderCapability {
 }
 
 /// A probe finding that is no encoder: a missing library, a device that can't be
-/// opened, a probe that failed or hung. A probe that crashes takes the process with it
-/// (panics abort), so the vendor-driver probes only run when asked for.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// opened, a probe that failed, hung or crashed its child process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub backend: Backend,
     pub device: Option<String>,
@@ -201,6 +200,11 @@ impl Probe {
 pub trait ProbeProvider: Send {
     fn backend(&self) -> Backend;
     fn probe(&self) -> Probe;
+    /// Ends on its own in bounded time (a child it kills at its own timeout), so the
+    /// registry waits for it past its deadline rather than leave it running.
+    fn bounded(&self) -> bool {
+        false
+    }
 }
 
 /// The host's encoders and what the probes said about the rest.
@@ -218,6 +222,7 @@ impl Registry {
     pub fn probe(providers: Vec<Box<dyn ProbeProvider>>, timeout: Duration) -> Registry {
         let (tx, rx) = mpsc::channel();
         let backends: Vec<Backend> = providers.iter().map(|p| p.backend()).collect();
+        let bounded: Vec<bool> = providers.iter().map(|p| p.bounded()).collect();
         for (i, p) in providers.into_iter().enumerate() {
             let sender = tx.clone();
             let spawned = std::thread::Builder::new()
@@ -235,11 +240,27 @@ impl Registry {
         drop(tx);
         let deadline = Instant::now() + timeout;
         let mut done: Vec<Option<Probe>> = backends.iter().map(|_| None).collect();
-        while done.iter().any(Option::is_none) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok((i, r)) => done[i] = Some(r),
-                Err(_) => break,
+        let mut late = false;
+        while done
+            .iter()
+            .zip(&bounded)
+            .any(|(d, &b)| d.is_none() && (b || !late))
+        {
+            let got = if late {
+                rx.recv().ok()
+            } else {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(r) => Some(r),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        late = true;
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            };
+            match got {
+                Some((i, r)) => done[i] = Some(r),
+                None => break,
             }
         }
         let mut reg = Registry::default();
@@ -337,8 +358,9 @@ fn describe(c: &EncoderCapability) -> String {
 }
 
 /// The providers for this platform and build. `hardware` false keeps to the software
-/// encoders; the VA-API, NVENC and Media Foundation probes load vendor drivers into the
-/// process and have no encoder yet, so they run only with `experimental`.
+/// encoders; the VA-API, NVENC and Media Foundation probes are experimental and run only
+/// with `experimental`. Hardware probes run in a child process when this executable
+/// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself.
 pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(Backend::OpenH264))];
     #[cfg(feature = "x264")]
@@ -346,24 +368,40 @@ pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbePr
     if !hardware {
         return v;
     }
-    #[cfg(target_os = "macos")]
-    v.push(Box::new(super::videotoolbox::Probe));
-    for b in [Backend::Vaapi, Backend::Nvenc, Backend::MediaFoundation] {
-        let probe: Option<Box<dyn ProbeProvider>> = match b {
-            #[cfg(target_os = "linux")]
-            Backend::Vaapi => Some(Box::new(super::vaapi::Probe)),
-            #[cfg(any(target_os = "linux", windows))]
-            Backend::Nvenc => Some(Box::new(super::nvenc::Probe)),
-            #[cfg(windows)]
-            Backend::MediaFoundation => Some(Box::new(super::mf::Probe)),
-            _ => None,
-        };
-        match probe {
-            Some(p) if experimental => v.push(p),
-            Some(_) => v.push(Box::new(Disabled(b))),
-            None => {}
+    for p in hardware_providers(true) {
+        let b = p.backend();
+        if b != Backend::VideoToolbox && !experimental {
+            v.push(Box::new(Disabled(b)));
+        } else if let Some(c) = super::isolate::child(b, experimental, PROBE_TIMEOUT) {
+            v.push(Box::new(c));
+        } else {
+            v.push(p);
         }
     }
+    v
+}
+
+/// The whole startup probe.
+pub fn host_probe(hardware: bool, experimental: bool) -> Registry {
+    Registry::probe(host_providers(hardware, experimental), PROBE_TIMEOUT)
+}
+
+/// This platform's hardware probes, run in-process: the experimental ones only with
+/// `experimental`.
+#[cfg_attr(target_os = "macos", allow(clippy::vec_init_then_push))]
+pub fn hardware_providers(experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
+    let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
+    #[cfg(target_os = "macos")]
+    v.push(Box::new(super::videotoolbox::Probe));
+    if !experimental {
+        return v;
+    }
+    #[cfg(target_os = "linux")]
+    v.push(Box::new(super::vaapi::Probe));
+    #[cfg(any(target_os = "linux", windows))]
+    v.push(Box::new(super::nvenc::Probe));
+    #[cfg(windows)]
+    v.push(Box::new(super::mf::Probe));
     v
 }
 
@@ -393,7 +431,7 @@ impl ProbeProvider for Disabled {
 }
 
 /// A compiled-in H.264 encoder, verified by encoding one small picture.
-struct Software(Backend);
+pub(crate) struct Software(pub Backend);
 
 impl ProbeProvider for Software {
     fn backend(&self) -> Backend {
