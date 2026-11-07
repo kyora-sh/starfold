@@ -157,6 +157,12 @@ pub fn display() -> u32 {
     SETTINGS.lock().display
 }
 
+/// The stream can't follow a cohort's cap without a reconfigure, so it runs at the most any
+/// cohort may take.
+pub fn set_fps(fps: u32) {
+    SETTINGS.lock().fps = fps.clamp(1, 240);
+}
+
 pub fn fps() -> u32 {
     SETTINGS.lock().fps
 }

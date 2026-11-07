@@ -515,6 +515,125 @@ fn vt(codec: Codec, w: u32, h: u32, kbps: u32) -> Box<dyn VideoEncoder> {
     open(&cfg).unwrap()
 }
 
+/// Whether the startup probe finds `codec` in hardware VideoToolbox; says so when it doesn't.
+#[cfg(target_os = "macos")]
+fn vt_hardware(codec: Codec) -> bool {
+    use super::caps::{host_providers, Acceleration, Registry, PROBE_TIMEOUT};
+    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let hw = r
+        .check(Backend::VideoToolbox, codec)
+        .is_ok_and(|c| c.acceleration == Acceleration::Hardware);
+    if !hw {
+        eprintln!("skipped: no hardware VideoToolbox {codec:?} encoder");
+    }
+    hw
+}
+
+/// A hardware encoder at `fps` and `kbps`, and 16 pictures of full-screen motion to cycle.
+#[cfg(target_os = "macos")]
+fn vt_at(
+    codec: Codec,
+    w: usize,
+    h: usize,
+    kbps: u32,
+    fps: u32,
+) -> (Box<dyn VideoEncoder>, Vec<Picture>) {
+    let mut cfg = config(Backend::VideoToolbox, w as u32, h as u32, kbps);
+    cfg.codec = codec;
+    cfg.fps = fps;
+    cfg.rate = RateConfig::new(24.0, kbps, fps);
+    let pics = (0..16)
+        .map(|f| {
+            let mut p = Picture::new(w, h);
+            p.video(f);
+            p
+        })
+        .collect();
+    (open(&cfg).unwrap(), pics)
+}
+
+/// Prints encode times of 1080p and 1440p motion at 120 fps timestamps (`--nocapture`): a
+/// cohort whose encodes average more than 0.8 of the 8.3 ms interval falls back to 60.
+#[cfg(target_os = "macos")]
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "times the encoder: needs an optimized build"
+)]
+fn videotoolbox_encode_times_at_120_fps() {
+    for codec in [Codec::H264, Codec::Hevc] {
+        if !vt_hardware(codec) {
+            continue;
+        }
+        for (w, h) in [(1920, 1080), (2560, 1440)] {
+            let (mut enc, pics) = vt_at(codec, w, h, 20_000, 120);
+            let mut ms = Vec::new();
+            for f in 0..360usize {
+                let t = std::time::Instant::now();
+                let got = encode_one(&mut *enc, &pics[f % 16], (f * 1000 / 120) as i64, false);
+                if f >= 10 {
+                    ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                assert_eq!(got.len(), 1, "{codec:?} {w}x{h} frame {f}");
+            }
+            ms.sort_by(f64::total_cmp);
+            let p95 = ms[ms.len() * 95 / 100];
+            println!(
+                "{codec:?} {w}x{h} at 120 fps: encode p50 {:.2} ms, p95 {p95:.2} ms",
+                ms[ms.len() / 2]
+            );
+        }
+    }
+}
+
+/// VideoToolbox budgets by timestamp: at 120 fps and at 60 each second carries the cap's
+/// bytes (within 15%), and moving between the two rates costs no keyframe.
+#[cfg(target_os = "macos")]
+#[test]
+fn videotoolbox_budgets_by_timestamp_at_120_and_60_fps() {
+    let kbps = 8000;
+    for codec in [Codec::H264, Codec::Hevc] {
+        if !vt_hardware(codec) {
+            continue;
+        }
+        let (mut enc, pics) = vt_at(codec, 1920, 1080, kbps, 120);
+        let mut aus = Vec::new();
+        let mut f = 0;
+        for (phase, fps) in [120u32, 60, 120].into_iter().enumerate() {
+            enc.set_rate(RateConfig::new(24.0, kbps, fps)).unwrap();
+            let start = phase as i64 * 3000;
+            for n in 0..3 * fps as i64 {
+                let pts = start + n * 1000 / fps as i64;
+                aus.extend(encode_one(&mut *enc, &pics[f % 16], pts, false));
+                f += 1;
+            }
+        }
+        aus.extend(enc.drain().unwrap());
+        let keys: Vec<i64> = aus
+            .iter()
+            .filter(|a| a.keyframe)
+            .map(|a| a.pts_ms)
+            .collect();
+        assert_eq!(keys, vec![0], "{codec:?}");
+        for (phase, fps) in [120u32, 60, 120].into_iter().enumerate() {
+            for s in 1..3 {
+                let from = phase as i64 * 3000 + s * 1000;
+                let bytes: usize = aus
+                    .iter()
+                    .filter(|a| (from..from + 1000).contains(&a.pts_ms))
+                    .map(|a| a.data.len())
+                    .sum();
+                let got = bytes as f64 * 8.0 / 1000.0;
+                println!("{codec:?} at {fps} fps, second {from} ms: {got:.0} kbit");
+                assert!(
+                    (got - kbps as f64).abs() <= kbps as f64 * 0.15,
+                    "{codec:?} at {fps} fps, second {from} ms: {got:.0} kbit"
+                );
+            }
+        }
+    }
+}
+
 /// ~60 frames of text, scrolling and motion through the hardware encoder: one access
 /// unit per frame, IDRs exactly where asked with their parameter sets first, and a
 /// bitrate change without reopening.

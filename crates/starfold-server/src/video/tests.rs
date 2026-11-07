@@ -78,6 +78,10 @@ struct Fake {
     rates: Option<Arc<StdMutex<Vec<u32>>>>,
     /// The least budget a step of sharpening needs (None: any).
     step_bytes: Option<usize>,
+    /// Every encode takes this long.
+    delay: Option<Duration>,
+    /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
+    slow_keys: Option<(usize, Duration)>,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -110,7 +114,16 @@ impl VideoEncoder for Fake {
         if let Some(g) = &self.gate {
             g.wait();
         }
+        if let Some(d) = self.delay {
+            std::thread::sleep(d);
+        }
         self.n += 1;
+        let own_key = self
+            .slow_keys
+            .is_some_and(|(k, _)| self.n.is_multiple_of(k));
+        if let (true, Some((_, d))) = (own_key, self.slow_keys) {
+            std::thread::sleep(d);
+        }
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
         }
@@ -145,7 +158,7 @@ impl VideoEncoder for Fake {
             }]);
         }
         let relevel = self.relevel == Some(self.n);
-        let key = opts.force_keyframe || self.n == 1 || relevel;
+        let key = opts.force_keyframe || self.n == 1 || relevel || own_key;
         let level = if self.relevel.is_some_and(|r| self.n >= r) {
             40
         } else {
@@ -216,6 +229,10 @@ struct Opts {
     h264_rates: Option<Arc<StdMutex<Vec<u32>>>>,
     /// The least budget a step of H.264 sharpening needs.
     h264_step_bytes: Option<usize>,
+    /// Every hardware H.264 encode takes this long.
+    h264_hw_delay: Option<Duration>,
+    /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
+    h264_hw_slow_keys: Option<(usize, Duration)>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -249,6 +266,8 @@ fn fakes(o: Opts) -> Open {
                 fill: None,
                 rates: None,
                 step_bytes: None,
+                delay: o.h264_hw_delay,
+                slow_keys: o.h264_hw_slow_keys,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -293,6 +312,8 @@ fn fakes(o: Opts) -> Open {
             fill: o.refine_fill.filter(|_| !hevc),
             rates: o.h264_rates.clone().filter(|_| !hevc && h264 == 1),
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
+            delay: None,
+            slow_keys: None,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -314,6 +335,8 @@ fn config() -> VideoConfig {
         coalesce: Duration::ZERO,
         stripes: 1,
         adaptive_threads: false,
+        high_fps: false,
+        source_fps: 0,
     }
 }
 
@@ -1655,6 +1678,9 @@ fn a_pass_is_work_for_the_capture_loop() {
         passes: vec![pass],
         want_key: false,
         catch_up: false,
+        paced: false,
+        pass_paced: false,
+        at: Instant::now(),
     };
     assert!(turn(true).work());
     assert!(!turn(false).work());
@@ -3069,5 +3095,392 @@ fn the_switch_through_the_engine_sends_its_frames() {
     assert!(
         frames > 0,
         "the control: passes do come out when the switch works"
+    );
+}
+
+fn high_fps() -> VideoConfig {
+    VideoConfig {
+        fps: 60,
+        high_fps: true,
+        ..config()
+    }
+}
+
+#[test]
+fn high_fps_caps_hardware_videotoolbox_only() {
+    let on = high_fps();
+    assert_eq!(fps_cap(&on, H264_HW), 120);
+    assert_eq!(fps_cap(&on, HEVC), 120);
+    assert_eq!(fps_cap(&on, H264), 60);
+    assert_eq!(fps_cap(&on, HEVC_SW), 60, "VideoToolbox in software");
+    assert_eq!(fps_cap(&on, AV1), 60, "NVENC isn't measured at 120");
+    let off = VideoConfig {
+        high_fps: false,
+        ..high_fps()
+    };
+    for c in [H264_HW, HEVC, H264, AV1] {
+        assert_eq!(fps_cap(&off, c), 60);
+    }
+    let fast = VideoConfig {
+        fps: 144,
+        ..high_fps()
+    };
+    assert_eq!((fps_cap(&fast, HEVC), fps_cap(&fast, H264)), (144, 60));
+    assert_eq!(base_fps(&fast), 60);
+    let slow = VideoConfig {
+        fps: 30,
+        ..high_fps()
+    };
+    assert_eq!((fps_cap(&slow, HEVC), fps_cap(&slow, H264)), (120, 30));
+    let forced = VideoConfig {
+        fps: 120,
+        high_fps: false,
+        ..high_fps()
+    };
+    assert_eq!((fps_cap(&forced, H264), base_fps(&forced)), (120, 120));
+    assert_eq!(encoder_config(&on, HEVC, W, H, 1).fps, 120);
+    assert_eq!(encoder_config(&on, HEVC, W, H, 1).rate.fps, 120);
+    assert_eq!(encoder_config(&on, H264, W, H, 1).fps, 60);
+}
+
+#[test]
+fn framerate_above_60_without_high_fps_warns() {
+    assert_eq!(
+        fps_warning(120, false, "openh264").as_deref(),
+        Some("unmeasured above 60 fps on openh264; use --high-fps on VideoToolbox")
+    );
+    assert_eq!(fps_warning(60, false, "openh264"), None);
+    assert_eq!(fps_warning(120, true, "videotoolbox"), None);
+}
+
+#[test]
+fn high_fps_leaves_an_openh264_server_as_it_was() {
+    for on in [false, true] {
+        let hub = Hub::new();
+        let cfg = VideoConfig {
+            high_fps: on,
+            ..high_fps()
+        };
+        let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264], fakes(Opts::default())).unwrap();
+        let (c, _rx) = client(&hub);
+        join_legacy(&hub, &c);
+        push(&mut eng);
+        let views = eng.views();
+        assert_eq!(eng.capture_fps(&views), 60);
+        assert_eq!((eng.cohorts[0].fps(), eng.cohorts[0].pace.fps), (60, 60));
+        assert_eq!(eng.early(&views, Instant::now()), vec![false]);
+    }
+}
+
+/// Captures at the rate the cohorts ask for, from `t` for `n` turns, each viewer acking what
+/// it got when `acks` says so. Returns the frames each viewer got and the turns at which a
+/// cohort was held back by its cap alone.
+fn run_captures(
+    eng: &mut Engine,
+    t: &mut Instant,
+    n: usize,
+    viewers: &mut [(&Client, &mut UnboundedReceiver<Out>, bool)],
+) -> (Vec<usize>, usize) {
+    let mut got = vec![0; viewers.len()];
+    let mut paced = 0;
+    for _ in 0..n {
+        eng.replan();
+        let views = eng.views();
+        eng.update_rates(&views);
+        let fps = eng.arrival_fps(&views);
+        let turn = eng.turn(&views, 1000.0 / eng.capture_fps(&views) as f64, *t);
+        paced += turn.paced as usize;
+        eng.mark(&views, None);
+        eng.dispatch(&whole(W, H), &views, &turn, *t);
+        settle(eng);
+        for (i, (c, rx, ack)) in viewers.iter_mut().enumerate() {
+            let epoch = c.route.lock().epoch;
+            let legacy = c.route.lock().proto == Proto::Legacy;
+            for v in videos(&drain(rx)) {
+                got[i] += 1;
+                if *ack {
+                    assert!(c.ack((!legacy).then_some(epoch), v.2));
+                }
+            }
+        }
+        *t += Duration::from_micros(1_000_000 / fps as u64);
+    }
+    (got, paced)
+}
+
+type Viewer = (Arc<Client>, UnboundedReceiver<Out>);
+
+/// A HEVC viewer on hardware VideoToolbox and a legacy one on OpenH264, both started.
+fn mixed(hub: &Arc<Hub>, o: Opts) -> (Engine, Viewer, Viewer) {
+    let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[HEVC, H264], fakes(o)).unwrap();
+    let (a, mut ra) = client(hub);
+    let (b, mut rb) = client(hub);
+    join_v2(hub, &a, &[Codec::Hevc]);
+    join_legacy(hub, &b);
+    push(&mut eng);
+    ready(&a, &drain(&mut ra));
+    for v in videos(&drain(&mut rb)) {
+        assert!(b.ack(None, v.2));
+    }
+    (eng, (a, ra), (b, rb))
+}
+
+#[test]
+fn a_software_cohort_keeps_60_while_the_capture_runs_at_120() {
+    let rates = Arc::new(StdMutex::new(Vec::new()));
+    let hub = Hub::new();
+    let (mut eng, (a, mut ra), (b, mut rb)) = mixed(
+        &hub,
+        Opts {
+            h264_rates: Some(rates.clone()),
+            ..Default::default()
+        },
+    );
+    let views = eng.views();
+    assert_eq!(eng.capture_fps(&views), 120);
+    let fps: Vec<(Candidate, u32, u32)> = eng
+        .cohorts
+        .iter()
+        .map(|c| (c.shared.cand, c.fps(), c.pace.fps))
+        .collect();
+    assert!(fps.contains(&(HEVC, 120, 120)), "{fps:?}");
+    assert!(fps.contains(&(H264, 60, 60)), "{fps:?}");
+    let mut t = Instant::now() + Duration::from_secs(1);
+    let (got, paced) = run_captures(
+        &mut eng,
+        &mut t,
+        120,
+        &mut [(&*a, &mut ra, true), (&*b, &mut rb, true)],
+    );
+    assert!(got[0] >= 118, "the HEVC viewer at 120: {got:?}");
+    assert!(
+        (59..=61).contains(&got[1]),
+        "the OpenH264 viewer at 60: {got:?}"
+    );
+    assert!(paced >= 59, "{paced}");
+    assert!(rates.lock().unwrap().iter().all(|&f| f <= 60), "{rates:?}");
+}
+
+#[test]
+fn a_60_cohort_behind_the_capture_keeps_up_at_its_own_interval() {
+    let hub = Hub::new();
+    let (mut eng, (a, mut ra), (b, mut rb)) = mixed(&hub, Opts::default());
+    let mut t = Instant::now() + Duration::from_secs(1);
+    let (got, _) = run_captures(
+        &mut eng,
+        &mut t,
+        60,
+        &mut [(&*a, &mut ra, true), (&*b, &mut rb, false)],
+    );
+    // 40 ms RTT + 40 ms over 60 fps frames, plus 2 (12 at 120 fps).
+    assert_eq!(got[1], 7, "{got:?}");
+}
+
+#[test]
+fn skipped_damage_is_caught_up_once_the_cap_allows() {
+    let hub = Hub::new();
+    let (mut eng, (a, mut ra), (b, mut rb)) = mixed(&hub, Opts::default());
+    let mut t = Instant::now() + Duration::from_secs(1);
+    let viewers = &mut [(&*a, &mut ra, true), (&*b, &mut rb, true)];
+    run_captures(&mut eng, &mut t, 1, viewers);
+    let (got, _) = run_captures(&mut eng, &mut t, 1, viewers);
+    assert_eq!(got, vec![1, 0], "OpenH264 skips the second capture");
+    let views = eng.views();
+    let turn = eng.turn(&views, 1000.0 / 120.0, t - Duration::from_millis(5));
+    assert!(turn.catch_up, "a capture is due for the skipped damage");
+    assert!(
+        !turn.takes[eng
+            .cohorts
+            .iter()
+            .position(|c| c.shared.cand == H264)
+            .unwrap()]
+    );
+}
+
+#[test]
+fn the_capture_follows_the_fastest_watched_cohort() {
+    let hub = Hub::new();
+    let o = Opts::default();
+    let mut eng =
+        Engine::new(high_fps(), hub.clone(), W, H, &[HEVC_SW, H264_HW], fakes(o)).unwrap();
+    let (a, _ra) = client(&hub);
+    let (b, mut rb) = client(&hub);
+    join_legacy(&hub, &a);
+    join_v2(&hub, &b, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&b, &drain(&mut rb));
+    push(&mut eng);
+    let fps = |eng: &Engine| eng.capture_fps(&eng.views());
+    assert_eq!(fps(&eng), 120);
+    hub.remove_client(a.id);
+    push(&mut eng);
+    assert_eq!(
+        eng.cohorts.len(),
+        2,
+        "the hardware H.264 cohort stays, unwatched"
+    );
+    assert_eq!(fps(&eng), 60);
+    assert!(eng.early(&eng.views(), Instant::now()).iter().all(|e| !e));
+}
+
+#[test]
+fn slow_encodes_count_for_two_seconds_without_a_pause() {
+    let t = Instant::now();
+    let at = |ms: u64| t + Duration::from_millis(ms);
+    let mut w = SlowWatch::default();
+    // At 120 fps the interval is 8.3 ms: 6.7 ms is SLOW_SHARE of it.
+    for i in 0..500 {
+        assert!(!w.note(6.0, 120, at(i * 8)));
+    }
+    let mut w = SlowWatch::default();
+    for i in 0..=248 {
+        assert!(!w.note(7.5, 120, at(i * 8)), "{i}");
+    }
+    assert!(w.note(7.5, 120, at(2000)));
+    let mut w = SlowWatch::default();
+    for i in 0..200 {
+        w.note(7.5, 120, at(i * 8));
+    }
+    for i in 200..210 {
+        w.note(1.0, 120, at(i * 8));
+    }
+    for i in 210..458 {
+        assert!(
+            !w.note(7.5, 120, at(i * 8)),
+            "a fast spell starts over: {i}"
+        );
+    }
+    let mut w = SlowWatch::default();
+    w.note(7.5, 120, at(0));
+    assert!(!w.note(7.5, 120, at(2500)), "a pause starts over");
+    assert!(!w.note(7.5, 60, at(5000)), "7.5 ms keeps up with 60");
+}
+
+#[test]
+fn a_cohort_too_slow_for_120_drops_to_60_until_it_reopens() {
+    let hub = Hub::new();
+    let eng = Engine::new(
+        high_fps(),
+        hub.clone(),
+        W,
+        H,
+        &[H264_HW, H264],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    let sh = eng.cohorts[0].shared.clone();
+    assert_eq!(sh.cand, H264_HW);
+    assert_eq!(sh.fps.load(Ordering::Acquire), 120);
+    let mut w = SlowWatch::default();
+    let t = Instant::now();
+    for i in 0..300 {
+        sh.encoded(&mut w, 9.0, t + Duration::from_millis(i * 8));
+    }
+    assert_eq!(sh.fps.load(Ordering::Acquire), 60);
+    for i in 300..1000 {
+        sh.encoded(&mut w, 0.5, t + Duration::from_millis(i * 8));
+    }
+    assert_eq!(
+        sh.fps.load(Ordering::Acquire),
+        60,
+        "no way back mid-session"
+    );
+    assert_eq!(eng.open_cohort(H264_HW).unwrap().fps(), 120);
+}
+
+#[test]
+fn the_encode_loop_watches_motion_encode_times() {
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_delay: Some(Duration::from_millis(8)),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) && eng.cohorts[0].fps() == 120 {
+        push(&mut eng);
+        for v in videos(&drain(&mut rx)) {
+            assert!(c.ack(None, v.2));
+        }
+    }
+    assert_eq!(eng.cohorts[0].fps(), 60);
+    assert!(start.elapsed() >= SLOW_FOR);
+}
+
+#[test]
+fn a_paced_source_runs_at_the_most_any_cohort_takes() {
+    let on = high_fps();
+    assert_eq!(source_fps(&on, &[H264]), 60);
+    assert_eq!(source_fps(&on, &[HEVC_SW, H264]), 60);
+    assert_eq!(source_fps(&on, &[H264_HW, H264]), 120);
+    let off = VideoConfig {
+        high_fps: false,
+        ..high_fps()
+    };
+    assert_eq!(source_fps(&off, &[H264_HW, H264]), 60);
+}
+
+#[test]
+fn a_cohort_keeps_its_cap_under_a_faster_source() {
+    let hub = Hub::new();
+    let cfg = VideoConfig {
+        source_fps: 120,
+        ..high_fps()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264], fakes(Opts::default())).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    for v in videos(&drain(&mut rx)) {
+        assert!(c.ack(None, v.2));
+    }
+    let mut t = Instant::now() + Duration::from_secs(1);
+    let (got, _) = run_captures(&mut eng, &mut t, 120, &mut [(&*c, &mut rx, true)]);
+    assert!((59..=61).contains(&got[0]), "{got:?}");
+}
+
+#[test]
+fn keyframes_an_encoder_makes_by_itself_are_not_timed() {
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_slow_keys: Some((3, Duration::from_millis(30))),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    let start = Instant::now();
+    while start.elapsed() < SLOW_FOR + Duration::from_millis(500) {
+        push(&mut eng);
+        for v in videos(&drain(&mut rx)) {
+            assert!(c.ack(None, v.2));
+        }
+    }
+    assert_eq!(eng.cohorts[0].fps(), 120);
+}
+
+#[test]
+fn a_pass_held_back_by_the_cap_is_still_work() {
+    let mut p = pair();
+    p.still();
+    p.ack_hevc();
+    p.ack_h264();
+    let later = p.t + Duration::from_secs(60);
+    let views = p.eng.views();
+    assert!(p
+        .eng
+        .passes(&views, &p.eng.takes(&views, 33.0), later)
+        .contains(&true));
+    p.eng.cfg.source_fps = 120;
+    for c in &mut p.eng.cohorts {
+        c.last_take = Some(later - Duration::from_millis(5));
+    }
+    let turn = p.eng.turn(&views, 33.0, later);
+    assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
+    assert!(
+        turn.work(),
+        "the loop waits for the cap, not the idle timeout"
     );
 }
