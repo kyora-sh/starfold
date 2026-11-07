@@ -130,6 +130,7 @@ export const msg = {
 	hello: (offer: number | undefined, decode: DecodeEntry[], hz?: number) =>
 		JSON.stringify({ t: 'hello', v: 2, offer, decode, hz }),
 	slow: () => JSON.stringify({ t: 'slow' }),
+	hz: (hz: number) => JSON.stringify({ t: 'hz', hz }),
 	ready: (epoch: number) => JSON.stringify({ t: 'codec-ready', epoch }),
 	error: (epoch: number, reason: string) =>
 		JSON.stringify({ t: 'codec-error', epoch, reason }),

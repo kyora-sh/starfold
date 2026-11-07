@@ -108,6 +108,8 @@ const hzWait = new Promise<void>((r) => {
 	hzKnown = r;
 	setTimeout(r, HZ_WAIT_MS);
 });
+/** A hello went out on this connection before the display rate was known. */
+let hzOwed = false;
 let rate = new StreamRate();
 let behind = new FellBehind();
 let layout: Stripe[] = [];
@@ -138,6 +140,7 @@ function connect() {
 	conn++;
 	rate = new StreamRate();
 	behind = new FellBehind();
+	hzOwed = false;
 	sock.binaryType = 'arraybuffer';
 	sock.addEventListener('open', () => {
 		post({ t: 'status', s: 'open' });
@@ -273,6 +276,7 @@ async function answer(
 	if (c !== conn || seq !== helloSeq || proto !== 2) return;
 	for (const [k, a] of r.accepted) accepted.set(k, a);
 	send(msg.hello(offer, r.decode, hz));
+	hzOwed = hz === undefined;
 	sendVideo();
 }
 
@@ -504,6 +508,7 @@ function onVideo(b: Uint8Array) {
 	st.bytes += b.length;
 	const first = !frames.has(h.frame);
 	if (!frames.open(h.frame, h.parts, performance.now())) {
+		if (behind.note(performance.now())) send(msg.slow());
 		dropAll();
 		return;
 	}
@@ -657,6 +662,8 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'hz':
 			hz = m.hz;
 			hzKnown();
+			if (hzOwed) send(msg.hz(m.hz));
+			hzOwed = false;
 			break;
 		case 'audioPort':
 			audioPort = m.port;

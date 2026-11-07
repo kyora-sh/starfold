@@ -386,6 +386,13 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
 /// microphone, resizing) and is dropped. The web client keeps the same list.
 const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
+/// The display rate a client measured, if it is a sensible number.
+fn set_hz(c: &Client, hz: Option<serde_json::Value>) {
+    if let Some(hz) = hz.and_then(|v| v.as_f64()).filter(|h| *h >= 1.0) {
+        c.hz.store(hz.round().min(1000.0) as u32, Ordering::Relaxed);
+    }
+}
+
 /// Protocol 2's JSON messages. All of them are about watching (capabilities, decoder
 /// state, acks and keyframe requests), so read-only viewers send them too.
 fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
@@ -396,9 +403,7 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             decode,
             hz,
         } if v >= crate::negotiate::PROTOCOL => {
-            if let Some(hz) = hz.filter(|h| h.is_finite() && *h >= 1.0) {
-                c.hz.store(hz.round().min(1000.0) as u32, Ordering::Relaxed);
-            }
+            set_hz(c, hz);
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
             if offer.is_some_and(|o| o != gen) {
@@ -433,6 +438,10 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             if c.request_keyframe(Some(epoch)) {
                 s.hub.wake();
             }
+        }
+        ClientMsg::Hz { hz } => {
+            set_hz(c, hz);
+            s.hub.wake();
         }
         ClientMsg::Slow => {
             if !c.slow.swap(true, Ordering::Relaxed) {
@@ -701,6 +710,16 @@ mod tests {
         assert_eq!(c.display_hz(), Some(120));
         handle_text(&s, &c, &hello("-5"), &mut rtts);
         assert_eq!(c.display_hz(), Some(120), "nonsense is ignored");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let odd = hub.add_client(tx);
+        for hz in [r#""120""#, "null", "{}"] {
+            odd.route.lock().proto = Proto::Unknown;
+            handle_text(&s, &odd, &hello(hz), &mut rtts);
+            assert_eq!(odd.route.lock().proto, Proto::V2, "the hello stands: {hz}");
+            assert_eq!(odd.display_hz(), None, "{hz}");
+        }
+        handle_text(&s, &odd, r#"{"t":"hz","hz":143.9}"#, &mut rtts);
+        assert_eq!(odd.display_hz(), Some(144), "measured after the hello");
         handle_text(&s, &c, r#"{"t":"slow"}"#, &mut rtts);
         assert_eq!(c.display_hz(), None);
     }
