@@ -62,6 +62,32 @@ pub fn child(backend: Backend, experimental: bool, timeout: Duration) -> Option<
     })
 }
 
+/// Opens and runs a VA-API session for `spec` in a child, if this executable takes [`FLAG`].
+pub fn session(spec: &str, timeout: Duration) -> Option<Probe> {
+    if !SELF_EXEC.load(Ordering::Relaxed) {
+        return None;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return Some(Probe::failed(
+                Backend::Vaapi,
+                format!("no path to this executable: {e}"),
+            ))
+        }
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg(FLAG)
+        .arg(Backend::Vaapi.name())
+        .arg(SESSION)
+        .arg(spec);
+    Some(run(cmd, Backend::Vaapi, timeout))
+}
+
+/// After [`FLAG`] and a backend: open one session (`<codec>:<w>x<h>@<fps>`) and encode a
+/// sample, rather than probe.
+pub const SESSION: &str = "--session";
+
 /// What a child prints: one line of JSON.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
@@ -73,6 +99,9 @@ pub struct Report {
 
 /// The child's side, given the arguments after [`FLAG`]; returns the exit code.
 pub fn child_main(args: &[String]) -> i32 {
+    if let Some(i) = args.iter().position(|a| a == SESSION) {
+        return session_main(args.first().map(String::as_str), args.get(i + 1));
+    }
     let experimental = args.iter().any(|a| a == "--experimental-hw-probes");
     let Some(p) = args.first().and_then(|name| {
         super::caps::hardware_providers(experimental)
@@ -84,9 +113,33 @@ pub fn child_main(args: &[String]) -> i32 {
     };
     let mut out = report_sink();
     let found = p.probe();
+    print_report(&mut out, p.backend(), found)
+}
+
+#[cfg(target_os = "linux")]
+fn session_main(backend: Option<&str>, spec: Option<&String>) -> i32 {
+    let (Some("vaapi"), Some(spec)) = (backend, spec) else {
+        eprintln!("{FLAG}: {SESSION} takes vaapi and a session");
+        return 2;
+    };
+    let mut out = report_sink();
+    let found = match super::vaapi::child_session(spec) {
+        Ok(()) => Probe::default(),
+        Err(e) => Probe::failed(Backend::Vaapi, e),
+    };
+    print_report(&mut out, Backend::Vaapi, found)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_main(_: Option<&str>, _: Option<&String>) -> i32 {
+    eprintln!("{FLAG}: {SESSION} is Linux-only");
+    2
+}
+
+fn print_report(out: &mut dyn Write, backend: Backend, found: Probe) -> i32 {
     let report = Report {
         probe: VERSION,
-        backend: p.backend(),
+        backend,
         caps: found.caps,
         diagnostics: found.diagnostics,
     };

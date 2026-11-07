@@ -65,13 +65,13 @@ pub fn codec_string(sps: &[u8]) -> Option<String> {
 
 /// Annex-B encoder output to access units: keyframe from the NAL types, the stream config
 /// whenever a new SPS arrives.
-#[cfg(any(feature = "kvazaar", feature = "x265"))]
+#[cfg(any(feature = "kvazaar", feature = "x265", target_os = "linux"))]
 pub struct Units {
     size: (u32, u32),
     sps: Option<Vec<u8>>,
 }
 
-#[cfg(any(feature = "kvazaar", feature = "x265"))]
+#[cfg(any(feature = "kvazaar", feature = "x265", target_os = "linux"))]
 impl Units {
     pub fn new(width: u32, height: u32) -> Self {
         Units {
