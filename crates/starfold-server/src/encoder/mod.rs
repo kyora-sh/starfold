@@ -32,7 +32,7 @@ mod hw;
 pub mod isolate;
 #[cfg(feature = "kvazaar")]
 mod kvazaar;
-#[cfg(windows)]
+#[cfg(any(windows, all(test, target_os = "linux")))]
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
@@ -261,7 +261,10 @@ impl Backend {
             "nvenc" => Ok(Backend::Nvenc),
             #[cfg(not(any(target_os = "linux", windows)))]
             "nvenc" => Err("nvenc is Linux and Windows only".into()),
-            "mediafoundation" => Err(format!("{s} is probed (see /stats) but has no encoder yet")),
+            #[cfg(windows)]
+            "mediafoundation" => Ok(Backend::MediaFoundation),
+            #[cfg(not(windows))]
+            "mediafoundation" => Err("mediafoundation is Windows-only".into()),
             _ => Err(format!(
                 "unknown encoder {s:?} (auto, openh264{}{})",
                 if cfg!(feature = "x264") { ", x264" } else { "" },
@@ -270,7 +273,7 @@ impl Backend {
                 } else if cfg!(target_os = "linux") {
                     ", vaapi, nvenc"
                 } else if cfg!(windows) {
-                    ", nvenc"
+                    ", nvenc, mediafoundation"
                 } else {
                     ""
                 }
@@ -326,7 +329,9 @@ impl Backend {
                 cfg!(any(target_os = "linux", windows))
                     && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
-            Backend::MediaFoundation => false,
+            Backend::MediaFoundation => {
+                cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
+            }
         }
     }
 
@@ -371,7 +376,7 @@ impl Backend {
             Backend::VideoToolbox => 64,
             Backend::Vaapi => 128,
             Backend::Nvenc => 160,
-            Backend::MediaFoundation => 16,
+            Backend::MediaFoundation => 128,
         }
     }
 
@@ -532,6 +537,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Vaapi => vaapi::open(&coded)?,
         #[cfg(any(target_os = "linux", windows))]
         Backend::Nvenc => nvenc::open(&coded)?,
+        #[cfg(windows)]
+        Backend::MediaFoundation => mf::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {

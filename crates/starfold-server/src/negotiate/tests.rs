@@ -272,6 +272,45 @@ fn nvenc_only_when_pinned() {
 }
 
 #[test]
+fn mediafoundation_only_when_pinned() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::MediaFoundation, true),
+        cap(Codec::Hevc, Backend::MediaFoundation, true),
+        cap(Codec::Av1, Backend::MediaFoundation, true),
+        cap(Codec::H264, Backend::OpenH264, false),
+    ]);
+    let h264 = h264_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(h264, Backend::OpenH264, "auto never picks Media Foundation");
+    assert!(candidates(&r, h264)
+        .iter()
+        .all(|c| c.backend != Backend::MediaFoundation));
+    let h264 = h264_backend(&r, Selection::Pinned(Backend::MediaFoundation)).unwrap();
+    assert_eq!(h264, Backend::MediaFoundation);
+    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
+        .iter()
+        .map(|c| (c.codec, c.backend))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Codec::Av1, Backend::MediaFoundation),
+            (Codec::Hevc, Backend::MediaFoundation),
+            (Codec::H264, Backend::MediaFoundation),
+            (Codec::H264, Backend::OpenH264),
+        ]
+    );
+    let mut off = r.encoders.clone();
+    for c in off
+        .iter_mut()
+        .filter(|c| c.backend == Backend::MediaFoundation)
+    {
+        c.status = ProbeStatus::Disabled;
+    }
+    let e = h264_backend(&reg(off), Selection::Pinned(Backend::MediaFoundation)).unwrap_err();
+    assert!(e.contains("--experimental-hw-probes"), "{e}");
+}
+
+#[test]
 fn chosen_is_each_codecs_first_candidate() {
     let r = reg(vec![
         cap(Codec::H264, Backend::OpenH264, false),
@@ -313,6 +352,12 @@ fn selection_parse() {
     );
     #[cfg(not(any(target_os = "linux", windows)))]
     assert!(Selection::parse("nvenc").is_err());
+    #[cfg(windows)]
+    assert_eq!(
+        Selection::parse("mediafoundation"),
+        Ok(Selection::Pinned(Backend::MediaFoundation))
+    );
+    #[cfg(not(windows))]
     assert!(Selection::parse("mediafoundation").is_err());
     assert!(Selection::parse("h265").unwrap_err().contains("auto"));
     assert_eq!(Selection::Auto.name(), "auto");

@@ -3,69 +3,30 @@
 
 use super::driver::Driver;
 use super::ffi::{self, Config, InitParams};
-use crate::encoder::h264::ParamSets;
+use crate::encoder::hw::{self, Rc};
 use crate::encoder::{
-    av1, hevc, AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions,
-    EncoderConfig, FrameView, RateConfig, StreamConfig, VideoEncoder,
+    AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
+    VideoEncoder,
 };
 
-/// A temporal delimiter OBU.
-const TD: [u8; 2] = [0x12, 0x00];
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rc {
-    pub cbr: bool,
-    pub bps: u32,
-    pub buffer_bits: u32,
-    pub fps: u32,
-    pub qp: u32,
-}
-
-impl Rc {
-    /// CBR when `rate` caps the bitrate, else constant QP. A session keeps its mode, and
-    /// an uncapped rate on a CBR one keeps its bitrate.
-    pub fn new(codec: Codec, rate: &RateConfig, prev: Option<&Rc>) -> Rc {
-        let cbr = prev.map_or(rate.max_kbps > 0, |p| p.cbr);
-        let (bps, buffer_bits) = match (cbr, rate.max_kbps, prev) {
-            (false, ..) => (0, 0),
-            (true, 0, Some(p)) => (p.bps, p.buffer_bits),
-            (true, k, _) => (
-                k.saturating_mul(1000),
-                rate.buf_kbit.max(1).saturating_mul(1000),
-            ),
+/// Low-delay rate control in `rc`: CBR at `r`'s bitrate, else constant QP.
+fn apply(r: &Rc, rc: &mut ffi::RcParams) {
+    rc.version = ffi::RC_PARAMS_VER;
+    rc.flags = (rc.flags | ffi::RC_ZERO_REORDER_DELAY) & !ffi::RC_ENABLE_LOOKAHEAD;
+    rc.lookahead_depth = 0;
+    if r.cbr {
+        rc.mode = ffi::RC_CBR;
+        rc.average_bit_rate = r.bps;
+        rc.max_bit_rate = r.bps;
+        rc.vbv_buffer_size = r.buffer_bits;
+        rc.vbv_initial_delay = r.buffer_bits;
+    } else {
+        rc.mode = ffi::RC_CONSTQP;
+        rc.const_qp = ffi::Qp {
+            inter_p: r.qp,
+            inter_b: r.qp,
+            intra: r.qp,
         };
-        let q = rate.quality.round() as i32;
-        let qp = match codec {
-            Codec::Av1 => (q * 5).clamp(1, 255),
-            _ => q.clamp(1, 51),
-        } as u32;
-        Rc {
-            cbr,
-            bps,
-            buffer_bits,
-            fps: rate.fps.max(1),
-            qp,
-        }
-    }
-
-    fn apply(&self, rc: &mut ffi::RcParams) {
-        rc.version = ffi::RC_PARAMS_VER;
-        rc.flags = (rc.flags | ffi::RC_ZERO_REORDER_DELAY) & !ffi::RC_ENABLE_LOOKAHEAD;
-        rc.lookahead_depth = 0;
-        if self.cbr {
-            rc.mode = ffi::RC_CBR;
-            rc.average_bit_rate = self.bps;
-            rc.max_bit_rate = self.bps;
-            rc.vbv_buffer_size = self.buffer_bits;
-            rc.vbv_initial_delay = self.buffer_bits;
-        } else {
-            rc.mode = ffi::RC_CONSTQP;
-            rc.const_qp = ffi::Qp {
-                inter_p: self.qp,
-                inter_b: self.qp,
-                intra: self.qp,
-            };
-        }
     }
 }
 
@@ -84,7 +45,7 @@ pub fn configure(c: &mut Config, codec: Codec, rc: &Rc, color: ColorInfo) {
     c.version = ffi::CONFIG_VER;
     c.gop_length = ffi::INFINITE_GOP;
     c.frame_interval_p = 1;
-    rc.apply(&mut c.rc);
+    apply(rc, &mut c.rc);
     unsafe {
         match codec {
             Codec::H264 => {
@@ -123,29 +84,12 @@ pub fn configure(c: &mut Config, codec: Codec, rc: &Rc, color: ColorInfo) {
     }
 }
 
-enum Units {
-    H264(ParamSets),
-    Hevc(hevc::Units),
-    Av1(Option<Vec<u8>>),
-}
-
-impl Units {
-    fn new(codec: Codec, (w, h): (u32, u32)) -> Units {
-        match codec {
-            Codec::Hevc => Units::Hevc(hevc::Units::new(w, h)),
-            Codec::Av1 => Units::Av1(None),
-            _ => Units::H264(ParamSets::default()),
-        }
-    }
-}
-
 pub struct Session {
     drv: Box<dyn Driver>,
     codec: Codec,
     init: Box<InitParams>,
     cfg: Box<Config>,
     size: (u32, u32),
-    color: ColorInfo,
     rc: Rc,
     /// The highest bitrate the session has been set up for: the driver picked its level
     /// for it, so a higher one reconfigures at an IDR.
@@ -153,9 +97,7 @@ pub struct Session {
     /// The next picture must be an IDR: first frame, a raised rate, or the last encode
     /// failed.
     need_idr: bool,
-    /// A stream config has gone out.
-    configured: bool,
-    units: Units,
+    stream: hw::Stream,
 }
 
 impl Session {
@@ -167,7 +109,6 @@ impl Session {
             #[allow(unreachable_patterns)]
             c => return Err(EncodeError(format!("NVENC has no {c:?} encoder"))),
         };
-        let units = Units::new(cfg.codec, (cfg.width, cfg.height));
         let color = ColorInfo::SRGB_BT601_LIMITED;
         let rc = Rc::new(cfg.codec, &cfg.rate, None);
         let mut c = drv.preset(guid)?;
@@ -193,116 +134,12 @@ impl Session {
             init,
             cfg: c,
             size: (cfg.width, cfg.height),
-            color,
             rc,
             peak_bps: rc.bps,
             need_idr: true,
-            configured: false,
-            units,
+            stream: hw::Stream::new("NVENC", cfg.codec, (cfg.width, cfg.height), color, false),
         })
     }
-
-    /// The access unit in `data`, checked against what was asked for. A rejected one
-    /// leaves the parameter-set readers as new, so the next IDR carries a config.
-    fn unit(
-        &mut self,
-        data: Vec<u8>,
-        pts_ms: i64,
-        idr: bool,
-    ) -> Result<Option<AccessUnit>, EncodeError> {
-        let r = self.check_unit(data, pts_ms, idr);
-        if r.is_err() {
-            self.units = Units::new(self.codec, self.size);
-        }
-        r
-    }
-
-    fn check_unit(
-        &mut self,
-        data: Vec<u8>,
-        pts_ms: i64,
-        idr: bool,
-    ) -> Result<Option<AccessUnit>, EncodeError> {
-        let au = match &mut self.units {
-            Units::H264(p) => p.unit(data, pts_ms, self.size, self.color),
-            Units::Hevc(u) => u.unit(data, pts_ms),
-            Units::Av1(seq) => av1_unit(seq, data, pts_ms, idr, self.size, self.color)?,
-        };
-        match &au {
-            None if idr => Err(EncodeError(format!(
-                "NVENC {:?} IDR came out without a picture",
-                self.codec
-            ))),
-            Some(a) if a.keyframe != idr => Err(EncodeError(format!(
-                "NVENC {:?} asked for {}, got {}",
-                self.codec,
-                if idr { "an IDR" } else { "a P frame" },
-                if a.keyframe { "an IDR" } else { "a P frame" }
-            ))),
-            Some(a) if a.config.is_none() && !self.configured => Err(EncodeError(format!(
-                "NVENC {:?} stream began without readable parameter sets",
-                self.codec
-            ))),
-            _ => {
-                self.configured |= au.as_ref().is_some_and(|a| a.config.is_some());
-                Ok(au)
-            }
-        }
-    }
-}
-
-pub fn av1_unit(
-    seq: &mut Option<Vec<u8>>,
-    data: Vec<u8>,
-    pts_ms: i64,
-    key: bool,
-    size: (u32, u32),
-    color: ColorInfo,
-) -> Result<Option<AccessUnit>, EncodeError> {
-    if data.is_empty() {
-        return Ok(None);
-    }
-    let mut tu = Vec::with_capacity(data.len() + TD.len());
-    if (data[0] >> 3) & 0xf != 2 {
-        tu.extend_from_slice(&TD);
-    }
-    tu.extend(data);
-    let kind =
-        av1::frame_type(&tu).ok_or_else(|| EncodeError("NVENC AV1 output has no frame".into()))?;
-    if (kind == 0) != key {
-        return Err(EncodeError(format!(
-            "NVENC AV1 asked for {}, got frame type {kind}",
-            if key { "a key frame" } else { "an inter frame" }
-        )));
-    }
-    let sh = av1::sequence_header(&tu).map(<[u8]>::to_vec);
-    let config = match (&sh, key) {
-        (None, true) => {
-            return Err(EncodeError(
-                "NVENC AV1 key frame without a sequence header".into(),
-            ))
-        }
-        (Some(s), true) if seq.as_ref() != Some(s) => {
-            let codec_string = av1::codec_string(&tu)
-                .ok_or_else(|| EncodeError("unreadable AV1 sequence header".into()))?;
-            *seq = sh;
-            Some(StreamConfig {
-                codec: Codec::Av1,
-                codec_string,
-                coded: size,
-                display: size,
-                format: BitstreamFormat::Av1LowOverhead,
-                color,
-            })
-        }
-        _ => None,
-    };
-    Ok(Some(AccessUnit {
-        pts_ms,
-        keyframe: key,
-        data: tu,
-        config,
-    }))
 }
 
 impl VideoEncoder for Session {
@@ -313,7 +150,7 @@ impl VideoEncoder for Session {
         }
         let raise = rc.bps > self.peak_bps;
         let mut cfg = self.cfg.clone();
-        rc.apply(&mut cfg.rc);
+        apply(&rc, &mut cfg.rc);
         let mut init = self.init.clone();
         init.frame_rate_num = rc.fps;
         let flags = if raise {
@@ -351,7 +188,7 @@ impl VideoEncoder for Session {
             0
         };
         let data = self.drv.encode(f, flags)?;
-        let au = self.unit(data, opts.pts_ms, idr)?;
+        let au = self.stream.unit(data, opts.pts_ms, idr)?;
         self.need_idr = false;
         Ok(au.into_iter().collect())
     }
