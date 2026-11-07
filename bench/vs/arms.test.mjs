@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { armOf, baseArm, expandArms, roundOrder, TWIN } from './arms.mjs';
+import { armOf, baseArm, expandArms, roundOrder, setOrder, TWIN } from './arms.mjs';
 import { ARMS } from './config.mjs';
 
 test('the first arm runs twice by default', () => {
@@ -22,6 +22,17 @@ test('each round starts one arm later, as the driver always did', () => {
 	assert.deepEqual(roundOrder(a, 0), ['a', 'b', 'c']);
 	assert.deepEqual(roundOrder(a, 1), ['b', 'c', 'a']);
 	assert.deepEqual(roundOrder(a, 1, 1), ['c', 'a', 'b']);
+});
+test('run 1 starts where run 0 would have gone on', () => {
+	const arms = expandArms(['a', 'b', 'c', 'd']);
+	assert.deepEqual(roundOrder(arms, 0, 0, 1, 4), roundOrder(arms, 4, 0, 0, 0));
+	assert.deepEqual(roundOrder(arms, 0, 0, 2, 4), roundOrder(arms, 8, 0, 0, 0));
+});
+test('AA=0 keeps the old order whatever RUN says', () => {
+	const order = setOrder(['novnc', 'starfold-video'], { aa: false, run: 1 });
+	assert.deepEqual(order(0, 0, 1), ['novnc', 'starfold-video']);
+	assert.deepEqual(order(1, 0, 1), ['starfold-video', 'novnc']);
+	assert.deepEqual(setOrder(['a', 'b', 'c'], { run: 1 })(0, 0, 1), ['b', 'c', 'a']);
 });
 test('runs continue the rotation, so every arm takes every position', () => {
 	const arms = expandArms(['a', 'b', 'c', 'd']);

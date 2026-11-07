@@ -6,7 +6,7 @@ import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
 import { answer, delivered, KEY_CAP_MS } from './match.mjs';
-import { armOf, expandArms, roundOrder } from './arms.mjs';
+import { armOf, expandArms, setOrder } from './arms.mjs';
 import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS, KEYS_LOG } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
@@ -396,8 +396,9 @@ async function soak(arm, seconds) {
 }
 // AA=0 drops the A/A twin of the first arm; RUN=<i> continues the arm rotation of earlier runs of `rounds` rounds.
 const listed = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => !ARMS[a].probe && (link === 'wan' || !ARMS[a].wanOnly));
-const arms = expandArms(listed, process.env.AA !== '0');
-const order = (i, w, n) => roundOrder(arms, i, w, Number(process.env.RUN || 0), n);
+const aa = process.env.AA !== '0';
+const arms = expandArms(listed, aa);
+const order = setOrder(arms, { aa, run: Number(process.env.RUN || 0) });
 const wls = process.env.WORKLOADS ? process.env.WORKLOADS.split(',') : WORKLOADS;
 const results = {}, ledger = {};
 const out = process.env.OUT ? fs.createWriteStream(process.env.OUT) : null;

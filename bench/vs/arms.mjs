@@ -21,3 +21,9 @@ export function roundOrder(arms, round, w = 0, run = 0, rounds = 0) {
 	const s = round + w + run * rounds;
 	return arms.map((_, k) => arms[(k + s) % arms.length]);
 }
+
+/** A set's order by round, workload and the set's round count. Only with the A/A on does `run`
+ * carry the rotation on; AA=0 keeps the order the driver always had, whatever RUN says. */
+export function setOrder(arms, { aa = true, run = 0 } = {}) {
+	return (round, w, rounds) => roundOrder(arms, round, w, aa ? run : 0, rounds);
+}
