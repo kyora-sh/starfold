@@ -211,8 +211,8 @@ jobs:
       - name: VideoToolbox at 120 fps (optimized build)
         run: cargo test --locked --release --lib videotoolbox_keeps_up -- --nocapture
         env:
-          CARGO_PROFILE_RELEASE_LTO: "false"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_LTO: 'false'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
       # A viewer that decodes HEVC gets VideoToolbox HEVC.
       - name: HEVC negotiation
         env:

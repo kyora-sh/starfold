@@ -557,28 +557,34 @@ fn vt_at(
     ignore = "times the encoder: needs an optimized build"
 )]
 fn videotoolbox_keeps_up_with_1440p_at_120_fps() {
+    let mut slow = Vec::new();
     for codec in [Codec::H264, Codec::Hevc] {
         if !vt_hardware(codec) {
             continue;
         }
-        let (mut enc, pics) = vt_at(codec, 2560, 1440, 20_000, 120);
-        let mut ms = Vec::new();
-        for f in 0..360usize {
-            let t = std::time::Instant::now();
-            let got = encode_one(&mut *enc, &pics[f % 16], (f * 1000 / 120) as i64, false);
-            if f >= 10 {
-                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        for (w, h) in [(1920, 1080), (2560, 1440)] {
+            let (mut enc, pics) = vt_at(codec, w, h, 20_000, 120);
+            let mut ms = Vec::new();
+            for f in 0..360usize {
+                let t = std::time::Instant::now();
+                let got = encode_one(&mut *enc, &pics[f % 16], (f * 1000 / 120) as i64, false);
+                if f >= 10 {
+                    ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                assert_eq!(got.len(), 1, "{codec:?} {w}x{h} frame {f}");
             }
-            assert_eq!(got.len(), 1, "{codec:?} frame {f}");
+            ms.sort_by(f64::total_cmp);
+            let p95 = ms[ms.len() * 95 / 100];
+            println!(
+                "{codec:?} {w}x{h} at 120 fps: encode p50 {:.2} ms, p95 {p95:.2} ms",
+                ms[ms.len() / 2]
+            );
+            if h == 1440 && p95 > 6.0 {
+                slow.push(format!("{codec:?}: p95 {p95:.2} ms"));
+            }
         }
-        ms.sort_by(f64::total_cmp);
-        let p95 = ms[ms.len() * 95 / 100];
-        println!(
-            "{codec:?} 2560x1440 at 120 fps: encode p50 {:.2} ms, p95 {p95:.2} ms",
-            ms[ms.len() / 2]
-        );
-        assert!(p95 <= 6.0, "{codec:?}: p95 {p95:.2} ms");
     }
+    assert!(slow.is_empty(), "{slow:?}");
 }
 
 /// VideoToolbox budgets by timestamp: at 120 fps and at 60 each second carries the cap's
