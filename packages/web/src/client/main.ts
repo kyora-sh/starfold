@@ -1,5 +1,6 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
+import { displayHz } from '../pace';
 import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
 import type { App } from './app';
@@ -55,6 +56,15 @@ function main() {
 	const worker = new Worker('worker.js' + location.search);
 	const post = (m: ToWorker, transfer: Transferable[] = []) =>
 		worker.postMessage(m, transfer);
+	// The display's refresh rate, for the hello: the server sends no faster than it shows.
+	const stamps: number[] = [];
+	const tick = (t: number) => {
+		stamps.push(t);
+		if (t - stamps[0] < 500) return requestAnimationFrame(tick);
+		const hz = displayHz(stamps);
+		if (hz) post({ t: 'hz', hz });
+	};
+	requestAnimationFrame(tick);
 	const app: App = {
 		worker,
 		post,

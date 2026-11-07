@@ -287,6 +287,9 @@ struct Shared {
     /// `base_fps` until the encoder reopens.
     fps: AtomicU32,
     base_fps: u32,
+    /// The slowest rate the cohort's viewers can show (u32::MAX: no viewers); it can hold the
+    /// cohort down to `base_fps`, not below.
+    hz: AtomicU32,
     w: u32,
     h: u32,
 }
@@ -298,11 +301,17 @@ const FAIL_AFTER: u32 = 3;
 const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 impl Shared {
+    /// The most the cohort takes frames at now: its cap, held down by its slowest viewer.
+    fn cap(&self) -> u32 {
+        let hz = self.hz.load(Ordering::Acquire).max(self.base_fps);
+        self.fps.load(Ordering::Acquire).min(hz)
+    }
+
     /// A motion frame took `ms` to encode at `now`. Encodes that keep missing the cap's
     /// frame interval drop the cohort to its base rate, for good: winning the cap back
     /// mid-session isn't worth oscillating between the two.
     fn encoded(&self, watch: &mut SlowWatch, ms: f64, now: Instant) {
-        let fps = self.fps.load(Ordering::Acquire);
+        let fps = self.cap();
         if fps > self.base_fps && watch.note(ms, fps, now) {
             self.fps.store(self.base_fps, Ordering::Release);
             log::info!(
@@ -469,7 +478,7 @@ impl Pace {
 
 impl Cohort {
     fn fps(&self) -> u32 {
-        self.shared.fps.load(Ordering::Acquire)
+        self.shared.cap()
     }
 
     /// Whether what was encoded so far has reached this cohort's viewers. One that hasn't
@@ -872,6 +881,7 @@ impl Engine {
             refinable_small: AtomicBool::new(true),
             fps: AtomicU32::new(fps),
             base_fps: base_fps(&self.cfg),
+            hz: AtomicU32::new(u32::MAX),
             w: self.w,
             h: self.h,
         });
@@ -1164,6 +1174,12 @@ impl Engine {
             }
             c.viewers.clear();
             c.viewers.extend(v.clients.iter().map(|x| x.id));
+            let hz = v
+                .clients
+                .iter()
+                .map(|x| x.display_hz().unwrap_or(BASE_FPS))
+                .min();
+            c.shared.hz.store(hz.unwrap_or(u32::MAX), Ordering::Release);
             c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
             if c.active {
                 shown = shown.max(c.rc.target as u32);
@@ -2735,7 +2751,7 @@ fn encode_loop(
                     cap,
                     refine,
                     fps,
-                    max_fps: sh.fps.load(Ordering::Acquire),
+                    max_fps: sh.cap(),
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
