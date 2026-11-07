@@ -133,9 +133,7 @@ fn candidates_rank_codecs_then_hardware() {
     assert_eq!(
         got,
         vec![
-            (Codec::Av1, Backend::Nvenc),
             (Codec::Hevc, Backend::VideoToolbox),
-            (Codec::Hevc, Backend::Vaapi),
             // H.264 is the configured backend alone, whatever else is eligible.
             (Codec::H264, Backend::OpenH264),
         ]
@@ -200,6 +198,44 @@ fn auto_selection() {
 }
 
 #[test]
+fn experimental_backends_only_when_pinned() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::Vaapi, true),
+        cap(Codec::Hevc, Backend::Vaapi, true),
+        cap(Codec::Av1, Backend::Vaapi, true),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::H264, Backend::OpenH264, false),
+    ]);
+    let h264 = h264_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(h264, Backend::OpenH264, "auto never picks VA-API");
+    assert!(candidates(&r, h264)
+        .iter()
+        .all(|c| c.backend != Backend::Vaapi));
+    let h264 = h264_backend(&r, Selection::Pinned(Backend::Vaapi)).unwrap();
+    assert_eq!(h264, Backend::Vaapi);
+    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
+        .iter()
+        .map(|c| (c.codec, c.backend))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Codec::Av1, Backend::Vaapi),
+            (Codec::Hevc, Backend::Vaapi),
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::Vaapi),
+            (Codec::H264, Backend::OpenH264),
+        ]
+    );
+    let mut off = r.encoders.clone();
+    for c in off.iter_mut().filter(|c| c.backend == Backend::Vaapi) {
+        c.status = ProbeStatus::Disabled;
+    }
+    let e = h264_backend(&reg(off), Selection::Pinned(Backend::Vaapi)).unwrap_err();
+    assert!(e.contains("--experimental-hw-probes"), "{e}");
+}
+
+#[test]
 fn chosen_is_each_codecs_first_candidate() {
     let r = reg(vec![
         cap(Codec::H264, Backend::OpenH264, false),
@@ -227,7 +263,14 @@ fn selection_parse() {
         Selection::parse("openh264"),
         Ok(Selection::Pinned(Backend::OpenH264))
     );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        Selection::parse("vaapi"),
+        Ok(Selection::Pinned(Backend::Vaapi))
+    );
+    #[cfg(not(target_os = "linux"))]
     assert!(Selection::parse("vaapi").is_err());
+    assert!(Selection::parse("nvenc").is_err());
     assert!(Selection::parse("h265").unwrap_err().contains("auto"));
     assert_eq!(Selection::Auto.name(), "auto");
 }

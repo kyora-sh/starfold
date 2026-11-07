@@ -144,13 +144,13 @@ fn codec_rank(c: Codec) -> u8 {
 }
 
 /// The H.264 backend `sel` stands for here: the pinned one, which must be eligible, or
-/// the first eligible hardware one, else OpenH264.
+/// the first eligible hardware one that isn't experimental, else OpenH264.
 pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
     let b = match sel {
         Selection::Pinned(b) => b,
         Selection::Auto => reg
             .eligible(Codec::H264)
-            .find(|e| e.acceleration == Acceleration::Hardware)
+            .find(|e| e.acceleration == Acceleration::Hardware && !e.backend.experimental())
             .map_or(Backend::OpenH264, |e| e.backend),
         #[cfg(feature = "sw-arm")]
         Selection::Arm(..) => Backend::OpenH264,
@@ -160,11 +160,15 @@ pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
 
 /// The encoders a stream may use, best first: eligible AV1, then HEVC (hardware before
 /// software), then the H.264 backend (`h264_backend`), which also serves legacy viewers
-/// and recording, and OpenH264 for when a hardware one fails.
+/// and recording, and OpenH264 for when a hardware one fails. An experimental backend
+/// takes part only when it is the H.264 one, i.e. pinned with `--encoder`.
 pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
     for codec in [Codec::Av1, Codec::Hevc] {
-        for e in reg.eligible(codec) {
+        for e in reg
+            .eligible(codec)
+            .filter(|e| !e.backend.experimental() || e.backend == h264)
+        {
             let c = Candidate {
                 codec,
                 backend: e.backend,

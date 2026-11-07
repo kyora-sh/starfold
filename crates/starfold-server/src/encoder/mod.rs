@@ -3,14 +3,24 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
-#[cfg(any(feature = "libaom", feature = "svt-av1", test))]
-#[cfg_attr(not(any(feature = "libaom", feature = "svt-av1")), allow(dead_code))]
+#[cfg(any(feature = "libaom", feature = "svt-av1", target_os = "linux", test))]
+#[cfg_attr(
+    not(any(feature = "libaom", feature = "svt-av1", target_os = "linux")),
+    allow(dead_code)
+)]
 mod av1;
 pub mod caps;
 mod h264;
-#[cfg(any(target_os = "macos", test, feature = "kvazaar", feature = "x265"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "kvazaar",
+    feature = "x265"
+))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hevc;
+pub mod isolate;
 #[cfg(feature = "kvazaar")]
 mod kvazaar;
 #[cfg(windows)]
@@ -33,7 +43,7 @@ mod x264;
 #[cfg(feature = "x265")]
 mod x265;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     H264,
@@ -200,7 +210,7 @@ pub trait VideoEncoder: Send {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     OpenH264,
@@ -234,7 +244,11 @@ impl Backend {
             "videotoolbox" => Ok(Backend::VideoToolbox),
             #[cfg(not(target_os = "macos"))]
             "videotoolbox" => Err("videotoolbox is macOS-only".into()),
-            "vaapi" | "nvenc" | "mediafoundation" => {
+            #[cfg(target_os = "linux")]
+            "vaapi" => Ok(Backend::Vaapi),
+            #[cfg(not(target_os = "linux"))]
+            "vaapi" => Err("vaapi is Linux-only".into()),
+            "nvenc" | "mediafoundation" => {
                 Err(format!("{s} is probed (see /stats) but has no encoder yet"))
             }
             _ => Err(format!(
@@ -242,6 +256,8 @@ impl Backend {
                 if cfg!(feature = "x264") { ", x264" } else { "" },
                 if cfg!(target_os = "macos") {
                     ", videotoolbox"
+                } else if cfg!(target_os = "linux") {
+                    ", vaapi"
                 } else {
                     ""
                 }
@@ -290,7 +306,10 @@ impl Backend {
             Backend::VideoToolbox => {
                 cfg!(target_os = "macos") && matches!(codec, Codec::H264 | Codec::Hevc)
             }
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => false,
+            Backend::Vaapi => {
+                cfg!(target_os = "linux") && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
+            }
+            Backend::Nvenc | Backend::MediaFoundation => false,
         }
     }
 
@@ -333,8 +352,18 @@ impl Backend {
             #[cfg(feature = "x265")]
             Backend::X265 => 64,
             Backend::VideoToolbox => 64,
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => 16,
+            Backend::Vaapi => 128,
+            Backend::Nvenc | Backend::MediaFoundation => 16,
         }
+    }
+
+    /// Never run on real hardware: `--encoder auto` leaves it out, only a pinned
+    /// `--encoder` uses it.
+    pub fn experimental(self) -> bool {
+        matches!(
+            self,
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation
+        )
     }
 
     /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
@@ -481,6 +510,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::X265 => Box::new(x265::X265::new(&coded)?),
         #[cfg(target_os = "macos")]
         Backend::VideoToolbox => Box::new(videotoolbox::VideoToolbox::new(&coded)?),
+        #[cfg(target_os = "linux")]
+        Backend::Vaapi => vaapi::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {

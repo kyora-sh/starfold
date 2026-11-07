@@ -34,14 +34,17 @@ Video:
   --encoder                     auto: each codec from its hardware encoder,
                                 H.264 from OpenH264 where there is none
                                 (default); or the H.264 encoder: openh264,
-                                videotoolbox (macOS hardware), or x264 in a
-                                build with the x264 feature; /stats shows
-                                what the startup probe found
+                                videotoolbox (macOS hardware), x264 in a
+                                build with the x264 feature, or vaapi
+                                (Linux, experimental, needs
+                                --experimental-hw-probes; auto never picks
+                                it); /stats shows what the probe found
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
   --experimental-hw-probes      experimental: also probe VA-API, NVENC and
-                                Media Foundation (no encoders yet), loading
-                                their drivers into the server (default false)
+                                Media Foundation (no NVENC or Media
+                                Foundation encoders yet), each in a child
+                                process (default false)
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             sliced threads (default min(4, cores/4))
   --adaptive-threads            encode on one thread, fanning out only under
