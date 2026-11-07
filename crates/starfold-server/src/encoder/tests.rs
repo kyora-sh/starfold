@@ -552,6 +552,10 @@ fn vt_at(
 /// the 8.3 ms interval past which a cohort falls back to 60.
 #[cfg(target_os = "macos")]
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "times the encoder: needs an optimized build"
+)]
 fn videotoolbox_keeps_up_with_1440p_at_120_fps() {
     for codec in [Codec::H264, Codec::Hevc] {
         if !vt_hardware(codec) {
