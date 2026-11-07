@@ -395,19 +395,17 @@ fn av1_output_needs_a_frame_of_the_asked_type() {
     let color = crate::encoder::ColorInfo::SRGB_BT601_LIMITED;
     let mut seq_only = vec![0x0a, AV1_SEQ.len() as u8];
     seq_only.extend_from_slice(AV1_SEQ);
-    let e = session::av1_unit(&mut None, seq_only, 0, true, size, color)
+    let e = hw::av1_unit("NVENC", &mut None, seq_only, 0, size, color)
         .err()
         .unwrap();
     assert!(e.0.contains("no frame"), "{e}");
-    let e = session::av1_unit(&mut None, vec![0x12, 0x00], 0, false, size, color)
+    let e = hw::av1_unit("NVENC", &mut None, vec![0x12, 0x00], 0, size, color)
         .err()
         .unwrap();
     assert!(e.0.contains("no frame"), "{e}");
-    let key = bitstream(Codec::Av1, true);
-    let e = session::av1_unit(&mut None, key, 0, false, size, color)
-        .err()
-        .unwrap();
-    assert!(e.0.contains("frame type 0"), "{e}");
+    let mut s = hw::Stream::new("NVENC", Codec::Av1, size, color, false);
+    let e = s.unit(bitstream(Codec::Av1, true), 0, false).err().unwrap();
+    assert!(e.0.contains("asked for a P frame, got an IDR"), "{e}");
 }
 
 #[test]

@@ -1,9 +1,12 @@
-//! What the VA-API and NVENC encoders share: NV12 upload, the sample encode that verifies
-//! a session, and opening each new session in a child process first.
+//! What the VA-API, NVENC and Media Foundation encoders share: NV12 upload, checking
+//! their output, the sample encode that verifies a session, and opening each new session
+//! in a child process first.
 
 use super::caps::Probe as Found;
+use super::h264::ParamSets;
 use super::{
-    Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder,
+    av1, hevc, AccessUnit, Backend, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions,
+    EncoderConfig, FrameView, RateConfig, StreamConfig, VideoEncoder,
 };
 use std::sync::Mutex;
 
@@ -51,6 +54,358 @@ pub fn write_nv12(
     Ok(())
 }
 
+/// A temporal delimiter OBU.
+const TD: [u8; 2] = [0x12, 0x00];
+
+enum Units {
+    H264(ParamSets),
+    Hevc(hevc::Units),
+    Av1(Option<Vec<u8>>),
+}
+
+impl Units {
+    fn new(codec: Codec, (w, h): (u32, u32)) -> Units {
+        match codec {
+            Codec::Hevc => Units::Hevc(hevc::Units::new(w, h)),
+            Codec::Av1 => Units::Av1(None),
+            _ => Units::H264(ParamSets::default()),
+        }
+    }
+}
+
+/// The parameter-set NAL types of an Annex B codec, in stream order, and its access unit
+/// delimiter.
+struct AnnexB {
+    nal_type: fn(&[u8]) -> u8,
+    sets: &'static [u8],
+    aud: u8,
+    random_access: fn(u8) -> bool,
+}
+
+fn h264_idr(t: u8) -> bool {
+    t == super::h264::NAL_IDR
+}
+
+static H264_NALS: AnnexB = AnnexB {
+    nal_type: super::h264::nal_type,
+    sets: &[super::h264::NAL_SPS, super::h264::NAL_PPS],
+    aud: 9,
+    random_access: h264_idr,
+};
+
+static HEVC_NALS: AnnexB = AnnexB {
+    nal_type: hevc::nal_type,
+    sets: &[hevc::NAL_VPS, hevc::NAL_SPS, hevc::NAL_PPS],
+    aud: 35,
+    random_access: hevc::is_random_access,
+};
+
+/// A hardware encoder's output, checked against what was asked for, with a stream config
+/// whenever its parameter sets change.
+pub struct Stream {
+    name: &'static str,
+    codec: Codec,
+    size: (u32, u32),
+    color: ColorInfo,
+    /// Takes a key frame where a P frame was asked for: the encoder keeps its own GOP.
+    extra_keyframes: bool,
+    /// A stream config has gone out.
+    configured: bool,
+    units: Units,
+    /// The parameter sets (Annex B, in stream order) or AV1 sequence header OBU of the
+    /// last accepted output; a key frame missing any gets these.
+    headers: Vec<Option<Vec<u8>>>,
+}
+
+impl Stream {
+    pub fn new(
+        name: &'static str,
+        codec: Codec,
+        size: (u32, u32),
+        color: ColorInfo,
+        extra_keyframes: bool,
+    ) -> Stream {
+        Stream {
+            name,
+            codec,
+            size,
+            color,
+            extra_keyframes,
+            configured: false,
+            units: Units::new(codec, size),
+            headers: Vec::new(),
+        }
+    }
+
+    fn nals(&self) -> Option<&'static AnnexB> {
+        match self.codec {
+            Codec::H264 => Some(&H264_NALS),
+            Codec::Hevc => Some(&HEVC_NALS),
+            _ => None,
+        }
+    }
+
+    /// The access unit in `data`. A rejected one leaves the parameter-set readers as new,
+    /// so the next IDR carries a config; the headers of accepted output stay.
+    pub fn unit(
+        &mut self,
+        data: Vec<u8>,
+        pts_ms: i64,
+        idr: bool,
+    ) -> Result<Option<AccessUnit>, EncodeError> {
+        let data = match self.nals() {
+            Some(n) => complete_annexb(n, &self.headers, data),
+            None if self.codec == Codec::Av1 => complete_av1(&self.headers, data),
+            None => data,
+        };
+        let r = match self.nals() {
+            Some(n) if lacks_sets(n, &data) => Err(EncodeError(format!(
+                "{} {:?} key frame without its parameter sets",
+                self.name, self.codec
+            ))),
+            _ => self.check(data, pts_ms, idr),
+        };
+        match &r {
+            Ok(Some(au)) => self.remember(&au.data),
+            Ok(None) => {}
+            Err(_) => self.units = Units::new(self.codec, self.size),
+        }
+        r
+    }
+
+    fn remember(&mut self, data: &[u8]) {
+        match self.nals() {
+            Some(n) => {
+                self.headers.resize(n.sets.len(), None);
+                for nal in super::h264::nal_units(data).filter(|n| n.len() >= 2) {
+                    if let Some(i) = n.sets.iter().position(|&k| k == (n.nal_type)(nal)) {
+                        self.headers[i] = Some(nal.to_vec());
+                    }
+                }
+            }
+            None => {
+                if let Some(obu) = av1_sequence_obu(data) {
+                    self.headers = vec![Some(obu)];
+                }
+            }
+        }
+    }
+
+    fn check(
+        &mut self,
+        data: Vec<u8>,
+        pts_ms: i64,
+        idr: bool,
+    ) -> Result<Option<AccessUnit>, EncodeError> {
+        let (name, codec) = (self.name, self.codec);
+        let au = match &mut self.units {
+            Units::H264(p) => p.unit(data, pts_ms, self.size, self.color),
+            Units::Hevc(u) => u.unit(data, pts_ms),
+            Units::Av1(seq) => av1_unit(name, seq, data, pts_ms, self.size, self.color)?,
+        };
+        let kind = |k: bool| if k { "an IDR" } else { "a P frame" };
+        match &au {
+            None if idr => Err(EncodeError(format!(
+                "{name} {codec:?} IDR came out without a picture"
+            ))),
+            Some(a) if a.keyframe != idr && !(a.keyframe && self.extra_keyframes) => {
+                Err(EncodeError(format!(
+                    "{name} {codec:?} asked for {}, got {}",
+                    kind(idr),
+                    kind(a.keyframe)
+                )))
+            }
+            Some(a) if a.config.is_none() && !self.configured => Err(EncodeError(format!(
+                "{name} {codec:?} stream began without readable parameter sets"
+            ))),
+            _ => {
+                self.configured |= au.as_ref().is_some_and(|a| a.config.is_some());
+                Ok(au)
+            }
+        }
+    }
+}
+
+/// A random-access picture in `data` without every parameter set it needs.
+fn lacks_sets(n: &AnnexB, data: &[u8]) -> bool {
+    let types: Vec<u8> = super::h264::nal_units(data)
+        .filter(|x| x.len() >= 2)
+        .map(|x| (n.nal_type)(x))
+        .collect();
+    types.iter().any(|&t| (n.random_access)(t)) && n.sets.iter().any(|k| !types.contains(k))
+}
+
+/// `data` with every parameter set a random-access picture lacks taken from `headers`:
+/// delimiters, then the parameter sets in stream order, then the rest as it came.
+fn complete_annexb(n: &AnnexB, headers: &[Option<Vec<u8>>], data: Vec<u8>) -> Vec<u8> {
+    let nals: Vec<&[u8]> = super::h264::nal_units(&data)
+        .filter(|x| x.len() >= 2)
+        .collect();
+    let types: Vec<u8> = nals.iter().map(|x| (n.nal_type)(x)).collect();
+    let missing = n
+        .sets
+        .iter()
+        .enumerate()
+        .any(|(i, k)| !types.contains(k) && headers.get(i).is_some_and(Option::is_some));
+    if !missing || !types.iter().any(|&t| (n.random_access)(t)) {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len() + 128);
+    let mut put = |x: &[u8]| {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(x);
+    };
+    for (x, _) in nals.iter().zip(&types).filter(|(_, &t)| t == n.aud) {
+        put(x);
+    }
+    for (i, k) in n.sets.iter().enumerate() {
+        match nals.iter().zip(&types).find(|(_, &t)| t == *k) {
+            Some((x, _)) => put(x),
+            None => {
+                if let Some(Some(h)) = headers.get(i) {
+                    put(h);
+                }
+            }
+        }
+    }
+    for (x, &t) in nals.iter().zip(&types) {
+        if t != n.aud && !n.sets.contains(&t) {
+            put(x);
+        }
+    }
+    out
+}
+
+fn leb128(mut n: usize, out: &mut Vec<u8>) {
+    loop {
+        let b = (n & 0x7f) as u8;
+        n >>= 7;
+        out.push(if n > 0 { b | 0x80 } else { b });
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// The first sequence header of `tu` as a whole OBU.
+fn av1_sequence_obu(tu: &[u8]) -> Option<Vec<u8>> {
+    let p = av1::sequence_header(tu)?;
+    let mut obu = vec![0x0a];
+    leb128(p.len(), &mut obu);
+    obu.extend_from_slice(p);
+    Some(obu)
+}
+
+/// `data` as a temporal unit, with the remembered sequence header after its temporal
+/// delimiter when it codes a key frame without one.
+fn complete_av1(headers: &[Option<Vec<u8>>], data: Vec<u8>) -> Vec<u8> {
+    let Some(Some(seq)) = headers.first() else {
+        return data;
+    };
+    if data.is_empty() {
+        return data;
+    }
+    let mut tu = Vec::with_capacity(data.len() + TD.len() + seq.len());
+    if (data[0] >> 3) & 0xf != 2 {
+        tu.extend_from_slice(&TD);
+    }
+    tu.extend(data);
+    if av1::frame_type(&tu) == Some(0) && av1::sequence_header(&tu).is_none() && tu.starts_with(&TD)
+    {
+        tu.splice(TD.len()..TD.len(), seq.iter().copied());
+    }
+    tu
+}
+
+/// One AV1 temporal unit, a temporal delimiter put in front where it has none; a key
+/// frame needs a sequence header.
+pub fn av1_unit(
+    name: &str,
+    seq: &mut Option<Vec<u8>>,
+    data: Vec<u8>,
+    pts_ms: i64,
+    size: (u32, u32),
+    color: ColorInfo,
+) -> Result<Option<AccessUnit>, EncodeError> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let mut tu = Vec::with_capacity(data.len() + TD.len());
+    if (data[0] >> 3) & 0xf != 2 {
+        tu.extend_from_slice(&TD);
+    }
+    tu.extend(data);
+    let key = av1::frame_type(&tu)
+        .ok_or_else(|| EncodeError(format!("{name} AV1 output has no frame")))?
+        == 0;
+    let sh = av1::sequence_header(&tu).map(<[u8]>::to_vec);
+    let config = match (&sh, key) {
+        (None, true) => {
+            return Err(EncodeError(format!(
+                "{name} AV1 key frame without a sequence header"
+            )))
+        }
+        (Some(s), true) if seq.as_ref() != Some(s) => {
+            let codec_string = av1::codec_string(&tu)
+                .ok_or_else(|| EncodeError("unreadable AV1 sequence header".into()))?;
+            *seq = sh;
+            Some(StreamConfig {
+                codec: Codec::Av1,
+                codec_string,
+                coded: size,
+                display: size,
+                format: BitstreamFormat::Av1LowOverhead,
+                color,
+            })
+        }
+        _ => None,
+    };
+    Ok(Some(AccessUnit {
+        pts_ms,
+        keyframe: key,
+        data: tu,
+        config,
+    }))
+}
+
+/// A hardware session's rate control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rc {
+    pub cbr: bool,
+    pub bps: u32,
+    pub buffer_bits: u32,
+    pub fps: u32,
+    pub qp: u32,
+}
+
+impl Rc {
+    /// CBR when `rate` caps the bitrate, else constant QP. A session keeps its mode, and
+    /// an uncapped rate on a CBR one keeps its bitrate.
+    pub fn new(codec: Codec, rate: &RateConfig, prev: Option<&Rc>) -> Rc {
+        let cbr = prev.map_or(rate.max_kbps > 0, |p| p.cbr);
+        let (bps, buffer_bits) = match (cbr, rate.max_kbps, prev) {
+            (false, ..) => (0, 0),
+            (true, 0, Some(p)) => (p.bps, p.buffer_bits),
+            (true, k, _) => (
+                k.saturating_mul(1000),
+                rate.buf_kbit.max(1).saturating_mul(1000),
+            ),
+        };
+        let q = rate.quality.round() as i32;
+        let qp = match codec {
+            Codec::Av1 => (q * 5).clamp(1, 255),
+            _ => q.clamp(1, 51),
+        } as u32;
+        Rc {
+            cbr,
+            bps,
+            buffer_bits,
+            fps: rate.fps.max(1),
+            qp,
+        }
+    }
+}
+
 pub fn sample_config(
     backend: Backend,
     codec: Codec,
@@ -73,6 +428,17 @@ pub fn sample_config(
 
 /// Encodes an IDR and a P frame of flat grey with `enc`.
 pub fn sample(enc: &mut dyn VideoEncoder, width: u32, height: u32) -> Result<(), EncodeError> {
+    sample_with(enc, width, height, false)
+}
+
+/// [`sample`] for an encoder that may code its own key frames: the P frame may come out
+/// as one.
+pub fn sample_with(
+    enc: &mut dyn VideoEncoder,
+    width: u32,
+    height: u32,
+    extra_keyframes: bool,
+) -> Result<(), EncodeError> {
     let (w, h) = (width as usize, height as usize);
     let (y, uv) = (
         vec![128u8; w * h],
@@ -96,7 +462,10 @@ pub fn sample(enc: &mut dyn VideoEncoder, width: u32, height: u32) -> Result<(),
                 ..Default::default()
             },
         )?;
-        if aus.len() != 1 || aus[0].keyframe != key || (key && aus[0].config.is_none()) {
+        let kind_ok = aus
+            .first()
+            .is_some_and(|a| a.keyframe == key || (extra_keyframes && a.keyframe));
+        if aus.len() != 1 || !kind_ok || (key && aus[0].config.is_none()) {
             return Err(EncodeError(format!(
                 "sample {} came out as {} unit(s)",
                 if key { "IDR" } else { "P frame" },

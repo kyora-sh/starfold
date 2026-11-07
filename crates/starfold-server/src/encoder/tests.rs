@@ -474,9 +474,15 @@ fn unknown_encoder_names() {
     assert_eq!(Backend::parse("nvenc"), Ok(Backend::Nvenc));
     #[cfg(not(any(target_os = "linux", windows)))]
     assert!(Backend::parse("nvenc").unwrap_err().contains("Windows"));
+    #[cfg(windows)]
+    assert_eq!(
+        Backend::parse("mediafoundation"),
+        Ok(Backend::MediaFoundation)
+    );
+    #[cfg(not(windows))]
     assert!(Backend::parse("mediafoundation")
         .unwrap_err()
-        .contains("no encoder yet"));
+        .contains("Windows-only"));
 }
 
 #[test]
@@ -484,9 +490,12 @@ fn backends_without_the_codec_refuse_to_open() {
     let mut cfg = config(Backend::OpenH264, 64, 64, 1000);
     cfg.codec = Codec::Hevc;
     assert!(open(&cfg).is_err());
-    cfg.backend = Backend::MediaFoundation;
-    cfg.codec = Codec::H264;
-    assert!(open(&cfg).is_err());
+    #[cfg(not(windows))]
+    {
+        cfg.backend = Backend::MediaFoundation;
+        cfg.codec = Codec::H264;
+        assert!(open(&cfg).is_err());
+    }
 }
 
 /// What the startup probe finds on this Mac (printed for the PR, `--nocapture`).
