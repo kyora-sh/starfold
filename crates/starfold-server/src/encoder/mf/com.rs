@@ -350,14 +350,14 @@ impl MfDriver {
                     .ok()
                     .map_err(|e| EncodeError(format!("MFT event {kind}: {e}")))?;
             }
-            match MF_EVENT_TYPE(kind as i32) {
-                METransformNeedInput => {
-                    self.need_input += 1;
-                    return Ok(None);
-                }
-                METransformHaveOutput => return self.output().map(Some),
-                MEError => return Err(EncodeError("MFT raised MEError".into())),
-                _ => {}
+            let kind = MF_EVENT_TYPE(kind as i32);
+            if kind == METransformNeedInput {
+                self.need_input += 1;
+                return Ok(None);
+            } else if kind == METransformHaveOutput {
+                return self.output().map(Some);
+            } else if kind == MEError {
+                return Err(EncodeError("MFT raised MEError".into()));
             }
         }
     }
