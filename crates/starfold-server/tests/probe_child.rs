@@ -2,7 +2,7 @@
 
 use starfold::encoder::isolate::{run, FLAG, GO, NO_GO};
 use starfold::encoder::Backend;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -39,14 +39,47 @@ fn experimental_probe_is_refused_without_the_flag() {
     assert_eq!(s.status.code(), Some(2));
 }
 
+/// Waits up to `d` for `c` to exit; kills and reaps it if it doesn't.
+fn exit_within(c: &mut std::process::Child, d: Duration) -> Option<std::process::ExitStatus> {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        if let Some(s) = c.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    None
+}
+
+/// Whether `pid` is blocked reading its stdin.
+#[cfg(target_os = "linux")]
+fn reading_stdin(pid: u32) -> bool {
+    const READ: &str = if cfg!(target_arch = "x86_64") {
+        "0"
+    } else {
+        "63"
+    };
+    let call = std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
+    let mut f = call.split_whitespace();
+    f.next() == Some(READ) && f.next() == Some("0x0")
+}
+
 /// Until it reads [`GO`] the child does nothing; if its stdin closes first, as when the
 /// server dies before confining it, it exits without having probed anything.
 #[test]
 fn child_waits_for_go_and_exits_without_it() {
     let mut c = piped(&[FLAG, "nvenc", "--experimental-hw-probes"]);
-    std::thread::sleep(Duration::from_millis(300));
     #[cfg(target_os = "linux")]
-    let before = std::fs::read_to_string(format!("/proc/{}/maps", c.id())).unwrap();
+    let before = {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !reading_stdin(c.id()) {
+            assert!(Instant::now() < end, "the child never waited on its stdin");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(format!("/proc/{}/maps", c.id())).unwrap()
+    };
     std::thread::sleep(Duration::from_millis(500));
     assert!(c.try_wait().unwrap().is_none());
     #[cfg(target_os = "linux")]
@@ -58,12 +91,13 @@ fn child_waits_for_go_and_exits_without_it() {
         assert_eq!(task.count(), 1, "the child started a thread before go");
         assert!(kids.trim().is_empty(), "the child spawned {kids} before go");
     }
-    let t = Instant::now();
     drop(c.stdin.take());
-    let out = c.wait_with_output().unwrap();
-    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-    assert_eq!(out.status.code(), Some(NO_GO));
-    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    let status = exit_within(&mut c, Duration::from_secs(5));
+    assert_eq!(status.and_then(|s| s.code()), Some(NO_GO), "{status:?}");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    c.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    c.stderr.take().unwrap().read_to_end(&mut err).unwrap();
+    assert!(out.is_empty() && err.is_empty(), "{out:?} {err:?}");
 }
 
 /// Whatever this host has, the child answers for the backend it was asked about.

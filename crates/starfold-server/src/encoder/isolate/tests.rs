@@ -464,7 +464,19 @@ fn go_follows_confinement() {
         }
     })
     .unwrap();
-    assert!(c.wait().unwrap().success());
+    let end = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match c.try_wait().unwrap() {
+            Some(s) => break Some(s),
+            None if Instant::now() >= end => break None,
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if status.is_none() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
     assert!(went.exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
