@@ -474,9 +474,15 @@ fn unknown_encoder_names() {
     assert_eq!(Backend::parse("nvenc"), Ok(Backend::Nvenc));
     #[cfg(not(any(target_os = "linux", windows)))]
     assert!(Backend::parse("nvenc").unwrap_err().contains("Windows"));
+    #[cfg(windows)]
+    assert_eq!(
+        Backend::parse("mediafoundation"),
+        Ok(Backend::MediaFoundation)
+    );
+    #[cfg(not(windows))]
     assert!(Backend::parse("mediafoundation")
         .unwrap_err()
-        .contains("no encoder yet"));
+        .contains("Windows-only"));
 }
 
 #[test]
