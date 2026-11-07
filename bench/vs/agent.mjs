@@ -3,7 +3,8 @@
 import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import http from 'http';
-import { ARMS, CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS, KEYS_LOG } from './config.mjs';
+import { armOf } from './arms.mjs';
+import { CTL_PORT, HEIGHT, FPS, NOVNC_PORT, STARFOLD_ARGS, STARFOLD_PORT, WAN, WIDTH, X11VNC_ARGS, KEYS_LOG } from './config.mjs';
 const [bin, source, web, pwFile, maxS, link, shaper, page] = process.argv.slice(2);
 const DISPLAY = ':11', SOCK = '/tmp/vs-x11vnc.sock', DUMP = '/tmp/vs-dump.raw';
 const pw = fs.readFileSync(pwFile, 'utf8').trim();
@@ -52,7 +53,7 @@ async function start(arm, wl) {
 		src.stdout.on('data', (b) => { if (String(b).includes('READY')) { clearTimeout(t); res(); } });
 		src.on('exit', (c) => rej(new Error(`source exited ${c}`)));
 	});
-	if (ARMS[arm].kind === 'novnc') {
+	if (armOf(arm).kind === 'novnc') {
 		run.push(group('x11vnc', ['-display', DISPLAY, ...X11VNC_ARGS, '-unixsock', SOCK]));
 		for (let i = 0; i < 100 && !fs.existsSync(SOCK); i++) await sleep(50);
 		if (!fs.existsSync(SOCK)) throw new Error('x11vnc did not open its socket');
@@ -67,7 +68,7 @@ async function start(arm, wl) {
 		await listening(NOVNC_PORT);
 	} else {
 		const log = fs.openSync('/tmp/vs-starfold.log', 'a');
-		const a = ARMS[arm];
+		const a = armOf(arm);
 		run.push(group(a.bin ? process.env[a.bin] : bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...(a.args ?? STARFOLD_ARGS)], { env: { VOXL_PASSWORD: pw, RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
 		await listening(STARFOLD_PORT);
 	}

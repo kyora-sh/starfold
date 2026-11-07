@@ -6,6 +6,7 @@ import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import fs from 'fs';
 import { answer, delivered, KEY_CAP_MS } from './match.mjs';
+import { armOf, expandArms, roundOrder } from './arms.mjs';
 import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS, KEYS_LOG } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
@@ -38,24 +39,24 @@ function chromeCpu() {
 	return j / 100;
 }
 const offset = link === 'wan' ? WAN.portOffset : 0;
-const portOf = (arm) => (ARMS[arm].kind === 'novnc' ? NOVNC_PORT : STARFOLD_PORT) + offset;
+const portOf = (arm) => (armOf(arm).kind === 'novnc' ? NOVNC_PORT : STARFOLD_PORT) + offset;
 const urlOf = (arm) => {
-	const a = ARMS[arm];
+	const a = armOf(arm);
 	if (a.kind === 'starfold') return `http://127.0.0.1:${portOf(arm)}/?token=${token}${a.query}`;
 	const { quality, compression } = NOVNC_PROFILES[a.profile];
 	return `http://127.0.0.1:${portOf(arm)}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
 };
-const serverStats = async (arm) => (ARMS[arm].kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
+const serverStats = async (arm) => (armOf(arm).kind === 'starfold' ? (await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } })).json() : {});
 const statsDelta = (a, b) => Object.fromEntries([['keyframes', 'keyframes'], ['paintovers', 'paintovers'], ['refines', 'refines'], ['refinedFrames', 'paintover_frames'], ['refinedBytes', 'paintover_bytes'], ['flowBlocked', 'flow_blocked'], ['encoded', 'encoded'], ['bytes', 'bytes']].filter(([, k]) => typeof b[k] === 'number').map(([n, k]) => [n, b[k] - a[k]]));
 /** Throws unless the one viewer is being served the arm's codec: a fallback must never count as that arm's result. */
 function assertCodec(arm, stats, when) {
-	if (ARMS[arm].kind !== 'starfold' || ARMS[arm].codec === null) return;
-	const want = ARMS[arm].codec ?? 'h264';
+	if (armOf(arm).kind !== 'starfold' || armOf(arm).codec === null) return;
+	const want = armOf(arm).codec ?? 'h264';
 	const got = (stats.clients || []).map((c) => c.stream?.codec);
 	if (got.length !== 1 || got[0] !== want) throw new Error(`codec ${when}: wanted ${want}, served ${JSON.stringify(got)}`);
 }
 async function viewers(arm) {
-	if (ARMS[arm].kind === 'starfold') {
+	if (armOf(arm).kind === 'starfold') {
 		const r = await fetch(`http://127.0.0.1:${STARFOLD_PORT}/stats`, { headers: { authorization: `Bearer ${token}` } });
 		return ((await r.json()).clients || []).length;
 	}
@@ -210,7 +211,7 @@ async function run(arm, wl, readback = true) {
 		p.on('pageerror', (e) => errs.push(String(e)));
 		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback, wsTs: !!process.env.WS_TS });
 		await p.goto(urlOf(arm), { waitUntil: 'commit', timeout: 20000 });
-		const ready = ARMS[arm].kind === 'starfold'
+		const ready = armOf(arm).kind === 'starfold'
 			? () => window.vs?.firstFrame !== undefined || window.starfoldFirstFrame !== undefined
 			: () => window.novncConnected === true;
 		await p.waitForFunction(ready, null, { timeout: 15000 }).catch((e) => { throw new Error(`${String(e.message).split('\n')[0]}${errs.length ? ` page: ${errs[0]}` : ''}`); });
@@ -393,7 +394,10 @@ async function soak(arm, seconds) {
 		await sleep(500);
 	}
 }
-const arms = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => !ARMS[a].probe && (link === 'wan' || !ARMS[a].wanOnly));
+// AA=0 drops the A/A twin of the first arm; RUN=<i> continues the arm rotation of earlier runs of `rounds` rounds.
+const listed = process.env.ARMS ? process.env.ARMS.split(',') : Object.keys(ARMS).filter((a) => !ARMS[a].probe && (link === 'wan' || !ARMS[a].wanOnly));
+const arms = expandArms(listed, process.env.AA !== '0');
+const order = (i, w, n) => roundOrder(arms, i, w, Number(process.env.RUN || 0), n);
 const wls = process.env.WORKLOADS ? process.env.WORKLOADS.split(',') : WORKLOADS;
 const results = {}, ledger = {};
 const out = process.env.OUT ? fs.createWriteStream(process.env.OUT) : null;
@@ -419,7 +423,7 @@ async function slot(arm, wl, round, readback, setName) {
 for (let i = 0; i < rounds && Date.now() - started < budget; i++) {
 	console.log(`ROUND ${i} at ${Math.round((Date.now() - started) / 1000)} s`);
 	for (const [w, wl] of wls.entries())
-		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, true, 'main');
+		for (const arm of order(i, w, rounds)) await slot(arm, wl, i, true, 'main');
 }
 // Reader against no reader, each arm's pair side by side: whether reading the strip moves what the link delivers.
 for (let i = 0; i < Number(process.env.PARITY_ROUNDS || 0) && Date.now() - started < budget; i++)
@@ -432,11 +436,10 @@ for (let i = 0; i < Number(process.env.PARITY_ROUNDS || 0) && Date.now() - start
 	}
 for (let i = 0; i < controlRounds && Date.now() - started < budget; i++)
 	for (const [w, wl] of wls.entries())
-		for (let k = 0; k < arms.length; k++) await slot(arms[(k + i + w) % arms.length], wl, i, false, 'no-readback');
+		for (const arm of order(i, w, controlRounds)) await slot(arm, wl, i, false, 'no-readback');
 for (let i = 0; i < Number(process.env.QUALITY_ROUNDS || 0) && Date.now() - started < budget; i++)
 	for (const [w, wl] of wls.entries())
-		for (let k = 0; k < arms.length; k++) {
-			const arm = arms[(k + i + w) % arms.length];
+		for (const arm of order(i, w, Number(process.env.QUALITY_ROUNDS))) {
 			const key = `quality|${wl}|${arm}`;
 			const l = (ledger[key] ??= { attempted: 0, valid: 0, failed: 0, why: [] });
 			l.attempted++;
