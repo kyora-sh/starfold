@@ -40,6 +40,7 @@ type MftEnumEx = unsafe extern "system" fn(
 ) -> HRESULT;
 type MfCreate = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
 type MfCreateMemoryBuffer = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
+type MfCreateAlignedMemoryBuffer = unsafe extern "system" fn(u32, u32, *mut *mut c_void) -> HRESULT;
 type MfCreateDxgiDeviceManager = unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> HRESULT;
 
 /// mfplat.dll, started for the life of the process.
@@ -49,6 +50,7 @@ pub struct Mf {
     media_type: MfCreate,
     sample: MfCreate,
     memory_buffer: MfCreateMemoryBuffer,
+    aligned_buffer: MfCreateAlignedMemoryBuffer,
     device_manager: MfCreateDxgiDeviceManager,
 }
 
@@ -95,6 +97,7 @@ impl Mf {
             media_type: *lib.get(b"MFCreateMediaType\0").map_err(get)?,
             sample: *lib.get(b"MFCreateSample\0").map_err(get)?,
             memory_buffer: *lib.get(b"MFCreateMemoryBuffer\0").map_err(get)?,
+            aligned_buffer: *lib.get(b"MFCreateAlignedMemoryBuffer\0").map_err(get)?,
             device_manager: *lib.get(b"MFCreateDXGIDeviceManager\0").map_err(get)?,
             _lib: lib,
         };
@@ -256,7 +259,7 @@ type Output = (Option<i64>, Vec<u8>);
 /// one frame at a time.
 pub struct MfDriver {
     mf: &'static Mf,
-    mft: IMFTransform,
+    mft: Mft,
     events: IMFMediaEventGenerator,
     codec_api: ICodecAPI,
     _manager: IMFDXGIDeviceManager,
@@ -279,9 +282,9 @@ impl MfDriver {
         let mf = mf().map_err(EncodeError)?;
         unsafe {
             let luid = a.GetUINT64(&MFT_ENUM_ADAPTER_LUID).ok();
-            let mft: IMFTransform = a
+            let mft = Mft(a
                 .ActivateObject()
-                .map_err(|e| err("IMFActivate::ActivateObject", e))?;
+                .map_err(|e| err("IMFActivate::ActivateObject", e))?);
             let mut d = MfDriver {
                 mf,
                 events: mft.cast().map_err(|e| err("IMFMediaEventGenerator", e))?,
@@ -377,7 +380,10 @@ impl MfDriver {
         let sample = if info.dwFlags & provides != 0 {
             None
         } else {
-            Some(self.sample(info.cbSize.max(MIN_OUTPUT))?.0)
+            Some(
+                self.sample(info.cbSize.max(MIN_OUTPUT), info.cbAlignment)?
+                    .0,
+            )
         };
         let mut out = [MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: self.ids.1,
@@ -421,12 +427,19 @@ impl MfDriver {
         Ok((sample.GetSampleTime().ok(), data))
     }
 
-    /// A sample with one `size`-byte memory buffer.
-    unsafe fn sample(&self, size: u32) -> Result<(IMFSample, IMFMediaBuffer), EncodeError> {
+    /// A sample with one `size`-byte memory buffer aligned to `align` bytes.
+    unsafe fn sample(
+        &self,
+        size: u32,
+        align: u32,
+    ) -> Result<(IMFSample, IMFMediaBuffer), EncodeError> {
         let mut p = std::ptr::null_mut();
-        (self.mf.memory_buffer)(size, &mut p)
-            .ok()
-            .map_err(|e| err("MFCreateMemoryBuffer", e))?;
+        let r = if align > 1 {
+            (self.mf.aligned_buffer)(size, align - 1, &mut p)
+        } else {
+            (self.mf.memory_buffer)(size, &mut p)
+        };
+        r.ok().map_err(|e| err("MFCreateMemoryBuffer", e))?;
         let buf: IMFMediaBuffer = owned(p, "MFCreateMemoryBuffer")?;
         let s: IMFSample = Mf::create(self.mf.sample, "MFCreateSample")?;
         s.AddBuffer(&buf)
@@ -437,7 +450,7 @@ impl MfDriver {
     unsafe fn input(&self, f: &FrameView<'_>) -> Result<IMFSample, EncodeError> {
         let (w, h) = (self.size.0 as usize, self.size.1 as usize);
         let len = w * h + w * h.div_ceil(2);
-        let (s, buf) = self.sample(len as u32)?;
+        let (s, buf) = self.sample(len as u32, 0)?;
         let mut p = std::ptr::null_mut();
         buf.Lock(&mut p, None, None)
             .map_err(|e| err("IMFMediaBuffer::Lock", e))?;
@@ -471,15 +484,32 @@ impl Drop for MfDriver {
                 let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             }
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-            if let Ok(s) = self.mft.cast::<IMFShutdown>() {
-                let _ = s.Shutdown();
-            }
+        }
+    }
+}
+
+/// An activated MFT, shut down when dropped.
+struct Mft(IMFTransform);
+
+impl std::ops::Deref for Mft {
+    type Target = IMFTransform;
+
+    fn deref(&self) -> &IMFTransform {
+        &self.0
+    }
+}
+
+impl Drop for Mft {
+    fn drop(&mut self) {
+        if let Ok(s) = self.0.cast::<IMFShutdown>() {
+            let _ = unsafe { s.Shutdown() };
         }
     }
 }
 
 impl Driver for MfDriver {
     fn set_types(&mut self, f: &Format) -> Result<(), EncodeError> {
+        com().map_err(EncodeError)?;
         let subtype = subtype(f.codec)
             .ok_or_else(|| EncodeError(format!("Media Foundation has no {:?}", f.codec)))?;
         unsafe {
@@ -510,6 +540,7 @@ impl Driver for MfDriver {
     }
 
     fn set(&mut self, api: Api, v: Value) -> Result<(), EncodeError> {
+        com().map_err(EncodeError)?;
         let v = match v {
             Value::Bool(v) => VARIANT::from(v),
             Value::U32(v) => VARIANT::from(v),
@@ -520,6 +551,7 @@ impl Driver for MfDriver {
     }
 
     fn begin(&mut self) -> Result<(), EncodeError> {
+        com().map_err(EncodeError)?;
         unsafe {
             self.mft
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -533,7 +565,7 @@ impl Driver for MfDriver {
 
     /// One frame in, its output back: the MFT asks for the input, codes it and announces
     /// the output within [`FRAME_TIMEOUT`], or the frame fails. Output left over from a
-    /// failed frame (another sample time) is dropped.
+    /// failed frame (another or no sample time) is dropped.
     fn encode(&mut self, f: &FrameView<'_>) -> Result<Vec<u8>, EncodeError> {
         if (f.width, f.height) != self.size {
             return Err(EncodeError(format!(
@@ -558,7 +590,7 @@ impl Driver for MfDriver {
             self.frame += 1;
             loop {
                 if let Some((t, d)) = self.pump(deadline)? {
-                    if !d.is_empty() && t.is_none_or(|t| t == time) {
+                    if !d.is_empty() && t == Some(time) {
                         return Ok(d);
                     }
                 }

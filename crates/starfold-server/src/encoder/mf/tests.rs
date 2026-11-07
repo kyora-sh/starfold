@@ -375,3 +375,40 @@ fn verification_takes_the_encoders_own_key_frames() {
     let mut enc = session(Box::new(fake), &cfg(Codec::H264, 160, 160, 2000)).unwrap();
     assert!(crate::encoder::hw::sample(enc.as_mut(), 160, 160).is_err());
 }
+
+#[test]
+fn each_missing_parameter_set_is_filled_in_order() {
+    use crate::encoder::{hw, ColorInfo};
+    let color = ColorInfo::SRGB_BT601_LIMITED;
+    let mut s = hw::Stream::new("MF", Codec::Hevc, (320, 240), color, true);
+    let aud: &[u8] = &[0x46, 0x01, 0x10];
+    s.unit(bitstream(Codec::Hevc, true), 0, true).unwrap();
+    let partial = annexb(&[aud, HEVC_SPS, HEVC_PPS, &[0x26, 0x01, 0xaf]]);
+    let k = s.unit(partial, 1, true).unwrap().unwrap();
+    assert_eq!(
+        k.data,
+        annexb(&[aud, HEVC_VPS, HEVC_SPS, HEVC_PPS, &[0x26, 0x01, 0xaf]])
+    );
+}
+
+#[test]
+fn a_rejected_unit_keeps_the_headers_for_recovery() {
+    use crate::encoder::{hw, ColorInfo};
+    let color = ColorInfo::SRGB_BT601_LIMITED;
+    for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
+        let mut s = hw::Stream::new("MF", codec, (320, 240), color, true);
+        s.unit(bitstream(codec, true), 0, true).unwrap();
+        assert!(s.unit(bitstream(codec, false), 1, true).is_err());
+        let bare = match codec {
+            Codec::H264 => annexb(&[&[0x65, 0x88, 0x84]]),
+            Codec::Hevc => annexb(&[&[0x26, 0x01, 0xaf]]),
+            _ => vec![0x32, 0x01, 0x10],
+        };
+        let k = s.unit(bare, 2, true).unwrap().unwrap();
+        assert!(k.keyframe, "{codec:?}");
+        assert!(
+            k.config.is_some(),
+            "{codec:?}: the next IDR carries a config"
+        );
+    }
+}
