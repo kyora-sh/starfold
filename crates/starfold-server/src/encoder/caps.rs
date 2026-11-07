@@ -200,6 +200,11 @@ impl Probe {
 pub trait ProbeProvider: Send {
     fn backend(&self) -> Backend;
     fn probe(&self) -> Probe;
+    /// Ends on its own in bounded time (a child it kills at its own timeout), so the
+    /// registry waits for it past its deadline rather than leave it running.
+    fn bounded(&self) -> bool {
+        false
+    }
 }
 
 /// The host's encoders and what the probes said about the rest.
@@ -217,6 +222,7 @@ impl Registry {
     pub fn probe(providers: Vec<Box<dyn ProbeProvider>>, timeout: Duration) -> Registry {
         let (tx, rx) = mpsc::channel();
         let backends: Vec<Backend> = providers.iter().map(|p| p.backend()).collect();
+        let bounded: Vec<bool> = providers.iter().map(|p| p.bounded()).collect();
         for (i, p) in providers.into_iter().enumerate() {
             let sender = tx.clone();
             let spawned = std::thread::Builder::new()
@@ -234,11 +240,27 @@ impl Registry {
         drop(tx);
         let deadline = Instant::now() + timeout;
         let mut done: Vec<Option<Probe>> = backends.iter().map(|_| None).collect();
-        while done.iter().any(Option::is_none) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok((i, r)) => done[i] = Some(r),
-                Err(_) => break,
+        let mut late = false;
+        while done
+            .iter()
+            .zip(&bounded)
+            .any(|(d, &b)| d.is_none() && (b || !late))
+        {
+            let got = if late {
+                rx.recv().ok()
+            } else {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(r) => Some(r),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        late = true;
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            };
+            match got {
+                Some((i, r)) => done[i] = Some(r),
+                None => break,
             }
         }
         let mut reg = Registry::default();
@@ -359,12 +381,9 @@ pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbePr
     v
 }
 
-/// The whole startup probe; children get [`PROBE_TIMEOUT`] and a moment to be killed.
+/// The whole startup probe.
 pub fn host_probe(hardware: bool, experimental: bool) -> Registry {
-    Registry::probe(
-        host_providers(hardware, experimental),
-        PROBE_TIMEOUT + Duration::from_secs(2),
-    )
+    Registry::probe(host_providers(hardware, experimental), PROBE_TIMEOUT)
 }
 
 /// This platform's hardware probes, run in-process: the experimental ones only with

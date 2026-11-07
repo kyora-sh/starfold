@@ -6,8 +6,9 @@ use super::caps::{Diagnostic, EncoderCapability, Probe, ProbeProvider};
 use super::Backend;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(unix))]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ const VERSION: u32 = 1;
 const MAX_OUTPUT: u64 = 1 << 20;
 /// How long the child's output may stay open once it has exited or been killed.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// How long a killed child may take to exit.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 static SELF_EXEC: AtomicBool = AtomicBool::new(false);
 
@@ -34,22 +37,17 @@ pub fn child(backend: Backend, experimental: bool, timeout: Duration) -> Option<
     if !SELF_EXEC.load(Ordering::Relaxed) {
         return None;
     }
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("encoder probe in-process: no path to this executable ({e})");
-            return None;
-        }
-    };
     Some(Child {
         backend,
         command: Box::new(move || {
-            let mut cmd = Command::new(&exe);
+            let exe =
+                std::env::current_exe().map_err(|e| format!("no path to this executable: {e}"))?;
+            let mut cmd = Command::new(exe);
             cmd.arg(FLAG).arg(backend.name());
             if experimental {
                 cmd.arg("--experimental-hw-probes");
             }
-            cmd
+            Ok(cmd)
         }),
         timeout,
     })
@@ -114,7 +112,7 @@ fn report_sink() -> Box<dyn Write> {
 /// A backend probed by [`run`]ning a child.
 pub struct Child {
     pub backend: Backend,
-    pub command: Box<dyn Fn() -> Command + Send>,
+    pub command: Box<dyn Fn() -> Result<Command, String> + Send>,
     pub timeout: Duration,
 }
 
@@ -124,15 +122,23 @@ impl ProbeProvider for Child {
     }
 
     fn probe(&self) -> Probe {
-        run((self.command)(), self.backend, self.timeout)
+        match (self.command)() {
+            Ok(cmd) => run(cmd, self.backend, self.timeout),
+            Err(e) => Probe::failed(self.backend, format!("probe didn't start: {e}")),
+        }
+    }
+
+    fn bounded(&self) -> bool {
+        true
     }
 }
 
 /// Runs `cmd` and reads its report on `backend`. A child that is still running after
 /// `timeout` is killed and reaped; one that crashes, fails or prints something else
-/// leaves a diagnostic in place of encoders. On Unix the child leads its own process
-/// group, and whatever is left in that group is killed before the child is reaped, while
-/// its pid can't have been reused.
+/// leaves a diagnostic in place of encoders. Returns within `timeout` plus a few seconds.
+///
+/// On Unix the child leads its own process group, and whatever is left in that group is
+/// killed while the child is known to be unreaped, so its pid can't have been reused.
 pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -143,16 +149,22 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
         Ok(c) => c,
         Err(e) => return Probe::failed(backend, format!("probe didn't start: {e}")),
     };
-    let (tx, rx) = mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let r = stdout.take(MAX_OUTPUT + 1).read_to_end(&mut buf);
-            let _ = tx.send(r.map(|_| buf));
-        });
-    }
+    let mut out = match Output::new(child.stdout.take()) {
+        Ok(o) => o,
+        Err(e) => {
+            if finished(&mut child).is_ok() {
+                kill(&mut child);
+            }
+            let _ = reap(child);
+            return Probe::failed(backend, e);
+        }
+    };
     let deadline = Instant::now() + timeout;
     let late = loop {
+        out.pump();
+        if out.too_long() {
+            break Some(OutputError::TooLong.to_string());
+        }
         match finished(&mut child) {
             Ok(true) => break None,
             Ok(false) if Instant::now() >= deadline => {
@@ -162,28 +174,188 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
                 ))
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => break Some(format!("probe wait failed: {e}")),
+            Err(e) => return Probe::failed(backend, format!("probe wait failed: {e}")),
         }
     };
     kill(&mut child);
-    let status = child.wait();
+    let status = reap(child);
     if let Some(e) = late {
         return Probe::failed(backend, e);
     }
-    let status = match status {
-        Ok(s) => s,
-        Err(e) => return Probe::failed(backend, format!("probe wait failed: {e}")),
-    };
-    if !status.success() {
-        return Probe::failed(backend, exited(status));
+    let out = out.finish(CLOSE_GRACE);
+    if let Err(e @ OutputError::TooLong) = &out {
+        return Probe::failed(backend, e.to_string());
     }
-    let out = match rx.recv_timeout(CLOSE_GRACE) {
-        Ok(Ok(b)) if b.len() as u64 <= MAX_OUTPUT => b,
-        Ok(Ok(_)) => return Probe::failed(backend, "probe printed more than 1 MiB"),
-        Ok(Err(e)) => return Probe::failed(backend, format!("probe output: {e}")),
-        Err(_) => return Probe::failed(backend, "probe output stayed open after it exited"),
-    };
-    parse(&out, backend)
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Probe::failed(backend, exited(s)),
+        Err(e) => return Probe::failed(backend, e),
+    }
+    match out {
+        Ok(b) => parse(&b, backend),
+        Err(e) => Probe::failed(backend, e.to_string()),
+    }
+}
+
+/// Reaps a child that exited or was killed, waiting at most [`KILL_GRACE`]: one stuck in
+/// the kernel past that is left to a thread that reaps it whenever it does exit.
+fn reap(mut child: std::process::Child) -> Result<ExitStatus, String> {
+    let end = Instant::now() + KILL_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return Ok(s),
+            Ok(None) if Instant::now() >= end => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("probe wait failed: {e}")),
+        }
+    }
+    let pid = child.id();
+    let _ = std::thread::Builder::new()
+        .name("probe-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Err(format!(
+        "probe {pid} was killed but did not exit in {} s",
+        KILL_GRACE.as_secs()
+    ))
+}
+
+#[derive(Debug)]
+enum OutputError {
+    TooLong,
+    Read(std::io::Error),
+    Open,
+}
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputError::TooLong => write!(f, "probe printed more than {} KiB", MAX_OUTPUT >> 10),
+            OutputError::Read(e) => write!(f, "probe output: {e}"),
+            OutputError::Open => f.write_str("probe output stayed open after it exited"),
+        }
+    }
+}
+
+/// The child's stdout, read without blocking from the waiting loop, so a child never
+/// blocks on a full pipe and nothing is left reading once [`run`] returns.
+#[cfg(unix)]
+struct Output {
+    pipe: Option<ChildStdout>,
+    buf: Vec<u8>,
+    err: Option<OutputError>,
+}
+
+#[cfg(unix)]
+impl Output {
+    fn new(pipe: Option<ChildStdout>) -> Result<Output, String> {
+        if let Some(p) = &pipe {
+            use std::os::fd::AsRawFd;
+            let fd = p.as_raw_fd();
+            let ok = unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+            };
+            if !ok {
+                return Err(format!("probe output: {}", std::io::Error::last_os_error()));
+            }
+        }
+        Ok(Output {
+            pipe,
+            buf: Vec::new(),
+            err: None,
+        })
+    }
+
+    fn too_long(&self) -> bool {
+        matches!(self.err, Some(OutputError::TooLong))
+    }
+
+    /// Reads what the child has written so far; true once the pipe is closed.
+    fn pump(&mut self) -> bool {
+        let Some(p) = self.pipe.as_mut() else {
+            return true;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match p.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    if self.buf.len() as u64 > MAX_OUTPUT {
+                        self.err = Some(OutputError::TooLong);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.err = Some(OutputError::Read(e));
+                    break;
+                }
+            }
+        }
+        self.pipe = None;
+        true
+    }
+
+    fn finish(mut self, grace: Duration) -> Result<Vec<u8>, OutputError> {
+        let end = Instant::now() + grace;
+        while !self.pump() {
+            if Instant::now() >= end {
+                return Err(OutputError::Open);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self.err {
+            Some(e) => Err(e),
+            None => Ok(self.buf),
+        }
+    }
+}
+
+/// The child's stdout, read on a thread (Windows pipes don't poll).
+#[cfg(not(unix))]
+struct Output(Option<mpsc::Receiver<std::io::Result<Vec<u8>>>>);
+
+#[cfg(not(unix))]
+impl Output {
+    fn new(pipe: Option<ChildStdout>) -> Result<Output, String> {
+        let Some(pipe) = pipe else {
+            return Ok(Output(None));
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("probe-output".into())
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let r = pipe.take(MAX_OUTPUT + 1).read_to_end(&mut buf);
+                let _ = tx.send(r.map(|_| buf));
+            })
+            .map_err(|e| format!("no probe output thread: {e}"))?;
+        Ok(Output(Some(rx)))
+    }
+
+    fn pump(&mut self) -> bool {
+        false
+    }
+
+    fn too_long(&self) -> bool {
+        false
+    }
+
+    fn finish(self, grace: Duration) -> Result<Vec<u8>, OutputError> {
+        let Some(rx) = self.0 else {
+            return Ok(Vec::new());
+        };
+        match rx.recv_timeout(grace) {
+            Ok(Ok(b)) if b.len() as u64 <= MAX_OUTPUT => Ok(b),
+            Ok(Ok(_)) => Err(OutputError::TooLong),
+            Ok(Err(e)) => Err(OutputError::Read(e)),
+            Err(_) => Err(OutputError::Open),
+        }
+    }
 }
 
 /// The report in a child's output: its last line.
@@ -215,26 +387,34 @@ pub fn parse(out: &[u8], backend: Backend) -> Probe {
     }
 }
 
-/// Whether the child has exited, leaving it unreaped.
+/// Whether the child has exited, leaving it unreaped. An error (the child already reaped
+/// behind our back, as with an inherited `SIGCHLD` of `SIG_IGN`) means its pid is no
+/// longer ours to signal.
 #[cfg(unix)]
 fn finished(child: &mut std::process::Child) -> std::io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let r = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error());
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        #[cfg(target_os = "linux")]
+        let pid = unsafe { info.si_pid() };
+        #[cfg(not(target_os = "linux"))]
+        let pid = info.si_pid;
+        return Ok(pid != 0);
     }
-    #[cfg(target_os = "linux")]
-    let pid = unsafe { info.si_pid() };
-    #[cfg(not(target_os = "linux"))]
-    let pid = info.si_pid;
-    Ok(pid != 0)
 }
 
 #[cfg(not(unix))]
@@ -258,7 +438,7 @@ fn kill(child: &mut std::process::Child) {
 }
 
 #[cfg(unix)]
-fn exited(s: std::process::ExitStatus) -> String {
+fn exited(s: ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
     match (s.signal(), s.code()) {
         (Some(sig), _) => format!("probe exited with signal {sig}"),
@@ -268,7 +448,7 @@ fn exited(s: std::process::ExitStatus) -> String {
 }
 
 #[cfg(not(unix))]
-fn exited(s: std::process::ExitStatus) -> String {
+fn exited(s: ExitStatus) -> String {
     match s.code() {
         Some(c) => format!("probe exited with status {c:#x}"),
         None => format!("probe exited ({s})"),

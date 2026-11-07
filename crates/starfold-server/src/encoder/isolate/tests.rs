@@ -34,7 +34,7 @@ fn sh(script: &str) -> Command {
 fn child(backend: Backend, script: String, timeout: Duration) -> Child {
     Child {
         backend,
-        command: Box::new(move || sh(&script)),
+        command: Box::new(move || Ok(sh(&script))),
         timeout,
     }
 }
@@ -247,4 +247,48 @@ fn crashed_childs_leftovers_are_killed() {
         .unwrap();
     assert!(gone_soon(pid), "pid {pid} outlived the crashed probe");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn unbuildable_command_is_a_diagnostic() {
+    let c = Child {
+        backend: Backend::Nvenc,
+        command: Box::new(|| Err("no path to this executable: gone".into())),
+        timeout: Duration::from_secs(1),
+    };
+    assert!(c.bounded());
+    let p = c.probe();
+    assert_eq!(
+        reason(&p),
+        "probe didn't start: no path to this executable: gone"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn flooding_child_is_cut_off() {
+    let t = Instant::now();
+    let p = run(
+        sh("head -c 4000000 /dev/zero; sleep 60"),
+        Backend::Vaapi,
+        Duration::from_secs(20),
+    );
+    assert_eq!(reason(&p), "probe printed more than 1024 KiB");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+}
+
+/// A process that left the child's process group and kept its stdout costs the grace
+/// period, not a reader blocked for as long as it lives.
+#[cfg(target_os = "linux")]
+#[test]
+fn output_held_open_by_an_escaped_process() {
+    let line = report(Backend::Vaapi, vec![good(Backend::Vaapi)]);
+    let t = Instant::now();
+    let p = run(
+        sh(&format!("setsid sleep 4 & echo '{line}'")),
+        Backend::Vaapi,
+        Duration::from_secs(10),
+    );
+    assert_eq!(reason(&p), "probe output stayed open after it exited");
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
 }
