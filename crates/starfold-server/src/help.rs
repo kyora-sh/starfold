@@ -25,6 +25,9 @@ Login:
 
 Video:
   --framerate                   max frames per second (default 60)
+  --high-fps                    up to 120 frames per second on hardware
+                                VideoToolbox; other encoders take 60 at most
+                                (default false)
   --crf                         base quality (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
                                 (default 30000, 2000)

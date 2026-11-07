@@ -226,7 +226,12 @@ async fn serve(a: HashMap<String, String>) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
+        high_fps: truthy(a.get("high-fps"), false),
+        source_fps: 0,
     };
+    if let Some(w) = video::fps_warning(vcfg.fps, vcfg.high_fps, encoder.name()) {
+        log::warn!("{w}");
+    }
     let clip = a
         .get("enable-clipboard")
         .map(|s| s.as_str())
@@ -300,6 +305,15 @@ async fn serve(a: HashMap<String, String>) {
             if c.hardware { "hardware" } else { "software" }
         );
     }
+    let vcfg = video::VideoConfig {
+        source_fps: match cfg!(target_os = "macos") {
+            true => video::source_fps(&vcfg, &candidates),
+            false => 0,
+        },
+        ..vcfg
+    };
+    #[cfg(target_os = "macos")]
+    mac::set_fps(vcfg.source_fps);
     if let Err(e) = video::spawn(vcfg, hub.clone(), screen, candidates) {
         log::error!("video init failed: {e}");
         std::process::exit(1);

@@ -41,6 +41,54 @@ pub struct VideoConfig {
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
+    pub high_fps: bool,
+    /// The rate the screen source delivers pictures at by itself (0: as fast as the capture
+    /// loop asks).
+    pub source_fps: u32,
+}
+
+/// With --high-fps, the rate a cohort may take frames at on a hardware encoder measured there.
+pub const HIGH_FPS: u32 = 120;
+/// With --high-fps, the most the other encoders take; without it, what was measured.
+const BASE_FPS: u32 = 60;
+
+/// Whether `cand` may run at HIGH_FPS: so far only VideoToolbox in hardware is measured there.
+fn high_fps_eligible(cand: Candidate) -> bool {
+    cand.hardware && cand.backend == encoder::Backend::VideoToolbox
+}
+
+/// The rate a cohort falls back to when its encodes can't keep up with its cap.
+fn base_fps(cfg: &VideoConfig) -> u32 {
+    if cfg.high_fps {
+        cfg.fps.min(BASE_FPS)
+    } else {
+        cfg.fps
+    }
+}
+
+/// The most a cohort encoding with `cand` takes frames at.
+fn fps_cap(cfg: &VideoConfig, cand: Candidate) -> u32 {
+    if cfg.high_fps && high_fps_eligible(cand) {
+        cfg.fps.max(HIGH_FPS)
+    } else {
+        base_fps(cfg)
+    }
+}
+
+/// The rate a source that paces itself should deliver at: the most any of `cands` takes.
+pub fn source_fps(cfg: &VideoConfig, cands: &[Candidate]) -> u32 {
+    cands
+        .iter()
+        .map(|&c| fps_cap(cfg, c))
+        .max()
+        .unwrap_or(cfg.fps)
+}
+
+/// The startup warning for a --framerate nobody measured.
+pub fn fps_warning(fps: u32, high_fps: bool, encoder: &str) -> Option<String> {
+    (fps > BASE_FPS && !high_fps).then(|| {
+        format!("unmeasured above {BASE_FPS} fps on {encoder}; use --high-fps on VideoToolbox")
+    })
 }
 
 /// Opens an encoder: `encoder::open`, or a fake in tests.
@@ -235,6 +283,10 @@ struct Shared {
     /// budget and at the ladder's.
     refinable: AtomicBool,
     refinable_small: AtomicBool,
+    /// The most this cohort takes frames at: its cap until encodes can't keep up, then
+    /// `base_fps` until the encoder reopens.
+    fps: AtomicU32,
+    base_fps: u32,
     w: u32,
     h: u32,
 }
@@ -246,6 +298,22 @@ const FAIL_AFTER: u32 = 3;
 const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 impl Shared {
+    /// A motion frame took `ms` to encode at `now`. Encodes that keep missing the cap's
+    /// frame interval drop the cohort to its base rate, for good: winning the cap back
+    /// mid-session isn't worth oscillating between the two.
+    fn encoded(&self, watch: &mut SlowWatch, ms: f64, now: Instant) {
+        let fps = self.fps.load(Ordering::Acquire);
+        if fps > self.base_fps && watch.note(ms, fps, now) {
+            self.fps.store(self.base_fps, Ordering::Release);
+            log::info!(
+                "cohort {}: {fps} -> {} fps (encode {:.1} ms)",
+                self.id,
+                self.base_fps,
+                watch.ewma_ms.unwrap_or(ms)
+            );
+        }
+    }
+
     /// A stripe keeps failing: keyframes are no longer a way to recover quickly.
     fn degraded(&self) -> bool {
         self.failures.load(Ordering::Acquire) >= FAIL_AFTER
@@ -296,6 +364,40 @@ impl Shared {
     }
 }
 
+/// Encodes averaging more than this share of the frame interval can't keep up with the cap.
+const SLOW_SHARE: f64 = 0.8;
+/// For this long.
+const SLOW_FOR: Duration = Duration::from_secs(2);
+
+/// Motion encode times against a cap's frame interval.
+#[derive(Default)]
+struct SlowWatch {
+    ewma_ms: Option<f64>,
+    over_since: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl SlowWatch {
+    /// True once encodes have been too slow for `fps` for SLOW_FOR; a pause of a second
+    /// or more starts the count over.
+    fn note(&mut self, ms: f64, fps: u32, now: Instant) -> bool {
+        let e = self.ewma_ms.map_or(ms, |e| e * 0.8 + ms * 0.2);
+        self.ewma_ms = Some(e);
+        if self
+            .last
+            .is_some_and(|l| now.saturating_duration_since(l) >= Duration::from_secs(1))
+        {
+            self.over_since = None;
+        }
+        self.last = Some(now);
+        if e <= SLOW_SHARE * 1000.0 / fps.max(1) as f64 {
+            self.over_since = None;
+            return false;
+        }
+        now.saturating_duration_since(*self.over_since.get_or_insert(now)) >= SLOW_FOR
+    }
+}
+
 /// One encoder per stripe for one candidate, on its own thread.
 struct Cohort {
     shared: Arc<Shared>,
@@ -309,6 +411,8 @@ struct Cohort {
     viewers: Vec<u64>,
     refine: Refinement,
     pace: Pace,
+    /// The capture this cohort last took a frame from.
+    last_take: Option<Instant>,
 }
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
@@ -364,6 +468,10 @@ impl Pace {
 }
 
 impl Cohort {
+    fn fps(&self) -> u32 {
+        self.shared.fps.load(Ordering::Acquire)
+    }
+
     /// Whether what was encoded so far has reached this cohort's viewers. One that hasn't
     /// answered for a while holds back nobody: flow control deals with it.
     fn drained(&self, v: &View) -> bool {
@@ -407,18 +515,19 @@ fn encoder_config(
     height: u32,
     stripes: usize,
 ) -> EncoderConfig {
+    let fps = fps_cap(cfg, cand);
     EncoderConfig {
         backend: cand.backend,
         codec: cand.codec,
         width,
         height,
-        fps: cfg.fps,
+        fps,
         threads: if cfg.adaptive_threads {
             1
         } else {
             (cfg.threads / stripes as u32).max(1)
         },
-        rate: RateConfig::new(cfg.crf, cfg.max_kbps, cfg.fps),
+        rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,
         preset: cfg.preset.clone(),
     }
@@ -464,7 +573,7 @@ fn sample(
     } else {
         stripe_share(START_KBPS.min(cfg.max_kbps as f64) as u32, n)
     };
-    enc.set_rate(keyframe_rate(cfg.crf, target, cfg.fps))?;
+    enc.set_rate(keyframe_rate(cfg.crf, target, ecfg.fps))?;
     let (w, h) = (ecfg.width as usize, ecfg.height as usize);
     let (y, uv) = (
         vec![128u8; w * h],
@@ -747,6 +856,7 @@ impl Engine {
             });
         }
         let rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
+        let fps = fps_cap(&self.cfg, cand);
         let shared = Arc::new(Shared {
             id: self.hub.next_cohort.fetch_add(1, Ordering::Relaxed),
             cand,
@@ -760,6 +870,8 @@ impl Engine {
             paintover_bytes: AtomicU64::new(0),
             refinable: AtomicBool::new(true),
             refinable_small: AtomicBool::new(true),
+            fps: AtomicU32::new(fps),
+            base_fps: base_fps(&self.cfg),
             w: self.w,
             h: self.h,
         });
@@ -780,6 +892,9 @@ impl Engine {
             self.w,
             self.h
         );
+        if fps > shared.base_fps {
+            log::info!("cohort {}: up to {fps} fps (--high-fps)", shared.id);
+        }
         Ok(Cohort {
             shared,
             tx: Some(tx),
@@ -789,7 +904,8 @@ impl Engine {
             active: false,
             viewers: Vec::new(),
             refine: Refinement::new(&self.cfg, cand.backend.refines_by_qp(), self.w, self.h),
-            pace: Pace::new(self.cfg.fps),
+            pace: Pace::new(fps),
+            last_take: None,
         })
     }
 
@@ -986,6 +1102,7 @@ impl Engine {
                     "hardware": s.cand.hardware,
                     "viewers": self.hub.cohort_clients(s.id).len(),
                     "target_kbps": s.target.load(Ordering::Relaxed),
+                    "fps": c.fps(),
                     "stripes": s.offer.lock().stripes,
                 })
             })
@@ -1058,16 +1175,54 @@ impl Engine {
         self.hub.target_kbps.store(shown, Ordering::Relaxed);
     }
 
-    /// Which cohorts take the next capture: those with viewers, room in their queue, and
-    /// either a keyframe owed or their viewers keeping up.
+    /// The rate captures can come at: the capture's own, or the source's when faster.
+    fn arrival_fps(&self, views: &[View]) -> u32 {
+        self.capture_fps(views).max(self.cfg.source_fps)
+    }
+
+    /// The rate the capture runs at: the highest cap of a cohort with viewers.
+    fn capture_fps(&self, views: &[View]) -> u32 {
+        self.cohorts
+            .iter()
+            .zip(views)
+            .filter(|(_, v)| !v.clients.is_empty())
+            .map(|(c, _)| c.fps())
+            .max()
+            .unwrap_or(self.cfg.fps)
+    }
+
+    /// Which cohorts could take the next capture: those with viewers, room in their queue,
+    /// and either a keyframe owed or their viewers keeping up. A cohort capped below the
+    /// capture's `interval_ms` keeps up at its own cap's interval.
     fn takes(&self, views: &[View], interval_ms: f64) -> Vec<bool> {
+        let capture = self.arrival_fps(views);
         self.cohorts
             .iter()
             .zip(views)
             .map(|(c, v)| {
+                let ms = match c.fps() < capture {
+                    true => 1000.0 / c.fps().max(1) as f64,
+                    false => interval_ms,
+                };
                 !v.clients.is_empty()
                     && c.shared.busy.load(Ordering::Acquire) < 2
-                    && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, interval_ms))
+                    && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, ms))
+            })
+            .collect()
+    }
+
+    /// Cohorts capped below the capture rate whose last frame is too recent for their cap
+    /// (with the capture's early allowance).
+    fn early(&self, views: &[View], now: Instant) -> Vec<bool> {
+        let capture = self.arrival_fps(views);
+        self.cohorts
+            .iter()
+            .map(|c| {
+                let fps = c.fps();
+                fps < capture
+                    && c.last_take.is_some_and(|t| {
+                        now.saturating_duration_since(t).as_secs_f64() < 0.85 / fps.max(1) as f64
+                    })
             })
             .collect()
     }
@@ -1075,14 +1230,20 @@ impl Engine {
     /// What this turn of the capture loop has to do besides any new damage.
     fn turn(&mut self, views: &[View], interval_ms: f64, now: Instant) -> Turn {
         self.update_refinement(views, now);
-        let takes = self.takes(views, interval_ms);
-        let passes = self.passes(views, &takes, now);
-        let catch_up = self.catch_up_due(&takes);
+        let ready = self.takes(views, interval_ms);
+        let early = self.early(views, now);
+        let takes: Vec<bool> = ready.iter().zip(&early).map(|(&r, &e)| r && !e).collect();
+        let due = self.passes(views, &ready, now);
+        let passes: Vec<bool> = due.iter().zip(&early).map(|(&p, &e)| p && !e).collect();
+        let catch_up = self.catch_up_due(&ready);
         Turn {
             want_key: views.iter().any(|v| v.want_key),
             catch_up,
+            paced: ready.iter().zip(&early).any(|(&r, &e)| r && e),
+            pass_paced: due.iter().zip(&early).any(|(&p, &e)| p && e),
             takes,
             passes,
+            at: now,
         }
     }
 
@@ -1160,7 +1321,6 @@ impl Engine {
             self.moved(views, now);
         }
         let input_at = *self.hub.input_at.lock();
-        let max_fps = self.cfg.fps;
         // While someone types, frames keep the full rate's budget: a key never waits behind a
         // frame sized for a slower rate. Pointer and wheel motion keep the rate frames are taken at.
         let typing = self
@@ -1181,6 +1341,7 @@ impl Engine {
                 continue;
             }
             let force = v.want_key;
+            let max_fps = c.fps();
             let Some((mut frame, step)) = c.refine.plan(f, force, c.skipped.is_some(), pass) else {
                 continue;
             };
@@ -1200,9 +1361,14 @@ impl Engine {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
-                fps: if typing { max_fps } else { c.pace.fps },
+                fps: if typing {
+                    max_fps
+                } else {
+                    c.pace.fps.min(max_fps)
+                },
             }) {
                 Ok(()) => {
+                    c.last_take = Some(turn.at);
                     if motion {
                         c.pace.took(now, max_fps, c.shared.id);
                     }
@@ -1229,12 +1395,17 @@ struct Turn {
     passes: Vec<bool>,
     want_key: bool,
     catch_up: bool,
+    /// A cohort would take this capture but for its cap.
+    paced: bool,
+    /// A cohort has a pass due but for its cap.
+    pass_paced: bool,
+    at: Instant,
 }
 
 impl Turn {
     /// Something is due even if nothing changed on screen.
     fn work(&self) -> bool {
-        self.want_key || self.catch_up || self.passes.contains(&true)
+        self.want_key || self.catch_up || self.pass_paced || self.passes.contains(&true)
     }
 }
 
@@ -1935,11 +2106,8 @@ fn capture_loop(
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool = Pool::new(w, h, cap.full());
-    let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-    // Allow slight early capture so source jitter doesn't alias into dropped frames.
-    let min_interval = interval.mul_f64(0.85);
-    let interval_ms = interval.as_secs_f64() * 1000.0;
-    let mut last_capture = Instant::now() - interval;
+    let mut fps = cfg.fps;
+    let mut last_capture = Instant::now() - Duration::from_secs(1);
     let mut had_clients = false;
     let mut full_next = true;
     let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
@@ -1989,6 +2157,15 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
+        let want = eng.capture_fps(&views);
+        if want != fps {
+            log::info!("capture {fps} -> {want} fps");
+            fps = want;
+        }
+        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        // Allow slight early capture so source jitter doesn't alias into dropped frames.
+        let min_interval = interval.mul_f64(0.85);
+        let interval_ms = interval.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let turn = eng.turn(&views, interval_ms, now);
         if !cap.damaged && !turn.work() {
@@ -2018,7 +2195,9 @@ fn capture_loop(
             }
         }
         if !turn.takes.contains(&true) {
-            hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
+            if !turn.paced {
+                hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
+            }
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
         }
@@ -2152,6 +2331,8 @@ struct StripeJob {
     cap: u32,
     refine: Option<PassBudget>,
     fps: u32,
+    /// The cohort's cap: the encoder's opening rate and the governor's frame budget.
+    max_fps: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -2278,6 +2459,11 @@ fn stripe_worker(
         predicted_ms: 0.0,
     };
     while let Ok(job) = rx.recv() {
+        if job.max_fps != s.cfg.fps {
+            s.cfg.fps = job.max_fps;
+            s.cfg.rate.fps = job.max_fps;
+            gov.budget_ms = 1000.0 / job.max_fps.max(1) as f64;
+        }
         let buf = &*job.buf;
         // A frame at a fixed QP is outside rate control; leave its budget alone.
         let refine = job
@@ -2461,6 +2647,7 @@ fn encode_loop(
         stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
     // Consecutive failed encodes per stripe; a stripe not asked to encode hasn't recovered.
     let mut fails = vec![0u32; n];
+    let mut slow = SlowWatch::default();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
         .into_iter()
@@ -2548,6 +2735,7 @@ fn encode_loop(
                     cap,
                     refine,
                     fps,
+                    max_fps: sh.fps.load(Ordering::Acquire),
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
@@ -2633,6 +2821,9 @@ fn encode_loop(
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
+        if !force_idr && !paintover && refine_qp.is_none() && !parts.iter().any(|p| p.1) {
+            sh.encoded(&mut slow, enc_us as f64 / 1000.0, Instant::now());
+        }
         let total: usize = parts.iter().map(|p| p.2.len()).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
