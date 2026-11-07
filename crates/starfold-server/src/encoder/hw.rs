@@ -59,14 +59,14 @@ const TD: [u8; 2] = [0x12, 0x00];
 
 enum Units {
     H264(ParamSets),
-    Hevc(hevc::Units),
+    Hevc(hevc::Units, [Option<Vec<u8>>; 3]),
     Av1(Option<Vec<u8>>),
 }
 
 impl Units {
     fn new(codec: Codec, (w, h): (u32, u32)) -> Units {
         match codec {
-            Codec::Hevc => Units::Hevc(hevc::Units::new(w, h)),
+            Codec::Hevc => Units::Hevc(hevc::Units::new(w, h), Default::default()),
             Codec::Av1 => Units::Av1(None),
             _ => Units::H264(ParamSets::default()),
         }
@@ -130,7 +130,7 @@ impl Stream {
         let (name, codec) = (self.name, self.codec);
         let au = match &mut self.units {
             Units::H264(p) => p.unit(data, pts_ms, self.size, self.color),
-            Units::Hevc(u) => u.unit(data, pts_ms),
+            Units::Hevc(u, sets) => u.unit(hevc_complete(sets, data), pts_ms),
             Units::Av1(seq) => av1_unit(name, seq, data, pts_ms, self.size, self.color)?,
         };
         let kind = |k: bool| if k { "an IDR" } else { "a P frame" };
@@ -156,8 +156,35 @@ impl Stream {
     }
 }
 
+/// `data` with the last VPS, SPS and PPS seen in front when it starts a stream a decoder
+/// can join but carries none of them.
+fn hevc_complete(sets: &mut [Option<Vec<u8>>; 3], data: Vec<u8>) -> Vec<u8> {
+    let (mut has, mut random_access) = ([false; 3], false);
+    for n in super::h264::nal_units(&data).filter(|n| n.len() >= 2) {
+        let t = hevc::nal_type(n);
+        random_access |= hevc::is_random_access(t);
+        if let Some(i) = [hevc::NAL_VPS, hevc::NAL_SPS, hevc::NAL_PPS]
+            .iter()
+            .position(|&k| k == t)
+        {
+            has[i] = true;
+            sets[i] = Some(n.to_vec());
+        }
+    }
+    if !random_access || has.iter().any(|&h| h) || sets.iter().any(Option::is_none) {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len() + 64);
+    for s in sets.iter().flatten() {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(s);
+    }
+    out.extend(data);
+    out
+}
+
 /// One AV1 temporal unit, a temporal delimiter put in front where it has none; a key
-/// frame needs a sequence header.
+/// frame without a sequence header gets the last one seen.
 pub fn av1_unit(
     name: &str,
     seq: &mut Option<Vec<u8>>,
@@ -174,6 +201,22 @@ pub fn av1_unit(
         tu.extend_from_slice(&TD);
     }
     tu.extend(data);
+    if av1::sequence_header(&tu).is_none() && tu.starts_with(&TD) {
+        if let Some(s) = seq.as_ref() {
+            let mut obu = vec![0x0a];
+            let mut n = s.len();
+            loop {
+                let b = (n & 0x7f) as u8;
+                n >>= 7;
+                obu.push(if n > 0 { b | 0x80 } else { b });
+                if n == 0 {
+                    break;
+                }
+            }
+            obu.extend_from_slice(s);
+            tu.splice(TD.len()..TD.len(), obu);
+        }
+    }
     let key = av1::frame_type(&tu)
         .ok_or_else(|| EncodeError(format!("{name} AV1 output has no frame")))?
         == 0;
@@ -267,6 +310,17 @@ pub fn sample_config(
 
 /// Encodes an IDR and a P frame of flat grey with `enc`.
 pub fn sample(enc: &mut dyn VideoEncoder, width: u32, height: u32) -> Result<(), EncodeError> {
+    sample_with(enc, width, height, false)
+}
+
+/// [`sample`] for an encoder that may code its own key frames: the P frame may come out
+/// as one.
+pub fn sample_with(
+    enc: &mut dyn VideoEncoder,
+    width: u32,
+    height: u32,
+    extra_keyframes: bool,
+) -> Result<(), EncodeError> {
     let (w, h) = (width as usize, height as usize);
     let (y, uv) = (
         vec![128u8; w * h],
@@ -290,7 +344,10 @@ pub fn sample(enc: &mut dyn VideoEncoder, width: u32, height: u32) -> Result<(),
                 ..Default::default()
             },
         )?;
-        if aus.len() != 1 || aus[0].keyframe != key || (key && aus[0].config.is_none()) {
+        let kind_ok = aus
+            .first()
+            .is_some_and(|a| a.keyframe == key || (extra_keyframes && a.keyframe));
+        if aus.len() != 1 || !kind_ok || (key && aus[0].config.is_none()) {
             return Err(EncodeError(format!(
                 "sample {} came out as {} unit(s)",
                 if key { "IDR" } else { "P frame" },

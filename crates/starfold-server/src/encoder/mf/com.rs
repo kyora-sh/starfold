@@ -232,9 +232,11 @@ unsafe fn d3d(mf: &Mf, luid: Option<u64>) -> Result<IMFDXGIDeviceManager, Encode
     )
     .map_err(|e| err("D3D11CreateDevice", e))?;
     let device = device.ok_or_else(|| EncodeError("D3D11CreateDevice returned nothing".into()))?;
-    if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-        let _ = mt.SetMultithreadProtected(true);
-    }
+    let mt: ID3D11Multithread = device
+        .GetImmediateContext()
+        .and_then(|c| c.cast())
+        .map_err(|e| err("ID3D11Multithread", e))?;
+    let _ = mt.SetMultithreadProtected(true);
     let mut token = 0u32;
     let mut p = std::ptr::null_mut();
     (mf.device_manager)(&mut token, &mut p)
@@ -246,6 +248,9 @@ unsafe fn d3d(mf: &Mf, luid: Option<u64>) -> Result<IMFDXGIDeviceManager, Encode
         .map_err(|e| err("IMFDXGIDeviceManager::ResetDevice", e))?;
     Ok(manager)
 }
+
+/// One output sample: its time, where the MFT kept it, and its bytes.
+type Output = (Option<i64>, Vec<u8>);
 
 /// One hardware MFT, unlocked for asynchronous use and fed system-memory NV12 samples
 /// one frame at a time.
@@ -328,17 +333,17 @@ impl MfDriver {
     }
 
     /// Handles the next transform event: a need-input credit, or the output one
-    /// announces. An error once `deadline` passes without one.
-    unsafe fn pump(&mut self, deadline: Instant) -> Result<Option<Vec<u8>>, EncodeError> {
+    /// announces with its sample time. An error once `deadline` passes.
+    unsafe fn pump(&mut self, deadline: Instant) -> Result<Option<Output>, EncodeError> {
         loop {
+            if Instant::now() >= deadline {
+                return Err(EncodeError(format!(
+                    "Media Foundation MFT took longer than {FRAME_TIMEOUT:?} for a frame"
+                )));
+            }
             let ev = match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                 Ok(ev) => ev,
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if Instant::now() >= deadline {
-                        return Err(EncodeError(format!(
-                            "Media Foundation MFT gave no event within {FRAME_TIMEOUT:?}"
-                        )));
-                    }
                     std::thread::sleep(POLL);
                     continue;
                 }
@@ -362,7 +367,7 @@ impl MfDriver {
         }
     }
 
-    unsafe fn output(&mut self) -> Result<Vec<u8>, EncodeError> {
+    unsafe fn output(&mut self) -> Result<Output, EncodeError> {
         let info = self
             .mft
             .GetOutputStreamInfo(self.ids.1)
@@ -393,7 +398,7 @@ impl MfDriver {
                 self.mft
                     .SetOutputType(self.ids.1, &t, 0)
                     .map_err(|e| err("IMFTransform::SetOutputType", e))?;
-                return Ok(Vec::new());
+                return Ok((None, Vec::new()));
             }
             Err(e) => return Err(err("IMFTransform::ProcessOutput", e)),
             Ok(()) => {}
@@ -413,7 +418,7 @@ impl MfDriver {
             std::slice::from_raw_parts(p, n as usize).to_vec()
         };
         let _ = buf.Unlock();
-        Ok(data)
+        Ok((sample.GetSampleTime().ok(), data))
     }
 
     /// A sample with one `size`-byte memory buffer.
@@ -506,6 +511,7 @@ impl Driver for MfDriver {
 
     fn set(&mut self, api: Api, v: Value) -> Result<(), EncodeError> {
         let v = match v {
+            Value::Bool(v) => VARIANT::from(v),
             Value::U32(v) => VARIANT::from(v),
             Value::U64(v) => VARIANT::from(v),
         };
@@ -527,7 +533,7 @@ impl Driver for MfDriver {
 
     /// One frame in, its output back: the MFT asks for the input, codes it and announces
     /// the output within [`FRAME_TIMEOUT`], or the frame fails. Output left over from a
-    /// failed frame is dropped while waiting for the input request.
+    /// failed frame (another sample time) is dropped.
     fn encode(&mut self, f: &FrameView<'_>) -> Result<Vec<u8>, EncodeError> {
         if (f.width, f.height) != self.size {
             return Err(EncodeError(format!(
@@ -539,6 +545,9 @@ impl Driver for MfDriver {
         let deadline = Instant::now() + FRAME_TIMEOUT;
         unsafe {
             let sample = self.input(f)?;
+            let time = sample
+                .GetSampleTime()
+                .map_err(|e| err("IMFSample::GetSampleTime", e))?;
             while self.need_input == 0 {
                 self.pump(deadline)?;
             }
@@ -548,8 +557,10 @@ impl Driver for MfDriver {
             self.need_input -= 1;
             self.frame += 1;
             loop {
-                if let Some(d) = self.pump(deadline)?.filter(|d| !d.is_empty()) {
-                    return Ok(d);
+                if let Some((t, d)) = self.pump(deadline)? {
+                    if !d.is_empty() && t.is_none_or(|t| t == time) {
+                        return Ok(d);
+                    }
                 }
             }
         }

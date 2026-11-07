@@ -57,7 +57,7 @@ impl Session {
             bps: if rc.cbr { rc.bps } else { UNCAPPED_BPS },
         })?;
         let d = drv.as_mut();
-        set(d, Api::LowLatency, Value::U32(1))?;
+        set(d, Api::LowLatency, Value::Bool(true))?;
         set(
             d,
             Api::RateControl,

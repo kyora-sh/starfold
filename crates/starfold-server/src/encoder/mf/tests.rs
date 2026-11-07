@@ -174,7 +174,7 @@ fn h264_low_latency_cbr_with_an_idr_on_request() {
                 fps: 30,
                 bps: 6_000_000,
             }),
-            Call::Set(Api::LowLatency, Value::U32(1)),
+            Call::Set(Api::LowLatency, Value::Bool(true)),
             Call::Set(Api::RateControl, Value::U32(RC_CBR)),
             Call::Set(Api::MeanBitRate, Value::U32(6_000_000)),
             Call::Set(Api::MaxBitRate, Value::U32(6_000_000)),
@@ -329,4 +329,49 @@ fn the_encoders_own_key_frames_pass_but_a_p_frame_for_an_idr_does_not() {
         let e = try_encode(enc.as_mut(), 320, 240, true).err().unwrap();
         assert!(e.0.contains("asked for an IDR"), "{codec:?}: {e}");
     }
+}
+
+#[test]
+fn key_frames_without_headers_get_the_last_ones() {
+    use crate::encoder::{av1, hw, ColorInfo};
+    let color = ColorInfo::SRGB_BT601_LIMITED;
+    let mut s = hw::Stream::new("MF", Codec::Hevc, (320, 240), color, true);
+    s.unit(bitstream(Codec::Hevc, true), 0, true).unwrap();
+    let bare = annexb(&[&[0x26, 0x01, 0xaf]]);
+    let k = s.unit(bare, 1, true).unwrap().unwrap();
+    assert!(k.keyframe && k.config.is_none());
+    assert_eq!(
+        k.data,
+        annexb(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, &[0x26, 0x01, 0xaf]])
+    );
+    let p = s
+        .unit(bitstream(Codec::Hevc, false), 2, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        p.data,
+        bitstream(Codec::Hevc, false),
+        "P frames stay as they are"
+    );
+
+    let mut s = hw::Stream::new("MF", Codec::Av1, (320, 240), color, true);
+    s.unit(bitstream(Codec::Av1, true), 0, true).unwrap();
+    let k = s.unit(vec![0x32, 0x01, 0x10], 1, true).unwrap().unwrap();
+    assert!(k.keyframe && k.config.is_none());
+    assert_eq!(av1::sequence_header(&k.data), Some(AV1_SEQ));
+    assert_eq!(&k.data[..2], &[0x12, 0x00]);
+    let mut fresh = hw::Stream::new("MF", Codec::Av1, (320, 240), color, true);
+    assert!(fresh.unit(vec![0x32, 0x01, 0x10], 0, true).is_err());
+}
+
+#[test]
+fn verification_takes_the_encoders_own_key_frames() {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.own_key = Some(1);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 160, 160, 2000)).unwrap();
+    crate::encoder::hw::sample_with(enc.as_mut(), 160, 160, true).unwrap();
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.own_key = Some(1);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 160, 160, 2000)).unwrap();
+    assert!(crate::encoder::hw::sample(enc.as_mut(), 160, 160).is_err());
 }

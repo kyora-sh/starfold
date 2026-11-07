@@ -24,7 +24,8 @@ pub(super) fn session(
 #[cfg(windows)]
 mod windows_impl {
     use super::super::caps::{
-        Acceleration, EncoderCapability, Probe as Found, ProbeProvider, ProbeStatus,
+        Acceleration, Chroma, EncoderCapability, Probe as Found, ProbeProvider, ProbeStatus,
+        ProfileCapability,
     };
     use super::super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
     use super::com::{self, MfDriver};
@@ -102,10 +103,16 @@ mod windows_impl {
             SAMPLE_SIDE,
             30,
         );
-        let r =
-            open_on(a, &cfg).and_then(|mut enc| hw::sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE));
+        let r = open_on(a, &cfg)
+            .and_then(|mut enc| hw::sample_with(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE, true));
         match r {
             Ok(()) => {
+                let profile = if c.codec == Codec::H264 {
+                    "high"
+                } else {
+                    "main"
+                };
+                c.profiles = vec![ProfileCapability::new(profile, 8, Chroma::Yuv420)];
                 c.status = ProbeStatus::Verified;
                 c.low_latency = Some(true);
                 c.keyframe_control = Some(true);
@@ -149,6 +156,6 @@ mod windows_impl {
             .find(|(d, _)| *d == device)
             .ok_or_else(|| format!("no MFT {device}"))?;
         let mut enc = open_on(&a, &cfg)?;
-        hw::sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
+        hw::sample_with(enc.as_mut(), cfg.width, cfg.height, true).map_err(String::from)
     }
 }

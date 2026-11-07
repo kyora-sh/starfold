@@ -24,6 +24,7 @@ pub const RC_QUALITY: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value {
+    Bool(bool),
     U32(u32),
     U64(u64),
 }
