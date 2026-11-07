@@ -93,8 +93,22 @@ pub struct Report {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// The child's side, given the arguments after [`FLAG`]; returns the exit code.
+/// What the parent writes on a child's stdin once the child can't outlive it.
+pub const GO: u8 = b'g';
+/// The exit code of a child whose stdin closed without [`GO`].
+pub const NO_GO: i32 = 3;
+
+/// The child's side, given the arguments after [`FLAG`]; returns the exit code. It does
+/// nothing before [`GO`] arrives: no probing, spawning or library loading.
 pub fn child_main(args: &[String]) -> i32 {
+    let mut go = [0u8];
+    if std::io::stdin().read_exact(&mut go).is_err() || go != [GO] {
+        return NO_GO;
+    }
+    probe_main(args)
+}
+
+fn probe_main(args: &[String]) -> i32 {
     if let Some(i) = args.iter().position(|a| a == SESSION) {
         return session_main(args.first().map(String::as_str), args.get(i + 1));
     }
@@ -217,9 +231,7 @@ pub fn run(mut cmd: Command, backend: Backend, timeout: Duration) -> Probe {
             "probe not run: SIGCHLD is ignored, so its child couldn't be killed safely",
         );
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let (mut child, group) = match Group::spawn(&mut cmd) {
         Ok(c) => c,
         Err(e) => return Probe::failed(backend, format!("probe didn't start: {e}")),
@@ -555,6 +567,28 @@ fn finished(child: &mut std::process::Child) -> std::io::Result<bool> {
     child.try_wait().map(|s| s.is_some())
 }
 
+/// Spawns `cmd` and sends it [`GO`] only once `confine` has made sure it can't outlive
+/// this process. A child that is never confined (this process died first, or `confine`
+/// failed) reads the end of its stdin and exits without doing anything. `cmd` keeps a
+/// read end of that pipe, so writing [`GO`] to a child that already exited can't fail
+/// with `SIGPIPE`.
+fn start(
+    cmd: &mut Command,
+    confine: impl FnOnce(&std::process::Child) -> Result<(), String>,
+) -> Result<std::process::Child, String> {
+    let (stdin, mut go) = std::io::pipe().map_err(|e| format!("no pipe for its stdin: {e}"))?;
+    cmd.stdin(stdin);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    if let Err(e) = confine(&child) {
+        drop(go);
+        let _ = child.kill();
+        let _ = reap(child);
+        return Err(e);
+    }
+    let _ = go.write_all(&[GO]);
+    Ok(child)
+}
+
 /// The child and whatever it starts, killed together.
 #[cfg(unix)]
 struct Group;
@@ -563,7 +597,7 @@ struct Group;
 impl Group {
     fn spawn(cmd: &mut Command) -> Result<(std::process::Child, Group), String> {
         std::os::unix::process::CommandExt::process_group(cmd, 0);
-        cmd.spawn().map(|c| (c, Group)).map_err(|e| e.to_string())
+        start(cmd, |_| Ok(())).map(|c| (c, Group))
     }
 
     /// Kills the child's process group; the unreaped child keeps its id from being reused.
@@ -583,28 +617,17 @@ struct Group(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 impl Group {
-    /// Starts the child suspended and resumes it only once it is in the job, so nothing
-    /// it starts can be outside.
     fn spawn(cmd: &mut Command) -> Result<(std::process::Child, Group), String> {
-        use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
-            AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
-        use windows::Win32::System::Threading::CREATE_SUSPENDED;
-        let group = Group(owned(
-            unsafe {
-                windows::Win32::System::JobObjects::CreateJobObjectW(
-                    None,
-                    windows::core::PCWSTR::null(),
-                )
-            }
-            .map_err(|e| format!("no job object: {e}"))?,
-        ));
-        let job = HANDLE(group.0.as_raw_handle());
+        let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
+            .map_err(|e| format!("no job object: {e}"))?;
+        let group = Group(unsafe { OwnedHandle::from_raw_handle(job.0) });
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
@@ -617,16 +640,10 @@ impl Group {
             )
         }
         .map_err(|e| format!("job object limits: {e}"))?;
-        cmd.creation_flags(CREATE_SUSPENDED.0);
-        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-        let started = unsafe { AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) }
-            .map_err(|e| format!("couldn't put it in a job object: {e}"))
-            .and_then(|()| resume(child.id()));
-        if let Err(e) = started {
-            let _ = child.kill();
-            let _ = reap(child);
-            return Err(e);
-        }
+        let child = start(cmd, |c| {
+            unsafe { AssignProcessToJobObject(job, HANDLE(c.as_raw_handle())) }
+                .map_err(|e| format!("couldn't put it in a job object: {e}"))
+        })?;
         Ok((child, group))
     }
 
@@ -638,55 +655,6 @@ impl Group {
             let _ = child.kill();
         }
     }
-}
-
-#[cfg(windows)]
-fn owned(h: windows::Win32::Foundation::HANDLE) -> std::os::windows::io::OwnedHandle {
-    use std::os::windows::io::FromRawHandle;
-    unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h.0) }
-}
-
-/// Resumes the threads of the suspended process `pid`: its main thread, as nothing else
-/// has run in it yet.
-#[cfg(windows)]
-fn resume(pid: u32) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-    let snap = owned(
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-            .map_err(|e| format!("no thread list to resume it: {e}"))?,
-    );
-    let snap = HANDLE(snap.as_raw_handle());
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut resumed = 0;
-    let mut more = unsafe { Thread32First(snap, &mut entry) }.is_ok();
-    while more {
-        if entry.th32OwnerProcessID == pid {
-            let thread = owned(
-                unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
-                    .map_err(|e| format!("couldn't resume it: {e}"))?,
-            );
-            if unsafe { ResumeThread(HANDLE(thread.as_raw_handle())) } == u32::MAX {
-                return Err(format!(
-                    "couldn't resume it: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            resumed += 1;
-        }
-        more = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
-    }
-    if resumed == 0 {
-        return Err("no thread to resume".into());
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

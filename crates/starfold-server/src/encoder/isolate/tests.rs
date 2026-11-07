@@ -69,8 +69,8 @@ fn no_child_unless_the_executable_takes_the_flag() {
 
 #[test]
 fn unknown_backend_exits_2() {
-    assert_eq!(child_main(&["bogus".into()]), 2);
-    assert_eq!(child_main(&[]), 2);
+    assert_eq!(probe_main(&["bogus".into()]), 2);
+    assert_eq!(probe_main(&[]), 2);
 }
 
 #[test]
@@ -321,8 +321,9 @@ fn fake(mode: &str, dir: &std::path::Path) -> Command {
     c
 }
 
-/// A probe child that starts a process holding its stdout, waits for it to record its
-/// id, then reports or hangs. Does nothing unless run by [`fake`].
+/// A probe child that waits for [`GO`] as the real one does, then (`gate`) records that it
+/// went and reports, or starts a process holding its stdout, waits for it to record its id,
+/// and reports or hangs. Does nothing unless run by [`fake`].
 #[test]
 fn fake_child() {
     let Ok(mode) = std::env::var(FAKE) else {
@@ -333,6 +334,14 @@ fn fake_child() {
         std::fs::write(dir.join("pid.tmp"), std::process::id().to_string()).unwrap();
         std::fs::rename(dir.join("pid.tmp"), dir.join("pid")).unwrap();
         std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+    let mut go = [0u8];
+    if std::io::stdin().read_exact(&mut go).is_err() || go != [GO] {
+        std::process::exit(NO_GO);
+    }
+    if mode == "gate" {
+        std::fs::write(dir.join("went"), "").unwrap();
         std::process::exit(0);
     }
     let _held = fake("sleep", &dir).stdin(Stdio::null()).spawn().unwrap();
@@ -438,4 +447,42 @@ fn output_is_read_to_its_end() {
     drop(w);
     let out = Output::new(Some(r)).unwrap();
     assert_eq!(out.finish(Duration::from_secs(5)).unwrap(), b"one\ntwo");
+}
+
+/// The child gets [`GO`] only after it was confined, and runs on once it has.
+#[test]
+fn go_follows_confinement() {
+    let dir = scratch("probe-go");
+    let mut cmd = fake("gate", &dir);
+    cmd.stdout(Stdio::null());
+    let went = dir.join("went");
+    let mut c = start(&mut cmd, |_| {
+        std::thread::sleep(Duration::from_millis(500));
+        match went.exists() {
+            true => Err("went before it was confined".into()),
+            false => Ok(()),
+        }
+    })
+    .unwrap();
+    assert!(c.wait().unwrap().success());
+    assert!(went.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A child that can't be confined never gets [`GO`] and is gone when `start` returns.
+#[test]
+fn unconfined_child_never_goes() {
+    let dir = scratch("probe-nogo");
+    let mut cmd = fake("gate", &dir);
+    cmd.stdout(Stdio::null());
+    let pid = std::cell::Cell::new(0);
+    let e = start(&mut cmd, |c| {
+        pid.set(c.id());
+        Err("no job".into())
+    })
+    .unwrap_err();
+    assert_eq!(e, "no job");
+    assert!(exits_soon(pid.get()));
+    assert!(!dir.join("went").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
 }
