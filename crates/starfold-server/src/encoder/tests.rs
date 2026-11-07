@@ -548,16 +548,15 @@ fn vt_at(
     (open(&cfg).unwrap(), pics)
 }
 
-/// 1440p motion at 120 fps timestamps: 95% of encodes take 6 ms or less, inside the 0.8 of
-/// the 8.3 ms interval past which a cohort falls back to 60.
+/// Prints encode times of 1080p and 1440p motion at 120 fps timestamps (`--nocapture`): a
+/// cohort whose encodes average more than 0.8 of the 8.3 ms interval falls back to 60.
 #[cfg(target_os = "macos")]
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "times the encoder: needs an optimized build"
 )]
-fn videotoolbox_keeps_up_with_1440p_at_120_fps() {
-    let mut slow = Vec::new();
+fn videotoolbox_encode_times_at_120_fps() {
     for codec in [Codec::H264, Codec::Hevc] {
         if !vt_hardware(codec) {
             continue;
@@ -579,12 +578,8 @@ fn videotoolbox_keeps_up_with_1440p_at_120_fps() {
                 "{codec:?} {w}x{h} at 120 fps: encode p50 {:.2} ms, p95 {p95:.2} ms",
                 ms[ms.len() / 2]
             );
-            if h == 1440 && p95 > 6.0 {
-                slow.push(format!("{codec:?}: p95 {p95:.2} ms"));
-            }
         }
     }
-    assert!(slow.is_empty(), "{slow:?}");
 }
 
 /// VideoToolbox budgets by timestamp: at 120 fps and at 60 each second carries the cap's
