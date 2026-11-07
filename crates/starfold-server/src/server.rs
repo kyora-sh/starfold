@@ -445,7 +445,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
     }
     let input = |ev: InputEvent| {
         if let Some(tx) = s.hub.input.lock().as_ref() {
-            s.hub.note_input();
+            s.hub.note_input(&ev);
             let _ = tx.send(ev);
         }
     };
@@ -629,6 +629,29 @@ mod tests {
             mic_rx.try_iter().count(),
             resized,
         )
+    }
+
+    #[test]
+    fn only_keys_count_as_typing() {
+        let hub = Hub::new();
+        hub.width.store(1280, Ordering::Relaxed);
+        hub.height.store(800, Ordering::Relaxed);
+        let (input_tx, _input_rx) = std::sync::mpsc::channel();
+        *hub.input.lock() = Some(input_tx);
+        let s = app(&hub, false, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx);
+        let mut rtts = Default::default();
+        for c in ["m,10,20", "b,1,1", "b,1,0", "s,0,1", "sp,0.0,12.0"] {
+            handle_text(&s, &client, c, &mut rtts);
+        }
+        assert!(hub.input_at.lock().is_some(), "pointer input went unnoted");
+        assert!(
+            hub.key_at.lock().is_none(),
+            "pointer input counted as typing"
+        );
+        handle_text(&s, &client, "k,65,1", &mut rtts);
+        assert!(hub.key_at.lock().is_some(), "a key went unnoted");
     }
 
     #[test]

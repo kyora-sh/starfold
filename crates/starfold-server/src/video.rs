@@ -73,6 +73,8 @@ struct Job {
     force_idr: bool,
     /// The keyframe gets the keyframe budget (not while the cohort is degraded).
     boost: bool,
+    /// The rate the cohort takes frames at while the picture moves: each frame is budgeted for it.
+    fps: u32,
 }
 
 fn union(a: Option<Band>, b: Band) -> Band {
@@ -306,6 +308,59 @@ struct Cohort {
     /// Who they were.
     viewers: Vec<u64>,
     refine: Refinement,
+    pace: Pace,
+}
+
+/// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
+/// second's worth of the cap.
+const FPS_FLOOR: u32 = 10;
+
+/// How often a cohort takes a frame while the picture moves. Flow control and a busy encoder
+/// skip frames, and an encoder that budgets for every capture would starve the ones that go out.
+struct Pace {
+    last: Option<Instant>,
+    /// Smoothed interval between frames taken in motion (ms); pauses of a second or more are stills.
+    interval_ms: Option<f64>,
+    fps: u32,
+    changed: Instant,
+}
+
+impl Pace {
+    fn new(fps: u32) -> Self {
+        Pace {
+            last: None,
+            interval_ms: None,
+            fps,
+            changed: Instant::now(),
+        }
+    }
+
+    /// A motion frame went to the encoder at `now`. Changes the budgeted rate at most once a
+    /// second, and only by a quarter or more.
+    fn took(&mut self, now: Instant, max: u32, cohort: u64) {
+        if let Some(gap) = self
+            .last
+            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0)
+        {
+            if gap < 1000.0 {
+                self.interval_ms = Some(self.interval_ms.map_or(gap, |i| i * 0.8 + gap * 0.2));
+            }
+        }
+        self.last = Some(now);
+        let Some(interval) = self.interval_ms else {
+            return;
+        };
+        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), max);
+        let step = (want as f64 - self.fps as f64).abs() >= self.fps as f64 * 0.25;
+        if step && now.saturating_duration_since(self.changed) >= Duration::from_secs(1) {
+            log::info!(
+                "cohort {cohort}: encoder rate {} -> {want} fps (a frame every {interval:.0} ms)",
+                self.fps
+            );
+            self.fps = want;
+            self.changed = now;
+        }
+    }
 }
 
 impl Cohort {
@@ -391,6 +446,7 @@ fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
         quality: crf,
         max_kbps: boost,
         buf_kbit: boost / fps.max(1) * 8,
+        fps,
     }
 }
 
@@ -686,6 +742,7 @@ impl Engine {
                 },
                 applied_kbps: None,
                 applied_crf: -1.0,
+                applied_fps: 0,
                 open: self.open.clone(),
             });
         }
@@ -732,6 +789,7 @@ impl Engine {
             active: false,
             viewers: Vec::new(),
             refine: Refinement::new(&self.cfg, cand.backend.refines_by_qp(), self.w, self.h),
+            pace: Pace::new(self.cfg.fps),
         })
     }
 
@@ -1102,6 +1160,14 @@ impl Engine {
             self.moved(views, now);
         }
         let input_at = *self.hub.input_at.lock();
+        let max_fps = self.cfg.fps;
+        // While someone types, frames keep the full rate's budget: a key never waits behind a
+        // frame sized for a slower rate. Pointer and wheel motion keep the rate frames are taken at.
+        let typing = self
+            .hub
+            .key_at
+            .lock()
+            .is_some_and(|k| now.saturating_duration_since(k) < REFINE_IDLE);
         let stats = &self.hub.stats;
         let plans = turn.takes.iter().zip(&turn.passes);
         for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
@@ -1129,12 +1195,19 @@ impl Engine {
                 *c.shared.last_key.lock() = Instant::now();
             }
             c.shared.busy.fetch_add(1, Ordering::AcqRel);
+            let motion = frame.band.is_some() && !matches!(step, Step::Pass);
             match tx.try_send(Job {
                 frame,
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
+                fps: if typing { max_fps } else { c.pace.fps },
             }) {
-                Ok(()) => c.refine.sent(step, stats, now),
+                Ok(()) => {
+                    if motion {
+                        c.pace.took(now, max_fps, c.shared.id);
+                    }
+                    c.refine.sent(step, stats, now)
+                }
                 Err(e) => {
                     c.shared.busy.fetch_sub(1, Ordering::AcqRel);
                     if force {
@@ -2063,6 +2136,7 @@ struct Stripe {
     /// The cap last applied (None: apply the next one).
     applied_kbps: Option<u32>,
     applied_crf: f32,
+    applied_fps: u32,
     open: Open,
 }
 
@@ -2077,6 +2151,7 @@ struct StripeJob {
     crf: f32,
     cap: u32,
     refine: Option<PassBudget>,
+    fps: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -2212,15 +2287,16 @@ fn stripe_worker(
             None
         } else if job.force_idr && job.boost {
             s.applied_kbps = None;
-            Some(keyframe_rate(job.crf, job.cap, s.cfg.fps))
+            Some(keyframe_rate(job.crf, job.cap, job.fps))
         } else {
             let moved = s
                 .applied_kbps
                 .is_none_or(|a| (job.cap as f64 - a as f64).abs() > a as f64 * 0.04);
-            (job.crf != s.applied_crf || moved).then(|| {
+            (job.crf != s.applied_crf || moved || job.fps != s.applied_fps).then(|| {
                 s.applied_crf = job.crf;
                 s.applied_kbps = Some(job.cap);
-                RateConfig::new(job.crf, job.cap, s.cfg.fps)
+                s.applied_fps = job.fps;
+                RateConfig::new(job.crf, job.cap, job.fps)
             })
         };
         if let Some(r) = rate {
@@ -2411,6 +2487,7 @@ fn encode_loop(
         frame: job,
         force_idr,
         boost,
+        fps,
     }) = rx.recv()
     {
         let t0 = Instant::now();
@@ -2470,6 +2547,7 @@ fn encode_loop(
                     crf: want_crf,
                     cap,
                     refine,
+                    fps,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });

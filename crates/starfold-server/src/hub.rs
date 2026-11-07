@@ -411,8 +411,9 @@ pub struct Hub {
     /// Wakes the capture thread (acks, joins, keyframe requests).
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::input::InputEvent>>>,
-    /// When input last went to the desktop.
+    /// When input last went to the desktop, and when a key last did.
     pub input_at: Mutex<Option<Instant>>,
+    pub key_at: Mutex<Option<Instant>>,
     pub last_clipboard: Mutex<Option<String>>,
     /// Desktop size a client asked for (dynamic resolution), applied by the video thread.
     pub resize_req: Mutex<Option<(u32, u32)>>,
@@ -453,6 +454,7 @@ impl Hub {
             waker: Wake::new().expect("wake"),
             input: Mutex::new(None),
             input_at: Mutex::new(None),
+            key_at: Mutex::new(None),
             last_clipboard: Mutex::new(None),
             resize_req: Mutex::new(None),
             resize_max: Mutex::new(None),
@@ -477,8 +479,15 @@ impl Hub {
         self.waker.drain();
     }
 
-    pub fn note_input(&self) {
-        *self.input_at.lock() = Some(Instant::now());
+    pub fn note_input(&self, ev: &crate::input::InputEvent) {
+        self.note_input_at(ev, Instant::now());
+    }
+
+    pub fn note_input_at(&self, ev: &crate::input::InputEvent, now: Instant) {
+        *self.input_at.lock() = Some(now);
+        if matches!(ev, crate::input::InputEvent::Key { .. }) {
+            *self.key_at.lock() = Some(now);
+        }
     }
 
     /// Asks the video thread to route viewers again.
