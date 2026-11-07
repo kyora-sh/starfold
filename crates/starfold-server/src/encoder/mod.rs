@@ -11,6 +11,7 @@ mod h264;
 #[cfg(any(target_os = "macos", test, feature = "kvazaar", feature = "x265"))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hevc;
+pub mod isolate;
 #[cfg(feature = "kvazaar")]
 mod kvazaar;
 #[cfg(windows)]
@@ -33,7 +34,7 @@ mod x264;
 #[cfg(feature = "x265")]
 mod x265;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     H264,
@@ -200,7 +201,7 @@ pub trait VideoEncoder: Send {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     OpenH264,
