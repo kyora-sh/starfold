@@ -405,7 +405,7 @@ impl MfDriver {
             .map_err(|e| err("IMFSample::ConvertToContiguousBuffer", e))?;
         let mut p = std::ptr::null_mut();
         let mut n = 0u32;
-        buf.Lock(&mut p, None, Some(&mut n))
+        buf.Lock(&mut p, None, Some(&mut n as *mut u32))
             .map_err(|e| err("IMFMediaBuffer::Lock", e))?;
         let data = if p.is_null() {
             Vec::new()

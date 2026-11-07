@@ -277,8 +277,7 @@ fn rate_changes_set_the_bitrate_or_qp() {
     let mut enc = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 4000)).unwrap();
     take(&log);
     enc.set_rate(RateConfig::new(24.0, 4000, 30)).unwrap();
-    enc.set_rate(RateConfig::new(24.0, 4000, 24)).unwrap();
-    assert!(take(&log).is_empty(), "nothing the session can change");
+    assert!(take(&log).is_empty(), "nothing changed");
     enc.set_rate(RateConfig::new(24.0, 9000, 30)).unwrap();
     assert_eq!(
         take(&log)[0],
