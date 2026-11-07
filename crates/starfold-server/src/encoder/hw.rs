@@ -158,7 +158,13 @@ impl Stream {
             None if self.codec == Codec::Av1 => complete_av1(&self.headers, data),
             None => data,
         };
-        let r = self.check(data, pts_ms, idr);
+        let r = match self.nals() {
+            Some(n) if lacks_sets(n, &data) => Err(EncodeError(format!(
+                "{} {:?} key frame without its parameter sets",
+                self.name, self.codec
+            ))),
+            _ => self.check(data, pts_ms, idr),
+        };
         match &r {
             Ok(Some(au)) => self.remember(&au.data),
             Ok(None) => {}
@@ -218,6 +224,15 @@ impl Stream {
             }
         }
     }
+}
+
+/// A random-access picture in `data` without every parameter set it needs.
+fn lacks_sets(n: &AnnexB, data: &[u8]) -> bool {
+    let types: Vec<u8> = super::h264::nal_units(data)
+        .filter(|x| x.len() >= 2)
+        .map(|x| (n.nal_type)(x))
+        .collect();
+    types.iter().any(|&t| (n.random_access)(t)) && n.sets.iter().any(|k| !types.contains(k))
 }
 
 /// `data` with every parameter set a random-access picture lacks taken from `headers`:

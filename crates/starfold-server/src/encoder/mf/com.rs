@@ -477,6 +477,7 @@ impl MfDriver {
 
 impl Drop for MfDriver {
     fn drop(&mut self) {
+        let _ = com();
         unsafe {
             if self.streaming {
                 let _ = self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
@@ -501,6 +502,7 @@ impl std::ops::Deref for Mft {
 
 impl Drop for Mft {
     fn drop(&mut self) {
+        let _ = com();
         if let Ok(s) = self.0.cast::<IMFShutdown>() {
             let _ = unsafe { s.Shutdown() };
         }

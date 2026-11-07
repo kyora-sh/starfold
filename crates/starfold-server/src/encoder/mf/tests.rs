@@ -412,3 +412,20 @@ fn a_rejected_unit_keeps_the_headers_for_recovery() {
         );
     }
 }
+
+#[test]
+fn a_key_frame_missing_parameter_sets_is_an_error() {
+    use crate::encoder::{hw, ColorInfo};
+    let color = ColorInfo::SRGB_BT601_LIMITED;
+    let mut s = hw::Stream::new("MF", Codec::Hevc, (320, 240), color, true);
+    let e = s
+        .unit(annexb(&[HEVC_SPS, &[0x26, 0x01, 0xaf]]), 0, true)
+        .err()
+        .unwrap();
+    assert!(e.0.contains("parameter sets"), "{e}");
+    let mut s = hw::Stream::new("MF", Codec::H264, (320, 240), color, true);
+    assert!(s
+        .unit(annexb(&[H264_SPS, &[0x65, 0x88, 0x84]]), 0, true)
+        .is_err());
+    assert!(s.unit(bitstream(Codec::H264, true), 1, true).is_ok());
+}

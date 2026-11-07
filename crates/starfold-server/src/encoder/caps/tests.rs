@@ -112,6 +112,7 @@ fn denied_device_skips_only_that_device() {
     assert_eq!(found[0].device_id, "/dev/dri/renderD129");
 }
 
+#[cfg(not(windows))]
 #[test]
 fn unimplemented_backends_are_never_eligible() {
     let mut f = Fake::new(Backend::MediaFoundation);

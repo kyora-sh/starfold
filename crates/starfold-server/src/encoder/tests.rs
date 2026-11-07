@@ -490,9 +490,12 @@ fn backends_without_the_codec_refuse_to_open() {
     let mut cfg = config(Backend::OpenH264, 64, 64, 1000);
     cfg.codec = Codec::Hevc;
     assert!(open(&cfg).is_err());
-    cfg.backend = Backend::MediaFoundation;
-    cfg.codec = Codec::H264;
-    assert!(open(&cfg).is_err());
+    #[cfg(not(windows))]
+    {
+        cfg.backend = Backend::MediaFoundation;
+        cfg.codec = Codec::H264;
+        assert!(open(&cfg).is_err());
+    }
 }
 
 /// What the startup probe finds on this Mac (printed for the PR, `--nocapture`).
