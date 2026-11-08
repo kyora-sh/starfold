@@ -286,15 +286,15 @@ that residual risk for self-built OpenH264. This needs legal review before any w
 
 The same matrix re-measured on main (86703ce), with #13's merge commit (f678862) run alongside it on the same VMs. The numbers above are #13's and stand as history.
 
-**What moved, all at 2 Mbit/s** (20 Mbit/s and LAN moved only in small byte counts, below):
+**What moved, all at 2 Mbit/s, with the last row's limit stated in it** (20 Mbit/s and LAN moved only in small byte counts, below):
 
 | cell | #13 build | main | A/A S | responsible |
 |---|---|---|---|---|
 | scroll page, settled at +8 s | 33.0 dB / 0.978 | 48.1 dB / 0.999 | 0.99 dB | #14/#15 (step +13.6 dB) |
 | dense text page, settled at +32 s | 30.7 dB / 0.991 | 42.0 dB / 0.9995 | 0.01 dB | not bracketed; #15 is the likely source (it changed the refinement cap and tail) |
 | scroll page, in motion, no keys typed | 27.7 dB | 39.4 dB | 3.2 dB | #20 (step +10.4 dB) |
-| **scroll page, usable picture at +500 ms** | **10/12 runs** | **1/12 runs** | - | **#20 (step -14.3 dB): a regression** |
-| typing during scroll, rounds with over 5% of keys lacking their own frame | 3/12 | 11/12 | - | #20 |
+| **scroll page, picture at +500 ms** | **28.0 dB; usable in 10/12 runs** | **14.0 dB; usable in 1/12 runs** | **10.3 dB** | **#20 (PSNR step -14.3 dB): a regression. The usable counts are descriptive** |
+| typing during scroll, rounds with over 5% of keys lacking their own frame (descriptive counts) | 3/12 | 11/12 | 0, censored p95 by rank | The tested step is 079c7ca -> 3e7f661 (#20, 1/12 -> 11/12), real by rank. Main against the #13 build is not real, CI [0, inf] |
 
 - Settled, the scroll and dense pages now lead noVNC q7 (scroll 48.7 vs 42.6 dB, dense 42.0 vs 34.4 dB), where #13 trailed it on both. Starfold's lead over noVNC in frame rate and latency is unchanged.
 - Everything else, on every link, is within the A/A spread between the #13 build and main, except a small rise in bytes while typing (LAN no reader 0.02 -> 0.03 Mbit/s; 20 Mbit/s 12 -> 14 kbit/s; cause not bracketed) and 0.04 dB in LAN typing settled quality. Both are negligible.
@@ -544,7 +544,7 @@ Pre-registered stepwise set: arms then, 8e32269 (#14 + #15), 079c7ca (adds #16-#
 
 Real steps: +8 s at #14/#15 (+13.6 dB [+9.5, +16.9], S 0.99); +500 ms at #20 (-14.3 dB [-17.2, -12.1], S 10.3; text SSIM -0.913, S 0.53); in motion at #20 (+10.4 dB [+8.3, +11.3], S 3.2).
 
-**This table suggests a second step between #20 and main at +1 s (12/12 against 11/24; PSNR -23.9 dB against S 22.7). It is not there.** A second pre-registered set (3e7f661, 25698ac, 87d84e9, main, twin; n=12, 3 VM runs, Fisher's exact test on the counts) found 3e7f661 usable at +1 s in 7/12, main in 7/12, the twin in 7/12, the others in 10/12 and 8/12. No step passes (smallest p 0.37), and PSNR, text SSIM, bytes by +500 ms and flow-blocked counts are all within the A/A. The stepwise 12/12 was on the high side. At +500 ms the second set's five arms, all from #20 on, were usable in 1-3 of 12, repeating the #20 result. At +2 s every arm of both sets is usable in all rounds. Across the two sets, builds from #20 on are usable at +1 s in 5-12 of 12 against 12/12 before; that comparison was not registered.
+**This table suggests a second step between #20 and main at +1 s (12/12 against 11/24; PSNR -23.9 dB against S 22.7). It is not there.** A second pre-registered set (3e7f661, 25698ac, 87d84e9, main, twin; n=12, 3 VM runs, Fisher's exact test on the counts) found 3e7f661 usable at +1 s in 7/12, main in 7/12, the twin in 7/12, the others in 10/12 and 8/12. No step passes (smallest p 0.37), and PSNR, text SSIM, bytes by +500 ms and flow-blocked counts are all within the A/A. The stepwise 12/12 was on the high side. At +500 ms the second set's five arms, all from #20 on, were usable in 1-3 of 12. That set has no arm before #20, so this repeats the level seen from #20 on, not the comparison with earlier builds. At +2 s every arm of both sets is usable in all rounds. Across the two sets, builds from #20 on are usable at +1 s in 5-12 of 12 against 12/12 before; that comparison was not registered.
 
 Latency, typing during scroll (n=12; sw-lat-1 twice replaced):
 
@@ -570,9 +570,9 @@ The censored p95 is judged by rank only, as registered: medians and the bootstra
 
 The table pools all of an arm's keys: at 2 Mbit/s a p95 of ~0.6 s becomes ~1 s, not 5 s (main 974 ms against 079c7ca 622 ms, +353 ms). The registered judgement is on each round's p95 instead, whose medians are main 1135, 3e7f661 670 and 079c7ca 576 ms. On those, main against 079c7ca is real (+559 ms, S 266). Main against 3e7f661 also passes the rule (+466 ms), but this is one VM run at n=6, and the n=12 latency set saw no such step, so no second step is claimed.
 
-**Mechanism.** #20 budgets each frame for the rate frames are taken at, down to 10 fps, except within 2 s of a key. The instrumented builds confirm the override: after a window's first key, 100% of motion frames are budgeted at 30 fps in every arm. Before it, the builds from #20 on mostly run at 10 fps, with median frames of 21-26 KB against 10 KB at 079c7ca, falling to 8-12 KB right after the key. Of the unanswered keys, 68% (41/60) fall in the window's first 2 s, where 21% of keys are: the override takes effect at once, and keys wait behind what is already queued. After a stop, the first frame is 14-31 KB (median) before #20, encoded within 250 ms in 36/36 rounds, and 100-132 KB from #20 on (~0.4-0.5 s of the link), encoded by then in 37/96. That is over the 10 fps budget of 25 KB. Its QP is not exposed by any log or stats field and was not measured.
+**Mechanism.** #20 budgets each frame for the rate frames are taken at, down to 10 fps, except within 2 s of a key. The instrumented builds confirm the override: after a window's first key, 100% of motion frames are budgeted at 30 fps in every arm. Before it, the builds from #20 on mostly run at 10 fps, with median frames of 21-26 KB against 10 KB at 079c7ca, falling to 8-12 KB right after the key. Of the unanswered keys, 68% (41/60) fall in the window's first 2 s, where 21% of keys are, which meets the registered prediction. That fits keys waiting behind what is already queued, with the override taking effect at once; the queue itself was not measured. After a stop, the first frame is 14-31 KB (median) before #20, encoded within 250 ms in 36/36 rounds, and 100-132 KB from #20 on (~0.4-0.5 s of the link), encoded by then in 37/96. That is over the 10 fps budget of 25 KB. Its QP is not exposed by any log or stats field and was not measured.
 
-**The first picture does not trade against settled quality.** 079c7ca has both (47.9 dB settled, 12/12 at +500 ms), because they come from different PRs. The trade is between the first picture and #20's in-motion gain. Options, none implemented or measured:
+**The first picture does not trade against settled quality.** 079c7ca has both (47.9 dB settled, usable in 12/12 at +500 ms), because they come from different PRs. The first-picture loss and the in-motion gain both come at the #20 step; whether a change can keep one without losing the other is not measured. Options, none implemented or measured:
 
 - Cap the first frame after a stall at the size of a ladder pass. Aims at the 100+ KB frame, not at the wait behind the queue.
 - Bound the queue by time on the link rather than by frames. Aims at the wait at a stop and at the first keys. Its cost to in-motion quality is unknown.
