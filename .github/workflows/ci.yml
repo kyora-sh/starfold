@@ -128,7 +128,9 @@ jobs:
     runs-on: kyora-8x16
     timeout-minutes: 45
     env:
+      VCPKG_BASELINE: 2026.10.16
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.vcpkg-downloads
       VCPKGRS_TRIPLET: x64-mingw-static
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
     steps:
@@ -140,13 +142,18 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-x64-mingw-static-2026.10.16-libyuv-opus-v1
+          key: vcpkg-x64-mingw-static-${{ env.VCPKG_BASELINE }}-libyuv-opus-v1
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-downloads
+          key: vcpkg-downloads-${{ env.VCPKG_BASELINE }}-v1
       - name: libyuv and Opus (vcpkg)
         run: |
-          mkdir -p .vcpkg-cache
-          git clone --quiet --depth 1 --branch 2026.10.16 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          "$VCPKG_ROOT/vcpkg" install libyuv opus --triplet "$VCPKGRS_TRIPLET"
+          mkdir -p .vcpkg-cache .vcpkg-downloads
+          retry() { for i in 1 2 3; do "$@" && return; [ "$i" = 3 ] || sleep $((i * 30)); done; return 1; }
+          retry git clone --quiet --depth 1 --branch "$VCPKG_BASELINE" https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          retry "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          retry "$VCPKG_ROOT/vcpkg" install libyuv opus --triplet "$VCPKGRS_TRIPLET"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
