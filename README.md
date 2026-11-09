@@ -145,6 +145,11 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 | `--max-record-seconds`                                         | `300`                              | longest recording (`/record`)                                                                                     |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                           | tuning                                                                                                            |
 
+An upload is written to a hidden `.starfold-upload-*` file and renamed when complete, never over
+an existing file (a name taken meanwhile gets 409). After a crash, hidden `.starfold-upload-*`
+files may remain in the upload folder and can be deleted when no starfold is running. A
+filesystem with neither an exclusive rename nor hard links refuses uploads (501).
+
 ### Login
 
 voxl asks for a password before it shows the desktop or takes input, files or API

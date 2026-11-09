@@ -378,7 +378,6 @@ async fn serve(a: HashMap<String, String>) {
         std::process::exit(2);
     });
     let files = std::sync::Arc::new(files);
-    files::sweep_stale(files.clone());
     match &files.root {
         Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
         None => log::info!("file transfer: off (share a folder with --files-root)"),

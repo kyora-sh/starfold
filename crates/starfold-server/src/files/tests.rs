@@ -1,6 +1,7 @@
 use super::*;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A fresh folder holding `root` (shared) and `outside` (not), removed on drop.
 struct Tmp(PathBuf);
@@ -384,13 +385,21 @@ async fn a_path_longer_than_the_kernel_resolves_at_once_still_works() {
 #[tokio::test]
 async fn a_listing_stops_at_its_cap() {
     let t = Tmp::new();
-    for i in 0..MAX_LISTED + 3 {
+    for i in 0..MAX_LISTED + 500 {
         std::fs::write(t.root().join(format!("f{i}")), "").unwrap();
     }
     let f = t.files("Downloads");
-    let (s, listed) = get_list(&f, "").await;
+    let (s, list) = get_list(&f, "").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(listed["entries"].as_array().unwrap().len(), MAX_LISTED);
+    assert_eq!(list["entries"].as_array().unwrap().len(), MAX_LISTED);
+    let top = Root::open(&t.root()).unwrap().dir(&[], false).unwrap();
+    beneath::STATS.with(|n| n.set(0));
+    assert_eq!(listed(&top).unwrap().len(), MAX_LISTED);
+    assert_eq!(
+        beneath::STATS.with(|n| n.get()),
+        MAX_LISTED,
+        "enumeration stops at the cap"
+    );
 }
 
 #[test]
@@ -410,31 +419,54 @@ fn publishing_never_replaces_a_file() {
     assert_eq!(std::fs::read(t.root().join("c")).unwrap(), b"second");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_uploads_of_one_name_never_overwrite_each_other() {
+    const N: usize = 16;
     let t = Tmp::new();
     let f = t.files("Downloads");
-    let uploads = (0..16).map(|i| {
-        let f = f.clone();
-        tokio::spawn(async move { put(&f, &[("name", "a.txt")], &format!("upload {i}")).await })
-    });
-    let mut saved = Vec::new();
+    // Every upload has its temporary file open before any body ends, so all of them reach
+    // the name choice and the publish together.
+    let all_open = Arc::new(tokio::sync::Barrier::new(N));
+    let uploads: Vec<_> = (0..N)
+        .map(|i| {
+            let (f, all_open) = (f.clone(), all_open.clone());
+            tokio::spawn(async move {
+                let body = futures_util::stream::once(async move {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(format!("upload {i}")))
+                })
+                .chain(futures_util::stream::once(async move {
+                    all_open.wait().await;
+                    Ok(bytes::Bytes::new())
+                }));
+                let mut h = HeaderMap::new();
+                h.insert(UPLOAD_HEADER, "1".parse().unwrap());
+                let r = upload(
+                    State(f),
+                    q(&[("name", "a.txt")]),
+                    h,
+                    Body::from_stream(body),
+                )
+                .await;
+                r.status()
+            })
+        })
+        .collect();
+    let mut saved = 0;
     for u in uploads {
-        let (s, b) = u.await.unwrap();
-        match s {
-            StatusCode::OK => saved.push(b),
+        match u.await.unwrap() {
+            StatusCode::OK => saved += 1,
             StatusCode::CONFLICT => {}
-            s => panic!("{s}: {b}"),
+            s => panic!("{s}"),
         }
     }
-    let dir = t.root().join("Downloads");
-    let mut contents: Vec<String> = std::fs::read_dir(&dir)
+    let mut contents: Vec<String> = std::fs::read_dir(t.root().join("Downloads"))
         .unwrap()
         .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
         .collect();
     contents.sort();
     contents.dedup();
-    assert_eq!(contents.len(), saved.len(), "{contents:?} vs {saved:?}");
+    assert_eq!(contents.len(), saved, "{contents:?}");
+    assert!(saved > 0);
 }
 
 #[tokio::test]
@@ -496,39 +528,126 @@ async fn a_wide_folder_downloads_whole() {
 }
 
 #[test]
-fn stale_uploads_are_swept_and_nothing_else() {
+fn a_temporary_name_does_not_grow_with_the_file_name() {
+    let (a, b) = (part_name().unwrap(), part_name().unwrap());
+    assert_eq!(a.len(), PART_PREFIX.len() + 32 + ".part".len());
+    assert_ne!(a, b);
+    assert!(reserved(a.to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn an_upload_cannot_take_a_temporary_name() {
     let t = Tmp::new();
-    let nested = t.root().join("a/b");
-    std::fs::create_dir_all(&nested).unwrap();
-    let ours = part_name();
+    let f = t.files("Downloads");
     for name in [
-        ".starfold-upload-1-0.part",
-        "keep.part",
-        ".starfold-upload-x-0.part",
-        ".starfold-upload-1-0.partial",
+        ".starfold-upload-0123.part",
+        ".STARFOLD-Upload-x",
+        ".starfold-upload-",
     ] {
-        std::fs::write(nested.join(name), "").unwrap();
+        assert_eq!(
+            put(&f, &[("name", name)], "x").await.0,
+            StatusCode::BAD_REQUEST,
+            "{name}"
+        );
     }
-    std::fs::write(t.root().join(&ours), "").unwrap();
-    std::fs::write(t.root().join(".starfold-upload-2-7.part"), "").unwrap();
-    let root = Root::open(&t.root()).unwrap();
-    assert_eq!(sweep(&root).unwrap(), 2);
-    assert!(!nested.join(".starfold-upload-1-0.part").exists());
-    assert!(!t.root().join(".starfold-upload-2-7.part").exists());
-    assert!(
-        t.root().join(&ours).exists(),
-        "this process's own upload stays"
+    assert_eq!(
+        put(&f, &[("name", ".starfold-uploads")], "x").await.0,
+        StatusCode::OK
     );
-    for name in [
-        "keep.part",
-        ".starfold-upload-x-0.part",
-        ".starfold-upload-1-0.partial",
-    ] {
-        assert!(nested.join(name).exists(), "{name}");
+}
+
+#[tokio::test]
+async fn a_taken_name_gets_a_number_within_the_name_limit() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let long = format!("{}.txt", "a".repeat(MAX_NAME - 4));
+    let wide = format!("{}b.txt", "é".repeat(125));
+    for name in [&long, &wide] {
+        assert_eq!(name.len(), MAX_NAME);
+        let mut saved = Vec::new();
+        for _ in 0..3 {
+            let (s, b) = put(&f, &[("name", name)], "x").await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+            saved.push(
+                v["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(saved[0], *name);
+        for n in &saved[1..] {
+            assert!(n.len() <= MAX_NAME && n.ends_with(").txt"), "{n}");
+        }
+        assert_ne!(saved[1], saved[2]);
     }
 }
 
+/// The zip of a folder much wider than the descriptors a process may hold: run as a child
+/// with RLIMIT_NOFILE lowered, by the test below.
 #[test]
-fn a_temporary_name_does_not_grow_with_the_file_name() {
-    assert!(part_name().len() < 64);
+#[ignore]
+fn zip_child_under_a_low_fd_limit() {
+    let Some(dir) = std::env::var_os("STARFOLD_FD_CHILD") else {
+        return;
+    };
+    let limit = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: 64,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let root = Root::open(Path::new(&dir)).unwrap();
+    let top = root.dir(&["wide"], false).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        while let Some(chunk) = rx.blocking_recv() {
+            let chunk: std::io::Result<bytes::Bytes> = chunk;
+            all.extend_from_slice(&chunk.unwrap());
+        }
+        all
+    });
+    let out = ChunkWriter {
+        tx,
+        buf: Vec::with_capacity(CHUNK),
+    };
+    write_zip(top, "wide", out).unwrap();
+    let zipped = reader.join().unwrap();
+    let z = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+    println!(
+        "FILES {}",
+        z.file_names().filter(|n| n.ends_with("/f")).count()
+    );
+}
+
+#[test]
+fn a_zip_needs_one_descriptor_per_level_not_per_folder() {
+    let t = Tmp::new();
+    for i in 0..200 {
+        let d = t.root().join("wide").join(format!("d{i:03}")).join("inner");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f"), i.to_string()).unwrap();
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "files::tests::zip_child_under_a_low_fd_limit",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("STARFOLD_FD_CHILD", t.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("FILES 200"), "{stdout}");
 }

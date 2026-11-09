@@ -77,6 +77,22 @@ impl Root {
     }
 }
 
+/// Neither an exclusive rename nor a hard link: an upload can't be saved without risking
+/// replacing a file another upload saved under the same name at the same moment.
+#[cfg(unix)]
+fn no_exclusive_rename() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this filesystem can't save an upload without risking replacing another one",
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries looked up by [`Dir::entries`] on this thread.
+    pub static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether Windows takes `name` as a plain name inside its folder: no drive, UNC or
 /// stream syntax (any `:`), no separator or wildcard, no device name (`NUL`, `COM1.txt`)
 /// and no trailing dot or space, which Windows would drop.
@@ -122,7 +138,7 @@ pub use windows::Dir;
 
 #[cfg(unix)]
 mod unix {
-    use super::{ControlFlow, Entry, Kind, Opened, Refused};
+    use super::{no_exclusive_rename, ControlFlow, Entry, Kind, Opened, Refused};
     use nix::errno::Errno;
     use nix::fcntl::{openat, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
@@ -268,14 +284,16 @@ mod unix {
         }
 
         /// Renames `from` to `to`, failing with `AlreadyExists` if `to` is there, however
-        /// close together two uploads finish.
+        /// close together two uploads finish. Without an exclusive rename it links and
+        /// unlinks; a filesystem with neither is `Unsupported`, never a replacing rename.
         pub fn publish(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
             let fd = self.0.as_fd();
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             {
                 use nix::fcntl::{renameat2, RenameFlags};
                 match renameat2(fd, from, fd, to, RenameFlags::RENAME_NOREPLACE) {
-                    Err(Errno::EINVAL | Errno::ENOSYS) => {}
+                    // EPERM: a seccomp filter that allows the rest (the resolver falls back too).
+                    Err(Errno::EINVAL | Errno::ENOSYS | Errno::EPERM) => {}
                     r => return Ok(r?),
                 }
             }
@@ -297,8 +315,22 @@ mod unix {
                     r => return Ok(r.map(drop)?),
                 }
             }
-            nix::unistd::linkat(fd, from, fd, to, AtFlags::empty())?;
-            Ok(unlinkat(fd, from, UnlinkatFlags::NoRemoveDir)?)
+            match nix::unistd::linkat(fd, from, fd, to, AtFlags::empty()) {
+                Ok(()) => Ok(unlinkat(fd, from, UnlinkatFlags::NoRemoveDir)?),
+                // ENOTSUP and EOPNOTSUPP are one value on Linux, two on macOS.
+                Err(e)
+                    if [
+                        Errno::EPERM,
+                        Errno::ENOTSUP,
+                        Errno::EOPNOTSUPP,
+                        Errno::ENOSYS,
+                    ]
+                    .contains(&e) =>
+                {
+                    Err(no_exclusive_rename())
+                }
+                Err(e) => Err(e.into()),
+            }
         }
 
         pub fn remove(&self, name: &OsStr) -> std::io::Result<()> {
@@ -319,8 +351,13 @@ mod unix {
                 if name == "." || name == ".." {
                     continue;
                 }
-                let Ok(st) = fstatat(self.0.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-                    continue;
+                #[cfg(test)]
+                super::STATS.with(|n| n.set(n.get() + 1));
+                let st = match fstatat(self.0.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                    Ok(st) => st,
+                    // Gone since it was listed.
+                    Err(Errno::ENOENT) => continue,
+                    Err(e) => return Err(e.into()),
                 };
                 let modified = (st.st_mtime >= 0).then(|| {
                     SystemTime::UNIX_EPOCH
@@ -462,11 +499,20 @@ mod windows {
                 .is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())
         }
 
-        /// A hard link then the old name's removal: the link fails if `to` is there.
+        /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`: it fails if `to` is there.
         pub fn publish(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
-            let from = self.at_io(from)?;
-            std::fs::hard_link(&from, self.at_io(to)?)?;
-            std::fs::remove_file(from)
+            use windows::core::HSTRING;
+            use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+            let (from, to) = (self.at_io(from)?, self.at_io(to)?);
+            let (from, to) = (HSTRING::from(from.as_path()), HSTRING::from(to.as_path()));
+            unsafe { MoveFileExW(&from, &to, MOVE_FILE_FLAGS(0)) }.map_err(|e| {
+                let code = e.code().0 as u32;
+                if code >> 16 == 0x8007 {
+                    std::io::Error::from_raw_os_error((code & 0xffff) as i32)
+                } else {
+                    std::io::Error::other(e)
+                }
+            })
         }
 
         pub fn remove(&self, name: &OsStr) -> std::io::Result<()> {
@@ -479,8 +525,11 @@ mod windows {
         ) -> std::io::Result<()> {
             for e in std::fs::read_dir(&self.path)? {
                 let e = e?;
-                let Ok(md) = std::fs::symlink_metadata(e.path()) else {
-                    continue;
+                let md = match std::fs::symlink_metadata(e.path()) {
+                    Ok(md) => md,
+                    // Gone since it was listed.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
                 };
                 let e = Entry {
                     name: e.file_name(),

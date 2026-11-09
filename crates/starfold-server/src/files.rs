@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::ops::ControlFlow;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,6 +126,30 @@ async fn blocking<T: Send + 'static>(
 /// The most entries a listing returns; enumeration stops there.
 const MAX_LISTED: usize = 5000;
 
+/// A folder's files and subfolders for a listing, at most [`MAX_LISTED`].
+fn listed(dir: &Dir) -> std::io::Result<Vec<serde_json::Value>> {
+    let mut entries = Vec::new();
+    dir.entries(|e| {
+        let name = e.name.to_string_lossy().into_owned();
+        // Symlinks are left out: they are never followed.
+        if name.starts_with('.') || !matches!(e.kind, Kind::Dir | Kind::File) {
+            return ControlFlow::Continue(());
+        }
+        let mtime = e
+            .modified
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        entries.push(serde_json::json!({ "name": name, "dir": e.kind == Kind::Dir, "size": e.len, "mtime": mtime }));
+        if entries.len() >= MAX_LISTED {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    Ok(entries)
+}
+
 pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
     if !f.download && !f.upload || f.root.is_none() {
         return err(StatusCode::FORBIDDEN, "file transfer is disabled");
@@ -141,26 +164,7 @@ pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
             Err(Refused::Missing) if rel == f.default_dir => return Ok((parts.join("/"), vec![])),
             Err(r) => return Err(refused(r)),
         };
-        let mut entries = Vec::new();
-        dir.entries(|e| {
-            let name = e.name.to_string_lossy().into_owned();
-            // Symlinks are left out: they are never followed.
-            if name.starts_with('.') || !matches!(e.kind, Kind::Dir | Kind::File) {
-                return ControlFlow::Continue(());
-            }
-            let mtime = e
-                .modified
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            entries.push(serde_json::json!({ "name": name, "dir": e.kind == Kind::Dir, "size": e.len, "mtime": mtime }));
-            if entries.len() >= MAX_LISTED {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .map_err(|e| refused(Refused::Io(e)))?;
+        let entries = listed(&dir).map_err(|e| refused(Refused::Io(e)))?;
         Ok((parts.join("/"), entries))
     })
     .await;
@@ -404,9 +408,11 @@ fn walk(
             Ok(Opened::Dir(d)) => {
                 next = Some((d, format!("{}/{}", level.rel, name.to_string_lossy())));
             }
+            // Gone, or swapped for something never followed, since it was listed.
+            Ok(Opened::File(_))
+            | Err(Refused::Missing | Refused::NotFolder | Refused::Link | Refused::Special) => {}
             Err(Refused::Io(e)) => return Err(e),
-            // Gone, or swapped for something else, since it was listed.
-            Ok(Opened::File(_)) | Err(_) => {}
+            Err(Refused::BadName) => return Err(std::io::Error::other("an unusable name")),
         }
     }
 }
@@ -420,9 +426,13 @@ fn write_zip(dir: Dir, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()
         for e in entries.into_iter().filter(|e| e.kind == Kind::File) {
             let mut file = match dir.open(&e.name) {
                 Ok(Opened::File(f)) => f,
+                // Gone, or swapped for something never followed, since it was listed.
+                Ok(Opened::Dir(_))
+                | Err(Refused::Missing | Refused::NotFolder | Refused::Link | Refused::Special) => {
+                    continue
+                }
                 Err(Refused::Io(e)) => return Err(e),
-                // Gone, or swapped for something else, since it was listed.
-                Ok(Opened::Dir(_)) | Err(_) => continue,
+                Err(Refused::BadName) => return Err(std::io::Error::other("an unusable name")),
             };
             let md = file.metadata()?;
             let name = e.name.to_string_lossy();
@@ -473,88 +483,56 @@ fn clean_name(name: &str) -> Option<&str> {
     let ok = !name.is_empty()
         && name != "."
         && name != ".."
-        && name.len() <= 255
+        && name.len() <= MAX_NAME
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control());
     ok.then_some(name)
 }
 
-/// `name`, or `name (1).ext`, `name (2).ext`, ... if taken.
+/// The longest name an upload gets, in bytes.
+const MAX_NAME: usize = 255;
+
+/// `name`, or `name (1).ext`, `name (2).ext`, ... if taken, the stem shortened (on a
+/// character boundary) where the suffix would take the name past [`MAX_NAME`].
 fn unique(dir: &Dir, name: &str) -> String {
     if !dir.exists(OsStr::new(name)) {
         return name.to_string();
     }
     let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        Some(i) if i > 0 && name.len() - i <= 32 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
     (1..)
-        .map(|n| format!("{stem} ({n}){ext}"))
+        .map(|n| numbered(stem, n, ext))
         .find(|p| !dir.exists(OsStr::new(p)))
         .unwrap()
 }
 
-static UPLOADS: AtomicU64 = AtomicU64::new(0);
+fn numbered(stem: &str, n: u64, ext: &str) -> String {
+    let suffix = format!(" ({n}){ext}");
+    let mut cut = stem.len().min(MAX_NAME - suffix.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &stem[..cut])
+}
 
+/// Upload temporaries' names start with this; no upload may take such a name.
 const PART_PREFIX: &str = ".starfold-upload-";
 
-/// A hidden temporary name for an upload, the same length whatever the file is called.
-fn part_name() -> OsString {
-    format!(
-        "{PART_PREFIX}{}-{}.part",
-        std::process::id(),
-        UPLOADS.fetch_add(1, Ordering::Relaxed)
-    )
-    .into()
+/// A hidden temporary name for an upload: the prefix and 128 random bits, the same
+/// length whatever the file is called.
+fn part_name() -> std::io::Result<OsString> {
+    let mut bits = [0u8; 16];
+    getrandom::fill(&mut bits).map_err(std::io::Error::other)?;
+    let hex: String = bits.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{PART_PREFIX}{hex}.part").into())
 }
 
-/// An upload temporary left by another process (one killed mid-upload).
-fn stale_part(name: &OsStr) -> bool {
-    let Some(ids) = name
-        .to_str()
-        .and_then(|n| n.strip_prefix(PART_PREFIX))
-        .and_then(|n| n.strip_suffix(".part"))
-    else {
-        return false;
-    };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    matches!(ids.split_once('-'), Some((pid, n)) if digits(pid) && digits(n) && pid != std::process::id().to_string())
-}
-
-/// Removes the upload temporaries earlier runs left anywhere under the root; how many.
-fn sweep(root: &Root) -> std::io::Result<usize> {
-    let mut removed = 0;
-    walk(
-        root.dir(&[], false).map_err(|r| match r {
-            Refused::Io(e) => e,
-            _ => std::io::Error::other("the files root is gone"),
-        })?,
-        String::new(),
-        |dir, _, entries| {
-            for e in entries {
-                if e.kind == Kind::File && stale_part(&e.name) && dir.remove(&e.name).is_ok() {
-                    removed += 1;
-                }
-            }
-            Ok(())
-        },
-    )?;
-    Ok(removed)
-}
-
-/// [`sweep`] in the background, at startup.
-pub fn sweep_stale(files: Arc<Files>) {
-    std::thread::spawn(move || {
-        let Some(root) = &files.root else {
-            return;
-        };
-        match sweep(root) {
-            Ok(0) => {}
-            Ok(n) => log::info!("removed {n} unfinished uploads"),
-            Err(e) => log::warn!("looking for unfinished uploads: {e}"),
-        }
-    });
+fn reserved(name: &str) -> bool {
+    name.get(..PART_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(PART_PREFIX))
 }
 
 /// An upload's temporary file, removed unless it was published, whatever ends the
@@ -594,7 +572,11 @@ pub async fn upload(
     if !headers.contains_key(UPLOAD_HEADER) {
         return err(StatusCode::FORBIDDEN, "missing upload header");
     }
-    let Some(name) = q.get("name").and_then(|n| clean_name(n)) else {
+    let Some(name) = q
+        .get("name")
+        .and_then(|n| clean_name(n))
+        .filter(|n| !reserved(n))
+    else {
         return err(StatusCode::BAD_REQUEST, "invalid file name");
     };
     let rel = q
@@ -628,7 +610,8 @@ pub async fn upload(
             };
             path.push(p);
         }
-        let part = part_name();
+        let part =
+            part_name().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
         let out = dir.create_new(&part).map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -685,6 +668,9 @@ pub async fn upload(
                     StatusCode::CONFLICT,
                     "another upload took that name first",
                 ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(err(StatusCode::NOT_IMPLEMENTED, &e.to_string()))
             }
             Err(e) => {
                 return Err(err(
