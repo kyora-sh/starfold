@@ -1,101 +1,78 @@
-# starfold
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/starfold-wordmark-dark.svg">
+    <img alt="kyora starfold" src="assets/starfold-wordmark-light.svg" width="360">
+  </picture>
+</p>
 
-starfold is kyora's remote-desktop streaming, with codec negotiation between server and
-browser. It is a fork of [tembo/voxl](https://github.com/tembo/voxl) (MIT, see
-[NOTICE](NOTICE)); the rest of this README is voxl's and still says voxl where it means
-the server. The binary is `starfold`; flags and environment variables are voxl's, and so
-is the protocol, which a protocol 2 client extends with codec negotiation (voxl's clients
-still get H.264 as before).
+<p align="center">Low-latency desktop streaming to the browser.</p>
 
-# voxl
+kyora starfold streams a desktop to a plain browser tab over one WebSocket: an X11 display (Xvfb
+included), a Mac's screen or a Windows desktop. The browser decodes with WebCodecs. H.264 is the
+baseline, and the server and the browser negotiate HEVC or AV1 where both have them. It carries the
+mouse, keyboard and touch, the clipboard, audio and the microphone, file transfer and dynamic resolution.
+Agents get HTTP APIs for screenshots, recordings, input and waiting until the screen settles.
 
-Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
-display, a Mac's screen or a Windows desktop as H.264 over a WebSocket to a small web
-client that decodes with WebCodecs, with input, clipboard, audio, microphone, file and
-folder transfer and dynamic resolution.
+starfold began as a fork of [tembo/voxl](https://github.com/tembo/voxl) (MIT); see [NOTICE](NOTICE).
+
+## How kyora uses it
+
+[kyora](https://kyora.sh) runs desktop sandboxes in microVMs with no GPU and no network ports in the
+guest: a relay carries each viewer's connection over vsock. In kyora's integration starfold runs
+inside the sandbox, encodes on the CPU and serves its viewers through that relay, with what kyora's
+platform handles itself, or a sandbox viewer should not reach, turned off:
+
+```sh
+starfold --enable-basic-auth=false --file-transfers none --enable-clipboard false \
+  --audio-enabled false --microphone-enabled false --enable-resize false \
+  --encoder auto --framerate 30
+```
+
+The relay passes binary WebSocket messages only, so kyora's integration serves starfold on a unix
+socket with every message framed as binary; that listener is being added.
 
 ## Quick start
 
 ```sh
-cargo install --locked --path crates/starfold-server   # needs nasm, libyuv, Opus, PulseAudio and esbuild (see Usage)
+cargo install --locked --path crates/starfold-server   # needs nasm, libyuv, Opus, PulseAudio and esbuild (see Build)
 DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
-Open the link it prints. On a Mac or a Windows PC, `starfold` streams that machine's own
-screen instead; see [macOS](#macos) and [Windows](#windows).
+Open the link it prints. On a Mac or a Windows PC, `starfold` streams that machine's own screen
+instead; see [macOS](#macos) and [Windows](#windows).
 
 ## Benchmarks
 
-https://github.com/user-attachments/assets/acdf3f31-64fc-4acf-b5c5-ff173d7100a8
+[`bench/results/2026-11-starfold-vs-novnc.md`](bench/results/2026-11-starfold-vs-novnc.md) measures
+starfold against noVNC as kyora runs it, on kyora VMs at 1920x1080 with a 30 fps source, on the LAN
+and on 20 and 2 Mbit/s links with 50 ms RTT: frame rate, key-to-paint latency, picture quality against
+the X server's own pixels, and bandwidth. Every set interleaves the arms on one VM and carries an A/A
+arm, so a difference only counts beyond what the same binary shows against itself. The harness is in
+[`bench/vs/`](bench/vs) and the method, caveats and raw cells are in the results file.
 
-In every test below voxl averages 60 FPS with a median latency of 12–99 ms; noVNC
-averages under 8 FPS.
+## Build
 
-A 16 vCPU AMD EPYC 9334 VM (no GPU), 2560x1600 Xvfb desktop, same workloads, each
-stream decoded by a native client that reads a pixel marker drawn into the content.
-Cells are FPS (worst second), then latency p50/p99 from the content being drawn to the
-frame being decoded. voxl's column is its best run of each test. To reproduce, see
-[`bench/`](bench/README.md).
-
-| Test                           | voxl                       | [selkies](https://github.com/selkies-project/selkies) | [KasmVNC](https://github.com/kasmtech/KasmVNC) | [Neko](https://github.com/m1k1o/neko) | [Neko, tuned](https://github.com/m1k1o/neko) | [noVNC](https://github.com/novnc/noVNC) | [Daytona](https://www.daytona.io) |
-| ------------------------------ | -------------------------- | ----------------------------------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------------------- | --------------------------------------- | --------------------------------- |
-| Chromium scroll, LAN           | **60.1 (59.7), 55/60 ms**  | 56.8 (54.0), 85/106 ms                                | 51.7 (39.5), 99/135 ms                         | 25.0 (23.7), 156/217 ms               | 53.9 (49.9), 128/155 ms                      | 6.7 (6.3), 198/301 ms                   | 5.2 (2.5), 306/713 ms             |
-| Scroll, 10 Mbps / 40 ms RTT    | **60.0 (59.4), 82/94 ms**  | 55.6 (47.7), 152/261 ms                               | 8.3 (7.4), 229/249 ms                          | 24.6 (14.9), 221/737 ms               | 46.3 (40.3), 606/831 ms                      | 2.6 (2.4), 426/678 ms                   | 1.9 (1.6), 617/798 ms             |
-| Scroll, 5 Mbps / 60 ms RTT     | **60.1 (59.7), 99/109 ms** | 27.9 (19.6), 2.7/3.7 s                                | 4.9 (3.6), 306/415 ms                          | 21.7 (3.8), 1.2/3.6 s                 | stalls                                       | 1.6 (1.4), 637/937 ms                   | 1.1 (0.9), 1.1/1.2 s              |
-| 1080p animation, LAN           | **60.1 (59.9), 12/16 ms**  | 58.7 (55.9), 31/48 ms                                 | 56.7 (51.6), 51/82 ms                          | 24.8 (23.6), 122/202 ms               | 55.6 (50.0), 54/82 ms                        | 7.7 (7.2), 149/210 ms                   | 10.5 (8.8), 138/209 ms            |
-| Animation, 10 Mbps / 40 ms RTT | **60.1 (59.5), 46/71 ms**  | 39.3 (31.8), 2.3/3.1 s                                | 52.9 (49.2), 76/115 ms                         | 25.1 (9.1), 295/962 ms                | 33.3 (25.4), 4.0/7.1 s                       | 5.8 (5.2), 160/226 ms                   | 7.4 (7.0), 154/213 ms             |
-| Animation, 5 Mbps / 60 ms RTT  | **60.0 (58.8), 66/92 ms**  | 18.4 (15.3), 2.2/4.3 s                                | 34.1 (26.4), 104/156 ms                        | 15.2 (8.6), 5.0/9.4 s                 | stalls                                       | 5.1 (4.7), 174/240 ms                   | 5.8 (4.4), 189/252 ms             |
-| Full-screen animation, LAN     | **59.8 (54.0), 18/25 ms**  | 54.8 (49.8), 54/79 ms                                 | 34.2 (32.5), 83/102 ms                         | 22.7 (18.0), 2.9/3.3 s                | 54.6 (49.7), 54/79 ms                        | 5.9 (5.2), 184/279 ms                   | 9.1 (7.2), 154/247 ms             |
-
-| Server CPU, X server + streamer (cores)               | idle | 1080p animation  | scroll           | full screen      |
-| ----------------------------------------------------- | ---- | ---------------- | ---------------- | ---------------- |
-| voxl                                                  | 0.00 | 1.39             | 1.33             | 1.68             |
-| [selkies](https://github.com/selkies-project/selkies) | 1.29 | not measured     | 1.54             | 1.80             |
-| [KasmVNC](https://github.com/kasmtech/KasmVNC)        | 0.00 | 1.97             | 2.07             | 1.82 (at 34 FPS) |
-| [Neko](https://github.com/m1k1o/neko)                 | 1.63 | 2.50 (at 25 FPS) | 2.20 (at 25 FPS) | 2.46 (at 23 FPS) |
-| [Neko](https://github.com/m1k1o/neko), tuned          | 1.90 | 2.28             | 2.30             | 2.52             |
-| [noVNC](https://github.com/novnc/noVNC)               | 0.01 | 0.55 (at 8 FPS)  | 0.58 (at 7 FPS)  | 0.64 (at 6 FPS)  |
-| [Daytona](https://www.daytona.io) (1 CPU limit)       | 0.02 | 0.82 (at 10 FPS) | 0.53 (at 5 FPS)  | 0.81 (at 9 FPS)  |
-
-- **selkies:** [selkies](https://github.com/selkies-project/selkies) with picom running.
-- **KasmVNC:** 1.4.0 with a 60 FPS cap, JPEG/WebP quality 8–9 and video mode, no
-  compositor.
-- **Neko:** [m1k1o/neko](https://github.com/m1k1o/neko) 3.2 with its defaults (VP8, 25
-  FPS). **Neko, tuned** captures at 60 FPS and encodes with x264 `ultrafast`/
-  `zerolatency` at up to 30 Mbps, like voxl. Neither adapts its bitrate (Neko's
-  estimator is off by default), so on slow links frames queue up; "stalls" means no
-  frame arrived in 20 s.
-- **noVNC:** x11vnc and noVNC as [E2B Desktop](https://github.com/e2b-dev/desktop)
-  and Daytona ship them (`-forever -wait 50 -shared`, Tight encoding). x11vnc polls the
-  screen, which caps it at 6–8 FPS.
-- **Daytona:** a default sandbox (1 CPU, x11vnc and noVNC at 2560x1600) streamed
-  through Daytona's signed preview proxy, about 12 ms away, which its latency includes.
-  The workloads run inside the sandbox, sharing its CPU, and slow links are added on top
-  of that internet path.
-- **Links:** a bottleneck with a deep queue: a TCP proxy for the WebSocket servers, and
-  `tc netem` for Neko's WebRTC media (UDP).
-
-## Usage
-
-Build (needs Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild;
-`nix-shell` provides them all). The H.264 encoder is OpenH264, built from source; x264
-is optional (`cargo build --features x264`, then `--encoder x264`; needs x264 and clang):
+Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild; `nix-shell` provides
+them all. The H.264 encoder is OpenH264, built from source; x264 is optional
+(`cargo build --features x264`, then `--encoder x264`; needs x264 and clang, see [Licence](#licence)).
 
 ```sh
 nix-shell
 cargo build --release
 ```
 
-Or install it with the same libraries on your system (the crate is `starfold-server`,
-the binary is `starfold`):
+Or install it with the same libraries on your system (the crate is `starfold-server`, the binary is
+`starfold`):
 
 ```sh
 cargo install --locked --path crates/starfold-server
 ```
 
-Run it against an X display, then open the link it prints (`?stats` adds an FPS
-overlay, `?present=canvas` paints into a canvas instead of `<video>`; a page embedding
-it can wait for the `starfold:firstframe` event on `window` rather than `load`):
+## Usage
+
+Run it against an X display, then open the link it prints (`?stats` adds an FPS overlay,
+`?present=canvas` paints into a canvas instead of `<video>`; a page embedding it can wait for the
+`starfold:firstframe` event on `window` rather than `load`):
 
 ```sh
 DISPLAY=:1 ./target/release/starfold --port=6901
@@ -103,15 +80,15 @@ DISPLAY=:1 ./target/release/starfold --port=6901
 ```
 
 Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
-(`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for smooth
-scrolling. voxl accepts selkies' command-line flags; other selkies flags are ignored.
-`starfold --help` lists every flag with its default, and `starfold --version` prints the version.
+(`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for pixel-smooth scrolling;
+stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag with its default, and
+`starfold --version` prints the version.
 
 | Flag                                                           | Default                            |                                                                                                                   |
 | -------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--addr`, `--port`                                             | `0.0.0.0`, `6901`                  | listen address                                                                                                    |
-| `--title`                                                      | `Voxl Computer Stream`             | the page's title: the browser tab, and the app's name if a viewer installs it                                     |
-| `--favicon`                                                    | voxl's icon                        | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                 |
+| `--title`                                                      | `starfold`             | the page's title: the browser tab, and the app's name if a viewer installs it                                     |
+| `--favicon`                                                    | starfold's icon                        | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                 |
 | `--enable-basic-auth`                                          | `true`                             | ask for a password (see [Login](#login)); `false` serves without one                                              |
 | `--basic-auth-password`                                        | `VOXL_PASSWORD`, else made up      | the password                                                                                                      |
 | `--basic-auth-user`                                            | any                                | the user name a browser's sign-in has to give                                                                     |
@@ -138,7 +115,7 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 | `--file-transfers`                                             | `upload,download`                  | `upload`, `download`, both, or `none`                                                                             |
 | `--read-only`                                                  | `false`                            | viewers only watch: input, clipboard writes, the microphone, uploads and resizing (`--enable-resize`) are refused |
 | `--allowed-hosts`                                              | none                               | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)         |
-| `--allowed-origins`                                            | none                               | other sites whose pages may connect, such as a page that embeds voxl's client (`*` any site)                      |
+| `--allowed-origins`                                            | none                               | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                      |
 | `--files-root`                                                 | `$HOME`                            | folder the Files panel can see; nothing outside it is reachable                                                   |
 | `--upload-dir`                                                 | `Downloads`                        | folder (under the root) the panel opens and uploads into; created on first upload                                 |
 | `--max-upload-mb`                                              | `0` (no limit)                     | largest accepted upload                                                                                           |
@@ -147,24 +124,24 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 
 ### Login
 
-voxl asks for a password before it shows the desktop or takes input, files or API
+starfold asks for a password before it shows the desktop or takes input, files or API
 calls. Give it one with `--basic-auth-password` or `VOXL_PASSWORD`; otherwise it makes
 one up when it starts and prints a link that signs you in. There are three ways in:
 
 - **The link**: `http://host:6901/?token=<password>`. The page passes the password on to
   its own connections, so the link also works as an iframe's `src`.
-- **The browser's sign-in prompt**, which voxl's page brings up: any user name (unless
+- **The browser's sign-in prompt**, which starfold's page brings up: any user name (unless
   `--basic-auth-user` names one) and the password. Password managers offer to save it.
 - **For programs**: `Authorization: Bearer <password>`, or `curl -u :<password>`.
 
-The page's scripts and `/healthz` load without it. If voxl sits behind a proxy that signs
-people in itself, `--enable-basic-auth=false` turns voxl's login off.
+The page's scripts and `/healthz` load without it. If starfold sits behind a proxy that signs
+people in itself, `--enable-basic-auth=false` turns starfold's login off.
 
 ### Hosts and origins
 
-voxl only answers requests for an IP address or `localhost`, and only from its own page.
+starfold only answers requests for an IP address or `localhost`, and only from its own page.
 That keeps out other web pages, which browsers let connect to any address, including
-pages whose domain is pointed at voxl's address (DNS rebinding). To reach voxl under a
+pages whose domain is pointed at starfold's address (DNS rebinding). To reach starfold under a
 host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-hosts`.
 To let a page on another site connect, name that site with `--allowed-origins`.
 Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as
@@ -172,7 +149,7 @@ usual. A refused request gets a 403 that names the flag to add.
 
 ### For agents and scripts
 
-Screenshots and recordings (start voxl with `VOXL_PASSWORD` set, and send it along):
+Screenshots and recordings (start starfold with `VOXL_PASSWORD` set, and send it along):
 
 ```sh
 # the screen as a PNG
@@ -185,7 +162,7 @@ id=$(curl -u ":$VOXL_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
 curl -u ":$VOXL_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
 ```
 
-A recording is the H.264 voxl already sends to viewers, saved as MP4 without encoding
+A recording is the H.264 starfold already sends to viewers, saved as MP4 without encoding
 it again, so it costs no extra CPU. It doesn't include the cursor (viewers draw it), and
 a resize ends it.
 
@@ -218,7 +195,7 @@ changed while waiting. A change can land before the request does, so to wait for
 action caused, pass `since` the `seq` of an earlier `/wait` or the `X-Voxl-Seq` header of
 a screenshot: `/wait?change&since=812` returns at once if anything changed after it. A
 blinking text caret redraws about twice a second, so keep `idle` under 500 ms or leave
-the caret out of `region`. voxl already knows which parts of the screen change (XDamage,
+the caret out of `region`. starfold already knows which parts of the screen change (XDamage,
 ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polling.
 
 `POST /input` drives the mouse and keyboard with JSON actions (one, or an array applied in
@@ -233,7 +210,7 @@ curl -u ":$VOXL_PASSWORD" -H 'Content-Type: application/json' localhost:6901/inp
 
 ### macOS
 
-voxl also streams a Mac's own screen, with every feature of the Linux version
+starfold also streams a Mac's own screen, with every feature of the Linux version
 (ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
 
 ```sh
@@ -242,8 +219,8 @@ cargo build --release
 ./target/release/starfold --port=6901
 ```
 
-Open the link it prints. On a Mac voxl listens on `127.0.0.1` unless `--addr` says
-otherwise, since the stream is your whole screen. macOS asks voxl (or the terminal that
+Open the link it prints. On a Mac starfold listens on `127.0.0.1` unless `--addr` says
+otherwise, since the stream is your whole screen. macOS asks starfold (or the terminal that
 starts it) for Screen Recording and Accessibility permissions. For the microphone,
 install a loopback device (`brew install blackhole-2ch`) and pick it as the input in the
 apps that should hear you.
@@ -261,7 +238,7 @@ rounded-corner flags don't apply.
 
 ### Windows
 
-voxl also streams a Windows desktop (Windows 10 or later), with every feature of the
+starfold also streams a Windows desktop (Windows 10 or later), with every feature of the
 Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
 WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
@@ -273,11 +250,11 @@ cargo build --release
 .\target\release\starfold.exe --port=6901
 ```
 
-Open the link it prints. As on a Mac, voxl listens on `127.0.0.1` unless `--addr` says
+Open the link it prints. As on a Mac, starfold listens on `127.0.0.1` unless `--addr` says
 otherwise. It streams the desktop of the session it runs in, so start it in the user's
 session (not as a service); Windows hides the lock screen and UAC prompts from it unless
 it runs as SYSTEM. For the microphone, install a virtual audio cable
-([VB-CABLE](https://vb-audio.com/Cable/)): voxl plays into "CABLE Input" and apps record
+([VB-CABLE](https://vb-audio.com/Cable/)): starfold plays into "CABLE Input" and apps record
 from "CABLE Output".
 
 | Windows flag          | Default                   |                                                                    |
@@ -289,42 +266,22 @@ from "CABLE Output".
 
 The other flags work as on Linux; `--microphone-fifo` and the rounded-corner flags don't
 apply. Dynamic resolution picks the largest display mode that fits the viewer's window,
-and Windows restores the original mode when voxl exits.
+and Windows restores the original mode when starfold exits.
 
 ## FAQ
 
-**Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through
-reverse proxies, tunnels and sandbox preview URLs, with no TURN servers or UDP ports to
-open. The browser decodes each frame the moment it arrives with WebCodecs, without
-WebRTC's jitter buffer, and voxl runs its own rate control, which keeps latency low on a
-clean link. The trade-off is TCP: on a link that drops packets (bad Wi-Fi, a weak mobile
-signal) a lost packet holds up the frames behind it, where WebRTC can skip ahead.
+**Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through reverse
+proxies, tunnels, sandbox preview URLs and relays like kyora's, with no TURN servers or UDP ports to
+open. The browser decodes each frame the moment it arrives with WebCodecs, without a jitter buffer,
+and starfold runs its own rate control, which keeps latency low on a clean link. The trade-off is TCP:
+on a link that drops packets a lost packet holds up the frames behind it, where WebRTC can skip ahead.
 
-**How is it different from Moonlight and Sunshine?** They're for playing games on your
-own GPU machine through the Moonlight app, and for that they're the better fit. voxl was
-built for things like software factories that use headless VMs and sandboxes (CI,
-computer-use agents), usually on Xvfb with no GPU. It streams them to a plain browser tab
-over one WebSocket and has APIs for agents.
+**Why doesn't the stream load at `http://<ip>:6901`?** Browsers only allow WebCodecs on HTTPS pages
+and on localhost. To watch from another machine, put starfold behind a TLS proxy and name its host
+with `--allowed-hosts`, or forward the port over SSH and open `localhost`.
 
-**How is it different from RustDesk?** RustDesk is an open-source alternative to
-TeamViewer and AnyDesk, for reaching your own computers or helping someone with theirs:
-you install its app on both ends, desktop or phone, and the two find each other through
-an ID server, then connect directly or through a relay. For that it's the better fit,
-and it also shares Wayland desktops (experimentally) and Android phones, which voxl
-doesn't. voxl is for desktops on servers, VMs and sandboxes: it's one process that
-serves its own page, so there's nothing to install on the viewing side and no ID or
-relay server to run. The stream goes wherever a URL does, can be embedded in another
-page and comes with the APIs agents use. RustDesk has a web client too, but it still
-goes through the ID and relay servers, and the self-hosted one comes with RustDesk
-Server Pro.
-
-**Why doesn't the stream load at `http://<ip>:6901`?** Browsers only allow WebCodecs on
-HTTPS pages and on localhost. To watch from another machine, put voxl behind a TLS proxy
-(Caddy, Cloudflare Tunnel, `tailscale serve`) and name its host with `--allowed-hosts`,
-or forward the port over SSH and open `localhost`.
-
-**Is it safe to expose?** voxl asks for a password by default but serves plain HTTP, so
-put it behind TLS away from localhost. See [SECURITY.md](SECURITY.md).
+**Is it safe to expose?** starfold asks for a password by default but serves plain HTTP, so put it
+behind TLS away from localhost. See [SECURITY.md](SECURITY.md).
 
 **Which browsers and devices work?** Any browser with WebCodecs, on an HTTPS page or
 localhost:
@@ -338,15 +295,15 @@ localhost:
 
 Phones and tablets get touch input and an on-screen keyboard.
 
-**Wayland?** Not yet; on Linux voxl streams X11 displays, Xvfb included. The virtual
-desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 lets voxl
-capture them without a permission prompt, with damage events that keep a still screen at
-no CPU and power `/wait`. Wayland support is being worked on.
+**Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
-**Does it use the GPU?** Not yet. starfold encodes H.264 on the CPU with OpenH264 (the
-CPU table above was measured with x264: 1.3–1.7 cores for a busy 2560x1600 desktop, X
-server included). On macOS, a browser that decodes HEVC gets it from VideoToolbox.
+**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU. `--encoder auto` uses
+a hardware encoder where it finds one (VideoToolbox on macOS); VA-API, NVENC and Media Foundation are
+experimental and opt-in (`--experimental-hw-probes`).
 
-**What's the license?** The code is MIT, and the default build links OpenH264
-(BSD-2-Clause). A build with the `x264` feature links x264, which is GPL-2.0, so that
-binary, and anything that bundles one, is distributed under the GPL.
+## Licence
+
+The source code is MIT ([LICENSE](LICENSE)). A binary built with the `x264` feature links x264
+(GPL-2.0-or-later), so that binary is distributed under GPL-2.0-or-later as a combined work. The
+default build links OpenH264 (BSD-2-Clause). [NOTICE](NOTICE) lists every bundled component and its
+licence.

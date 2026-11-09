@@ -54,7 +54,7 @@ pub fn index_html(title: &str) -> Bytes {
     Bytes::from(include_str!("../../../packages/web/index.html").replace("{{title}}", &escaped))
 }
 
-/// The page's icon (--favicon): that file's bytes and content type, or voxl's own icon.
+/// The page's icon (--favicon): that file's bytes and content type, or starfold's own icon.
 pub fn favicon(path: Option<&str>) -> Result<(Bytes, &'static str), String> {
     let Some(path) = path else {
         return Ok((

@@ -1,7 +1,7 @@
 //! `--help` and `--version`: printed instead of starting the server.
 
 const USAGE: &str = "
-Usage: voxl [--flag=value]...
+Usage: starfold [--flag=value]...
 
 Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
 WebSocket, and prints a link that signs you in. Flags take --name=value or
@@ -9,9 +9,9 @@ WebSocket, and prints a link that signs you in. Flags take --name=value or
 
 Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
-  --title                       the page's title (default: Voxl Computer Stream)
+  --title                       the page's title (default: starfold)
   --favicon                     the page's icon: an .ico, .png, .gif, .webp or .svg
-                                file (default: voxl's own)
+                                file (default: starfold's own)
   --allowed-hosts               host names to answer for besides IP addresses and
                                 localhost (.example.com covers subdomains, * any)
   --allowed-origins             other sites whose pages may connect (* any)

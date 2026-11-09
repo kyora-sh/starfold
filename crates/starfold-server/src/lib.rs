@@ -427,7 +427,7 @@ async fn serve(a: HashMap<String, String>) {
             );
         }
     }
-    // --favicon: the tab's icon (default: voxl's own).
+    // --favicon: the tab's icon (default: starfold's own).
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
@@ -449,7 +449,7 @@ async fn serve(a: HashMap<String, String>) {
         // --title: the browser tab's title.
         index: server::index_html(
             a.get("title")
-                .map_or("Voxl Computer Stream", |t| t.as_str()),
+                .map_or("starfold", |t| t.as_str()),
         ),
         favicon,
         favicon_type,
