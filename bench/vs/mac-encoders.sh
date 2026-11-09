@@ -4,6 +4,9 @@
 # Usage: mac-encoders.sh <rounds>. Also says whether this host can capture its screen for a browser run.
 set -euo pipefail
 rounds=${1:-5}
+# The OpenH264 arm measures what ships: Cisco's binary (the test binary would otherwise build it from source).
+STARFOLD_OPENH264_LIB=${STARFOLD_OPENH264_LIB:-$(scripts/fetch-openh264.sh)}
+export STARFOLD_OPENH264_LIB
 bin=$(cargo test --release --locked --lib --no-run --color never 2>&1 | tee /dev/stderr | grep -oE 'target/release/deps/starfold-[0-9a-f]+' | head -1)
 arms=("videotoolbox h264" "videotoolbox hevc" "openh264 h264")
 for ((i = 0; i < rounds; i++)); do

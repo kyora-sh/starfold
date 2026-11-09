@@ -23,6 +23,9 @@ path = "src/main.rs"
 
 [features]
 default = []
+# OpenH264 compiled from source when no Cisco library is given: dev and CI only, never
+# in a release (tests always have it, through the dev-dependency below).
+openh264-source = ["openh264-sys2/source"]
 # libx264 (GPL-2.0) as an optional encoder, picked with --encoder x264.
 x264 = ["dep:bindgen"]
 # Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
@@ -62,10 +65,11 @@ getrandom = "0.3"
 zip = { version = "7", default-features = false, features = [
 	"deflate-flate2-zlib-rs",
 ] }
-# OpenH264 (BSD-2-Clause) built from its bundled source, not Cisco's downloadable binary.
+# OpenH264 is Cisco's binary, loaded at runtime (--openh264-lib); see the README.
 openh264-sys2 = { version = "=0.9.9", default-features = false, features = [
-	"source",
+	"libloading",
 ] }
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["fs", "poll", "time"] }

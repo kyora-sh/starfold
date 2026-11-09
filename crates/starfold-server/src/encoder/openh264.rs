@@ -1,5 +1,6 @@
-//! OpenH264 (BSD-2-Clause, compiled from source by openh264-sys2) through its C vtable:
-//! constrained Baseline, bitrate rate control, IDR on request only.
+//! OpenH264 through its C vtable: constrained Baseline, bitrate rate control, IDR on
+//! request only. The library is Cisco's binary, fetched from Cisco on the machine that runs
+//! starfold and loaded at runtime (--openh264-lib); starfold never contains or downloads it.
 
 use super::h264::ParamSets;
 use super::{
@@ -7,8 +8,98 @@ use super::{
     Refine, VideoEncoder,
 };
 use openh264_sys2 as sys;
+use sha2::Digest;
 use std::os::raw::{c_int, c_void};
+use std::path::Path;
 use std::ptr;
+use std::sync::OnceLock;
+use sys::API;
+
+/// Cisco's OpenH264 2.6.0 builds starfold loads: (sha256, Cisco's file name).
+pub const CISCO_BUILDS: &[(&str, &str)] = &[
+    (
+        "2f0cde7c6a6abcf5cae76942894ea42897fa677bce4ed6c91a24dd1b041d5f04",
+        "libopenh264-2.6.0-linux64.8.so",
+    ),
+    (
+        "12e7b33623667cdab0e575170c147b1b36eadb77d0d2aa7ceb5afd3e58902140",
+        "libopenh264-2.6.0-linux-arm64.8.so",
+    ),
+    (
+        "e3dc8bc01fe69363f61fd3c02fd27798537a585eadd38cd808f303d1ee505a19",
+        "libopenh264-2.6.0-mac-x64.dylib",
+    ),
+    (
+        "052e98bfcf7a9167d22f3bbb3f5988ef79065591f36af8b52924b22b13624551",
+        "libopenh264-2.6.0-mac-arm64.dylib",
+    ),
+    (
+        "2076cb5675ec6c1a4c70e7a2a322552f547b6eeed649d6dfcd9e02a543b24691",
+        "openh264-2.6.0-win64.dll",
+    ),
+];
+
+/// The library's path when --openh264-lib isn't given (tests too).
+pub const LIB_ENV: &str = "STARFOLD_OPENH264_LIB";
+
+struct Library(sys::DynamicAPI);
+
+// The loaded library's entry points are plain C functions, callable from any thread.
+unsafe impl Send for Library {}
+unsafe impl Sync for Library {}
+
+static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
+
+/// Loads OpenH264 from `path`, else from $STARFOLD_OPENH264_LIB, for the life of the
+/// process; later calls return the first call's outcome. Without either, only builds with
+/// the `openh264-source` feature (and tests) have one: the from-source library.
+pub fn load(path: Option<&Path>) -> Result<(), String> {
+    LIBRARY
+        .get_or_init(|| open(path))
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
+}
+
+fn library() -> Result<&'static sys::DynamicAPI, EncodeError> {
+    LIBRARY
+        .get_or_init(|| open(None))
+        .as_ref()
+        .map(|l| &l.0)
+        .map_err(|e| EncodeError(e.clone()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn open(path: Option<&Path>) -> Result<Library, String> {
+    let env = std::env::var_os(LIB_ENV).filter(|p| !p.is_empty());
+    let Some(path) = path.or(env.as_deref().map(Path::new)) else {
+        #[cfg(any(test, feature = "openh264-source"))]
+        return Ok(Library(sys::DynamicAPI::from_source()));
+        #[cfg(not(any(test, feature = "openh264-source")))]
+        return Err(format!(
+            "no OpenH264 library: fetch Cisco's OpenH264 2.6.0 and pass it with --openh264-lib or {LIB_ENV}"
+        ));
+    };
+    let shown = path.display();
+    let bytes = std::fs::read(path).map_err(|e| format!("OpenH264 library {shown}: {e}"))?;
+    let sum = sha256_hex(&bytes);
+    if !CISCO_BUILDS.iter().any(|(h, _)| *h == sum) {
+        return Err(format!(
+            "OpenH264 library {shown}: sha256 {sum} is not one of Cisco's OpenH264 2.6.0 builds"
+        ));
+    }
+    // The checksum pins the file to a Cisco 2.6.0 build, whose API this binding matches.
+    let lib = unsafe { sys::DynamicAPI::from_blob_path_unchecked(path) }
+        .map_err(|e| format!("OpenH264 library {shown}: {e}"))?;
+    log::info!("OpenH264 Video Codec provided by Cisco Systems, Inc. ({shown})");
+    Ok(Library(lib))
+}
 
 /// Level 5.2's frame size, OpenH264's limit for one picture.
 pub const MAX_MBS: usize = 36864;
@@ -146,7 +237,8 @@ fn bps(max_kbps: u32, fps: u32) -> c_int {
 impl OpenH264 {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, EncodeError> {
         let mut enc = ptr::null_mut();
-        let r = unsafe { sys::source::APILoader::WelsCreateSVCEncoder(&mut enc) };
+        let lib = library()?;
+        let r = unsafe { lib.WelsCreateSVCEncoder(&mut enc) };
         if r != 0 || enc.is_null() {
             return Err(EncodeError(format!("WelsCreateSVCEncoder failed ({r})")));
         }
@@ -424,7 +516,57 @@ impl Drop for OpenH264 {
     fn drop(&mut self) {
         unsafe {
             self.vt().Uninitialize.unwrap()(self.enc);
-            sys::source::APILoader::WelsDestroySVCEncoder(self.enc);
+            if let Ok(lib) = library() {
+                lib.WelsDestroySVCEncoder(self.enc);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_cisco_builds_load() {
+        let dir = std::env::temp_dir().join(format!("sf-openh264-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.so");
+        let e = open(Some(&missing)).err().unwrap();
+        assert!(e.contains("missing.so"), "{e}");
+        let other = dir.join("libopenh264.so");
+        std::fs::write(&other, b"not cisco").unwrap();
+        let e = open(Some(&other)).err().unwrap();
+        assert!(e.contains(&sha256_hex(b"not cisco")), "{e}");
+        assert!(e.contains("not one of Cisco's"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pinned_hashes_are_sha256() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        for (h, name) in CISCO_BUILDS {
+            assert!(
+                h.len() == 64
+                    && h.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "{name}"
+            );
+            assert!(name.contains("2.6.0"), "{name}");
+        }
+    }
+
+    /// With $STARFOLD_OPENH264_LIB set (CI fetches Cisco's file), every encoder test runs
+    /// on it; this one says which library they ran on. Set but empty, as when the fetch
+    /// failed, fails rather than testing the source build instead.
+    #[test]
+    fn the_library_tests_run_on() {
+        let v = unsafe { library().unwrap().WelsGetCodecVersion() };
+        let cisco = std::env::var_os(LIB_ENV).is_some();
+        let want = if cisco { (2, 6) } else { (2, 7) };
+        assert_eq!((v.uMajor, v.uMinor), want);
     }
 }

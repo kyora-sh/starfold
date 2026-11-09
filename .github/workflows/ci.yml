@@ -94,6 +94,11 @@ jobs:
       # Unit tests, including the Linux-only ones (dynamic resolution).
       - name: Test
         run: cargo test --locked
+      # The encoder tests again, on what ships: Cisco's OpenH264, fetched from Cisco.
+      - name: Test on Cisco's OpenH264
+        run: |
+          lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
+          STARFOLD_OPENH264_LIB=$lib cargo test --locked --lib
 
   x264:
     name: Rust with x264 (clippy, test)
@@ -211,6 +216,10 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Test on Cisco's OpenH264
+        run: |
+          lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
+          STARFOLD_OPENH264_LIB=$lib cargo test --locked --lib
       # What the startup probe finds on this host's hardware encoders.
       - name: Encoder probe
         run: cargo test --locked --lib videotoolbox_probe -- --nocapture

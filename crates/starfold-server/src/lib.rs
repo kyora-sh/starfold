@@ -166,6 +166,11 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
+    // --openh264-lib (else $STARFOLD_OPENH264_LIB): Cisco's OpenH264, fetched from Cisco on
+    // this machine. Without it the probe reports OpenH264 unavailable, with this reason.
+    if let Err(e) = encoder::openh264::load(a.get("openh264-lib").map(std::path::Path::new)) {
+        log::warn!("{e}");
+    }
     let encoders = std::sync::Arc::new(encoder::caps::host_probe(
         truthy(a.get("encoder-probe"), true),
         truthy(a.get("experimental-hw-probes"), false),
