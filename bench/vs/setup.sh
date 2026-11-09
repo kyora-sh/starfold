@@ -6,6 +6,9 @@ sudo apt-get update -qq >/dev/null 2>&1
 sudo apt-get install -y -qq nasm esbuild libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 x11-apps xfonts-base python3-numpy python3-pil >/dev/null 2>&1
 build() { "$@" > /tmp/vs-build.log 2>&1; local c=$?; tail -3 /tmp/vs-build.log; return $c; }
 build cargo +1.93.0 build --release --locked || { echo 'server did not build'; exit 1; }
+# What ships: Cisco's OpenH264, fetched from Cisco and checked against the pinned sha256.
+STARFOLD_OPENH264_LIB=$(scripts/fetch-openh264.sh /tmp/openh264) || { echo 'no OpenH264 from Cisco'; exit 1; }
+export STARFOLD_OPENH264_LIB
 cc -O2 bench/vs/source.c -lX11 -lXext -lm -o /tmp/vs-source || { echo 'source did not build'; exit 1; }
 rm -rf /tmp/novnc; mkdir -p /tmp/novnc
 tar -xzf "$NOVNC_TGZ" -C /tmp/novnc --strip-components=1 || { echo "bad NOVNC_TGZ $NOVNC_TGZ"; exit 1; }

@@ -764,6 +764,49 @@ fn dump_streams() {
     }
 }
 
+/// One fixed clip per workload through whichever OpenH264 this process loaded (Cisco's with
+/// $STARFOLD_OPENH264_LIB, else the source build), to compare the two:
+/// `cargo test --release --lib openh264_fixed_clip -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn openh264_fixed_clip() {
+    use ::openh264::formats::YUVSource;
+    use sha2::Digest;
+    let (w, h) = (1280usize, 720usize);
+    for kbps in [2_000u32, 30_000] {
+        for workload in ["typing", "scrolling", "video"] {
+            let mut enc = open(&config(Backend::OpenH264, w as u32, h as u32, kbps)).unwrap();
+            let mut dec = ::openh264::decoder::Decoder::new().unwrap();
+            let mut p = Picture::new(w, h);
+            let (mut sum, mut bytes, mut psnr, mut shown) = (sha2::Sha256::new(), 0, 0.0, 0);
+            for f in 0..120 {
+                match workload {
+                    "typing" => {
+                        let (x, y) = (100 + (f % 80) * 12, 200 + (f / 80) * 22);
+                        p.texture(f as u32 + 1, x, y, x + 12, y + 22, 0);
+                    }
+                    "scrolling" => p.texture(0, 200, 60, 1000, 660, f * 8),
+                    _ => p.video(f),
+                }
+                for au in encode_one(&mut *enc, &p, f as i64 * 33, f == 60) {
+                    sum.update(&au.data);
+                    bytes += au.data.len();
+                    if let Some(d) = dec.decode(&au.data).unwrap() {
+                        psnr += luma_psnr(d.y(), d.strides().0, &p);
+                        shown += 1;
+                    }
+                }
+            }
+            let digest: String = sum.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            println!(
+                "CLIP {workload} {kbps} kbps: {bytes} bytes, {shown} frames, luma PSNR {:.3} dB, sha256 {}",
+                psnr / shown.max(1) as f64,
+                &digest[..16]
+            );
+        }
+    }
+}
+
 /// CPU per stream at 1080p30 for typing, scrolling and video-like content:
 /// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND=x264 with the
 /// x264 feature; FRAMES, THREADS). One line per workload, `bench` first.

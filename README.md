@@ -78,13 +78,41 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 ## Usage
 
 Build (needs Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild;
-`nix-shell` provides them all). The H.264 encoder is OpenH264, built from source; x264
-is optional (`cargo build --features x264`, then `--encoder x264`; needs x264 and clang):
+`nix-shell` provides them all). The H.264 encoder is OpenH264, Cisco's binary, which
+starfold loads at runtime (see [OpenH264](#openh264)); x264 is optional (`cargo build
+--features x264`, then `--encoder x264`; needs x264 and clang):
 
 ```sh
 nix-shell
 cargo build --release
+starfold --openh264-lib "$(scripts/fetch-openh264.sh)"
 ```
+
+### OpenH264
+
+starfold never contains OpenH264 and never downloads it. Cisco's binary is fetched from
+Cisco's server (`ciscobinary.openh264.org`) on the machine that runs starfold, by whoever
+runs it, and passed with `--openh264-lib PATH` (or `STARFOLD_OPENH264_LIB`). starfold loads
+only Cisco's OpenH264 2.6.0 builds: it checks the file's sha256 against the ones it pins
+(Linux x86-64 and arm64, macOS x86-64 and arm64, Windows x64) and won't load anything
+else. Without the library, or with another file, OpenH264 is unavailable: `/stats` and the
+startup log say why, `--encoder auto` still picks a hardware encoder where there is one
+(VideoToolbox on a Mac), and without one starfold doesn't start. The same goes for
+Windows: Cisco's DLL is fetched at runtime and checked, never bundled.
+
+`scripts/fetch-openh264.sh [dir]` fetches and checks the file for this machine and prints
+its path. It is for development and benchmarks; it is not part of a release, and neither
+is any build that compiles OpenH264 from source (the `openh264-source` cargo feature, for
+CI and development only).
+
+Cisco licenses its binary under its [binary licence](licenses/openh264-cisco-binary.txt),
+which also carries Cisco's AVC/H.264 patent licence from MPEG LA, on conditions that fall
+on whoever ships starfold to end users: the binary is downloaded separately to the end
+user's device and not combined with other software before that; the end user can enable,
+disable and re-enable it; where they control it, the software shows "OpenH264 Video Codec
+provided by Cisco Systems, Inc."; and the licence text, with those conditions, is
+reproduced where licensing information is presented to them. starfold logs that line when
+it loads the library.
 
 Or install it with the same libraries on your system (the crate is `starfold-server`,
 the binary is `starfold`):
@@ -347,6 +375,6 @@ no CPU and power `/wait`. Wayland support is being worked on.
 CPU table above was measured with x264: 1.3–1.7 cores for a busy 2560x1600 desktop, X
 server included). On macOS, a browser that decodes HEVC gets it from VideoToolbox.
 
-**What's the license?** The code is MIT, and the default build links OpenH264
-(BSD-2-Clause). A build with the `x264` feature links x264, which is GPL-2.0, so that
+**What's the license?** The code is MIT. OpenH264 is not part of starfold: it is Cisco's
+binary, fetched at runtime under Cisco's licence (see [OpenH264](#openh264)). A build with the `x264` feature links x264, which is GPL-2.0, so that
 binary, and anything that bundles one, is distributed under the GPL.

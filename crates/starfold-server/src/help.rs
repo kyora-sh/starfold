@@ -42,6 +42,10 @@ Video:
                                 --experimental-hw-probes and auto never
                                 picks them; /stats shows what the probe
                                 found
+  --openh264-lib                Cisco's OpenH264 2.6.0 library, fetched from
+                                Cisco on this machine and checked against its
+                                pinned sha256 (default: $STARFOLD_OPENH264_LIB);
+                                without it OpenH264 is unavailable
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
   --experimental-hw-probes      experimental: also probe VA-API, NVENC and
