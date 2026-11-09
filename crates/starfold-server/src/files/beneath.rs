@@ -288,13 +288,25 @@ mod unix {
         /// unlinks; a filesystem with neither is `Unsupported`, never a replacing rename.
         pub fn publish(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
             let fd = self.0.as_fd();
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // The raw syscall: musl has no renameat2 wrapper.
+            #[cfg(target_os = "linux")]
             {
-                use nix::fcntl::{renameat2, RenameFlags};
-                match renameat2(fd, from, fd, to, RenameFlags::RENAME_NOREPLACE) {
+                use std::os::fd::AsRawFd;
+                let (f, t) = (cstr(from)?, cstr(to)?);
+                let r = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        fd.as_raw_fd(),
+                        f.as_ptr(),
+                        fd.as_raw_fd(),
+                        t.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                };
+                match Errno::result(r) {
                     // EPERM: a seccomp filter that allows the rest (the resolver falls back too).
                     Err(Errno::EINVAL | Errno::ENOSYS | Errno::EPERM) => {}
-                    r => return Ok(r?),
+                    r => return Ok(r.map(drop)?),
                 }
             }
             #[cfg(target_os = "macos")]
@@ -377,7 +389,7 @@ mod unix {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn cstr(s: &OsStr) -> std::io::Result<std::ffi::CString> {
         std::ffi::CString::new(s.as_bytes()).map_err(std::io::Error::other)
     }

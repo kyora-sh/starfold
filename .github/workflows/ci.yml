@@ -123,6 +123,37 @@ jobs:
       - name: Test
         run: cargo test --features x264 --locked
 
+  musl:
+    name: Linux musl (clippy)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # Checked, not linked: musl-gcc for the C dependencies, the host g++ for OpenH264's C++.
+      - name: Native libraries
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        env:
+          PKG_CONFIG_ALLOW_CROSS: '1'
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CXX_x86_64_unknown_linux_musl: g++
+        run: cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --all-targets --locked -- -D warnings
+
   windows:
     name: Windows (clippy, cross-compiled on Linux)
     runs-on: kyora-8x16

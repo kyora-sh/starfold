@@ -81,7 +81,7 @@ fn err(code: StatusCode, msg: &str) -> Response {
 }
 
 /// A client path ("Downloads/report.pdf") as plain names under the root: absolute paths,
-/// `..` and NULs are rejected.
+/// `..`, NULs and reserved names are rejected.
 // The error is the HTTP response to send, as is usual with axum.
 #[allow(clippy::result_large_err)]
 fn parts(rel: &str) -> Result<Vec<&str>, Response> {
@@ -92,6 +92,7 @@ fn parts(rel: &str) -> Result<Vec<&str>, Response> {
     let mut v = Vec::new();
     for c in Path::new(rel).components() {
         match c {
+            Component::Normal(s) if reserved(s) => return Err(bad()),
             Component::Normal(s) => v.push(s.to_str().ok_or_else(bad)?),
             Component::CurDir => {}
             _ => return Err(bad()),
@@ -132,7 +133,7 @@ fn listed(dir: &Dir) -> std::io::Result<Vec<serde_json::Value>> {
     dir.entries(|e| {
         let name = e.name.to_string_lossy().into_owned();
         // Symlinks are left out: they are never followed.
-        if name.starts_with('.') || !matches!(e.kind, Kind::Dir | Kind::File) {
+        if name.starts_with('.') || reserved(&e.name) || !matches!(e.kind, Kind::Dir | Kind::File) {
             return ControlFlow::Continue(());
         }
         let mtime = e
@@ -380,7 +381,9 @@ fn walk(
             }
             let mut entries = Vec::new();
             dir.entries(|e| {
-                entries.push(e);
+                if !reserved(&e.name) {
+                    entries.push(e);
+                }
                 ControlFlow::Continue(())
             })?;
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -530,9 +533,12 @@ fn part_name() -> std::io::Result<OsString> {
     Ok(format!("{PART_PREFIX}{hex}.part").into())
 }
 
-fn reserved(name: &str) -> bool {
-    name.get(..PART_PREFIX.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(PART_PREFIX))
+/// A name upload temporaries use, refused in every path component a client sends and
+/// left out of listings and zips (any case: some filesystems ignore it).
+fn reserved(name: &OsStr) -> bool {
+    name.as_encoded_bytes()
+        .get(..PART_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(PART_PREFIX.as_bytes()))
 }
 
 /// An upload's temporary file, removed unless it was published, whatever ends the
@@ -575,7 +581,7 @@ pub async fn upload(
     let Some(name) = q
         .get("name")
         .and_then(|n| clean_name(n))
-        .filter(|n| !reserved(n))
+        .filter(|n| !reserved(OsStr::new(n)))
     else {
         return err(StatusCode::BAD_REQUEST, "invalid file name");
     };
@@ -596,7 +602,7 @@ pub async fn upload(
         // Folder uploads: `sub` is the file's folder inside the upload ("Photos/2024"),
         // created as needed. Folders that already exist are merged into.
         for p in sub.split('/').filter(|p| !p.is_empty()) {
-            let Some(p) = clean_name(p) else {
+            let Some(p) = clean_name(p).filter(|p| !reserved(OsStr::new(p))) else {
                 return Err(err(StatusCode::BAD_REQUEST, "invalid folder name"));
             };
             dir = match dir.child(OsStr::new(p), true) {
@@ -661,6 +667,8 @@ pub async fn upload(
     let saved = blocking(move || {
         result?;
         let dest = unique(&part.dir, &name);
+        #[cfg(all(test, unix))]
+        tests::before_publish(&dest);
         match part.publish(OsStr::new(&dest)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

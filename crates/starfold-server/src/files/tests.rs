@@ -532,7 +532,7 @@ fn a_temporary_name_does_not_grow_with_the_file_name() {
     let (a, b) = (part_name().unwrap(), part_name().unwrap());
     assert_eq!(a.len(), PART_PREFIX.len() + 32 + ".part".len());
     assert_ne!(a, b);
-    assert!(reserved(a.to_str().unwrap()));
+    assert!(reserved(&a));
 }
 
 #[tokio::test]
@@ -650,4 +650,122 @@ fn a_zip_needs_one_descriptor_per_level_not_per_folder() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("FILES 200"), "{stdout}");
+}
+
+/// Uploads whose destination is `.0` wait here, after choosing it and before publishing,
+/// until `.1` of them have.
+static BEFORE_PUBLISH: std::sync::Mutex<Option<(String, Arc<std::sync::Barrier>)>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn before_publish(dest: &str) {
+    let hook = BEFORE_PUBLISH.lock().unwrap().clone();
+    if let Some((name, all_chosen)) = hook {
+        if name == dest {
+            all_chosen.wait();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_uploads_publishing_one_name_get_one_save_and_one_conflict() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let name = "collide-two-uploads.txt";
+    *BEFORE_PUBLISH.lock().unwrap() = Some((name.into(), Arc::new(std::sync::Barrier::new(2))));
+    let (a, b) = {
+        let (fa, fb) = (f.clone(), f.clone());
+        tokio::join!(
+            tokio::spawn(async move { put(&fa, &[("name", name)], "first body").await }),
+            tokio::spawn(async move { put(&fb, &[("name", name)], "second body").await })
+        )
+    };
+    *BEFORE_PUBLISH.lock().unwrap() = None;
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::CONFLICT], "{a:?} {b:?}");
+    let saved = if a.0 == StatusCode::OK {
+        "first body"
+    } else {
+        "second body"
+    };
+    let dir = t.root().join("Downloads");
+    assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), saved);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "the loser's temporary is gone"
+    );
+}
+
+#[tokio::test]
+async fn reserved_names_are_refused_in_every_component() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.root().join("a")).unwrap();
+    let f = t.files("Downloads");
+    for sub in [".starfold-upload-x", "ok/.STARFOLD-UPLOAD-y"] {
+        let (s, b) = put(&f, &[("name", "f.txt"), ("sub", sub)], "x").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "sub {sub}: {b}");
+    }
+    for path in ["a/.starfold-upload-x", ".Starfold-Upload-y/a"] {
+        let (s, b) = put(&f, &[("name", "f.txt"), ("path", path)], "x").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "path {path}: {b}");
+        assert_eq!(
+            get_list(&f, path).await.0,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+        assert_eq!(
+            get_file(&f, path).await.0,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upload_in_progress_is_never_listed_zipped_or_downloaded() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.root().join("Downloads")).unwrap();
+    std::fs::write(t.root().join("Downloads/done.txt"), "done").unwrap();
+    let f = t.files("Downloads");
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    tx.send(Ok(bytes::Bytes::from_static(b"half")))
+        .await
+        .unwrap();
+    let mut h = HeaderMap::new();
+    h.insert(UPLOAD_HEADER, "1".parse().unwrap());
+    let held = tokio::spawn(upload(
+        State(f.clone()),
+        q(&[("name", "big.bin")]),
+        h,
+        Body::from_stream(tokio_stream_from(rx)),
+    ));
+    let dir = t.root().join("Downloads");
+    let temp = loop {
+        let found = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .find(|n| reserved(n));
+        if let Some(n) = found {
+            break n.into_string().unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let (s, list) = get_list(&f, "Downloads").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
+    let (s, zipped) = get_file(&f, "Downloads").await;
+    assert_eq!(s, StatusCode::OK);
+    let z = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+    let names: Vec<&str> = z.file_names().collect();
+    assert!(names.iter().all(|n| !n.contains(PART_PREFIX)), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with("done.txt")), "{names:?}");
+    assert_eq!(
+        get_file(&f, &format!("Downloads/{temp}")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    held.abort();
+    let _ = held.await;
+    drop(tx);
 }
