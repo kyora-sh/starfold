@@ -234,6 +234,7 @@ async fn downloads_never_go_through_a_symlink() {
     std::fs::write(t.root().join("folder/kept"), "k").unwrap();
     symlink(t.outside(), t.root().join("folder/dir-out")).unwrap();
     symlink(t.outside().join("secret"), t.root().join("folder/file-out")).unwrap();
+    symlink("folder", t.root().join("dir-in")).unwrap();
     let f = t.files("Downloads");
     for p in [
         "file-out",
@@ -241,9 +242,12 @@ async fn downloads_never_go_through_a_symlink() {
         "dir-out",
         "dir-out/secret",
         "folder/file-out",
+        "dir-in",
+        "dir-in/kept",
     ] {
         assert_eq!(get_file(&f, p).await.0, StatusCode::FORBIDDEN, "{p}");
     }
+    assert_eq!(get_list(&f, "dir-in").await.0, StatusCode::FORBIDDEN);
     assert_eq!(
         get_file(&f, "inside").await,
         (StatusCode::OK, b"i".to_vec())
@@ -308,6 +312,8 @@ fn the_component_walk_refuses_symlinks_on_its_own() {
     ));
     assert!(matches!(top.open(OsStr::new("link")), Err(Refused::Link)));
     assert!(top.create_new(OsStr::new("link")).is_err());
+    symlink(t.outside().join("made-through"), t.root().join("dangling")).unwrap();
+    assert!(top.create_new(OsStr::new("dangling")).is_err());
     assert!(is_empty(&t.outside()));
     assert!(top.child(OsStr::new("made"), true).is_ok());
     assert!(t.root().join("made").is_dir());
