@@ -560,12 +560,12 @@ mod tests {
     }
 
     /// With $STARFOLD_OPENH264_LIB set (CI fetches Cisco's file), every encoder test runs
-    /// on it; this one says which library they ran on.
+    /// on it; this one says which library they ran on. Set but empty, as when the fetch
+    /// failed, fails rather than testing the source build instead.
     #[test]
     fn the_library_tests_run_on() {
-        library().unwrap();
         let v = unsafe { library().unwrap().WelsGetCodecVersion() };
-        let cisco = std::env::var_os(LIB_ENV).is_some_and(|p| !p.is_empty());
+        let cisco = std::env::var_os(LIB_ENV).is_some();
         let want = if cisco { (2, 6) } else { (2, 7) };
         assert_eq!((v.uMajor, v.uMinor), want);
     }
