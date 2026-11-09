@@ -148,7 +148,9 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 An upload is written to a hidden `.starfold-upload-*` file and renamed when complete, never over
 an existing file (a name taken meanwhile gets 409). After a crash, hidden `.starfold-upload-*`
 files may remain in the upload folder and can be deleted when no starfold is running. A
-filesystem with neither an exclusive rename nor hard links refuses uploads (501).
+filesystem with neither an exclusive rename nor hard links refuses uploads (501). Hiding
+those temporary files is best effort: on filesystems with short names (FAT), a signed-in
+viewer may be able to see an upload while it is in progress.
 
 ### Login
 
