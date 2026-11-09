@@ -2,7 +2,7 @@
 # suite.sh : streaming servers across configs, workloads and links on the benchmark displays.
 # Appends JSON lines to $OUT. Start the servers under test first:
 #   selkies: env/xvfb.sh, env/openbox.sh, env/selkies.sh (display :2, port 6912)
-#   voxl:    env/xvfb.sh, env/openbox.sh, env/voxl.sh    (display :2, port 6902)
+#   voxl:    env/xvfb.sh, env/openbox.sh, env/starfold.sh (display :2, port 6902)
 #   kasmvnc: env/kasmvnc.sh, BENCH_DISPLAY=:5 env/openbox.sh (display :5, port 6922)
 # Configs: py_picom py_nopicom (selkies), voxl voxl_picom, kasm kasm_picom.
 # *_picom runs picom from env/picom-start.sh (PICOM, PICOM_CONF; selkies' picom config

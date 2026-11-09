@@ -1,10 +1,11 @@
 """Native benchmark client: decodes the stream with FFmpeg (PyAV) and reads the loadgen
 pixel marker, reporting unique displayed frames/s and capture->decode latency.
-Usage: nclient.py voxl|selkies <host:port> <secs> [markerX markerY]"""
+Usage: nclient.py starfold|selkies <host:port> <secs> [markerX markerY]"""
 import asyncio, json, os, sys, time
 import av, websockets
 
 mode, hostport, secs = sys.argv[1], sys.argv[2], float(sys.argv[3])
+mode = 'voxl' if mode == 'starfold' else mode
 mx, my = (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (300, 150)
 
 def make_ctx():

@@ -216,7 +216,7 @@ function main() {
 				}
 				break;
 			case 'log':
-				console.warn('[voxl]', m.s);
+				console.warn('[starfold]', m.s);
 				break;
 		}
 	});

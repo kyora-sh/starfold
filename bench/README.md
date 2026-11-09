@@ -1,8 +1,6 @@
 # Benchmarks
 
-Tools used to compare starfold with selkies, KasmVNC, noVNC and Neko. Some names in the harness
-(`env/voxl.sh`, `VOXL_*`, `nclient.py voxl`) come from voxl, the project starfold is forked from.
-Everything runs on a separate Xvfb display (`:2` by default, `BENCH_DISPLAY` to change it), so a
+Tools used to compare starfold with selkies, KasmVNC, noVNC and Neko. Everything runs on a separate Xvfb display (`:2` by default, `BENCH_DISPLAY` to change it), so a
 live desktop isn't disturbed.
 
 ## Setup
@@ -11,22 +9,22 @@ live desktop isn't disturbed.
 cc -O2 -o loadgen loadgen.c -lX11 -lXext      # 60 Hz animation with a frame/time marker
 cc -O2 -o rootlat rootlat.c -lX11             # marker latency on the root window
 env/xvfb.sh & sleep 1; env/openbox.sh &       # 2560x1600 @ 144 DPI, like production
-env/voxl.sh                                   # starfold on :6902 (VOXL_BIN to override)
+env/starfold.sh                               # starfold on :6902 (STARFOLD_BIN to override)
 SELKIES_BIN=/path/to/selkies env/selkies.sh & # selkies on :6912
 KASMVNC=/path/to/kasmvncserver XKB_DIR=/path/to/xkb env/kasmvnc.sh &  # KasmVNC (own X server) :5, port 6922
 sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
 ```
 
-`KASMVNC` is a KasmVNC server build (voxl's upstream builds it as `nix/packages/kasmvnc`); `XKB_DIR` is
-`xkeyboard_config`'s `share/X11/xkb`. `env/kasmvnc.sh` passes the flags Tembo's
-`kasmvnc.yaml` expands to.
+`KASMVNC` is a KasmVNC server package (the directory with `bin/Xvnc` and `share/kasmvnc/www`);
+`XKB_DIR` is `xkeyboard_config`'s `share/X11/xkb`. `env/kasmvnc.sh` runs its Xvnc directly with the
+settings listed in the script (60 fps cap, JPEG/WebP quality 8-9, video mode up to 1920x1080).
 
 `*.mjs` need Playwright (`PLAYWRIGHT_NODE_MODULES`) and Chromium (`CHROMIUM`).
 `py.sh` runs Python with PyAV and websockets through nix-shell.
 
 ## Measuring
 
-- `nclient.py voxl|selkies host:port secs [x y]`: native client (FFmpeg decode)
+- `nclient.py starfold|selkies host:port secs [x y]`: native client (FFmpeg decode)
   that reads the marker at (x, y). Reports unique FPS, latency and Mbps.
 - `kclient.py host:port secs [x y]`: native KasmVNC client. Speaks RFB over its
   WebSocket the way KasmVNC's web client does (same pixel format and encodings,

@@ -51,7 +51,7 @@ export function createMic(app: App) {
 						chunk.copyTo(b);
 						app.sendBin(Bin.MicOpus, b);
 					},
-					error: (err) => console.warn('[voxl] microphone encoder', err),
+					error: (err) => console.warn('[starfold] microphone encoder', err),
 				});
 				e.configure(config);
 				return e;
@@ -112,7 +112,7 @@ export function createMic(app: App) {
 			on = true;
 			app.send(cmd.mic(true));
 		} catch (err) {
-			console.warn('[voxl] microphone unavailable', err);
+			console.warn('[starfold] microphone unavailable', err);
 			stop();
 			btn.classList.add('err');
 			btn.title =

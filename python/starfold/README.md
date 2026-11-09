@@ -10,7 +10,7 @@ uv add --editable path/to/starfold/python/starfold   # or: pip install -e python
 ```python
 from starfold import Starfold, act
 
-with Starfold("http://localhost:6901", password="...") as sf:  # password defaults to $VOXL_PASSWORD
+with Starfold("http://localhost:6901", password="...") as sf:  # password defaults to $VOXL_PASSWORD (being renamed to $STARFOLD_PASSWORD)
     shot = sf.screenshot()  # shot.png (bytes), shot.seq, shot.size
     shot.save("before.png")
 
