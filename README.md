@@ -13,8 +13,6 @@ baseline, and the server and the browser negotiate HEVC or AV1 where both have t
 mouse, keyboard and touch, the clipboard, audio and the microphone, file transfer and dynamic resolution.
 Agents get HTTP APIs for screenshots, recordings, input and waiting until the screen settles.
 
-starfold began as a fork of [tembo/voxl](https://github.com/tembo/voxl) (MIT); see [NOTICE](NOTICE).
-
 ## How kyora uses it
 
 [kyora](https://kyora.sh) runs desktop sandboxes in microVMs with no GPU and no network ports in the
@@ -54,7 +52,7 @@ arm, so a difference only counts beyond what the same binary shows against itsel
 
 Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild; `nix-shell` provides
 them all. The H.264 encoder is OpenH264, built from source; x264 is optional
-(`cargo build --features x264`, then `--encoder x264`; needs x264 and clang, see [Licence](#licence)).
+(`cargo build --features x264`, then `--encoder x264`; needs x264 and clang, see [Licensing](#licensing)).
 
 ```sh
 nix-shell
@@ -301,10 +299,8 @@ Phones and tablets get touch input and an on-screen keyboard.
 a hardware encoder where it finds one (VideoToolbox on macOS); VA-API, NVENC and Media Foundation are
 experimental and opt-in (`--experimental-hw-probes`).
 
-## Licence
+## Licensing
 
-The source code is MIT ([LICENSE](LICENSE)). A binary built with the `x264` feature links x264
-(GPL-2.0-or-later), so that binary is distributed under GPL-2.0-or-later as a combined work. The
-default build links OpenH264 (BSD-2-Clause). Attribution and third-party notices are in
-[NOTICE](NOTICE); the web client's font, Inter, is under the SIL Open Font License
-([packages/web/inter-LICENSE.txt](packages/web/inter-LICENSE.txt)).
+The source code is MIT ([LICENSE](LICENSE)). Binaries built with x264 (the `x264` feature) are
+GPL-2.0-or-later as a combined work. The default build links OpenH264 (BSD-2-Clause).
+[THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.
