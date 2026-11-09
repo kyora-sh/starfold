@@ -2,7 +2,9 @@ use super::*;
 use crate::encoder::caps::{Acceleration, Chroma, ProbeStatus, ProfileCapability};
 #[cfg(unix)]
 use crate::encoder::caps::{Registry, Software};
-use crate::encoder::{Codec, SOFTWARE_H264};
+use crate::encoder::Codec;
+#[cfg(unix)]
+use crate::encoder::SOFTWARE_H264;
 
 fn good(backend: Backend) -> EncoderCapability {
     let mut c = EncoderCapability::new(Codec::H264, backend, Acceleration::Hardware, "gpu0");
