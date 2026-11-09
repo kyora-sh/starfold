@@ -130,7 +130,8 @@ const st = {
 };
 
 function send(s: string) {
-	if (ws && ws.readyState === WebSocket.OPEN) ws.send(framed ? frameText(s) : s);
+	if (ws && ws.readyState === WebSocket.OPEN)
+		ws.send(framed ? frameText(s) : s);
 }
 function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);

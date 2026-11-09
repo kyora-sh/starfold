@@ -7,7 +7,9 @@ export const Kind = { Binary: 0, Text: 1 } as const;
 /** The largest message either side takes, kind byte included. */
 export const MAX_MESSAGE = 64 << 20;
 
-export type Unframed = { t: 'text'; s: string } | { t: 'binary'; b: ArrayBuffer };
+export type Unframed =
+	| { t: 'text'; s: string }
+	| { t: 'binary'; b: ArrayBuffer };
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
