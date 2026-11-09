@@ -235,6 +235,8 @@ async fn downloads_never_go_through_a_symlink() {
     symlink(t.outside(), t.root().join("folder/dir-out")).unwrap();
     symlink(t.outside().join("secret"), t.root().join("folder/file-out")).unwrap();
     symlink("folder", t.root().join("dir-in")).unwrap();
+    std::fs::create_dir(t.root().join("folder/sub")).unwrap();
+    std::fs::write(t.root().join("folder/sub/deep"), "d").unwrap();
     let f = t.files("Downloads");
     for p in [
         "file-out",
@@ -244,10 +246,12 @@ async fn downloads_never_go_through_a_symlink() {
         "folder/file-out",
         "dir-in",
         "dir-in/kept",
+        "dir-in/sub/deep",
     ] {
         assert_eq!(get_file(&f, p).await.0, StatusCode::FORBIDDEN, "{p}");
     }
     assert_eq!(get_list(&f, "dir-in").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get_list(&f, "dir-in/sub").await.0, StatusCode::FORBIDDEN);
     assert_eq!(
         get_file(&f, "inside").await,
         (StatusCode::OK, b"i".to_vec())
