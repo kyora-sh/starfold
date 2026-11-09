@@ -1703,6 +1703,7 @@ mod tests {
             assert_eq!(unix_socket_path(&at).as_os_str().len(), max_path() + 1);
             let e = bind_unix(&at, 0o600).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+            assert!(e.to_string().contains("too long for a unix socket"), "{e}");
             assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
             let at = d.join("a".repeat(max_path() - base - 2));
             let (l, file) = bind_unix(&at, 0o600).expect("the longest path that fits");
