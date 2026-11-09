@@ -447,10 +447,7 @@ async fn serve(a: HashMap<String, String>) {
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
         ),
         // --title: the browser tab's title.
-        index: server::index_html(
-            a.get("title")
-                .map_or("starfold", |t| t.as_str()),
-        ),
+        index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
         favicon_type,
         encoders,
