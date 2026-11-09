@@ -534,7 +534,7 @@ async fn serve(a: HashMap<String, String>) {
                 std::process::exit(1);
             });
             log::info!("listening on unix:{} (mode {mode:o})", path.display());
-            (Some(l), Some((path.clone(), file)))
+            (Some(l), Some(file))
         }
         None => (None, None),
     };
@@ -577,8 +577,8 @@ async fn serve(a: HashMap<String, String>) {
             let _ = tx.send(input::InputEvent::Shutdown);
         }
         #[cfg(unix)]
-        if let Some((path, file)) = &socket_file {
-            server::remove_unix(path, *file);
+        if let Some(file) = &socket_file {
+            server::remove_unix(file);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);

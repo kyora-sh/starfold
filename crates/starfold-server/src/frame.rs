@@ -26,6 +26,8 @@ pub enum FrameError {
     TooLarge(usize),
     /// A text message where only binary ones are framed.
     Unframed,
+    /// A message the WebSocket itself refused for its size, before it could be decoded.
+    Oversized,
 }
 
 impl fmt::Display for FrameError {
@@ -38,6 +40,7 @@ impl fmt::Display for FrameError {
                 write!(f, "a framed message of {n} bytes (at most {MAX_MESSAGE})")
             }
             FrameError::Unframed => write!(f, "a text message on a framed socket"),
+            FrameError::Oversized => write!(f, "a message over {MAX_MESSAGE} bytes"),
         }
     }
 }
@@ -47,7 +50,7 @@ impl FrameError {
     pub fn close_code(&self) -> u16 {
         match self {
             FrameError::BadUtf8 => 1007,
-            FrameError::TooLarge(_) => 1009,
+            FrameError::TooLarge(_) | FrameError::Oversized => 1009,
             FrameError::Empty | FrameError::UnknownKind(_) | FrameError::Unframed => 1003,
         }
     }
