@@ -32,7 +32,8 @@ class FakeSocket {
 	send(d: string | ArrayBuffer | ArrayBufferView) {
 		if (typeof d === 'string') this.sent.push(d);
 		else if (d instanceof ArrayBuffer) this.sent.push([...new Uint8Array(d)]);
-		else this.sent.push([...new Uint8Array(d.buffer, d.byteOffset, d.byteLength)]);
+		else
+			this.sent.push([...new Uint8Array(d.buffer, d.byteOffset, d.byteLength)]);
 	}
 	close(code?: number) {
 		// As in browsers: any other code throws InvalidAccessError.
@@ -49,13 +50,16 @@ let toWorker: (e: { data: unknown }) => void = () => {};
 const enc = new TextEncoder();
 const bytes = (s: string) => [...enc.encode(s)];
 const framedText = (s: string) => [Kind.Text, ...bytes(s)];
-const buf = (u: Uint8Array) => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+const buf = (u: Uint8Array) =>
+	u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
 const hello = JSON.stringify({ t: 'hello', w: 64, h: 32, audio: false });
 const canvas = { width: 0, height: 0, getContext: () => ({}) };
 
 function connect(framed: boolean): FakeSocket {
 	const n = FakeSocket.all.length;
-	toWorker({ data: { t: 'init', canvas, url: 'ws://x/ws', presentToMain: false, framed } });
+	toWorker({
+		data: { t: 'init', canvas, url: 'ws://x/ws', presentToMain: false, framed },
+	});
 	expect(FakeSocket.all.length).toBe(n + 1);
 	const s = FakeSocket.all[n];
 	s.open();
@@ -93,7 +97,9 @@ describe('the worker, framed', () => {
 			[Kind.Binary, 0x11, 9],
 		]);
 		const cursor = posted.find((m) => m.t === 'cursor');
-		expect([...new Uint8Array(cursor?.buf as ArrayBuffer)]).toEqual([0x03, 7, 8]);
+		expect([...new Uint8Array(cursor?.buf as ArrayBuffer)]).toEqual([
+			0x03, 7, 8,
+		]);
 	});
 
 	test('anything not framed closes the socket with a code browsers take', () => {
