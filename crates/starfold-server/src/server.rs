@@ -44,11 +44,12 @@ pub struct AppState {
 /// directory, opened once and used for every later step, and the lock that keeps a second
 /// server off the same path. Shutdown removes that socket and nothing that has taken its place.
 #[cfg(unix)]
+#[derive(Debug)]
 pub struct SocketFile {
     dir: std::os::fd::OwnedFd,
     name: std::ffi::CString,
-    dev: u64,
-    ino: u64,
+    dev: libc::dev_t,
+    ino: libc::ino_t,
     _lock: std::os::fd::OwnedFd,
 }
 
@@ -333,7 +334,7 @@ pub fn bind_unix(
                 _ => e,
             });
         }
-        Ok((listener, st.st_dev as u64, st.st_ino as u64))
+        Ok((listener, st.st_dev, st.st_ino))
     })();
     let cleared = clear_stage();
     let (listener, dev, ino) = placed?;
@@ -354,7 +355,7 @@ pub fn bind_unix(
 #[cfg(unix)]
 pub fn remove_unix(file: &SocketFile) {
     if let Ok(st) = stat_at(&file.dir, &file.name) {
-        if is_socket(&st) && st.st_dev as u64 == file.dev && st.st_ino as u64 == file.ino {
+        if is_socket(&st) && st.st_dev == file.dev && st.st_ino == file.ino {
             let _ = unlink_at(&file.dir, &file.name, 0);
         }
     }
