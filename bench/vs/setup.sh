@@ -10,7 +10,7 @@ cc -O2 bench/vs/source.c -lX11 -lXext -lm -o /tmp/vs-source || { echo 'source di
 rm -rf /tmp/novnc; mkdir -p /tmp/novnc
 tar -xzf "$NOVNC_TGZ" -C /tmp/novnc --strip-components=1 || { echo "bad NOVNC_TGZ $NOVNC_TGZ"; exit 1; }
 grep -q "\"version\": \"$(node -e "import('./bench/vs/config.mjs').then((c) => console.log(c.NOVNC_VERSION))")\"" /tmp/novnc/package.json || { echo 'wrong noVNC version'; exit 1; }
-cp bench/vs/novnc-viewer.html /tmp/novnc/
+cp bench/vs/novnc-viewer.html bench/vs/kyora/kyora-viewer.html bench/vs/kyora/vms-viewer.js /tmp/novnc/
 mkdir -p /tmp/pw && (cd /tmp/pw && npm i -s playwright-core >/dev/null 2>&1 && npx -y playwright-core install-deps chromium >/dev/null 2>&1)
 unzip -qo "$CHROME_ZIP" -d /tmp/chrome
 CHROMIUM=$(find /tmp/chrome -name chrome-headless-shell -type f | head -1)

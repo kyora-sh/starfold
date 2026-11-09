@@ -53,8 +53,8 @@ async function start(arm, wl) {
 		src.stdout.on('data', (b) => { if (String(b).includes('READY')) { clearTimeout(t); res(); } });
 		src.on('exit', (c) => rej(new Error(`source exited ${c}`)));
 	});
-	if (armOf(arm).kind === 'novnc') {
-		run.push(group('x11vnc', ['-display', DISPLAY, ...X11VNC_ARGS, '-unixsock', SOCK]));
+	if (armOf(arm).kind !== 'starfold') {
+		run.push(group('x11vnc', ['-display', DISPLAY, ...(armOf(arm).x11vnc ?? X11VNC_ARGS), '-unixsock', SOCK]));
 		for (let i = 0; i < 100 && !fs.existsSync(SOCK); i++) await sleep(50);
 		if (!fs.existsSync(SOCK)) throw new Error('x11vnc did not open its socket');
 		let relay = SOCK;
