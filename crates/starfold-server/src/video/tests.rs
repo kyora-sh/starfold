@@ -2083,7 +2083,7 @@ fn hevc_nal_types(d: &[u8]) -> Vec<u8> {
 fn videotoolbox_hevc_negotiated() {
     use crate::encoder::caps::{host_providers, Registry, PROBE_TIMEOUT};
     let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
-    let cands = negotiate::candidates(&reg, Backend::OpenH264);
+    let cands = negotiate::candidates(&reg, encoder::SOFTWARE_H264);
     if !cands.iter().any(|c| c.codec == Codec::Hevc) {
         assert!(
             std::env::var_os("STARFOLD_EXPECT_HEVC").is_none(),
