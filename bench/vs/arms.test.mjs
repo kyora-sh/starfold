@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import test from 'node:test';
 import { armOf, baseArm, expandArms, roundOrder, setOrder, TWIN } from './arms.mjs';
-import { ARMS } from './config.mjs';
+import { ARMS, KYORA_VIEWER, KYORA_X11VNC, X11VNC_ARGS } from './config.mjs';
 
 test('the first arm runs twice by default', () => {
 	assert.deepEqual(expandArms(['before', 'starfold-video']), ['before', `before${TWIN}`, 'starfold-video']);
@@ -40,4 +42,19 @@ test('runs continue the rotation, so every arm takes every position', () => {
 	for (let run = 0; run < 3; run++)
 		for (let round = 0; round < 4; round++) roundOrder(arms, round, 0, run, 4).forEach((x, p) => at[x][p]++);
 	for (const counts of Object.values(at)) assert.ok(Math.max(...counts) - Math.min(...counts) <= 1, JSON.stringify(at));
+});
+test('the vendored kyora viewer is the pinned file, unchanged', () => {
+	const got = createHash('sha256').update(fs.readFileSync(new URL('./kyora/vms-viewer.js', import.meta.url))).digest('hex');
+	assert.equal(got, KYORA_VIEWER.sha256);
+});
+test('kyora-rfb runs view only on the shared x11vnc, the noVNC arm the same flags without -viewonly', () => {
+	assert.equal(ARMS['kyora-rfb'].x11vnc, KYORA_X11VNC.view);
+	assert.ok(ARMS['kyora-rfb'].viewOnly && !ARMS['kyora-rfb'].control);
+	assert.deepEqual([...KYORA_X11VNC.view].filter((f) => f !== '-viewonly').sort(), [...X11VNC_ARGS].sort());
+});
+test('kyora-rfb-control takes keys at x11vnc default timing, and neither kyora arm runs unless named', () => {
+	const c = ARMS['kyora-rfb-control'];
+	assert.ok(c.control && !c.viewOnly);
+	for (const f of ['-viewonly', '-wait', '-defer', '-nonap']) assert.ok(!c.x11vnc.includes(f), f);
+	assert.ok(ARMS['kyora-rfb'].probe && c.probe);
 });

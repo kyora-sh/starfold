@@ -59,6 +59,11 @@ sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
   settings, interleaved and rotated with the others (`AA=0` turns it off). Pass the run's index as `<run>`
   so the arm order carries on across runs. `vs/aa.py <run logs...>` judges each arm against the first:
   its spread S is the A/A's CI, and only a shift beyond S with a CI that excludes 0 counts.
+  `--usable 500,1000` counts each arm's usable first pictures (settled PSNR >= 25 dB) in the quality
+  rounds instead, failed rows included, with a Fisher test against the first arm.
+- `ARMS=...,kyora-rfb,kyora-rfb-control`: kyora's dashboard live view (`vs/kyora/vms-viewer.js`, vendored from
+  kyora-platform at the commit in `config.mjs`) on x11vnc as kyora runs it. `kyora-rfb` is view only and runs
+  quality rounds alone; `kyora-rfb-control` is take control, which types.
 
 ## Feature tests
 

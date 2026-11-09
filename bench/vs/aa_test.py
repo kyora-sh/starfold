@@ -68,5 +68,35 @@ class Analysis(unittest.TestCase):
         self.assertFalse(pairs['near'][-1])
 
 
+def quality(arm, n, ok, t=500, **extra):
+    return [{'set': 'quality', 'arm': arm, 'round': i, f'settled{t}Psnr': 30.0 if i < ok else 14.0, **extra} for i in range(n)]
+
+
+class Usable(unittest.TestCase):
+    def test_fisher_matches_known_tables(self):
+        self.assertAlmostEqual(aa.fisher(3, 1, 1, 3), 0.4857, places=4)
+        self.assertAlmostEqual(aa.fisher(8, 2, 1, 5), 0.0350, places=4)
+        self.assertEqual(aa.fisher(0, 0, 0, 0), 1.0)
+
+    def test_a_failed_row_counts_as_not_usable_and_a_stolen_one_is_left_out(self):
+        r = quality('a', 4, 2) + quality('a~aa', 4, 2) + [{'set': 'quality', 'arm': 'a', 'round': 9, 'failed': 'timeout'}]
+        r += [dict(quality('a', 1, 1)[0], round=10, stealPct=5.0)]
+        out = aa.usable([log(r)], points=[500])
+        self.assertEqual(out['points'][500]['counts']['a'], (2, 5, 1))
+
+    def test_a_rise_beyond_the_aa_counts_and_a_twin_as_far_off_cancels_it(self):
+        far = aa.usable([log(quality('a', 12, 1) + quality('a~aa', 12, 2) + quality('b', 12, 10))], points=[500])
+        d, p, real = far['points'][500]['pairs']['b']
+        self.assertTrue(real and p < 0.05 and d > 0)
+        loud = aa.usable([log(quality('a', 12, 1) + quality('a~aa', 12, 11) + quality('b', 12, 10))], points=[500])
+        self.assertFalse(loud['points'][500]['pairs']['b'][-1])
+
+    def test_main_rows_and_other_points_are_not_counted(self):
+        r = quality('a', 3, 3) + quality('a~aa', 3, 3) + rows('a', 3, 100) + quality('b', 3, 3, t=1000)
+        out = aa.usable([log(r)], points=[500])
+        self.assertEqual(out['points'][500]['counts']['a'], (3, 3, 0))
+        self.assertEqual(out['points'][500]['counts']['b'], (0, 3, 0))
+
+
 if __name__ == '__main__':
     unittest.main()
