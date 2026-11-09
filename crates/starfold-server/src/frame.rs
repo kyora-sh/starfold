@@ -121,6 +121,19 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_bom_is_text() {
+        assert_eq!(
+            decode(Bytes::from_static(&[TEXT, 0xef, 0xbb, 0xbf])),
+            Ok(Payload::Text("\u{feff}".into()))
+        );
+        let text = "\u{feff}k,65,1";
+        assert_eq!(
+            decode(encode_text(text).unwrap()),
+            Ok(Payload::Text(text.into()))
+        );
+    }
+
+    #[test]
     fn unknown_kinds_and_bad_text_are_refused() {
         for k in [2u8, 0x11, 255] {
             assert_eq!(

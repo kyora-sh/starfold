@@ -40,23 +40,26 @@ pub struct AppState {
     pub framed: bool,
 }
 
-/// The socket --listen-unix made, with what it holds for the server's lifetime: its
-/// directory, opened once and used for every later step, and the lock that keeps a second
-/// server off the same path. Shutdown removes that socket and nothing that has taken its place.
+/// The directory --listen-unix made and the socket in it, with what shutdown needs to
+/// remove exactly those: both directories as opened, and each entry's device and inode.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct SocketFile {
-    dir: std::os::fd::OwnedFd,
+    parent: std::os::fd::OwnedFd,
     name: std::ffi::CString,
-    dev: libc::dev_t,
-    ino: libc::ino_t,
-    _lock: std::os::fd::OwnedFd,
+    dir: std::os::fd::OwnedFd,
+    dir_id: (libc::dev_t, libc::ino_t),
+    socket_id: Option<(libc::dev_t, libc::ino_t)>,
 }
 
+/// The socket's name in the --listen-unix directory.
 #[cfg(unix)]
-enum Peer {
-    Live,
-    Gone,
+const SOCKET: &std::ffi::CStr = c"s";
+
+/// Where clients connect for --listen-unix `dir`.
+#[cfg(unix)]
+pub fn unix_socket_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(SOCKET.to_str().unwrap())
 }
 
 #[cfg(unix)]
@@ -89,10 +92,17 @@ fn open_at(
             at,
             name.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
         )
     })?;
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn fstat(fd: &std::os::fd::OwnedFd) -> std::io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    cvt(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    Ok(st)
 }
 
 /// `name` in `dir`, not following a symlink.
@@ -112,6 +122,11 @@ fn stat_at(dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result
 }
 
 #[cfg(unix)]
+fn id(st: &libc::stat) -> (libc::dev_t, libc::ino_t) {
+    (st.st_dev, st.st_ino)
+}
+
+#[cfg(unix)]
 fn is_socket(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFSOCK
 }
@@ -126,71 +141,94 @@ fn unlink_at(
     cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) }).map(|_| ())
 }
 
-/// Starts a connection to the socket at `path` without waiting for it: the socket, and
-/// 0 or the error `connect` gave.
 #[cfg(unix)]
-fn nonblocking_connect(path: &Path) -> std::io::Result<(std::os::fd::OwnedFd, i32)> {
-    use std::io::Error;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= addr.sun_path.len() {
-        return Err(Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is too long for a unix socket", path.display()),
-        ));
-    }
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
-        *d = *s as libc::c_char;
-    }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(Error::last_os_error());
-    }
-    let r = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
-    let errno = match r {
-        0 => 0,
-        _ => Error::last_os_error().raw_os_error().unwrap_or(-1),
-    };
-    Ok((fd, errno))
+fn acl_left() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "the new directory kept an ACL",
+    )
 }
 
-/// Whether a server still listens at `path`, without waiting on it: only a refused
-/// connection says it is gone. A full backlog counts as live; anything else is an error.
-#[cfg(unix)]
-fn probe(path: &Path) -> std::io::Result<Peer> {
-    match nonblocking_connect(path)?.1 {
-        0 | libc::EINPROGRESS | libc::EAGAIN => Ok(Peer::Live),
-        libc::ECONNREFUSED => Ok(Peer::Gone),
-        e => Err(std::io::Error::from_raw_os_error(e)),
+/// Removes the POSIX ACLs a new directory inherits from its parent's default ACL, and
+/// checks none is left: its mode bits then say who reaches it and what is made in it.
+#[cfg(target_os = "linux")]
+fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let absent = |e: std::io::Error| match e.raw_os_error() {
+        Some(libc::ENODATA | libc::EOPNOTSUPP) => Ok(()),
+        _ => Err(e),
+    };
+    for name in [c"system.posix_acl_default", c"system.posix_acl_access"] {
+        if unsafe { libc::fremovexattr(dir.as_raw_fd(), name.as_ptr()) } < 0 {
+            absent(std::io::Error::last_os_error())?;
+        }
+        let r = unsafe { libc::fgetxattr(dir.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if r >= 0 {
+            return Err(acl_left());
+        }
+        absent(std::io::Error::last_os_error())?;
+    }
+    Ok(())
+}
+
+/// Replaces the extended ACL a new directory inherits (which grants access whatever the
+/// mode bits say) with an empty one, and checks it reads back empty.
+#[cfg(target_os = "macos")]
+fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_void};
+    extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_set_fd(fd: c_int, acl: *mut c_void) -> c_int;
+        fn acl_get_fd(fd: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+    const ACL_FIRST_ENTRY: c_int = 0;
+    unsafe {
+        let empty = acl_init(0);
+        if empty.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let set = acl_set_fd(dir.as_raw_fd(), empty);
+        let e = std::io::Error::last_os_error();
+        acl_free(empty);
+        if set < 0 {
+            return Err(e);
+        }
+        let acl = acl_get_fd(dir.as_raw_fd());
+        if acl.is_null() {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(()),
+                _ => Err(e),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        let any = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
+        acl_free(acl);
+        if any {
+            Err(acl_left())
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// Binds a unix socket at `path` with permissions `mode` (--listen-unix).
-///
-/// The directory is opened once and has to be one only this user can change (a real
-/// directory it owns, without group or other write); every later step works on that open
-/// directory rather than on the path, so swapping a directory on the way there changes
-/// nothing. A lock next to the socket (`NAME.lock`, kept for the server's lifetime) turns a
-/// second server away. The socket is bound in a 0700 directory made here (`.sf`), given its
-/// mode there and then linked into place, which never replaces anything. A socket left by a
-/// server that is gone is replaced; one that may still be in use, or a file that isn't a
-/// socket, is not.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn clear_acl(_: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unix sockets need Linux or macOS",
+    ))
+}
+
+/// Serves --listen-unix: makes the directory `path` (it must not exist yet; its parent
+/// must) for this user alone and binds a socket named `s` in it with permissions `mode`.
+/// Every step after the mkdir works on the directory as opened, and nothing that already
+/// existed is used, replaced or removed: a path that exists, a server's or a stale one, is
+/// an error. Group or other access in `mode` gives that class search permission on the
+/// directory, once the socket has its mode.
 #[cfg(unix)]
 pub fn bind_unix(
     path: &Path,
@@ -201,163 +239,123 @@ pub fn bind_unix(
     let invalid = |m: String| Error::new(ErrorKind::InvalidInput, m);
     let name = path
         .file_name()
-        .ok_or_else(|| invalid(format!("{} has no file name", path.display())))?;
-    let dir_path = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staged = dir_path.join(".sf").join("s");
+        .ok_or_else(|| invalid(format!("{} has no directory name", path.display())))?;
+    let socket = unix_socket_path(path);
     let max = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
         .sun_path
         .len()
         - 1;
-    for (p, what) in [
-        (path, "the socket"),
-        (staged.as_path(), "where it is set up first"),
-    ] {
-        if p.as_os_str().len() > max {
-            return Err(invalid(format!(
-                "{} is too long for a unix socket: {} ({}) is {} bytes, at most {max}",
-                path.display(),
-                what,
-                p.display(),
-                p.as_os_str().len()
-            )));
-        }
+    if socket.as_os_str().len() > max {
+        return Err(invalid(format!(
+            "{} is too long for a unix socket: {} bytes, at most {max}",
+            socket.display(),
+            socket.as_os_str().len()
+        )));
     }
+    let parent_path = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let name = cname(name)?;
-    let not_private = || {
-        Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "{} has to be a directory (not a symlink) that this user owns and only it can write",
-                dir_path.display()
-            ),
-        )
-    };
-    let dir = open_at(
+    let parent = open_at(
         None,
-        &cname(dir_path.as_os_str())?,
+        &cname(parent_path.as_os_str())?,
         libc::O_RDONLY | libc::O_DIRECTORY,
-    )
-    .map_err(|e| match e.raw_os_error() {
-        Some(libc::ELOOP | libc::ENOTDIR) => not_private(),
-        _ => e,
-    })?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    cvt(unsafe { libc::fstat(dir.as_raw_fd(), &mut st) })?;
-    if st.st_uid != unsafe { libc::geteuid() } || st.st_mode & 0o022 != 0 {
-        return Err(not_private());
-    }
-    let mut lock_name = name.as_bytes().to_vec();
-    lock_name.extend_from_slice(b".lock");
-    let lock = open_at(
-        Some(&dir),
-        &std::ffi::CString::new(lock_name).unwrap(),
-        libc::O_RDWR | libc::O_CREAT,
     )?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
         let e = Error::last_os_error();
         return Err(match e.raw_os_error() {
-            Some(libc::EWOULDBLOCK) => Error::new(
-                ErrorKind::AddrInUse,
-                format!("another server listens at {}", path.display()),
+            Some(libc::EEXIST) => Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists: --listen-unix makes a new directory there",
+                    path.display()
+                ),
             ),
             _ => e,
         });
     }
-    match stat_at(&dir, &name) {
-        Ok(st) if is_socket(&st) => match probe(path)? {
-            Peer::Live => {
-                return Err(Error::new(
-                    ErrorKind::AddrInUse,
-                    format!("{} is in use by another server", path.display()),
-                ))
+    let moved = || {
+        Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} changed while it was set up", path.display()),
+        )
+    };
+    let dir =
+        open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|e| {
+            match e.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => moved(),
+                _ => e,
             }
-            Peer::Gone => unlink_at(&dir, &name, 0)?,
-        },
-        Ok(_) => {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                format!("{} exists and is not a socket", path.display()),
-            ))
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        })?;
+    let st = fstat(&dir)?;
+    let made = stat_at(&parent, &name)?;
+    if st.st_uid != unsafe { libc::geteuid() }
+        || st.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || id(&st) != id(&made)
+    {
+        return Err(moved());
     }
-    // `.sf` is shared by every socket in this directory, one setup at a time.
-    let setup = open_at(Some(&dir), c".starfold.lock", libc::O_RDWR | libc::O_CREAT)?;
-    cvt(unsafe { libc::flock(setup.as_raw_fd(), libc::LOCK_EX) })?;
-    let clear_stage = || -> std::io::Result<()> {
-        match open_at(Some(&dir), c".sf", libc::O_RDONLY | libc::O_DIRECTORY) {
-            Ok(stage) => {
-                match unlink_at(&stage, c"s", 0) {
-                    Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-                    _ => {}
-                }
-                unlink_at(&dir, c".sf", libc::AT_REMOVEDIR)
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+    let mut file = SocketFile {
+        parent,
+        name,
+        dir,
+        dir_id: id(&st),
+        socket_id: None,
+    };
+    let reach =
+        (if mode & 0o070 != 0 { 0o010 } else { 0 }) | (if mode & 0o007 != 0 { 0o001 } else { 0 });
+    let set_mode = |file: &SocketFile, m: u32| -> std::io::Result<()> {
+        cvt(unsafe { libc::fchmod(file.dir.as_raw_fd(), m as libc::mode_t) })?;
+        match fstat(&file.dir)?.st_mode as u32 & 0o7777 == m {
+            true => Ok(()),
+            false => Err(moved()),
         }
     };
-    clear_stage()?;
-    cvt(unsafe { libc::mkdirat(dir.as_raw_fd(), c".sf".as_ptr(), 0o700) })?;
-    let placed = (|| {
-        let stage = open_at(Some(&dir), c".sf", libc::O_RDONLY | libc::O_DIRECTORY)?;
-        let listener = tokio::net::UnixListener::bind(&staged)?;
-        // Only this user can make a file in `.sf`, so a socket there is the one just bound,
-        // wherever the path led.
-        let st = stat_at(&stage, c"s")
+    let bound = (|| {
+        clear_acl(&file.dir)?;
+        set_mode(&file, 0o700)?;
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        // Only this user can add to the directory, so a socket in it is the one just bound.
+        let st = stat_at(&file.dir, SOCKET)
             .ok()
             .filter(is_socket)
-            .ok_or_else(|| {
-                Error::other(format!("{} moved while it was set up", dir_path.display()))
-            })?;
-        cvt(unsafe { libc::fchmodat(stage.as_raw_fd(), c"s".as_ptr(), mode as libc::mode_t, 0) })?;
-        let linked = unsafe {
-            libc::linkat(
-                stage.as_raw_fd(),
-                c"s".as_ptr(),
-                dir.as_raw_fd(),
-                name.as_ptr(),
+            .ok_or_else(moved)?;
+        file.socket_id = Some(id(&st));
+        cvt(unsafe {
+            libc::fchmodat(
+                file.dir.as_raw_fd(),
+                SOCKET.as_ptr(),
+                mode as libc::mode_t,
                 0,
             )
-        };
-        if linked < 0 {
-            let e = Error::last_os_error();
-            return Err(match e.raw_os_error() {
-                Some(libc::EEXIST) => Error::new(
-                    ErrorKind::AddrInUse,
-                    format!("{} appeared while it was set up", path.display()),
-                ),
-                _ => e,
-            });
-        }
-        Ok((listener, st.st_dev, st.st_ino))
+        })?;
+        set_mode(&file, 0o700 | reach)?;
+        Ok(listener)
     })();
-    let cleared = clear_stage();
-    let (listener, dev, ino) = placed?;
-    cleared?;
-    Ok((
-        listener,
-        SocketFile {
-            dir,
-            name,
-            dev,
-            ino,
-            _lock: lock,
-        },
-    ))
+    match bound {
+        Ok(listener) => Ok((listener, file)),
+        Err(e) => {
+            remove_unix(&file);
+            Err(e)
+        }
+    }
 }
 
-/// Removes the socket `bind_unix` made, if it is still there.
+/// Removes what `bind_unix` made, each only if it is still the entry that was made: the
+/// socket, then the directory if nothing else is in it.
 #[cfg(unix)]
 pub fn remove_unix(file: &SocketFile) {
-    if let Ok(st) = stat_at(&file.dir, &file.name) {
-        if is_socket(&st) && st.st_dev == file.dev && st.st_ino == file.ino {
-            let _ = unlink_at(&file.dir, &file.name, 0);
+    let at = |dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr, want| {
+        stat_at(dir, name).is_ok_and(|st| id(&st) == want)
+    };
+    if let Some(socket) = file.socket_id {
+        if at(&file.dir, SOCKET, socket) {
+            let _ = unlink_at(&file.dir, SOCKET, 0);
         }
+    }
+    if at(&file.parent, &file.name, file.dir_id) {
+        let _ = unlink_at(&file.parent, &file.name, libc::AT_REMOVEDIR);
     }
 }
 
@@ -1299,12 +1297,17 @@ mod tests {
             let mut s = app(&hub, false, None);
             s.framed = true;
             let d = dir("framed");
-            let path = d.join("s.sock");
+            let path = d.join("sf");
             let (l, _) = bind_unix(&path, 0o600).unwrap();
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            let mode = std::fs::metadata(unix_socket_path(&path))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
             let server = tokio::spawn(axum::serve(l, router(s)).into_future());
-            let sock = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let sock = tokio::net::UnixStream::connect(unix_socket_path(&path))
+                .await
+                .unwrap();
             let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
                 .await
                 .unwrap();
@@ -1346,7 +1349,7 @@ mod tests {
             let mut s = app(&hub, false, None);
             s.framed = true;
             let d = dir("refuse");
-            let path = d.join("s.sock");
+            let path = d.join("sf");
             let server = tokio::spawn(
                 axum::serve(bind_unix(&path, 0o600).unwrap().0, router(s)).into_future(),
             );
@@ -1356,7 +1359,9 @@ mod tests {
                 (Ws::Binary(Bytes::new()), 1003),
                 (Ws::Binary(Bytes::from_static(&[1, 0xff])), 1007),
             ] {
-                let sock = tokio::net::UnixStream::connect(&path).await.unwrap();
+                let sock = tokio::net::UnixStream::connect(unix_socket_path(&path))
+                    .await
+                    .unwrap();
                 let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
                     .await
                     .unwrap();
@@ -1382,10 +1387,12 @@ mod tests {
             let mut s = app(&hub, false, None);
             s.framed = true;
             let d = dir("oversized");
-            let path = d.join("s.sock");
+            let path = d.join("sf");
             let (l, file) = bind_unix(&path, 0o600).unwrap();
             let server = tokio::spawn(axum::serve(l, router(s)).into_future());
-            let sock = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let sock = tokio::net::UnixStream::connect(unix_socket_path(&path))
+                .await
+                .unwrap();
             let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
                 .await
                 .unwrap();
@@ -1434,80 +1441,43 @@ mod tests {
         }
 
         #[test]
-        fn a_unix_socket_replaces_only_a_dead_one() {
-            let d = dir("bind");
-            let path = d.join("s.sock");
+        fn a_path_that_exists_is_refused_and_left_as_it_was() {
             let rt = runtime();
             let _guard = rt.enter();
-            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-            let (l, _) = bind_unix(&path, 0o660).unwrap();
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o660);
-            let e = bind_unix(&path, 0o600).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
-            drop(l);
-            let file = d.join("plain");
-            std::fs::write(&file, b"x").unwrap();
-            assert_eq!(
-                bind_unix(&file, 0o600).unwrap_err().kind(),
-                std::io::ErrorKind::AlreadyExists
+            let d = dir("exists");
+            let refused = |p: &std::path::Path| {
+                let e = bind_unix(p, 0o600).unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+            };
+            let empty = d.join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            refused(&empty);
+            assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+            let stale = d.join("stale");
+            std::fs::create_dir(&stale).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&stale)).unwrap());
+            refused(&stale);
+            assert!(
+                unix_socket_path(&stale).exists(),
+                "a stale socket was replaced"
             );
-            assert_eq!(std::fs::read(&file).unwrap(), b"x");
+            let live = d.join("live");
+            std::fs::create_dir(&live).unwrap();
+            let server = std::os::unix::net::UnixListener::bind(unix_socket_path(&live)).unwrap();
+            refused(&live);
+            std::os::unix::net::UnixStream::connect(unix_socket_path(&live))
+                .expect("the live socket is gone");
+            let plain = d.join("plain");
+            std::fs::write(&plain, b"x").unwrap();
+            refused(&plain);
+            assert_eq!(std::fs::read(&plain).unwrap(), b"x");
+            let target = dir("exists-target");
+            std::os::unix::fs::symlink(&target, d.join("link")).unwrap();
+            refused(&d.join("link"));
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+            drop(server);
             std::fs::remove_dir_all(&d).unwrap();
-        }
-
-        #[test]
-        fn a_socket_that_may_still_be_in_use_is_kept() {
-            // Root connects whatever the mode, so only another user sees the refusal.
-            if unsafe { libc::geteuid() } == 0 {
-                return;
-            }
-            let d = dir("denied");
-            let path = d.join("s.sock");
-            let rt = runtime();
-            let _guard = rt.enter();
-            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let e = bind_unix(&path, 0o600).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            std::os::unix::net::UnixStream::connect(&path).expect("the live socket is gone");
-            drop(live);
-            std::fs::remove_dir_all(&d).unwrap();
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_full_backlog_is_a_live_server_and_is_not_waited_on() {
-            use std::os::fd::AsRawFd;
-            let d = dir("backlog");
-            let path = d.join("s.sock");
-            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            assert_eq!(unsafe { libc::listen(live.as_raw_fd(), 0) }, 0);
-            let mut queued = Vec::new();
-            loop {
-                let (fd, e) = nonblocking_connect(&path).unwrap();
-                if e == libc::EAGAIN {
-                    break;
-                }
-                assert_eq!(e, 0);
-                queued.push(fd);
-                assert!(queued.len() < 64, "the backlog never filled");
-            }
-            let (tx, rx) = std::sync::mpsc::channel();
-            let p = path.clone();
-            std::thread::spawn(move || {
-                let rt = runtime();
-                let _guard = rt.enter();
-                let _ = tx.send(bind_unix(&p, 0o600).map(|_| ()));
-            });
-            let r = rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("binding waited on a server that doesn't accept");
-            assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
-            assert!(path.exists());
-            drop((queued, live));
-            std::fs::remove_dir_all(&d).unwrap();
+            std::fs::remove_dir_all(&target).unwrap();
         }
 
         #[cfg(target_os = "linux")]
@@ -1537,80 +1507,125 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             for i in 0..1000 {
-                let path = d.join(format!("s{i}"));
-                drop(bind_unix(&path, 0o666).unwrap());
-                std::fs::remove_file(&path).unwrap();
+                let (l, file) = bind_unix(&d.join(format!("s{i}")), 0o666).unwrap();
+                drop(l);
+                remove_unix(&file);
             }
             stop.store(true, Ordering::Relaxed);
             let seen = watcher.join().unwrap();
             assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![before]);
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
             std::fs::remove_dir_all(&d).unwrap();
         }
 
         #[test]
-        fn only_a_private_directory_takes_the_socket() {
+        fn the_directory_lets_in_only_who_may_connect() {
             let rt = runtime();
             let _guard = rt.enter();
-            let d = dir("shared");
-            for mode in [0o777, 0o770, 0o1777] {
-                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
-                let e = bind_unix(&d.join("s.sock"), 0o600).unwrap_err();
-                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{mode:o}");
-                assert!(!d.join("s.sock").exists());
+            let d = dir("modes");
+            // Whoever can write the parent: the directory made in it is private all the same.
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+            for (mode, dir_mode) in [
+                (0o600, 0o700),
+                (0o660, 0o710),
+                (0o606, 0o701),
+                (0o666, 0o711),
+            ] {
+                let at = d.join(format!("m{mode:o}"));
+                let (l, file) = bind_unix(&at, mode).unwrap();
+                let m = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+                assert_eq!(m(&at) & 0o7777, dir_mode, "{mode:o}");
+                assert_eq!(m(&unix_socket_path(&at)) & 0o777, mode, "{mode:o}");
+                drop(l);
+                remove_unix(&file);
+                assert!(!at.exists());
             }
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let target = dir("target");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn a_symlinked_parent_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("via");
+            let target = dir("via-target");
             std::os::unix::fs::symlink(&target, d.join("via")).unwrap();
-            let e = bind_unix(&d.join("via").join("s.sock"), 0o600).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(bind_unix(&d.join("via").join("sf"), 0o600).is_err());
             assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
             std::fs::remove_dir_all(&d).unwrap();
             std::fs::remove_dir_all(&target).unwrap();
         }
 
         #[test]
-        fn shutdown_removes_only_our_socket() {
+        fn internal_names_are_free_for_the_directory() {
             let rt = runtime();
             let _guard = rt.enter();
-            let d = dir("cleanup");
-            let path = d.join("s.sock");
-            let (l, file) = bind_unix(&path, 0o600).unwrap();
-            assert!(
-                !d.join(".sf").exists(),
-                "the staging directory was left behind"
-            );
-            drop(l);
-            std::fs::remove_file(&path).unwrap();
-            std::fs::write(&path, b"x").unwrap();
-            remove_unix(&file);
-            assert_eq!(std::fs::read(&path).unwrap(), b"x");
-            std::fs::remove_file(&path).unwrap();
-            drop(file);
-            let (l, file) = bind_unix(&path, 0o600).unwrap();
-            remove_unix(&file);
-            assert!(!path.exists());
-            drop((l, file));
+            let d = dir("names");
+            let held: Vec<_> = ["s", "s.lock", ".sf", ".starfold.lock"]
+                .into_iter()
+                .map(|n| {
+                    let at = d.join(n);
+                    let r = bind_unix(&at, 0o600).unwrap_or_else(|e| panic!("{n}: {e}"));
+                    std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
+                    r
+                })
+                .collect();
+            for (l, file) in held {
+                drop(l);
+                remove_unix(&file);
+            }
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
             std::fs::remove_dir_all(&d).unwrap();
         }
 
         #[test]
-        fn shutdown_works_in_the_directory_it_bound_in_wherever_the_path_now_leads() {
+        fn shutdown_removes_only_what_it_made() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("cleanup");
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            drop(l);
+            remove_unix(&file);
+            assert!(!at.exists());
+
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            drop(l);
+            std::fs::write(at.join("other"), b"x").unwrap();
+            remove_unix(&file);
+            assert!(!unix_socket_path(&at).exists(), "left its own socket");
+            assert_eq!(std::fs::read(at.join("other")).unwrap(), b"x");
+            std::fs::remove_dir_all(&at).unwrap();
+
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            drop(l);
+            std::fs::remove_file(unix_socket_path(&at)).unwrap();
+            std::fs::write(unix_socket_path(&at), b"x").unwrap();
+            remove_unix(&file);
+            assert_eq!(std::fs::read(unix_socket_path(&at)).unwrap(), b"x");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn shutdown_works_in_the_directory_it_made_wherever_the_path_now_leads() {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("moved");
-            let away = dir("moved-away");
-            std::fs::remove_dir(&away).unwrap();
-            let path = d.join("s.sock");
-            let (l, file) = bind_unix(&path, 0o600).unwrap();
-            std::fs::rename(&d, &away).unwrap();
-            std::fs::create_dir(&d).unwrap();
-            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            let at = d.join("sf");
+            let away = d.join("away");
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            std::fs::rename(&at, &away).unwrap();
+            std::fs::create_dir(&at).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
             remove_unix(&file);
-            assert!(path.exists(), "removed what now sits at the path");
-            assert!(!away.join("s.sock").exists(), "left its own socket");
-            drop((l, file));
+            assert!(
+                unix_socket_path(&at).exists(),
+                "removed what now sits at the path"
+            );
+            assert!(!unix_socket_path(&away).exists(), "left its own socket");
+            drop(l);
             std::fs::remove_dir_all(&d).unwrap();
-            std::fs::remove_dir_all(&away).unwrap();
         }
 
         #[test]
@@ -1618,13 +1633,16 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("second");
-            let path = d.join("s.sock");
-            let (l, file) = bind_unix(&path, 0o600).unwrap();
-            std::fs::remove_file(&path).unwrap();
-            let e = bind_unix(&path, 0o600).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
-            drop((l, file));
-            drop(bind_unix(&path, 0o600).unwrap());
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+            std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
+            drop(l);
+            remove_unix(&file);
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            drop(l);
+            remove_unix(&file);
             std::fs::remove_dir_all(&d).unwrap();
         }
 
@@ -1632,21 +1650,21 @@ mod tests {
         fn servers_starting_together_get_one_socket() {
             let d = dir("race");
             for round in 0..20 {
-                let path = d.join(format!("s{round}.sock"));
+                let at = d.join(format!("s{round}"));
                 let go = Arc::new(std::sync::Barrier::new(6));
                 let (tx, rx) = std::sync::mpsc::channel();
                 let threads: Vec<_> = (0..6)
                     .map(|_| {
-                        let (go, tx, path) = (go.clone(), tx.clone(), path.clone());
+                        let (go, tx, at) = (go.clone(), tx.clone(), at.clone());
                         std::thread::spawn(move || {
                             let rt = runtime();
                             let _guard = rt.enter();
                             go.wait();
-                            let r = bind_unix(&path, 0o600);
+                            let r = bind_unix(&at, 0o600);
                             let won = r.as_ref().is_ok_and(|(_, f)| {
-                                let m = std::fs::symlink_metadata(&path).unwrap();
                                 use std::os::unix::fs::MetadataExt;
-                                m.ino() == f.ino
+                                let m = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap();
+                                f.socket_id == Some((m.dev() as _, m.ino() as _))
                             });
                             tx.send((r.is_ok(), won)).unwrap();
                             // Hold on until everyone has tried.
@@ -1682,34 +1700,100 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("long");
+            // `<dir>/s`: the directory's name plus 2 bytes, after `<d>/`.
             let base = d.as_os_str().len() + 1;
-            let path = d.join("a".repeat(max_path() + 1 - base));
-            assert_eq!(path.as_os_str().len(), max_path() + 1);
-            let e = bind_unix(&path, 0o600).unwrap_err();
+            let at = d.join("a".repeat(max_path() + 1 - base - 2));
+            assert_eq!(unix_socket_path(&at).as_os_str().len(), max_path() + 1);
+            let e = bind_unix(&at, 0o600).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
             assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
-            let path = d.join("a".repeat(max_path() - base));
-            let (l, file) = bind_unix(&path, 0o600).expect("the longest path that fits");
-            std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let at = d.join("a".repeat(max_path() - base - 2));
+            let (l, file) = bind_unix(&at, 0o600).expect("the longest path that fits");
+            std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
             drop((l, file));
             std::fs::remove_dir_all(&d).unwrap();
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
-        fn a_short_name_whose_setup_path_is_too_long_is_refused_clearly() {
+        fn an_inherited_acl_is_cleared() {
+            use std::os::unix::ffi::OsStrExt;
             let rt = runtime();
             let _guard = rt.enter();
-            let d = dir("stage");
-            // `.sf/s` is 6 bytes past the directory, `/abc` 4.
-            let sub = d.join("d".repeat(max_path() - 5 - d.as_os_str().len() - 1));
-            std::fs::create_dir(&sub).unwrap();
-            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let path = sub.join("abc");
-            assert!(path.as_os_str().len() <= max_path());
-            let e = bind_unix(&path, 0o600).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
-            assert!(e.to_string().contains("set up first"), "{e}");
-            assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 0);
+            let d = dir("acl");
+            let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            // A default ACL (version 2): user::rwx, user:nobody:rwx, group::---, mask::rwx, other::---.
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (0x01u16, 7u16, u32::MAX),
+                (0x02, 7, 65534),
+                (0x04, 0, u32::MAX),
+                (0x10, 7, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ] {
+                acl.extend(tag.to_le_bytes());
+                acl.extend(perm.to_le_bytes());
+                acl.extend(id.to_le_bytes());
+            }
+            let set = unsafe {
+                libc::setxattr(
+                    c(&d).as_ptr(),
+                    c"system.posix_acl_default".as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            };
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+            let has = |p: &std::path::Path, name: &std::ffi::CStr| unsafe {
+                libc::getxattr(c(p).as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) >= 0
+            };
+            let plain = d.join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert!(has(&plain, c"system.posix_acl_access"), "no ACL to inherit");
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o660).unwrap();
+            for (p, name) in [
+                (at.clone(), c"system.posix_acl_default"),
+                (at.clone(), c"system.posix_acl_access"),
+                (unix_socket_path(&at), c"system.posix_acl_access"),
+            ] {
+                assert!(!has(&p, name), "{} kept {name:?}", p.display());
+            }
+            drop((l, file));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn an_inherited_acl_is_cleared() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("acl");
+            let granted = std::process::Command::new("/bin/chmod")
+                .arg("+a")
+                .arg("everyone allow list,search,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit")
+                .arg(&d)
+                .status()
+                .unwrap();
+            assert!(granted.success());
+            // `ls -led` lists ACL entries on the lines after the file's own.
+            let acl = |p: &std::path::Path| {
+                let out = std::process::Command::new("/bin/ls")
+                    .arg("-led")
+                    .arg(p)
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).lines().count() > 1
+            };
+            let plain = d.join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert!(acl(&plain), "no ACL to inherit");
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            assert!(!acl(&at), "the directory kept an ACL");
+            assert!(!acl(&unix_socket_path(&at)), "the socket has an ACL");
+            drop((l, file));
             std::fs::remove_dir_all(&d).unwrap();
         }
     }

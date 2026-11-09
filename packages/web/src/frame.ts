@@ -12,7 +12,7 @@ export type Unframed =
 	| { t: 'binary'; b: ArrayBuffer };
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder('utf-8', { fatal: true });
+const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 function frame(kind: number, payload: Uint8Array): Uint8Array<ArrayBuffer> {
 	if (payload.length + 1 > MAX_MESSAGE)

@@ -82,7 +82,8 @@ fn truthy(v: Option<&String>, default: bool) -> bool {
 }
 
 /// Where the server listens: TCP on --addr/--port unless --listen-tcp=false, and a
-/// unix socket at --listen-unix with permissions --listen-unix-mode (octal, default 0600).
+/// unix socket in the new directory --listen-unix with permissions --listen-unix-mode
+/// (octal, default 0600).
 #[derive(Debug, PartialEq)]
 struct Listen {
     tcp: bool,
@@ -533,7 +534,10 @@ async fn serve(a: HashMap<String, String>) {
                 log::error!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
             });
-            log::info!("listening on unix:{} (mode {mode:o})", path.display());
+            log::info!(
+                "listening on unix:{} (mode {mode:o})",
+                server::unix_socket_path(path).display()
+            );
             (Some(l), Some(file))
         }
         None => (None, None),

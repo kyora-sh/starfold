@@ -39,6 +39,12 @@ describe('framed messages', () => {
 		expect(u.t === 'binary' && u.b.byteLength).toBe(0);
 		expect(() => unframe(new ArrayBuffer(0))).toThrow(TypeError);
 	});
+	test('a leading BOM is text, as on the server', () => {
+		const bom = new Uint8Array([Kind.Text, 0xef, 0xbb, 0xbf]);
+		expect(unframe(buf(bom))).toEqual({ t: 'text', s: '\uFEFF' });
+		for (const s of ['\uFEFF', '\uFEFFk,65,1'])
+			expect(unframe(buf(frameText(s)))).toEqual({ t: 'text', s });
+	});
 	test('unknown kinds and bad UTF-8 are refused', () => {
 		for (const k of [2, 0x11, 255])
 			expect(() => unframe(new Uint8Array([k, 1]).buffer)).toThrow(/kind/);
