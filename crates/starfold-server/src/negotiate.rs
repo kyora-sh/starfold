@@ -8,7 +8,7 @@
 //! would need a third joins the closest cohort it can decode.
 
 use crate::encoder::caps::{Acceleration, Registry};
-use crate::encoder::{Backend, BitstreamFormat, Codec, Selection, StreamConfig};
+use crate::encoder::{Backend, BitstreamFormat, Codec, SOFTWARE_H264, Selection, StreamConfig};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: u32 = 2;
@@ -144,23 +144,23 @@ fn codec_rank(c: Codec) -> u8 {
 }
 
 /// The H.264 backend `sel` stands for here: the pinned one, which must be eligible, or
-/// the first eligible hardware one that isn't experimental, else OpenH264.
+/// the first eligible hardware one that isn't experimental, else [`SOFTWARE_H264`].
 pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
     let b = match sel {
         Selection::Pinned(b) => b,
         Selection::Auto => reg
             .eligible(Codec::H264)
             .find(|e| e.acceleration == Acceleration::Hardware && !e.backend.experimental())
-            .map_or(Backend::OpenH264, |e| e.backend),
+            .map_or(SOFTWARE_H264, |e| e.backend),
         #[cfg(feature = "sw-arm")]
-        Selection::Arm(..) => Backend::OpenH264,
+        Selection::Arm(..) => SOFTWARE_H264,
     };
     reg.check(b, Codec::H264).map(|_| b)
 }
 
 /// The encoders a stream may use, best first: eligible AV1, then HEVC (hardware before
 /// software), then the H.264 backend (`h264_backend`), which also serves legacy viewers
-/// and recording, and OpenH264 for when a hardware one fails. An experimental backend
+/// and recording, and [`SOFTWARE_H264`] for when a hardware one fails. An experimental backend
 /// takes part only when it is the H.264 one, i.e. pinned with `--encoder`.
 pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
@@ -194,11 +194,11 @@ pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
     if hardware
         && reg
             .eligible(Codec::H264)
-            .any(|e| e.backend == Backend::OpenH264)
+            .any(|e| e.backend == SOFTWARE_H264)
     {
         v.push(Candidate {
             codec: Codec::H264,
-            backend: Backend::OpenH264,
+            backend: SOFTWARE_H264,
             hardware: false,
         });
     }

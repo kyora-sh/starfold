@@ -2,6 +2,8 @@ name: Release
 
 # A version tag (v0.4.0, ...) gets a GitHub release with GitHub's generated notes (the
 # pull requests merged since the previous tag). Nothing is published to a registry.
+# starfold links x264 (GPL-2.0-or-later), so each release also carries the source of the
+# x264 its Linux build links: Ubuntu 24.04's package, checksum-pinned, and its upstream commit.
 # Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
 on:
   push:
@@ -27,13 +29,34 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
             exit 1
           fi
+      - name: x264's source
+        run: |
+          base=https://archive.ubuntu.com/ubuntu/pool/universe/x/x264
+          mkdir x264-source
+          for f in x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164.3108+git31e19f9-1.debian.tar.xz x264_0.164.3108+git31e19f9-1.dsc; do
+            curl -fsSL --retry 3 -o "x264-source/$f" "$base/$f"
+          done
+          cd x264-source
+          sha256sum -c - <<'SUMS'
+          41606cb8e788a7f8c4514290646d4ba5c7bc68d9e1ccd1a73f446a90546913eb  x264_0.164.3108+git31e19f9.orig.tar.gz
+          7844a9b42bedec211bc9a131d0655ea52524fbb055582921d8e6d4a4d953efc6  x264_0.164.3108+git31e19f9-1.debian.tar.xz
+          SUMS
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes)
+          cat > x264-notes.md <<'NOTES'
+          ## x264 source
+
+          Binaries built from this release link x264 and are GPL-2.0-or-later as a combined work.
+          The x264 source is attached: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1`, the one CI
+          builds against, upstream commit [31e19f92](https://code.videolan.org/videolan/x264/-/commit/31e19f92f00c7003fa115047ce50978bc98c3a0d).
+          Builds through vcpkg or Homebrew link upstream r3222, commit
+          [b35605ac](https://code.videolan.org/videolan/x264/-/commit/b35605ace3ddf7c1a5d67a2eb553f034aef41d55).
+          NOTES
+          args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes --notes-file x264-notes.md)
           prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
           if [ -n "$prev" ]; then
             args+=(--notes-start-tag "$prev")
           fi
-          gh release create "$GITHUB_REF_NAME" "${args[@]}"
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" x264-source/*

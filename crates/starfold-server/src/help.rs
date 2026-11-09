@@ -32,13 +32,13 @@ Video:
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
                                 (default 30000, 2000)
   --encoder                     auto: each codec from its hardware encoder,
-                                H.264 from OpenH264 where there is none
-                                (default); or the H.264 encoder: openh264,
-                                videotoolbox (macOS hardware), x264 in a
-                                build with the x264 feature, vaapi (Linux),
-                                nvenc (Linux, Windows) or mediafoundation
-                                (Windows); vaapi, nvenc and mediafoundation
-                                are experimental, need
+                                H.264 from x264 where there is none
+                                (default); or the H.264 encoder: x264,
+                                videotoolbox (macOS hardware), openh264 in
+                                a build with the openh264 feature, vaapi
+                                (Linux), nvenc (Linux, Windows) or
+                                mediafoundation (Windows); vaapi, nvenc and
+                                mediafoundation are experimental, need
                                 --experimental-hw-probes and auto never
                                 picks them; /stats shows what the probe
                                 found

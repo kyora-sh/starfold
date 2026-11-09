@@ -3,7 +3,7 @@
 # CHROME_ZIP and NOVNC_TGZ (noVNC's source tag tarball: the npm package's lib/ has a top-level await in CommonJS).
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq >/dev/null 2>&1
-sudo apt-get install -y -qq nasm esbuild libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 x11-apps xfonts-base python3-numpy python3-pil >/dev/null 2>&1
+sudo apt-get install -y -qq nasm esbuild libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev libx11-dev libxext-dev x11-xserver-utils unzip xvfb x11vnc websockify iproute2 x11-apps xfonts-base python3-numpy python3-pil >/dev/null 2>&1
 build() { "$@" > /tmp/vs-build.log 2>&1; local c=$?; tail -3 /tmp/vs-build.log; return $c; }
 build cargo +1.93.0 build --release --locked || { echo 'server did not build'; exit 1; }
 cc -O2 bench/vs/source.c -lX11 -lXext -lm -o /tmp/vs-source || { echo 'source did not build'; exit 1; }
@@ -29,7 +29,6 @@ if [ -f "${BEFORE_TGZ:-}" ]; then
 	export STARFOLD_BEFORE_BIN=/tmp/t-before/release/starfold
 fi
 if [ "${PROBE_BUILDS:-0}" = 1 ]; then
-	sudo apt-get install -y -qq libx264-dev libclang-dev >/dev/null 2>&1
 	CARGO_TARGET_DIR=/tmp/t-x264 build cargo +1.93.0 build --release --locked --features x264 || { echo 'x264 did not build'; exit 1; }
 	export STARFOLD_X264_BIN=/tmp/t-x264/release/starfold
 	if [ -f "${VOXL_TGZ:-}" ]; then
