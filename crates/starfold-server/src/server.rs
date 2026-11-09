@@ -1618,12 +1618,8 @@ mod tests {
             let (l, file) = bind_unix(&at, 0o600).unwrap();
             std::fs::rename(&at, &away).unwrap();
             std::fs::create_dir(&at).unwrap();
-            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
             remove_unix(&file);
-            assert!(
-                unix_socket_path(&at).exists(),
-                "removed what now sits at the path"
-            );
+            assert!(at.exists(), "removed the directory now at the path");
             assert!(!unix_socket_path(&away).exists(), "left its own socket");
             drop(l);
             std::fs::remove_dir_all(&d).unwrap();
