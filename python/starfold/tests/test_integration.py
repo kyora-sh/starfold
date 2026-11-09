@@ -235,7 +235,7 @@ def test_encoder_fallback_rolls_the_recording(desktop):
     deadline = time.monotonic() + 15
     while True:
         chosen = sf._http.get("/stats").json()["encoder"]["chosen"]
-        if any(c["codec"] == "h264" and c["backend"] == "openh264" for c in chosen):
+        if any(c["codec"] == "h264" and c["backend"] == "x264" for c in chosen):
             break
         assert time.monotonic() < deadline, f"no fallback: {chosen}"
         time.sleep(0.1)

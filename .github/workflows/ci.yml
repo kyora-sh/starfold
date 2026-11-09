@@ -129,7 +129,9 @@ jobs:
           cargo clippy --features openh264 --all-targets --locked -- -D warnings
           cargo clippy --no-default-features --features openh264 --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --features openh264 --locked
+        run: |
+          cargo test --features openh264 --locked
+          cargo test --no-default-features --features openh264 --locked
 
   windows:
     name: Windows (clippy, cross-compiled on Linux)

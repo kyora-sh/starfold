@@ -17,7 +17,7 @@ folder transfer and dynamic resolution.
 ## Quick start
 
 ```sh
-cargo install --locked --path crates/starfold-server   # needs nasm, libyuv, Opus, PulseAudio and esbuild (see Usage)
+cargo install --locked --path crates/starfold-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
 DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
@@ -77,9 +77,11 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 
 ## Usage
 
-Build (needs Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild;
-`nix-shell` provides them all). The H.264 encoder is OpenH264, built from source; x264
-is optional (`cargo build --features x264`, then `--encoder x264`; needs x264 and clang):
+Build (needs Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and
+esbuild; `nix-shell` provides them all). The H.264 encoder is x264. OpenH264, built from
+source (needs nasm), is optional: `--features openh264` adds it beside x264 (`--encoder
+openh264`), and `--no-default-features --features openh264` builds without x264 (see
+[Licensing](#licensing)):
 
 ```sh
 nix-shell
@@ -117,7 +119,7 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 | `--basic-auth-user`                                            | any                                | the user name a browser's sign-in has to give                                                                     |
 | `--framerate`                                                  | `60`                               | max frames per second (`60-60` style ranges accepted)                                                             |
 | `--high-fps`                                                   | `false`                            | up to 120 frames per second on hardware VideoToolbox; other encoders take 60 at most                              |
-| `--encoder`                                                    | `auto`                             | `auto`: each codec's hardware encoder, else OpenH264; or the H.264 one: `openh264`, `videotoolbox`, `x264`        |
+| `--encoder`                                                    | `auto`                             | `auto`: each codec's hardware encoder, else x264; or the H.264 one: `x264`, `videotoolbox`, `openh264`            |
 | `--encoder-probe`                                              | `true`                             | probe the hardware encoders at startup (`/stats` lists what was found)                                            |
 | `--experimental-hw-probes`                                     | `false`                            | experimental: also probe VA-API, NVENC and Media Foundation (no encoders yet; each in a child process)            |
 | `--preset`                                                     | `ultrafast`                        | x264 preset                                                                                                       |
@@ -189,7 +191,7 @@ A recording is the H.264 voxl already sends to viewers, saved as MP4 without enc
 it again, so it costs no extra CPU. It doesn't include the cursor (viewers draw it), and
 a resize ends it.
 
-If another encoder takes over mid-recording (a hardware encoder failing over to OpenH264,
+If another encoder takes over mid-recording (a hardware encoder failing over to x264,
 say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
@@ -266,7 +268,7 @@ Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and i
 WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
-vcpkg install libyuv opus --triplet x64-windows-static-md
+vcpkg install x264 libyuv opus --triplet x64-windows-static-md
 $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
 npm install -g esbuild
 cargo build --release
@@ -343,10 +345,18 @@ desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 let
 capture them without a permission prompt, with damage events that keep a still screen at
 no CPU and power `/wait`. Wayland support is being worked on.
 
-**Does it use the GPU?** Not yet. starfold encodes H.264 on the CPU with OpenH264 (the
-CPU table above was measured with x264: 1.3–1.7 cores for a busy 2560x1600 desktop, X
-server included). On macOS, a browser that decodes HEVC gets it from VideoToolbox.
+**Does it use the GPU?** Not yet. starfold encodes H.264 on the CPU with x264 (1.3–1.7
+cores for a busy 2560x1600 desktop, X server included, in the CPU table above). On macOS,
+a browser that decodes HEVC gets it from VideoToolbox.
 
-**What's the license?** The code is MIT, and the default build links OpenH264
-(BSD-2-Clause). A build with the `x264` feature links x264, which is GPL-2.0, so that
-binary, and anything that bundles one, is distributed under the GPL.
+**What's the license?** The code is MIT; a default build links x264 and is
+GPL-2.0-or-later. See [Licensing](#licensing).
+
+## Licensing
+
+The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2.0-or-later),
+so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
+work. Each release carries or links the exact x264 source its builds link. A build with
+`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
+no GPL component. [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their
+licences.

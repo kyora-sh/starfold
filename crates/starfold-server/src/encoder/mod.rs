@@ -221,7 +221,9 @@ pub trait VideoEncoder: Send {
 }
 
 #[cfg(not(any(feature = "x264", feature = "openh264")))]
-compile_error!("starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature");
+compile_error!(
+    "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
+);
 
 /// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
 const MAX_MBS: usize = 36864;

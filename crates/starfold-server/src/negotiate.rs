@@ -8,7 +8,7 @@
 //! would need a third joins the closest cohort it can decode.
 
 use crate::encoder::caps::{Acceleration, Registry};
-use crate::encoder::{Backend, BitstreamFormat, Codec, SOFTWARE_H264, Selection, StreamConfig};
+use crate::encoder::{Backend, BitstreamFormat, Codec, Selection, StreamConfig, SOFTWARE_H264};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: u32 = 2;
