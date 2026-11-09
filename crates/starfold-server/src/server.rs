@@ -40,23 +40,112 @@ pub struct AppState {
     pub framed: bool,
 }
 
-/// Binds a unix socket at `path` with permissions `mode` (--listen-unix). A socket left
-/// behind by a server that is gone is replaced; one that still answers, or a file that
+/// The socket file --listen-unix made, so that shutdown removes that file and nothing that
+/// has since taken its place.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketFile {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+enum Peer {
+    Live,
+    Gone,
+}
+
+/// Starts a connection to the socket at `path` without waiting for it: the socket, and
+/// 0 or the error `connect` gave.
+#[cfg(unix)]
+fn nonblocking_connect(path: &Path) -> std::io::Result<(std::os::fd::OwnedFd, i32)> {
+    use std::io::Error;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is too long for a unix socket", path.display()),
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(Error::last_os_error());
+    }
+    let r = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    let errno = match r {
+        0 => 0,
+        _ => Error::last_os_error().raw_os_error().unwrap_or(-1),
+    };
+    Ok((fd, errno))
+}
+
+/// Whether a server still listens at `path`, without waiting on it: only a refused
+/// connection says it is gone. A full backlog counts as live; anything else is an error.
+#[cfg(unix)]
+fn probe(path: &Path) -> std::io::Result<Peer> {
+    match nonblocking_connect(path)?.1 {
+        0 | libc::EINPROGRESS | libc::EAGAIN => Ok(Peer::Live),
+        libc::ECONNREFUSED => Ok(Peer::Gone),
+        e => Err(std::io::Error::from_raw_os_error(e)),
+    }
+}
+
+/// Binds a unix socket at `path` with permissions `mode` (--listen-unix). Its directory has
+/// to be one only this user can change (a real directory it owns, without group or other
+/// write), so nobody else can swap the path while it is set up or removed. A socket left
+/// behind by a server that is gone is replaced; one that may still be in use, or a file that
 /// isn't a socket, is not.
 #[cfg(unix)]
-pub fn bind_unix(path: &Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
+pub fn bind_unix(
+    path: &Path,
+    mode: u32,
+) -> std::io::Result<(tokio::net::UnixListener, SocketFile)> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let d = std::fs::symlink_metadata(dir)?;
+    if !d.is_dir() || d.uid() != unsafe { libc::geteuid() } || d.mode() & 0o022 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} has to be a directory (not a symlink) that this user owns and only it can write",
+                dir.display()
+            ),
+        ));
+    }
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_socket() => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        Ok(m) if m.file_type().is_socket() => match probe(path)? {
+            Peer::Live => {
                 return Err(Error::new(
                     ErrorKind::AddrInUse,
                     format!("{} is in use by another server", path.display()),
-                ));
+                ))
             }
-            std::fs::remove_file(path)?;
-        }
+            Peer::Gone => std::fs::remove_file(path)?,
+        },
         Ok(_) => {
             return Err(Error::new(
                 ErrorKind::AlreadyExists,
@@ -66,13 +155,44 @@ pub fn bind_unix(path: &Path, mode: u32) -> std::io::Result<tokio::net::UnixList
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // The socket is created with `mode` already, so nobody else connects before the chmod.
-    let old = unsafe { libc::umask((0o777 & !mode) as libc::mode_t) };
-    let listener = tokio::net::UnixListener::bind(path);
-    unsafe { libc::umask(old) };
-    let listener = listener?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(listener)
+    // Made and given its mode in a directory only this user can enter, then moved into
+    // place, so nobody connects before the mode applies.
+    let stage = dir.join(format!(
+        ".starfold-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.subsec_nanos())
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let staged = stage.join("s");
+    let placed = (|| {
+        let listener = tokio::net::UnixListener::bind(&staged)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&staged, path)?;
+        let m = std::fs::symlink_metadata(path)?;
+        Ok((
+            listener,
+            SocketFile {
+                dev: m.dev(),
+                ino: m.ino(),
+            },
+        ))
+    })();
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&stage);
+    placed
+}
+
+/// Removes the socket `bind_unix` made, if `path` is still that socket.
+#[cfg(unix)]
+pub fn remove_unix(path: &Path, file: SocketFile) {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if m.file_type().is_socket() && m.dev() == file.dev && m.ino() == file.ino {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// The web client's page, titled `title` (--title): the browser tab, and the name of
@@ -906,7 +1026,15 @@ mod tests {
             let d = std::env::temp_dir().join(format!("sf-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
             d
+        }
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
         }
 
         fn wired() -> (Arc<Hub>, std::sync::mpsc::Receiver<InputEvent>) {
@@ -989,7 +1117,7 @@ mod tests {
             s.framed = true;
             let d = dir("framed");
             let path = d.join("s.sock");
-            let l = bind_unix(&path, 0o600).unwrap();
+            let (l, _) = bind_unix(&path, 0o600).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
             let server = tokio::spawn(axum::serve(l, router(s)).into_future());
@@ -1037,7 +1165,7 @@ mod tests {
             let d = dir("refuse");
             let path = d.join("s.sock");
             let server = tokio::spawn(
-                axum::serve(bind_unix(&path, 0o600).unwrap(), router(s)).into_future(),
+                axum::serve(bind_unix(&path, 0o600).unwrap().0, router(s)).into_future(),
             );
             for (bad, code) in [
                 (Ws::Text("k,65,1".into()), 1003),
@@ -1094,13 +1222,10 @@ mod tests {
         fn a_unix_socket_replaces_only_a_dead_one() {
             let d = dir("bind");
             let path = d.join("s.sock");
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            let rt = runtime();
             let _guard = rt.enter();
             drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-            let l = bind_unix(&path, 0o660).unwrap();
+            let (l, _) = bind_unix(&path, 0o660).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o660);
             let e = bind_unix(&path, 0o600).unwrap_err();
@@ -1113,6 +1238,143 @@ mod tests {
                 std::io::ErrorKind::AlreadyExists
             );
             assert_eq!(std::fs::read(&file).unwrap(), b"x");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn a_socket_that_may_still_be_in_use_is_kept() {
+            // Root connects whatever the mode, so only another user sees the refusal.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let d = dir("denied");
+            let path = d.join("s.sock");
+            let rt = runtime();
+            let _guard = rt.enter();
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let e = bind_unix(&path, 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::os::unix::net::UnixStream::connect(&path).expect("the live socket is gone");
+            drop(live);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_full_backlog_is_a_live_server_and_is_not_waited_on() {
+            use std::os::fd::AsRawFd;
+            let d = dir("backlog");
+            let path = d.join("s.sock");
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            assert_eq!(unsafe { libc::listen(live.as_raw_fd(), 0) }, 0);
+            let mut queued = Vec::new();
+            loop {
+                let (fd, e) = nonblocking_connect(&path).unwrap();
+                if e == libc::EAGAIN {
+                    break;
+                }
+                assert_eq!(e, 0);
+                queued.push(fd);
+                assert!(queued.len() < 64, "the backlog never filled");
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let rt = runtime();
+                let _guard = rt.enter();
+                let _ = tx.send(bind_unix(&p, 0o600).map(|_| ()));
+            });
+            let r = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("binding waited on a server that doesn't accept");
+            assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+            assert!(path.exists());
+            drop((queued, live));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn binding_leaves_the_umask_alone() {
+            use std::sync::atomic::AtomicBool;
+            let umask = || {
+                std::fs::read_to_string("/proc/self/status")
+                    .unwrap()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_string()))
+                    .unwrap()
+            };
+            let before = umask();
+            let stop = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut seen = std::collections::BTreeSet::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        seen.insert(umask());
+                    }
+                    seen
+                })
+            };
+            let d = dir("umask");
+            let rt = runtime();
+            let _guard = rt.enter();
+            for i in 0..1000 {
+                let path = d.join(format!("s{i}"));
+                drop(bind_unix(&path, 0o666).unwrap());
+                std::fs::remove_file(&path).unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            let seen = watcher.join().unwrap();
+            assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![before]);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn only_a_private_directory_takes_the_socket() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("shared");
+            for mode in [0o777, 0o770, 0o1777] {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+                let e = bind_unix(&d.join("s.sock"), 0o600).unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{mode:o}");
+                assert!(!d.join("s.sock").exists());
+            }
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let target = dir("target");
+            std::os::unix::fs::symlink(&target, d.join("via")).unwrap();
+            let e = bind_unix(&d.join("via").join("s.sock"), 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+            std::fs::remove_dir_all(&d).unwrap();
+            std::fs::remove_dir_all(&target).unwrap();
+        }
+
+        #[test]
+        fn shutdown_removes_only_our_socket() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("cleanup");
+            let path = d.join("s.sock");
+            let (l, file) = bind_unix(&path, 0o600).unwrap();
+            assert_eq!(
+                std::fs::read_dir(&d).unwrap().count(),
+                1,
+                "the staging directory was left behind"
+            );
+            drop(l);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            remove_unix(&path, file);
+            assert_eq!(std::fs::read(&path).unwrap(), b"x");
+            std::fs::remove_file(&path).unwrap();
+            let (l, file) = bind_unix(&path, 0o600).unwrap();
+            remove_unix(&path, file);
+            assert!(!path.exists());
+            drop(l);
             std::fs::remove_dir_all(&d).unwrap();
         }
     }

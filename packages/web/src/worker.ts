@@ -167,7 +167,7 @@ function connect() {
 			onMessage(m.t === 'text' ? m.s : m.b);
 		} catch (err) {
 			post({ t: 'log', s: `framed socket: ${err}` });
-			sock.close(1003);
+			sock.close(4003, 'not a framed message');
 		}
 	});
 }

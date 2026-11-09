@@ -86,6 +86,7 @@ fn truthy(v: Option<&String>, default: bool) -> bool {
 #[derive(Debug, PartialEq)]
 struct Listen {
     tcp: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     unix: Option<(std::path::PathBuf, u32)>,
 }
 
@@ -526,14 +527,17 @@ async fn serve(a: HashMap<String, String>) {
         false => None,
     };
     #[cfg(unix)]
-    let unix = listen.unix.as_ref().map(|(path, mode)| {
-        let l = server::bind_unix(path, *mode).unwrap_or_else(|e| {
-            log::error!("--listen-unix {}: {e}", path.display());
-            std::process::exit(1);
-        });
-        log::info!("listening on unix:{} (mode {mode:o})", path.display());
-        l
-    });
+    let (unix, socket_file) = match &listen.unix {
+        Some((path, mode)) => {
+            let (l, file) = server::bind_unix(path, *mode).unwrap_or_else(|e| {
+                log::error!("--listen-unix {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            log::info!("listening on unix:{} (mode {mode:o})", path.display());
+            (Some(l), Some((path.clone(), file)))
+        }
+        None => (None, None),
+    };
     if tcp.is_some() {
         log::info!("listening on http://{addr}:{port}");
     }
@@ -558,7 +562,6 @@ async fn serve(a: HashMap<String, String>) {
         log::info!("--framed: every WebSocket message is binary with a kind byte");
     }
     let shutdown_hub = hub.clone();
-    let socket_path = listen.unix.map(|(p, _)| p);
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -573,8 +576,9 @@ async fn serve(a: HashMap<String, String>) {
         if let Some(tx) = shutdown_hub.input.lock().as_ref() {
             let _ = tx.send(input::InputEvent::Shutdown);
         }
-        if let Some(p) = &socket_path {
-            let _ = std::fs::remove_file(p);
+        #[cfg(unix)]
+        if let Some((path, file)) = &socket_file {
+            server::remove_unix(path, *file);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);

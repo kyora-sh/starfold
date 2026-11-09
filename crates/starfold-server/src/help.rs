@@ -11,8 +11,9 @@ Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
   --listen-tcp                  listen on --addr/--port (default true)
   --listen-unix                 also serve on a unix socket at this path
-                                (Linux, macOS); the host and origin checks
-                                still apply
+                                (Linux, macOS), in a directory this user owns
+                                and only it can write; the host and origin
+                                checks still apply
   --listen-unix-mode            the socket's permissions (default 0600)
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
