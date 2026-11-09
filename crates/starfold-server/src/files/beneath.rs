@@ -2,11 +2,13 @@
 //! step goes through a held directory fd (`openat2` with `RESOLVE_BENEATH` and
 //! `RESOLVE_NO_SYMLINKS` on Linux where the kernel has it, else an `O_NOFOLLOW` walk),
 //! and folders, files and renames are made relative to it, so a symlink, wherever it
-//! is, is never followed. Windows has no `*at` calls: each step is checked with
-//! `symlink_metadata` (symlinks and junctions refused) and then used by path.
+//! is, is never followed. Windows has no `*at` calls: each name must be a plain one
+//! ([`windows_plain`]), the joined path must stay under the root, and each step is
+//! checked with `symlink_metadata` (symlinks and junctions refused) and then used by path.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -16,6 +18,8 @@ pub enum Refused {
     NotFolder,
     Link,
     Special,
+    #[cfg_attr(unix, allow(dead_code))]
+    BadName,
     Io(io::Error),
 }
 
@@ -73,6 +77,38 @@ impl Root {
     }
 }
 
+/// Whether Windows takes `name` as a plain name inside its folder: no drive, UNC or
+/// stream syntax (any `:`), no separator or wildcard, no device name (`NUL`, `COM1.txt`)
+/// and no trailing dot or space, which Windows would drop.
+#[cfg_attr(unix, allow(dead_code))]
+pub fn windows_plain(name: &OsStr) -> bool {
+    let Some(s) = name.to_str() else {
+        return false;
+    };
+    if s.is_empty()
+        || s.ends_with(['.', ' '])
+        || s.chars()
+            .any(|c| c < ' ' || matches!(c, ':' | '/' | '\\' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let stem = s.split('.').next().unwrap_or("").trim_end().to_uppercase();
+    let numbered = |p: &str| {
+        stem.strip_prefix(p).is_some_and(|n| {
+            let mut c = n.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('0'..='9' | '¹' | '²' | '³'), None)
+            )
+        })
+    };
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) && !numbered("COM")
+        && !numbered("LPT")
+}
+
 impl From<io::Error> for Refused {
     fn from(e: io::Error) -> Self {
         Refused::Io(e)
@@ -86,9 +122,9 @@ pub use windows::Dir;
 
 #[cfg(unix)]
 mod unix {
-    use super::{Entry, Kind, Opened, Refused};
+    use super::{ControlFlow, Entry, Kind, Opened, Refused};
     use nix::errno::Errno;
-    use nix::fcntl::{openat, renameat, AtFlags, OFlag};
+    use nix::fcntl::{openat, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
     use nix::unistd::{unlinkat, UnlinkatFlags};
     use std::ffi::OsStr;
@@ -115,6 +151,27 @@ mod unix {
 
     fn io(e: Errno) -> Refused {
         Refused::Io(e.into())
+    }
+
+    /// What a failed `openat2` means: Ok to take the component walk instead (the kernel
+    /// can't, the joined path is too long, a non-folder is on the way, or with `create`
+    /// something is missing), else the refusal.
+    #[cfg(target_os = "linux")]
+    pub(super) fn openat2_failed(e: Errno, create: bool) -> Result<(), Refused> {
+        match e {
+            Errno::ENOSYS
+            | Errno::EPERM
+            | Errno::EINVAL
+            | Errno::E2BIG
+            | Errno::EAGAIN
+            | Errno::ENAMETOOLONG => Ok(()),
+            Errno::ENOENT if create => Ok(()),
+            // A file or a symlink on the way: the walk tells which.
+            Errno::ENOTDIR => Ok(()),
+            Errno::ENOENT => Err(Refused::Missing),
+            Errno::ELOOP | Errno::EXDEV => Err(Refused::Link),
+            e => Err(io(e)),
+        }
     }
 
     impl Dir {
@@ -156,15 +213,7 @@ mod unix {
             );
             match openat2(self.0.as_fd(), parts.join("/").as_str(), how) {
                 Ok(fd) => Ok(Some(Dir(fd))),
-                Err(
-                    Errno::ENOSYS | Errno::EPERM | Errno::EINVAL | Errno::E2BIG | Errno::EAGAIN,
-                ) => Ok(None),
-                Err(Errno::ENOENT) if create => Ok(None),
-                // A file or a symlink on the way: the walk tells which.
-                Err(Errno::ENOTDIR) => Ok(None),
-                Err(Errno::ENOENT) => Err(Refused::Missing),
-                Err(Errno::ELOOP | Errno::EXDEV) => Err(Refused::Link),
-                Err(e) => Err(io(e)),
+                Err(e) => openat2_failed(e, create).map(|()| None),
             }
         }
 
@@ -212,19 +261,58 @@ mod unix {
             fstatat(self.0.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
         }
 
-        pub fn rename(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
-            Ok(renameat(self.0.as_fd(), from, self.0.as_fd(), to)?)
+        /// The device and inode of this folder.
+        pub fn id(&self) -> Option<(u64, u64)> {
+            let st = fstat(self.0.as_fd()).ok()?;
+            Some((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// Renames `from` to `to`, failing with `AlreadyExists` if `to` is there, however
+        /// close together two uploads finish.
+        pub fn publish(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+            let fd = self.0.as_fd();
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                use nix::fcntl::{renameat2, RenameFlags};
+                match renameat2(fd, from, fd, to, RenameFlags::RENAME_NOREPLACE) {
+                    Err(Errno::EINVAL | Errno::ENOSYS) => {}
+                    r => return Ok(r?),
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                let (from, to) = (cstr(from)?, cstr(to)?);
+                let r = unsafe {
+                    libc::renameatx_np(
+                        fd.as_raw_fd(),
+                        from.as_ptr(),
+                        fd.as_raw_fd(),
+                        to.as_ptr(),
+                        libc::RENAME_EXCL,
+                    )
+                };
+                match Errno::result(r) {
+                    Err(Errno::ENOTSUP | Errno::EINVAL) => {}
+                    r => return Ok(r.map(drop)?),
+                }
+            }
+            nix::unistd::linkat(fd, from, fd, to, AtFlags::empty())?;
+            Ok(unlinkat(fd, from, UnlinkatFlags::NoRemoveDir)?)
         }
 
         pub fn remove(&self, name: &OsStr) -> std::io::Result<()> {
             Ok(unlinkat(self.0.as_fd(), name, UnlinkatFlags::NoRemoveDir)?)
         }
 
-        /// What this folder holds, symlinks reported as links and not followed.
-        pub fn entries(&self) -> std::io::Result<Vec<Entry>> {
+        /// What this folder holds, one entry at a time until `each` breaks, symlinks
+        /// reported as links and not followed.
+        pub fn entries(
+            &self,
+            mut each: impl FnMut(Entry) -> ControlFlow<()>,
+        ) -> std::io::Result<()> {
             let fresh = openat(self.0.as_fd(), ".", DIR, Mode::empty())?;
             let mut d = nix::dir::Dir::from_fd(fresh)?;
-            let mut v = Vec::new();
             for e in d.iter() {
                 let e = e?;
                 let name = OsStr::from_bytes(e.file_name().to_bytes());
@@ -238,26 +326,38 @@ mod unix {
                     SystemTime::UNIX_EPOCH
                         + Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32)
                 });
-                v.push(Entry {
+                let e = Entry {
                     name: name.to_owned(),
                     kind: kind(&st),
                     len: st.st_size as u64,
                     modified,
-                });
+                };
+                if each(e).is_break() {
+                    break;
+                }
             }
-            Ok(v)
+            Ok(())
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cstr(s: &OsStr) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(s.as_bytes()).map_err(std::io::Error::other)
     }
 }
 
 #[cfg(windows)]
 mod windows {
-    use super::{Entry, Kind, Opened, Refused};
+    use super::{windows_plain, ControlFlow, Entry, Kind, Opened, Refused};
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
-    pub struct Dir(PathBuf);
+    pub struct Dir {
+        path: PathBuf,
+        root: Arc<Path>,
+    }
 
     fn kind(md: &Metadata) -> Kind {
         let t = md.file_type();
@@ -282,15 +382,46 @@ mod windows {
 
     impl Dir {
         pub(super) fn open_root(path: &Path) -> std::io::Result<Dir> {
-            Ok(Dir(path.to_path_buf()))
+            Ok(Dir {
+                path: path.to_path_buf(),
+                root: path.into(),
+            })
         }
 
         pub(super) fn try_clone(&self) -> std::io::Result<Dir> {
-            Ok(Dir(self.0.clone()))
+            Ok(self.under(self.path.clone()))
+        }
+
+        fn under(&self, path: PathBuf) -> Dir {
+            Dir {
+                path,
+                root: self.root.clone(),
+            }
+        }
+
+        /// `name` in this folder: a plain name, and the result still under the root.
+        fn at(&self, name: &OsStr) -> Result<PathBuf, Refused> {
+            if !windows_plain(name) {
+                return Err(Refused::BadName);
+            }
+            let p = self.path.join(name);
+            if p.parent() != Some(self.path.as_path()) || !p.starts_with(&self.root) {
+                return Err(Refused::BadName);
+            }
+            Ok(p)
+        }
+
+        fn at_io(&self, name: &OsStr) -> std::io::Result<PathBuf> {
+            self.at(name)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid name"))
+        }
+
+        pub fn id(&self) -> Option<(u64, u64)> {
+            None
         }
 
         pub fn child(&self, name: &OsStr, create: bool) -> Result<Dir, Refused> {
-            let p = self.0.join(name);
+            let p = self.at(name)?;
             let k = match look(&p) {
                 Err(Refused::Missing) if create => {
                     if let Err(e) = std::fs::create_dir(&p) {
@@ -303,16 +434,16 @@ mod windows {
                 k => k?,
             };
             match k {
-                Kind::Dir => Ok(Dir(p)),
+                Kind::Dir => Ok(self.under(p)),
                 Kind::Link => Err(Refused::Link),
                 _ => Err(Refused::NotFolder),
             }
         }
 
         pub fn open(&self, name: &OsStr) -> Result<Opened, Refused> {
-            let p = self.0.join(name);
+            let p = self.at(name)?;
             match look(&p)? {
-                Kind::Dir => Ok(Opened::Dir(Dir(p))),
+                Kind::Dir => Ok(Opened::Dir(self.under(p))),
                 Kind::File => Ok(Opened::File(std::fs::File::open(&p)?)),
                 Kind::Link => Err(Refused::Link),
                 Kind::Other => Err(Refused::Special),
@@ -323,36 +454,128 @@ mod windows {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(self.0.join(name))
+                .open(self.at_io(name)?)
         }
 
         pub fn exists(&self, name: &OsStr) -> bool {
-            std::fs::symlink_metadata(self.0.join(name)).is_ok()
+            self.at(name)
+                .is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())
         }
 
-        pub fn rename(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
-            std::fs::rename(self.0.join(from), self.0.join(to))
+        /// A hard link then the old name's removal: the link fails if `to` is there.
+        pub fn publish(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+            let from = self.at_io(from)?;
+            std::fs::hard_link(&from, self.at_io(to)?)?;
+            std::fs::remove_file(from)
         }
 
         pub fn remove(&self, name: &OsStr) -> std::io::Result<()> {
-            std::fs::remove_file(self.0.join(name))
+            std::fs::remove_file(self.at_io(name)?)
         }
 
-        pub fn entries(&self) -> std::io::Result<Vec<Entry>> {
-            let mut v = Vec::new();
-            for e in std::fs::read_dir(&self.0)? {
+        pub fn entries(
+            &self,
+            mut each: impl FnMut(Entry) -> ControlFlow<()>,
+        ) -> std::io::Result<()> {
+            for e in std::fs::read_dir(&self.path)? {
                 let e = e?;
                 let Ok(md) = std::fs::symlink_metadata(e.path()) else {
                     continue;
                 };
-                v.push(Entry {
+                let e = Entry {
                     name: e.file_name(),
                     kind: kind(&md),
                     len: md.len(),
                     modified: md.modified().ok(),
-                });
+                };
+                if each(e).is_break() {
+                    break;
+                }
             }
-            Ok(v)
+            Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_takes_only_plain_names() {
+        for ok in [
+            "a.txt",
+            "report 2024.pdf",
+            ".hidden",
+            "com10",
+            "console",
+            "nul2.txt",
+            "Ünïcode",
+        ] {
+            assert!(windows_plain(OsStr::new(ok)), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "C:",
+            "C:outside",
+            "file.txt:stream",
+            "a:b",
+            "a\\b",
+            "a/b",
+            "\\\\server\\share",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "NUL",
+            "Aux.tar.gz",
+            "PRN ",
+            "COM1",
+            "lpt9.log",
+            "COM\u{b9}",
+            "CONIN$",
+            "a*b",
+            "a?b",
+            "a\u{1}b",
+        ] {
+            assert!(!windows_plain(OsStr::new(bad)), "{bad:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openat2_failures_that_take_the_walk() {
+        use nix::errno::Errno;
+        use unix::openat2_failed;
+        for e in [
+            Errno::ENOSYS,
+            Errno::EPERM,
+            Errno::EINVAL,
+            Errno::E2BIG,
+            Errno::EAGAIN,
+            Errno::ENAMETOOLONG,
+            Errno::ENOTDIR,
+        ] {
+            assert!(openat2_failed(e, false).is_ok(), "{e}");
+        }
+        assert!(openat2_failed(Errno::ENOENT, true).is_ok());
+        assert!(matches!(
+            openat2_failed(Errno::ENOENT, false),
+            Err(Refused::Missing)
+        ));
+        assert!(matches!(
+            openat2_failed(Errno::ELOOP, false),
+            Err(Refused::Link)
+        ));
+        assert!(matches!(
+            openat2_failed(Errno::EXDEV, true),
+            Err(Refused::Link)
+        ));
+        assert!(matches!(
+            openat2_failed(Errno::EACCES, false),
+            Err(Refused::Io(_))
+        ));
     }
 }

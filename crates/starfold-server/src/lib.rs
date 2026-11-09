@@ -366,26 +366,19 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| "upload,download".into());
     // No --files-root, no file transfer: there is no default folder to share.
-    let root = a.get("files-root").map(|r| {
-        files::beneath::Root::open(std::path::Path::new(r)).unwrap_or_else(|e| {
-            log::error!("--files-root {r}: {e}");
-            std::process::exit(2);
-        })
+    let files = files::Files::new(
+        a.get("files-root").map(String::as_str),
+        &transfers,
+        read_only,
+        a.get("upload-dir").map_or("Downloads", String::as_str),
+        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    )
+    .unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(2);
     });
-    let shared = root.is_some();
-    let files = std::sync::Arc::new(files::Files {
-        root,
-        // Uploading writes to the desktop, so a read-only viewer does not get it.
-        upload: shared && !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
-        download: shared && transfers.split(',').any(|t| t.trim() == "download"),
-        default_dir: a
-            .get("upload-dir")
-            .cloned()
-            .unwrap_or_else(|| "Downloads".into())
-            .trim_matches('/')
-            .to_string(),
-        max_upload_bytes: (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
-    });
+    let files = std::sync::Arc::new(files);
+    files::sweep_stale(files.clone());
     match &files.root {
         Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
@@ -420,10 +413,7 @@ async fn serve(a: HashMap<String, String>) {
         if read_only {
             extra.insert("readOnly".into(), true.into());
         }
-        extra.insert(
-            "files".into(),
-            serde_json::json!({"upload": files.upload, "download": files.download, "dir": files.default_dir}),
-        );
+        extra.insert("files".into(), files.hello());
         if resize_on {
             extra.insert(
                 "resize".into(),

@@ -339,3 +339,196 @@ async fn without_a_root_every_endpoint_is_off() {
         StatusCode::FORBIDDEN
     );
 }
+
+#[test]
+fn the_command_line_decides_whether_files_are_shared() {
+    let off = Files::new(None, "upload,download", false, "Downloads", 0).unwrap();
+    assert!(off.root.is_none());
+    assert_eq!(off.hello()["upload"], false);
+    assert_eq!(off.hello()["download"], false);
+    let t = Tmp::new();
+    let root = t.root();
+    let on = Files::new(root.to_str(), "upload,download", false, "/Downloads/", 0).unwrap();
+    assert_eq!(on.hello()["upload"], true);
+    assert_eq!(on.hello()["download"], true);
+    assert_eq!(on.hello()["dir"], "Downloads");
+    let viewer = Files::new(root.to_str(), "upload,download", true, "Downloads", 0).unwrap();
+    assert_eq!(viewer.hello()["upload"], false);
+    let missing = t.0.join("missing");
+    assert!(Files::new(missing.to_str(), "upload", false, "Downloads", 0).is_err());
+    std::fs::write(t.0.join("file"), "f").unwrap();
+    let file = t.0.join("file");
+    assert!(Files::new(file.to_str(), "upload", false, "Downloads", 0).is_err());
+}
+
+#[tokio::test]
+async fn a_path_longer_than_the_kernel_resolves_at_once_still_works() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let long = "d".repeat(200);
+    let sub = vec![long.as_str(); 25].join("/");
+    let (s, b) = put(
+        &f,
+        &[("name", "a.txt"), ("path", ""), ("sub", &sub)],
+        "deep",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, listed) = get_list(&f, &sub).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(listed["entries"][0]["name"], "a.txt");
+    let (s, body) = get_file(&f, &format!("{sub}/a.txt")).await;
+    assert_eq!((s, body.as_slice()), (StatusCode::OK, b"deep".as_slice()));
+}
+
+#[tokio::test]
+async fn a_listing_stops_at_its_cap() {
+    let t = Tmp::new();
+    for i in 0..MAX_LISTED + 3 {
+        std::fs::write(t.root().join(format!("f{i}")), "").unwrap();
+    }
+    let f = t.files("Downloads");
+    let (s, listed) = get_list(&f, "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(listed["entries"].as_array().unwrap().len(), MAX_LISTED);
+}
+
+#[test]
+fn publishing_never_replaces_a_file() {
+    let t = Tmp::new();
+    std::fs::write(t.root().join("a.txt"), "first").unwrap();
+    std::fs::write(t.root().join("b"), "second").unwrap();
+    let top = Root::open(&t.root()).unwrap().dir(&[], false).unwrap();
+    let e = top
+        .publish(OsStr::new("b"), OsStr::new("a.txt"))
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(t.root().join("a.txt")).unwrap(), b"first");
+    assert_eq!(std::fs::read(t.root().join("b")).unwrap(), b"second");
+    top.publish(OsStr::new("b"), OsStr::new("c")).unwrap();
+    assert!(!t.root().join("b").exists());
+    assert_eq!(std::fs::read(t.root().join("c")).unwrap(), b"second");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_of_one_name_never_overwrite_each_other() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let uploads = (0..16).map(|i| {
+        let f = f.clone();
+        tokio::spawn(async move { put(&f, &[("name", "a.txt")], &format!("upload {i}")).await })
+    });
+    let mut saved = Vec::new();
+    for u in uploads {
+        let (s, b) = u.await.unwrap();
+        match s {
+            StatusCode::OK => saved.push(b),
+            StatusCode::CONFLICT => {}
+            s => panic!("{s}: {b}"),
+        }
+    }
+    let dir = t.root().join("Downloads");
+    let mut contents: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    contents.sort();
+    contents.dedup();
+    assert_eq!(contents.len(), saved.len(), "{contents:?} vs {saved:?}");
+}
+
+#[tokio::test]
+async fn a_cancelled_upload_leaves_nothing_behind() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    tx.send(Ok(bytes::Bytes::from_static(b"half")))
+        .await
+        .unwrap();
+    let body = Body::from_stream(tokio_stream_from(rx));
+    let mut h = HeaderMap::new();
+    h.insert(UPLOAD_HEADER, "1".parse().unwrap());
+    let up = upload(State(f.clone()), q(&[("name", "a.txt")]), h, body);
+    let dir = t.root().join("Downloads");
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(500), up).await;
+    assert!(waited.is_err(), "the upload waits for the rest of its body");
+    assert!(dir.is_dir());
+    assert!(
+        is_empty(&dir),
+        "{:?}",
+        std::fs::read_dir(&dir).unwrap().collect::<Vec<_>>()
+    );
+    drop(tx);
+}
+
+fn tokio_stream_from<T: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<T>,
+) -> impl futures_util::Stream<Item = T> + Send {
+    futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
+}
+
+#[tokio::test]
+async fn a_folder_too_deep_fails_its_download_rather_than_truncating_it() {
+    let t = Tmp::new();
+    let deep: PathBuf = (0..MAX_DEPTH + 1).fold(t.root().join("top"), |p, i| p.join(i.to_string()));
+    std::fs::create_dir_all(&deep).unwrap();
+    let f = t.files("Downloads");
+    let r = download(State(f.clone()), q(&[("path", "top")])).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn a_wide_folder_downloads_whole() {
+    let t = Tmp::new();
+    for i in 0..300 {
+        let d = t.root().join("wide").join(format!("d{i:03}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f"), i.to_string()).unwrap();
+    }
+    let f = t.files("Downloads");
+    let (s, zipped) = get_file(&f, "wide").await;
+    assert_eq!(s, StatusCode::OK);
+    let z = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+    assert_eq!(z.file_names().filter(|n| n.ends_with("/f")).count(), 300);
+}
+
+#[test]
+fn stale_uploads_are_swept_and_nothing_else() {
+    let t = Tmp::new();
+    let nested = t.root().join("a/b");
+    std::fs::create_dir_all(&nested).unwrap();
+    let ours = part_name();
+    for name in [
+        ".starfold-upload-1-0.part",
+        "keep.part",
+        ".starfold-upload-x-0.part",
+        ".starfold-upload-1-0.partial",
+    ] {
+        std::fs::write(nested.join(name), "").unwrap();
+    }
+    std::fs::write(t.root().join(&ours), "").unwrap();
+    std::fs::write(t.root().join(".starfold-upload-2-7.part"), "").unwrap();
+    let root = Root::open(&t.root()).unwrap();
+    assert_eq!(sweep(&root).unwrap(), 2);
+    assert!(!nested.join(".starfold-upload-1-0.part").exists());
+    assert!(!t.root().join(".starfold-upload-2-7.part").exists());
+    assert!(
+        t.root().join(&ours).exists(),
+        "this process's own upload stays"
+    );
+    for name in [
+        "keep.part",
+        ".starfold-upload-x-0.part",
+        ".starfold-upload-1-0.partial",
+    ] {
+        assert!(nested.join(name).exists(), "{name}");
+    }
+}
+
+#[test]
+fn a_temporary_name_does_not_grow_with_the_file_name() {
+    assert!(part_name().len() < 64);
+}

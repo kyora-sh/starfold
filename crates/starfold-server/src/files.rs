@@ -12,10 +12,11 @@ use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use beneath::{Dir, Kind, Opened, Refused, Root};
+use beneath::{Dir, Entry, Kind, Opened, Refused, Root};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::ops::ControlFlow;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,6 +33,37 @@ pub struct Files {
     pub default_dir: String,
     /// 0 = unlimited.
     pub max_upload_bytes: u64,
+}
+
+impl Files {
+    /// From the command line: no `root`, no file transfer; a `root` that can't be
+    /// opened as a folder is an error. `transfers` is `upload,download` or a part of it.
+    pub fn new(
+        root: Option<&str>,
+        transfers: &str,
+        read_only: bool,
+        default_dir: &str,
+        max_upload_bytes: u64,
+    ) -> Result<Files, String> {
+        let root = root
+            .map(|r| Root::open(Path::new(r)).map_err(|e| format!("--files-root {r}: {e}")))
+            .transpose()?;
+        let shared = root.is_some();
+        let on = |t: &str| shared && transfers.split(',').any(|x| x.trim() == t);
+        Ok(Files {
+            root,
+            // Uploading writes to the desktop, so a read-only viewer does not get it.
+            upload: on("upload") && !read_only,
+            download: on("download"),
+            default_dir: default_dir.trim_matches('/').to_string(),
+            max_upload_bytes,
+        })
+    }
+
+    /// What the hello message tells the web client.
+    pub fn hello(&self) -> serde_json::Value {
+        serde_json::json!({"upload": self.upload, "download": self.download, "dir": self.default_dir})
+    }
 }
 
 /// Uploads must carry this header. Browsers only send custom headers cross-origin
@@ -75,6 +107,7 @@ fn refused(r: Refused) -> Response {
         Refused::NotFolder => err(StatusCode::NOT_FOUND, "not a folder"),
         Refused::Link => err(StatusCode::FORBIDDEN, "symlinks are not followed"),
         Refused::Special => err(StatusCode::BAD_REQUEST, "not a file"),
+        Refused::BadName => err(StatusCode::BAD_REQUEST, "invalid name"),
         Refused::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             err(StatusCode::FORBIDDEN, "permission denied")
         }
@@ -91,6 +124,9 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|_| Err(err(StatusCode::INTERNAL_SERVER_ERROR, "file task failed")))
 }
 
+/// The most entries a listing returns; enumeration stops there.
+const MAX_LISTED: usize = 5000;
+
 pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
     if !f.download && !f.upload || f.root.is_none() {
         return err(StatusCode::FORBIDDEN, "file transfer is disabled");
@@ -106,11 +142,11 @@ pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
             Err(r) => return Err(refused(r)),
         };
         let mut entries = Vec::new();
-        // Symlinks are left out: they are never followed.
-        for e in dir.entries().map_err(|e| refused(Refused::Io(e)))? {
+        dir.entries(|e| {
             let name = e.name.to_string_lossy().into_owned();
+            // Symlinks are left out: they are never followed.
             if name.starts_with('.') || !matches!(e.kind, Kind::Dir | Kind::File) {
-                continue;
+                return ControlFlow::Continue(());
             }
             let mtime = e
                 .modified
@@ -118,10 +154,13 @@ pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             entries.push(serde_json::json!({ "name": name, "dir": e.kind == Kind::Dir, "size": e.len, "mtime": mtime }));
-            if entries.len() >= 5000 {
-                break;
+            if entries.len() >= MAX_LISTED {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
-        }
+        })
+        .map_err(|e| refused(Refused::Io(e)))?;
         Ok((parts.join("/"), entries))
     })
     .await;
@@ -304,39 +343,90 @@ fn zip_time(t: std::time::SystemTime) -> Option<zip::DateTime> {
     .ok()
 }
 
+/// The deepest a walk goes; each level holds one open folder.
+const MAX_DEPTH: usize = 64;
+
+/// Walks the folders under `top` depth first, holding one open folder per level and
+/// opening a subfolder only when its turn comes. `each` gets every folder, its path from
+/// `top` and its entries in name order. A folder inside itself (a bind mount of an
+/// ancestor) or nesting past [`MAX_DEPTH`] is an error.
+fn walk(
+    top: Dir,
+    rel: String,
+    mut each: impl FnMut(&Dir, &str, Vec<Entry>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    struct Level {
+        dir: Dir,
+        rel: String,
+        id: Option<(u64, u64)>,
+        subdirs: std::vec::IntoIter<OsString>,
+    }
+    let mut stack: Vec<Level> = Vec::new();
+    let mut next = Some((top, rel));
+    loop {
+        if let Some((dir, rel)) = next.take() {
+            let id = dir.id();
+            if id.is_some() && stack.iter().any(|l| l.id == id) {
+                return Err(std::io::Error::other(format!("{rel} is inside itself")));
+            }
+            if stack.len() >= MAX_DEPTH {
+                return Err(std::io::Error::other(format!(
+                    "{rel}: more than {MAX_DEPTH} folders deep"
+                )));
+            }
+            let mut entries = Vec::new();
+            dir.entries(|e| {
+                entries.push(e);
+                ControlFlow::Continue(())
+            })?;
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let subdirs: Vec<OsString> = entries
+                .iter()
+                .filter(|e| e.kind == Kind::Dir)
+                .map(|e| e.name.clone())
+                .collect();
+            each(&dir, &rel, entries)?;
+            stack.push(Level {
+                dir,
+                rel,
+                id,
+                subdirs: subdirs.into_iter(),
+            });
+        }
+        let Some(level) = stack.last_mut() else {
+            return Ok(());
+        };
+        let Some(name) = level.subdirs.next() else {
+            stack.pop();
+            continue;
+        };
+        match level.dir.open(&name) {
+            Ok(Opened::Dir(d)) => {
+                next = Some((d, format!("{}/{}", level.rel, name.to_string_lossy())));
+            }
+            Err(Refused::Io(e)) => return Err(e),
+            // Gone, or swapped for something else, since it was listed.
+            Ok(Opened::File(_)) | Err(_) => {}
+        }
+    }
+}
+
 fn write_zip(dir: Dir, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()> {
     use zip::write::SimpleFileOptions;
     let mut z = zip::ZipWriter::new_stream(out);
     let base = SimpleFileOptions::default();
-    let mut todo = vec![(dir, top.to_string())];
-    while let Some((dir, rel)) = todo.pop() {
+    walk(dir, top.to_string(), |dir, rel, entries| {
         z.add_directory(format!("{rel}/"), base)?;
-        let mut entries = match dir.entries() {
-            Ok(v) => v,
-            // Unreadable folders are left empty rather than failing the whole download.
-            Err(_) => continue,
-        };
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        // Pushed in reverse so folders come out in name order.
-        let mut dirs = Vec::new();
-        for e in entries {
-            let name = e.name.to_string_lossy().into_owned();
-            let rel = format!("{rel}/{name}");
-            let mut file = match e.kind {
-                Kind::Dir | Kind::File => match dir.open(&e.name) {
-                    Ok(Opened::Dir(d)) => {
-                        dirs.push((d, rel));
-                        continue;
-                    }
-                    Ok(Opened::File(f)) => f,
-                    Err(_) => continue,
-                },
-                Kind::Link | Kind::Other => continue,
+        for e in entries.into_iter().filter(|e| e.kind == Kind::File) {
+            let mut file = match dir.open(&e.name) {
+                Ok(Opened::File(f)) => f,
+                Err(Refused::Io(e)) => return Err(e),
+                // Gone, or swapped for something else, since it was listed.
+                Ok(Opened::Dir(_)) | Err(_) => continue,
             };
-            let Ok(md) = file.metadata() else {
-                continue;
-            };
-            let stored = Path::new(&name)
+            let md = file.metadata()?;
+            let name = e.name.to_string_lossy();
+            let stored = Path::new(name.as_ref())
                 .extension()
                 .and_then(|x| x.to_str())
                 .is_some_and(|x| COMPRESSED.contains(&x.to_ascii_lowercase().as_str()));
@@ -356,11 +446,11 @@ fn write_zip(dir: Dir, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()
             if let Some(t) = md.modified().ok().and_then(zip_time) {
                 opts = opts.last_modified_time(t);
             }
-            z.start_file(rel, opts)?;
+            z.start_file(format!("{rel}/{name}"), opts)?;
             std::io::copy(&mut file, &mut z)?;
         }
-        todo.extend(dirs.into_iter().rev());
-    }
+        Ok(())
+    })?;
     z.finish()?;
     Ok(())
 }
@@ -407,6 +497,91 @@ fn unique(dir: &Dir, name: &str) -> String {
 
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
+const PART_PREFIX: &str = ".starfold-upload-";
+
+/// A hidden temporary name for an upload, the same length whatever the file is called.
+fn part_name() -> OsString {
+    format!(
+        "{PART_PREFIX}{}-{}.part",
+        std::process::id(),
+        UPLOADS.fetch_add(1, Ordering::Relaxed)
+    )
+    .into()
+}
+
+/// An upload temporary left by another process (one killed mid-upload).
+fn stale_part(name: &OsStr) -> bool {
+    let Some(ids) = name
+        .to_str()
+        .and_then(|n| n.strip_prefix(PART_PREFIX))
+        .and_then(|n| n.strip_suffix(".part"))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    matches!(ids.split_once('-'), Some((pid, n)) if digits(pid) && digits(n) && pid != std::process::id().to_string())
+}
+
+/// Removes the upload temporaries earlier runs left anywhere under the root; how many.
+fn sweep(root: &Root) -> std::io::Result<usize> {
+    let mut removed = 0;
+    walk(
+        root.dir(&[], false).map_err(|r| match r {
+            Refused::Io(e) => e,
+            _ => std::io::Error::other("the files root is gone"),
+        })?,
+        String::new(),
+        |dir, _, entries| {
+            for e in entries {
+                if e.kind == Kind::File && stale_part(&e.name) && dir.remove(&e.name).is_ok() {
+                    removed += 1;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(removed)
+}
+
+/// [`sweep`] in the background, at startup.
+pub fn sweep_stale(files: Arc<Files>) {
+    std::thread::spawn(move || {
+        let Some(root) = &files.root else {
+            return;
+        };
+        match sweep(root) {
+            Ok(0) => {}
+            Ok(n) => log::info!("removed {n} unfinished uploads"),
+            Err(e) => log::warn!("looking for unfinished uploads: {e}"),
+        }
+    });
+}
+
+/// An upload's temporary file, removed unless it was published, whatever ends the
+/// request: an error, or the client going away while it is written.
+struct Part {
+    dir: Dir,
+    name: OsString,
+    published: bool,
+}
+
+impl Part {
+    /// Renames it to `to`, never over anything already there.
+    fn publish(&mut self, to: &OsStr) -> std::io::Result<()> {
+        self.dir.publish(&self.name, to)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Part {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.dir.remove(&self.name);
+        }
+    }
+}
+
 pub async fn upload(
     State(f): State<Arc<Files>>,
     Query(q): Q,
@@ -430,14 +605,7 @@ pub async fn upload(
     let name = name.to_string();
     // Write to a hidden temporary file and rename once complete, so nothing in the
     // VM sees (or opens) a half-uploaded file.
-    let part: OsString = format!(
-        ".{name}.{}-{}.part",
-        std::process::id(),
-        UPLOADS.fetch_add(1, Ordering::Relaxed)
-    )
-    .into();
     let fs = f.clone();
-    let part2 = part.clone();
     let opened = blocking(move || {
         let root = fs.root.as_ref().expect("checked");
         let mut path = parts(&rel)?;
@@ -460,17 +628,23 @@ pub async fn upload(
             };
             path.push(p);
         }
-        let out = dir.create_new(&part2).map_err(|e| {
+        let part = part_name();
+        let out = dir.create_new(&part).map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("cannot write: {e}"),
             )
         })?;
+        let part = Part {
+            dir,
+            name: part,
+            published: false,
+        };
         let path: Vec<String> = path.into_iter().map(String::from).collect();
-        Ok((dir, path, out))
+        Ok((part, path, out))
     })
     .await;
-    let (dir, path, out) = match opened {
+    let (mut part, path, out) = match opened {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -502,17 +676,22 @@ pub async fn upload(
     .await;
     drop(out);
     let saved = blocking(move || {
-        if let Err(e) = result {
-            let _ = dir.remove(&part);
-            return Err(e);
-        }
-        let dest = unique(&dir, &name);
-        if let Err(e) = dir.rename(&part, OsStr::new(&dest)) {
-            let _ = dir.remove(&part);
-            return Err(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("cannot save: {e}"),
-            ));
+        result?;
+        let dest = unique(&part.dir, &name);
+        match part.publish(OsStr::new(&dest)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "another upload took that name first",
+                ))
+            }
+            Err(e) => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("cannot save: {e}"),
+                ))
+            }
         }
         Ok(path.into_iter().chain([dest]).collect::<Vec<_>>().join("/"))
     })
