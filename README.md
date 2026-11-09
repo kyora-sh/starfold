@@ -305,5 +305,6 @@ experimental and opt-in (`--experimental-hw-probes`).
 
 The source code is MIT ([LICENSE](LICENSE)). A binary built with the `x264` feature links x264
 (GPL-2.0-or-later), so that binary is distributed under GPL-2.0-or-later as a combined work. The
-default build links OpenH264 (BSD-2-Clause). [NOTICE](NOTICE) lists every bundled component and its
-licence.
+default build links OpenH264 (BSD-2-Clause). Attribution and third-party notices are in
+[NOTICE](NOTICE); the web client's font, Inter, is under the SIL Open Font License
+([packages/web/inter-LICENSE.txt](packages/web/inter-LICENSE.txt)).
