@@ -3,6 +3,7 @@
 
 Each log is one set.sh run (its RUN lines and CALIB lines). Runs whose CALIB drifts more than --calib
 (or whose CALIB is missing or not positive) are left out, as are rows whose steal is above --steal.
+A row with no steal reading can't be judged by that rule: it stays in and is reported as steal unknown.
 The first arm's twin (`<arm>~aa`) is the A/A: the spread S of a metric is max(|lo|, |hi|) of the
 twin-minus-arm 95% bootstrap CI, and a pair's shift is real only if its CI excludes 0 and its median
 difference is beyond S. Each metric uses the rows that have a finite value for it.
@@ -41,6 +42,12 @@ def values(rows, arm, metric):
     return out
 
 
+def steal(row):
+    """A row's steal share, or None when it has no usable reading."""
+    v = row.get('stealPct')
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
 def boot(x, y, n=10000):
     """Median difference x - y and its 95% bootstrap CI; None without samples on both sides."""
     if not x or not y:
@@ -52,18 +59,19 @@ def boot(x, y, n=10000):
 
 
 def analyze(logs, set_name='main', metrics=('i2pP50', 'i2pP95'), max_drift=0.15, max_steal=2.0):
-    runs, notes = [], []
+    runs, notes, unknown = [], [], {}
     for path in logs:
         cal, rows = load(path)
         d = drift(cal)
         keep = d is not None and d <= max_drift
         notes.append((path, cal, d, keep))
         if keep:
-            kept = [r for r in rows if r.get('set') == set_name and (r.get('stealPct') or 0) <= max_steal]
+            kept = [r for r in rows if r.get('set') == set_name and (steal(r) is None or steal(r) <= max_steal)]
             runs.append((path, kept))
+            unknown[path] = sum(steal(r) is None and not r.get('failed') for r in kept)
     arms = list(dict.fromkeys(r['arm'] for _, R in runs for r in R if 'arm' in r))
     twin = next((x for x in arms if x.endswith(TWIN)), None)
-    out = {'notes': notes, 'arms': arms, 'base': twin and twin[: -len(TWIN)], 'metrics': {}}
+    out = {'notes': notes, 'stealUnknown': unknown, 'arms': arms, 'base': twin and twin[: -len(TWIN)], 'metrics': {}}
     if not twin:
         return out
     base = out['base']
@@ -100,6 +108,8 @@ def main():
     for path, cal, d, keep in out['notes']:
         print(f"{path}: CALIB {' -> '.join(map(str, cal)) or 'missing'}"
               f"{f' ({d * 100:.1f}%)' if d is not None else ' (drift unknown)'}{'' if keep else ' LEFT OUT'}")
+        if out['stealUnknown'].get(path):
+            print(f"  {out['stealUnknown'][path]} rows steal unknown (no reading): kept, not checked against --steal")
     if not out['base']:
         print('no A/A twin in these runs (AA=0?): nothing to judge against')
         return

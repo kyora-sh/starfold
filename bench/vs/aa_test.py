@@ -42,6 +42,18 @@ class Analysis(unittest.TestCase):
         self.assertIsNone(out['metrics']['i2pP50']['aa'])
         self.assertEqual(out['metrics']['i2pP50']['pairs'], {})
 
+    def test_a_row_without_a_steal_reading_is_kept_and_reported(self):
+        r = rows('a', 6, 100, stealPct=0.1) + rows('a~aa', 6, 100, stealPct=0.1)
+        r[0].pop('stealPct')
+        r[1]['stealPct'] = None
+        r[2]['stealPct'] = math.nan
+        r += [{'arm': 'a', 'round': 9, 'failed': 'x'}, dict(rows('b', 1, 100)[0], stealPct=9.0)]
+        path = log(r)
+        out = aa.analyze([path], metrics=['i2pP50'])
+        self.assertEqual(out['stealUnknown'], {path: 3})
+        self.assertIsNotNone(out['metrics']['i2pP50']['aa'])
+        self.assertEqual(out['arms'], ['a', 'a~aa'], 'the steal 9 row is dropped')
+
     def test_a_zero_calib_leaves_that_run_out(self):
         good = log(rows('a', 6, 100) + rows('a~aa', 6, 100))
         zero = log(rows('a', 6, 500) + rows('a~aa', 6, 500), cal=(0.0, 1.8))

@@ -7,6 +7,7 @@ import { createRequire } from 'module';
 import fs from 'fs';
 import { answer, delivered, KEY_CAP_MS } from './match.mjs';
 import { armOf, expandArms, setOrder } from './arms.mjs';
+import { stealBetween } from './steal.mjs';
 import { ARMS, CTL_PORT, HEIGHT, NOVNC_PORT, NOVNC_PROFILES, STARFOLD_PORT, WAN, WIDTH, WORKLOADS, KEYS_LOG } from './config.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES);
 const { chromium } = require('playwright-core');
@@ -273,7 +274,7 @@ async function run(arm, wl, readback = true) {
 			keys: r.keys.length, keysReceived: received.length, keysSeen: i2p.length, keysNoOwnFrame: noOwnFrame,
 			i2pP50: pct(i2p, 0.5), i2pP95: pct(i2p, 0.95), i2pMax: Math.max(...i2p),
 			mbps: acked.length ? (Math.max(...acked) * 8) / dt / 1e6 : NaN,
-			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, stealPct: ((s1.host.steal - s0.host.steal) / (s1.host.all - s0.host.all)) * 100, browserCpu: ((c1 - c0) / dt) * 100,
+			serverCpu: ((s1.server - s0.server) / dt) * 100, xCpu: ((s1.x - s0.x) / dt) * 100, sourceCpu: ((s1.source - s0.source) / dt) * 100, stealPct: stealBetween(s0.host, s1.host), browserCpu: ((c1 - c0) / dt) * 100,
 			swapsPerS: swaps.length / dt, swapP50: pct(swapIv, 0.5), swapP95: pct(swapIv, 0.95), swapP99: pct(swapIv, 0.99),
 			rafHz: ticks / dt, noFrames: r.noFrames ? 1 : 0, format: r.format, badReads: r.bad, long: r.long, longMs: r.longMs, errs: errs.length, vMid, vEnd,
 			stats: r.stats,
@@ -300,7 +301,7 @@ async function quality(arm, wl, round) {
 		await sleep(3000);
 		await p.mouse.click(WIDTH / 2, HEIGHT / 2);
 		await sleep(200);
-		const s0 = await serverStats(arm);
+		const s0 = await serverStats(arm), h0 = await ctlJson('/cpu');
 		assertCodec(arm, s0, 'at start');
 		if (wl === 'typing') await typeKeys(p, wl, Date.now() + 5000);
 		else if (wl === 'mixed' || wl === 'paged') await typeKeys(p, wl, Date.now() + Number(process.env.MIXED_S || 30) * 1000);
@@ -332,11 +333,12 @@ async function quality(arm, wl, round) {
 		}
 		polling = false;
 		await poller;
+		const h1 = await ctlJson('/cpu');
 		await ctl(`/truth?out=${dir}/truth.xwd`);
 		const crops = process.env.CROPS && round === 0 ? [`${process.env.CROPS}/${arm}-${wl}`] : [];
 		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, wl, '/tmp/vs-dump.raw', ...crops], { encoding: 'utf8', maxBuffer: 1 << 24 }));
 		fs.rmSync(dir, { recursive: true, force: true });
-		return { ...scores, viewerCount, motion: statsDelta(s0, s1), shotAt, afterFreeze: after, timeline };
+		return { ...scores, viewerCount, motion: statsDelta(s0, s1), shotAt, afterFreeze: after, timeline, stealPct: stealBetween(h0.host, h1.host) };
 	} finally {
 		await ctx.close();
 		await ctl('/stop').catch(() => {});
