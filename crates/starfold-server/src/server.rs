@@ -342,19 +342,20 @@ pub fn bind_unix(
     }
 }
 
-/// Removes what `bind_unix` made, each only if it is still the entry that was made: the
-/// socket, then the directory if nothing else is in it.
+/// Removes what `bind_unix` made, each only if it is still the entry that was made (type,
+/// device and inode: a freed socket's inode can come back as another file): the socket,
+/// then the directory if nothing else is in it.
 #[cfg(unix)]
 pub fn remove_unix(file: &SocketFile) {
-    let at = |dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr, want| {
-        stat_at(dir, name).is_ok_and(|st| id(&st) == want)
+    let at = |dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr, kind, want| {
+        stat_at(dir, name).is_ok_and(|st| st.st_mode & libc::S_IFMT == kind && id(&st) == want)
     };
     if let Some(socket) = file.socket_id {
-        if at(&file.dir, SOCKET, socket) {
+        if at(&file.dir, SOCKET, libc::S_IFSOCK, socket) {
             let _ = unlink_at(&file.dir, SOCKET, 0);
         }
     }
-    if at(&file.parent, &file.name, file.dir_id) {
+    if at(&file.parent, &file.name, libc::S_IFDIR, file.dir_id) {
         let _ = unlink_at(&file.parent, &file.name, libc::AT_REMOVEDIR);
     }
 }
