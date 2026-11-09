@@ -17,6 +17,7 @@ mod corners;
 mod desktop;
 pub mod encoder;
 mod files;
+mod frame;
 mod help;
 mod hub;
 #[cfg(target_os = "linux")]
@@ -43,6 +44,7 @@ use mac::{audio, capture, desktop, input, screen};
 use win::{audio, capture, desktop, input, screen};
 
 use std::collections::HashMap;
+use std::future::IntoFuture;
 use std::time::Instant;
 
 /// Parses `--key=value` / `--key value` / `--flag`; unknown options are accepted so the
@@ -77,6 +79,41 @@ fn range_max(v: Option<&String>, default: f64) -> f64 {
 fn truthy(v: Option<&String>, default: bool) -> bool {
     v.map(|s| matches!(s.as_str(), "true" | "1" | "yes" | "on"))
         .unwrap_or(default)
+}
+
+/// Where the server listens: TCP on --addr/--port unless --listen-tcp=false, and a
+/// unix socket in the new directory --listen-unix with permissions --listen-unix-mode
+/// (octal, default 0600).
+#[derive(Debug, PartialEq)]
+struct Listen {
+    tcp: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    unix: Option<(std::path::PathBuf, u32)>,
+}
+
+fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
+    let tcp = truthy(a.get("listen-tcp"), true);
+    let mode = match a.get("listen-unix-mode") {
+        None => 0o600,
+        Some(m) => u32::from_str_radix(m.trim_start_matches("0o"), 8)
+            .ok()
+            .filter(|m| *m <= 0o777)
+            .ok_or_else(|| {
+                format!("--listen-unix-mode {m}: expected octal permissions like 0600")
+            })?,
+    };
+    let unix = match a.get("listen-unix").map(String::as_str) {
+        None => None,
+        Some("" | "true") => return Err("--listen-unix needs a path".into()),
+        Some(_) if cfg!(not(unix)) => {
+            return Err("--listen-unix: unix sockets need Linux or macOS".into())
+        }
+        Some(p) => Some((p.into(), mode)),
+    };
+    if !tcp && unix.is_none() {
+        return Err("--listen-tcp=false needs --listen-unix: nothing to listen on".into());
+    }
+    Ok(Listen { tcp, unix })
 }
 
 /// The `starfold` binary's `main`: [`run`] with the process's arguments, probing the
@@ -154,6 +191,10 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| default_addr.into());
     let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
+    let listen = listen_config(&a).unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(2);
+    });
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -433,6 +474,8 @@ async fn serve(a: HashMap<String, String>) {
             log::error!("{e}");
             std::process::exit(1);
         });
+    // --framed: for hops that carry binary WebSocket messages only (see frame.rs).
+    let framed = truthy(a.get("framed"), false);
     let state = server::AppState {
         hub: hub.clone(),
         audio: audio_on,
@@ -454,6 +497,7 @@ async fn serve(a: HashMap<String, String>) {
         favicon,
         favicon_type,
         encoders,
+        framed,
     };
     // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
     // besides IP addresses, localhost and its own page (see access.rs).
@@ -475,12 +519,35 @@ async fn serve(a: HashMap<String, String>) {
     // Added last, so it runs first: a request for the wrong host or from another site's
     // page is turned away before the login is asked for.
     let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
-    let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
-        .await
-        .expect("bind");
-    log::info!("listening on http://{addr}:{port}");
+    let tcp = match listen.tcp {
+        true => Some(
+            tokio::net::TcpListener::bind((addr.as_str(), port))
+                .await
+                .expect("bind"),
+        ),
+        false => None,
+    };
+    #[cfg(unix)]
+    let (unix, socket_file) = match &listen.unix {
+        Some((path, mode)) => {
+            let (l, file) = server::bind_unix(path, *mode).unwrap_or_else(|e| {
+                log::error!("--listen-unix {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            log::info!(
+                "listening on unix:{} (mode {mode:o})",
+                server::unix_socket_path(path).display()
+            );
+            (Some(l), Some(file))
+        }
+        None => (None, None),
+    };
+    if tcp.is_some() {
+        log::info!("listening on http://{addr}:{port}");
+    }
     // Where to point a browser on this machine.
     let page = match addr.as_str() {
+        _ if tcp.is_none() => "/ on the unix socket".into(),
         "0.0.0.0" | "::" => format!("http://localhost:{port}/"),
         a if a.contains(':') => format!("http://[{a}]:{port}/"),
         a => format!("http://{a}:{port}/"),
@@ -495,10 +562,9 @@ async fn serve(a: HashMap<String, String>) {
         ),
         None => log::info!("login off (--enable-basic-auth=false): anyone who reaches {page} can use this desktop"),
     }
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|tcp| {
-        let _ = tcp.set_nodelay(true);
-    });
+    if framed {
+        log::info!("--framed: every WebSocket message is binary with a kind byte");
+    }
     let shutdown_hub = hub.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -514,8 +580,74 @@ async fn serve(a: HashMap<String, String>) {
         if let Some(tx) = shutdown_hub.input.lock().as_ref() {
             let _ = tx.send(input::InputEvent::Shutdown);
         }
+        #[cfg(unix)]
+        if let Some(file) = &socket_file {
+            server::remove_unix(file);
+        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);
     });
-    axum::serve(listener, app).await.unwrap();
+    let mut servers = tokio::task::JoinSet::new();
+    #[cfg(unix)]
+    if let Some(l) = unix {
+        servers.spawn(axum::serve(l, app.clone()).into_future());
+    }
+    if let Some(l) = tcp {
+        use axum::serve::ListenerExt;
+        let l = l.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
+        servers.spawn(axum::serve(l, app).into_future());
+    }
+    while let Some(r) = servers.join_next().await {
+        r.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listen(args: &[&str]) -> Result<Listen, String> {
+        listen_config(&parse_args(args.iter().map(|s| s.to_string())))
+    }
+
+    #[test]
+    fn tcp_alone_unless_a_unix_socket_is_asked_for() {
+        let tcp_only = Listen {
+            tcp: true,
+            unix: None,
+        };
+        assert_eq!(listen(&[]), Ok(tcp_only));
+        assert_eq!(
+            listen(&["--listen-unix", "/run/sf.sock"]),
+            Ok(Listen {
+                tcp: true,
+                unix: Some(("/run/sf.sock".into(), 0o600)),
+            })
+        );
+        assert_eq!(
+            listen(&[
+                "--listen-unix=/run/sf.sock",
+                "--listen-tcp=false",
+                "--listen-unix-mode=0660"
+            ]),
+            Ok(Listen {
+                tcp: false,
+                unix: Some(("/run/sf.sock".into(), 0o660)),
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_to_listen_on_or_a_bad_mode_is_an_error() {
+        assert!(listen(&["--listen-tcp=false"]).is_err());
+        assert!(listen(&["--listen-unix"]).is_err());
+        for mode in ["0999", "rw", "01777"] {
+            assert!(
+                listen(&["--listen-unix=/s", &format!("--listen-unix-mode={mode}")]).is_err(),
+                "{mode}"
+            );
+        }
+    }
 }

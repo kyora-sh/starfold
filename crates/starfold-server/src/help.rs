@@ -9,6 +9,19 @@ WebSocket, and prints a link that signs you in. Flags take --name=value or
 
 Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
+  --listen-tcp                  listen on --addr/--port (default true)
+  --listen-unix                 also serve on a unix socket (Linux, macOS): makes
+                                this directory, which must not exist yet, for
+                                this user alone and listens on the socket s in
+                                it; removes both on exit; the host and origin
+                                checks still apply
+  --listen-unix-mode            the socket's permissions (default 0600); group
+                                or other access also lets that class search
+                                the directory
+  --framed                      every WebSocket message binary, its first byte
+                                0 (binary) or 1 (text), for hops that carry
+                                binary only; the page needs ?framed=1
+                                (default false)
   --title                       the page's title (default: Voxl Computer Stream)
   --favicon                     the page's icon: an .ico, .png, .gif, .webp or .svg
                                 file (default: voxl's own)
