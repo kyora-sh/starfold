@@ -124,6 +124,9 @@ windows = { version = "0.61", features = [
 windows-core = "0.61"
 
 [dev-dependencies]
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+	"handshake",
+] }
 openh264 = { version = "=0.9.9", default-features = false, features = [
 	"source",
 ] }

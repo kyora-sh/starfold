@@ -1441,6 +1441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "vcpkg",
  "windows",
  "windows-core",

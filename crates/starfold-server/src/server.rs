@@ -1,9 +1,10 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
+use crate::frame::{self, FrameError};
 use crate::hub::{Client, Hub, Out, Phase, Proto};
 use crate::input::InputEvent;
 use crate::negotiate::ClientMsg;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -14,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,6 +36,43 @@ pub struct AppState {
     pub favicon_type: &'static str,
     /// The host's encoders, probed at startup.
     pub encoders: Arc<crate::encoder::caps::Registry>,
+    /// Every WebSocket message is binary with a kind byte (--framed, see frame.rs).
+    pub framed: bool,
+}
+
+/// Binds a unix socket at `path` with permissions `mode` (--listen-unix). A socket left
+/// behind by a server that is gone is replaced; one that still answers, or a file that
+/// isn't a socket, is not.
+#[cfg(unix)]
+pub fn bind_unix(path: &Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("{} is in use by another server", path.display()),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // The socket is created with `mode` already, so nobody else connects before the chmod.
+    let old = unsafe { libc::umask((0o777 & !mode) as libc::mode_t) };
+    let listener = tokio::net::UnixListener::bind(path);
+    unsafe { libc::umask(old) };
+    let listener = listener?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(listener)
 }
 
 /// The web client's page, titled `title` (--title): the browser tab, and the name of
@@ -288,7 +326,7 @@ async fn stats(State(s): State<AppState>) -> Response {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
-    ws.max_message_size(64 << 20)
+    ws.max_message_size(frame::MAX_MESSAGE)
         .on_upgrade(move |socket| handle_socket(socket, s))
 }
 
@@ -296,20 +334,52 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
+    let (close_tx, mut close_rx) = oneshot::channel::<FrameError>();
+    let framed = s.framed;
     let client = s.hub.add_client(tx);
     log::info!("client {} connected", client.id);
     client.send(Out::Text(s.hub.hello()));
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
-        while let Some(m) = rx.recv().await {
+        loop {
+            let m = tokio::select! {
+                biased;
+                Ok(e) = &mut close_rx => {
+                    let _ = sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: e.close_code(),
+                            reason: e.to_string().into(),
+                        })))
+                        .await;
+                    break;
+                }
+                m = rx.recv() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
-            let msg = match m {
-                Out::Bin(b) => Message::Binary(b),
-                Out::Text(t) => Message::Text(t.into()),
+            let msg = if framed {
+                let f = match &m {
+                    Out::Bin(b) => frame::encode_binary(b),
+                    Out::Text(t) => frame::encode_text(t),
+                };
+                match f {
+                    Ok(f) => Message::Binary(f),
+                    Err(e) => {
+                        log::warn!("not sent: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                match m {
+                    Out::Bin(b) => Message::Binary(b),
+                    Out::Text(t) => Message::Text(t.into()),
+                }
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -336,7 +406,19 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         })
     };
     let mut rtts: std::collections::VecDeque<u32> = Default::default();
+    let mut refused = None;
     while let Some(Ok(msg)) = stream.next().await {
+        let msg = if framed {
+            match unframe(msg) {
+                Ok(m) => m,
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        } else {
+            msg
+        };
         match msg {
             Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
             // Every binary message from a viewer acts on the desktop (clipboard images,
@@ -366,6 +448,11 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         }
     }
     pinger.abort();
+    if let Some(e) = refused {
+        log::warn!("client {}: {e}; closing", client.id);
+        let _ = close_tx.send(e);
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+    }
     writer.abort();
     if let Some(tx) = s.hub.input.lock().as_ref() {
         let _ = tx.send(InputEvent::ReleaseAll);
@@ -375,6 +462,18 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     s.hub.remove_client(client.id);
     log::info!("client {} disconnected", client.id);
+}
+
+/// A framed message (--framed) as the message plain WebSockets would have carried.
+fn unframe(m: Message) -> Result<Message, FrameError> {
+    match m {
+        Message::Binary(b) => Ok(match frame::decode(b)? {
+            frame::Payload::Binary(b) => Message::Binary(b),
+            frame::Payload::Text(t) => Message::Text(t.into()),
+        }),
+        Message::Text(_) => Err(FrameError::Unframed),
+        m => Ok(m),
+    }
 }
 
 fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
@@ -628,6 +727,7 @@ mod tests {
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
             encoders: Default::default(),
+            framed: false,
         }
     }
 
@@ -789,5 +889,231 @@ mod tests {
         assert!(favicon(Some(dir.join("icon.txt").to_str().unwrap())).is_err());
         assert!(favicon(Some(dir.join("missing.ico").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    mod socket {
+        use super::*;
+        use crate::frame::Payload;
+        use futures_util::{SinkExt, StreamExt};
+        use std::future::IntoFuture;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncRead, AsyncWrite};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        use tokio_tungstenite::WebSocketStream;
+
+        fn dir(name: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("sf-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn wired() -> (Arc<Hub>, std::sync::mpsc::Receiver<InputEvent>) {
+            let hub = Hub::new();
+            hub.width.store(1280, Ordering::Relaxed);
+            hub.height.store(800, Ordering::Relaxed);
+            let (tx, rx) = std::sync::mpsc::channel();
+            *hub.input.lock() = Some(tx);
+            (hub, rx)
+        }
+
+        async fn raw<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>) -> Ws {
+            tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("nothing within 5 s")
+                .expect("the server hung up")
+                .expect("a WebSocket error")
+        }
+
+        /// The next message other than a ping, as plain WebSockets would carry it.
+        async fn next<S: AsyncRead + AsyncWrite + Unpin>(
+            ws: &mut WebSocketStream<S>,
+            framed: bool,
+        ) -> Payload {
+            loop {
+                let p = match (raw(ws).await, framed) {
+                    (Ws::Binary(b), true) => frame::decode(b).unwrap(),
+                    (Ws::Binary(b), false) => Payload::Binary(b),
+                    (Ws::Text(t), false) => Payload::Text(t.to_string()),
+                    (m, _) => panic!("unexpected {m:?}"),
+                };
+                if !matches!(&p, Payload::Text(t) if t.starts_with(r#"{"t":"ping""#)) {
+                    return p;
+                }
+            }
+        }
+
+        async fn close_code<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>) -> u16 {
+            loop {
+                if let Ws::Close(c) = raw(ws).await {
+                    return c.map_or(0, |c| c.code.into());
+                }
+            }
+        }
+
+        async fn key(
+            rx: std::sync::mpsc::Receiver<InputEvent>,
+        ) -> (bool, std::sync::mpsc::Receiver<InputEvent>) {
+            tokio::task::spawn_blocking(move || {
+                let ev = rx.recv_timeout(Duration::from_secs(5));
+                (
+                    matches!(
+                        ev,
+                        Ok(InputEvent::Key {
+                            keysym: 65,
+                            down: true
+                        })
+                    ),
+                    rx,
+                )
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn gone(hub: &Hub) {
+            for _ in 0..500 {
+                if hub.clients.lock().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the client was never removed");
+        }
+
+        #[tokio::test]
+        async fn a_framed_session_over_a_unix_socket() {
+            let (hub, input) = wired();
+            let mut s = app(&hub, false, None);
+            s.framed = true;
+            let d = dir("framed");
+            let path = d.join("s.sock");
+            let l = bind_unix(&path, 0o600).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let server = tokio::spawn(axum::serve(l, router(s)).into_future());
+            let sock = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
+                .await
+                .unwrap();
+
+            let Payload::Text(hello) = next(&mut ws, true).await else {
+                panic!("the hello is text");
+            };
+            assert_eq!(hello, hub.hello());
+            let v: serde_json::Value = serde_json::from_str(&hello).unwrap();
+            assert_eq!(
+                (v["t"].as_str(), v["w"].as_u64()),
+                (Some("hello"), Some(1280))
+            );
+
+            let video = Bytes::from_static(&[0x05, 1, 0, 0, 0, 7, 0xaa, 0xbb]);
+            hub.clients.lock()[0].send(Out::Bin(video.clone()));
+            assert_eq!(next(&mut ws, true).await, Payload::Binary(video));
+
+            ws.send(Ws::Binary(frame::encode_text("k,65,1").unwrap()))
+                .await
+                .unwrap();
+            let (typed, input) = key(input).await;
+            assert!(typed, "the key never reached the desktop");
+
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            let released =
+                tokio::task::spawn_blocking(move || input.recv_timeout(Duration::from_secs(5)))
+                    .await
+                    .unwrap();
+            assert!(matches!(released, Ok(InputEvent::ReleaseAll)));
+            server.abort();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_framed_socket_closes_on_text_and_unknown_kinds() {
+            let (hub, input) = wired();
+            let mut s = app(&hub, false, None);
+            s.framed = true;
+            let d = dir("refuse");
+            let path = d.join("s.sock");
+            let server = tokio::spawn(
+                axum::serve(bind_unix(&path, 0o600).unwrap(), router(s)).into_future(),
+            );
+            for (bad, code) in [
+                (Ws::Text("k,65,1".into()), 1003),
+                (Ws::Binary(Bytes::from_static(&[9, b'k'])), 1003),
+                (Ws::Binary(Bytes::new()), 1003),
+                (Ws::Binary(Bytes::from_static(&[1, 0xff])), 1007),
+            ] {
+                let sock = tokio::net::UnixStream::connect(&path).await.unwrap();
+                let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
+                    .await
+                    .unwrap();
+                next(&mut ws, true).await;
+                ws.send(bad).await.unwrap();
+                assert_eq!(close_code(&mut ws).await, code);
+                gone(&hub).await;
+            }
+            let events: Vec<_> = input.try_iter().collect();
+            assert!(
+                events.iter().all(|e| matches!(e, InputEvent::ReleaseAll)),
+                "a refused message acted on the desktop"
+            );
+            server.abort();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[tokio::test]
+        async fn tcp_without_framed_is_unchanged() {
+            let (hub, input) = wired();
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let server = tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (mut ws, _) =
+                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
+                    .await
+                    .unwrap();
+            let Ws::Text(hello) = raw(&mut ws).await else {
+                panic!("the hello is a text message");
+            };
+            assert_eq!(hello.as_str(), hub.hello());
+            let video = Bytes::from_static(&[0x05, 1, 0, 0, 0, 7]);
+            hub.clients.lock()[0].send(Out::Bin(video.clone()));
+            assert_eq!(next(&mut ws, false).await, Payload::Binary(video));
+            ws.send(Ws::Text("k,65,1".into())).await.unwrap();
+            assert!(key(input).await.0);
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            server.abort();
+        }
+
+        #[test]
+        fn a_unix_socket_replaces_only_a_dead_one() {
+            let d = dir("bind");
+            let path = d.join("s.sock");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _guard = rt.enter();
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            let l = bind_unix(&path, 0o660).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o660);
+            let e = bind_unix(&path, 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+            drop(l);
+            let file = d.join("plain");
+            std::fs::write(&file, b"x").unwrap();
+            assert_eq!(
+                bind_unix(&file, 0o600).unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"x");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
     }
 }

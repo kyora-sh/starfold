@@ -224,7 +224,14 @@ export type FromWorker =
 
 /** Page -> worker. */
 export type ToWorker =
-	| { t: 'init'; canvas: OffscreenCanvas; url: string; presentToMain: boolean }
+	| {
+			t: 'init';
+			canvas: OffscreenCanvas;
+			url: string;
+			presentToMain: boolean;
+			/** Every message binary with a kind byte (frame.ts), for binary-only hops. */
+			framed?: boolean;
+	  }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }

@@ -14,6 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { frameBinary, frameText, unframe } from './frame';
 import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
@@ -58,6 +59,7 @@ let surface: 'video' | 'canvas' | null = null;
 let painted = false;
 let ws: WebSocket | null = null;
 let url = '';
+let framed = false;
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let audioDecoder: AudioDecoder | null = null;
@@ -128,7 +130,7 @@ const st = {
 };
 
 function send(s: string) {
-	if (ws && ws.readyState === WebSocket.OPEN) ws.send(s);
+	if (ws && ws.readyState === WebSocket.OPEN) ws.send(framed ? frameText(s) : s);
 }
 function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
@@ -157,24 +159,36 @@ function connect() {
 		setTimeout(connect, 1000);
 	});
 	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
-		if (typeof e.data === 'string') return onText(e.data);
-		const b = new Uint8Array(e.data);
-		switch (b[0]) {
-			case Bin.Video:
-			case Bin.VideoV2:
-				onVideo(b);
-				break;
-			case Bin.Audio:
-				onAudio(b);
-				break;
-			case Bin.Cursor:
-				post({ t: 'cursor', buf: e.data }, [e.data]);
-				break;
-			case Bin.ClipImage:
-				post({ t: 'clipImage', buf: e.data }, [e.data]);
-				break;
+		if (!framed) return onMessage(e.data);
+		try {
+			if (typeof e.data === 'string') throw new TypeError('a text message');
+			const m = unframe(e.data);
+			onMessage(m.t === 'text' ? m.s : m.b);
+		} catch (err) {
+			post({ t: 'log', s: `framed socket: ${err}` });
+			sock.close(1003);
 		}
 	});
+}
+
+function onMessage(data: string | ArrayBuffer) {
+	if (typeof data === 'string') return onText(data);
+	const b = new Uint8Array(data);
+	switch (b[0]) {
+		case Bin.Video:
+		case Bin.VideoV2:
+			onVideo(b);
+			break;
+		case Bin.Audio:
+			onAudio(b);
+			break;
+		case Bin.Cursor:
+			post({ t: 'cursor', buf: data }, [data]);
+			break;
+		case Bin.ClipImage:
+			post({ t: 'clipImage', buf: data }, [data]);
+			break;
+	}
 }
 
 function onText(s: string) {
@@ -638,6 +652,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'init':
 			canvas = m.canvas;
 			url = m.url;
+			framed = m.framed === true;
 			presentToMain = m.presentToMain;
 			ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 			connect();
@@ -646,7 +661,8 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			send(m.d);
 			break;
 		case 'sendBin':
-			if (ws && ws.readyState === WebSocket.OPEN) ws.send(m.d);
+			if (ws && ws.readyState === WebSocket.OPEN)
+				ws.send(framed ? frameBinary(m.d) : m.d);
 			break;
 		case 'video':
 			if (wantVideo !== m.on) {

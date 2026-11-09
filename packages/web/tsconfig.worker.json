@@ -2,5 +2,5 @@
 	// The decode/socket worker.
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": { "lib": ["ES2022", "WebWorker"] },
-	"include": ["src/worker.ts", "src/protocol.ts", "src/dav1d"]
+	"include": ["src/worker.ts", "src/protocol.ts", "src/frame.ts", "src/dav1d"]
 }

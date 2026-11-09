@@ -119,7 +119,14 @@ function main() {
 
 	const offscreen = canvas.transferControlToOffscreen();
 	post(
-		{ t: 'init', canvas: offscreen, url: wsUrl.href, presentToMain: useVideo },
+		{
+			t: 'init',
+			canvas: offscreen,
+			url: wsUrl.href,
+			presentToMain: useVideo,
+			// ?framed=1: the server runs with --framed, behind a hop that carries binary only.
+			framed: params.get('framed') === '1',
+		},
 		[offscreen]
 	);
 
