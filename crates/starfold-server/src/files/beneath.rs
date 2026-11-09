@@ -20,6 +20,8 @@ pub enum Refused {
     Special,
     #[cfg_attr(unix, allow(dead_code))]
     BadName,
+    /// The filesystem calls it by a reserved name, whatever the request spelled.
+    Reserved,
     Io(io::Error),
 }
 
@@ -67,14 +69,65 @@ impl Root {
     pub fn dir(&self, parts: &[&str], create: bool) -> Result<Dir, Refused> {
         #[cfg(target_os = "linux")]
         if let Some(d) = self.dir.beneath(parts, create)? {
-            return Ok(d);
+            return self.checked(d);
         }
         let mut d = self.dir.try_clone()?;
         for p in parts {
             d = d.child(OsStr::new(p), create)?;
         }
-        Ok(d)
+        self.checked(d)
     }
+
+    fn checked(&self, d: Dir) -> Result<Dir, Refused> {
+        match d.reported() {
+            Some(p) if reports_reserved(&p, &self.path) => Err(Refused::Reserved),
+            _ => Ok(d),
+        }
+    }
+}
+
+/// Upload temporaries' names start with this; nothing a client names may resolve to one.
+pub const PART_PREFIX: &str = ".starfold-upload-";
+
+/// Unicode default-ignorable code points, which some filesystems (HFS+) skip when they
+/// compare names.
+pub fn ignorable(c: char) -> bool {
+    matches!(c as u32,
+        0xAD | 0x34F | 0x61C | 0x115F..=0x1160 | 0x17B4..=0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8 | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
+}
+
+/// Whether `name` is an upload temporary's, compared as a filesystem that ignores case,
+/// default-ignorable code points and normalization might: without the ignorables, then
+/// NFC and full case folding. For this ASCII prefix that folding comes down to ASCII case
+/// plus the only non-ASCII code points it takes to the prefix's characters: U+017F (to
+/// "s") and U+FB05 and U+FB06 (to "st").
+pub fn reserved(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    let mut folded = String::with_capacity(PART_PREFIX.len() + 4);
+    for c in name.chars().filter(|&c| !ignorable(c)) {
+        match c {
+            '\u{17F}' => folded.push('s'),
+            '\u{FB05}' | '\u{FB06}' => folded.push_str("st"),
+            c => folded.push(c.to_ascii_lowercase()),
+        }
+        if folded.len() >= PART_PREFIX.len() {
+            break;
+        }
+    }
+    folded.starts_with(PART_PREFIX)
+}
+
+/// Whether the path the filesystem reports for an opened entry has a reserved name in
+/// it: every component under `root` (all of them if it isn't under `root`).
+pub fn reports_reserved(reported: &Path, root: &Path) -> bool {
+    reported
+        .strip_prefix(root)
+        .unwrap_or(reported)
+        .components()
+        .any(|c| reserved(c.as_os_str()))
 }
 
 /// Neither an exclusive rename nor a hard link: an upload can't be saved without risking
@@ -138,15 +191,15 @@ pub use windows::Dir;
 
 #[cfg(unix)]
 mod unix {
-    use super::{no_exclusive_rename, ControlFlow, Entry, Kind, Opened, Refused};
+    use super::{no_exclusive_rename, reserved, ControlFlow, Entry, Kind, Opened, Refused};
     use nix::errno::Errno;
     use nix::fcntl::{openat, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
     use nix::unistd::{unlinkat, UnlinkatFlags};
     use std::ffi::OsStr;
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     pub struct Dir(OwnedFd);
@@ -190,6 +243,37 @@ mod unix {
         }
     }
 
+    /// The path the filesystem reports for `fd`, in its own spelling of each name.
+    #[cfg(target_os = "linux")]
+    fn reported(fd: BorrowedFd) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reported(fd: BorrowedFd) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let n = buf.iter().position(|&b| b == 0)?;
+        Some(PathBuf::from(OsStr::from_bytes(&buf[..n])))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn reported(_: BorrowedFd) -> Option<PathBuf> {
+        None
+    }
+
+    /// Refuses `fd` if the filesystem's own name for it is reserved.
+    fn own_name(fd: OwnedFd) -> Result<OwnedFd, Refused> {
+        match reported(fd.as_fd()) {
+            Some(p) if p.file_name().is_some_and(reserved) => Err(Refused::Reserved),
+            _ => Ok(fd),
+        }
+    }
+
     impl Dir {
         pub(super) fn open_root(path: &Path) -> std::io::Result<Dir> {
             Ok(Dir(nix::fcntl::open(path, DIR, Mode::empty())?))
@@ -197,6 +281,10 @@ mod unix {
 
         pub(super) fn try_clone(&self) -> std::io::Result<Dir> {
             Ok(Dir(self.0.try_clone()?))
+        }
+
+        pub(super) fn reported(&self) -> Option<PathBuf> {
+            reported(self.0.as_fd())
         }
 
         /// What a failed `O_NOFOLLOW` open of `name` met.
@@ -236,15 +324,15 @@ mod unix {
         /// The folder `name` in this one, made first if missing and `create`.
         pub fn child(&self, name: &OsStr, create: bool) -> Result<Dir, Refused> {
             match openat(self.0.as_fd(), name, DIR, Mode::empty()) {
-                Ok(fd) => Ok(Dir(fd)),
+                Ok(fd) => Ok(Dir(own_name(fd)?)),
                 Err(Errno::ENOENT) if create => {
                     match mkdirat(self.0.as_fd(), name, Mode::from_bits_truncate(0o777)) {
                         Ok(()) | Err(Errno::EEXIST) => {}
                         Err(e) => return Err(io(e)),
                     }
-                    openat(self.0.as_fd(), name, DIR, Mode::empty())
-                        .map(Dir)
-                        .map_err(|e| self.why(name, e))
+                    let fd = openat(self.0.as_fd(), name, DIR, Mode::empty())
+                        .map_err(|e| self.why(name, e))?;
+                    Ok(Dir(own_name(fd)?))
                 }
                 Err(e) => Err(self.why(name, e)),
             }
@@ -256,6 +344,7 @@ mod unix {
             let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
             let fd = openat(self.0.as_fd(), name, flags, Mode::empty())
                 .map_err(|e| self.why(name, e))?;
+            let fd = own_name(fd)?;
             match kind(&fstat(fd.as_fd()).map_err(io)?) {
                 Kind::Dir => Ok(Opened::Dir(Dir(fd))),
                 Kind::File => Ok(Opened::File(fd.into())),
@@ -397,7 +486,7 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use super::{windows_plain, ControlFlow, Entry, Kind, Opened, Refused};
+    use super::{reserved, windows_plain, ControlFlow, Entry, Kind, Opened, Refused};
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::path::{Path, PathBuf};
@@ -469,6 +558,21 @@ mod windows {
             None
         }
 
+        pub(super) fn reported(&self) -> Option<PathBuf> {
+            std::fs::canonicalize(&self.path).ok()
+        }
+
+        /// Refuses `p` (which exists) if its long name is reserved: an 8.3 alias such as
+        /// `STARFO~1.PAR` names the same file. `canonicalize` asks the open handle for its
+        /// final path (`GetFinalPathNameByHandleW`), long names throughout.
+        fn own_name(p: &Path) -> Result<(), Refused> {
+            let long = std::fs::canonicalize(p)?;
+            if long.file_name().is_some_and(reserved) {
+                return Err(Refused::Reserved);
+            }
+            Ok(())
+        }
+
         pub fn child(&self, name: &OsStr, create: bool) -> Result<Dir, Refused> {
             let p = self.at(name)?;
             let k = match look(&p) {
@@ -483,7 +587,10 @@ mod windows {
                 k => k?,
             };
             match k {
-                Kind::Dir => Ok(self.under(p)),
+                Kind::Dir => {
+                    Self::own_name(&p)?;
+                    Ok(self.under(p))
+                }
                 Kind::Link => Err(Refused::Link),
                 _ => Err(Refused::NotFolder),
             }
@@ -491,7 +598,11 @@ mod windows {
 
         pub fn open(&self, name: &OsStr) -> Result<Opened, Refused> {
             let p = self.at(name)?;
-            match look(&p)? {
+            let k = look(&p)?;
+            if matches!(k, Kind::Dir | Kind::File) {
+                Self::own_name(&p)?;
+            }
+            match k {
                 Kind::Dir => Ok(Opened::Dir(self.under(p))),
                 Kind::File => Ok(Opened::File(std::fs::File::open(&p)?)),
                 Kind::Link => Err(Refused::Link),
@@ -603,6 +714,76 @@ mod tests {
         ] {
             assert!(!windows_plain(OsStr::new(bad)), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn reserved_names_in_any_spelling_a_filesystem_may_equate() {
+        for name in [
+            ".starfold-upload-0a.part",
+            ".STARFOLD-Upload-x",
+            ".\u{200C}starfold-upload-x",
+            "\u{FEFF}.starfold-upload-x",
+            ".star\u{200B}fold-up\u{2060}load-x",
+            ".\u{17F}tarfold-upload-x",
+            ".\u{FB06}arfold-upload-x",
+            ".\u{FB05}ARFOLD-UPLOAD-",
+        ] {
+            assert!(reserved(OsStr::new(name)), "{name:?}");
+        }
+        for name in [
+            ".starfold-uploads",
+            ".starfold-upload",
+            "starfold-upload-x",
+            ".s-tarfold-upload-x",
+            "STARFO~1.PAR",
+        ] {
+            assert!(!reserved(OsStr::new(name)), "{name:?}");
+        }
+        for c in [
+            '\u{AD}',
+            '\u{200C}',
+            '\u{200F}',
+            '\u{2064}',
+            '\u{FEFF}',
+            '\u{E0001}',
+        ] {
+            assert!(ignorable(c), "{:x}", c as u32);
+        }
+        for c in ['a', '.', '-', '\u{E9}', '\u{2010}'] {
+            assert!(!ignorable(c), "{:x}", c as u32);
+        }
+    }
+
+    /// The check on the name the filesystem reports for an opened entry, with made-up
+    /// reports: an alias or another spelling the request used doesn't matter, only the
+    /// name the entry really has.
+    #[test]
+    fn the_name_a_filesystem_reports_decides() {
+        let root = Path::new("/srv/shared");
+        // Asked for as an 8.3 alias (STARFO~1.PAR) on Windows: the long name is reported.
+        assert!(reports_reserved(
+            Path::new("/srv/shared/Downloads/.starfold-upload-0a.part"),
+            root
+        ));
+        assert!(reports_reserved(
+            Path::new("/srv/shared/.starfold-upload-dir/a/b.txt"),
+            root
+        ));
+        assert!(!reports_reserved(
+            Path::new("/srv/shared/Downloads/report.txt"),
+            root
+        ));
+        // Outside the root as reported (a different mount spelling): every component counts.
+        assert!(reports_reserved(
+            Path::new("/mnt/x/.starfold-upload-1/f"),
+            root
+        ));
+        assert!(!reports_reserved(Path::new("/mnt/x/Downloads/f"), root));
+        // The root's own name is not the client's to have chosen.
+        assert!(!reports_reserved(
+            Path::new("/srv/.starfold-upload-root/Downloads/f"),
+            Path::new("/srv/.starfold-upload-root")
+        ));
     }
 
     #[cfg(target_os = "linux")]

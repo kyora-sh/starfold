@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use beneath::{Dir, Entry, Kind, Opened, Refused, Root};
+use beneath::{reserved, Dir, Entry, Kind, Opened, Refused, Root, PART_PREFIX};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -92,7 +92,7 @@ fn parts(rel: &str) -> Result<Vec<&str>, Response> {
     let mut v = Vec::new();
     for c in Path::new(rel).components() {
         match c {
-            Component::Normal(s) if reserved(s) => return Err(bad()),
+            Component::Normal(s) if refused_name(s) => return Err(bad()),
             Component::Normal(s) => v.push(s.to_str().ok_or_else(bad)?),
             Component::CurDir => {}
             _ => return Err(bad()),
@@ -107,7 +107,7 @@ fn refused(r: Refused) -> Response {
         Refused::NotFolder => err(StatusCode::NOT_FOUND, "not a folder"),
         Refused::Link => err(StatusCode::FORBIDDEN, "symlinks are not followed"),
         Refused::Special => err(StatusCode::BAD_REQUEST, "not a file"),
-        Refused::BadName => err(StatusCode::BAD_REQUEST, "invalid name"),
+        Refused::BadName | Refused::Reserved => err(StatusCode::BAD_REQUEST, "invalid name"),
         Refused::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             err(StatusCode::FORBIDDEN, "permission denied")
         }
@@ -413,7 +413,13 @@ fn walk(
             }
             // Gone, or swapped for something never followed, since it was listed.
             Ok(Opened::File(_))
-            | Err(Refused::Missing | Refused::NotFolder | Refused::Link | Refused::Special) => {}
+            | Err(
+                Refused::Missing
+                | Refused::NotFolder
+                | Refused::Link
+                | Refused::Special
+                | Refused::Reserved,
+            ) => {}
             Err(Refused::Io(e)) => return Err(e),
             Err(Refused::BadName) => return Err(std::io::Error::other("an unusable name")),
         }
@@ -431,9 +437,13 @@ fn write_zip(dir: Dir, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()
                 Ok(Opened::File(f)) => f,
                 // Gone, or swapped for something never followed, since it was listed.
                 Ok(Opened::Dir(_))
-                | Err(Refused::Missing | Refused::NotFolder | Refused::Link | Refused::Special) => {
-                    continue
-                }
+                | Err(
+                    Refused::Missing
+                    | Refused::NotFolder
+                    | Refused::Link
+                    | Refused::Special
+                    | Refused::Reserved,
+                ) => continue,
                 Err(Refused::Io(e)) => return Err(e),
                 Err(Refused::BadName) => return Err(std::io::Error::other("an unusable name")),
             };
@@ -521,9 +531,6 @@ fn numbered(stem: &str, n: u64, ext: &str) -> String {
     format!("{}{suffix}", &stem[..cut])
 }
 
-/// Upload temporaries' names start with this; no upload may take such a name.
-const PART_PREFIX: &str = ".starfold-upload-";
-
 /// A hidden temporary name for an upload: the prefix and 128 random bits, the same
 /// length whatever the file is called.
 fn part_name() -> std::io::Result<OsString> {
@@ -533,12 +540,10 @@ fn part_name() -> std::io::Result<OsString> {
     Ok(format!("{PART_PREFIX}{hex}.part").into())
 }
 
-/// A name upload temporaries use, refused in every path component a client sends and
-/// left out of listings and zips (any case: some filesystems ignore it).
-fn reserved(name: &OsStr) -> bool {
-    name.as_encoded_bytes()
-        .get(..PART_PREFIX.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(PART_PREFIX.as_bytes()))
+/// A name a client may not send as any path component: a reserved one, or one with a
+/// default-ignorable code point (which some filesystems skip when comparing names).
+fn refused_name(name: &OsStr) -> bool {
+    reserved(name) || name.to_string_lossy().chars().any(beneath::ignorable)
 }
 
 /// An upload's temporary file, removed unless it was published, whatever ends the
@@ -581,7 +586,7 @@ pub async fn upload(
     let Some(name) = q
         .get("name")
         .and_then(|n| clean_name(n))
-        .filter(|n| !reserved(OsStr::new(n)))
+        .filter(|n| !refused_name(OsStr::new(n)))
     else {
         return err(StatusCode::BAD_REQUEST, "invalid file name");
     };
@@ -602,7 +607,7 @@ pub async fn upload(
         // Folder uploads: `sub` is the file's folder inside the upload ("Photos/2024"),
         // created as needed. Folders that already exist are merged into.
         for p in sub.split('/').filter(|p| !p.is_empty()) {
-            let Some(p) = clean_name(p).filter(|p| !reserved(OsStr::new(p))) else {
+            let Some(p) = clean_name(p).filter(|p| !refused_name(OsStr::new(p))) else {
                 return Err(err(StatusCode::BAD_REQUEST, "invalid folder name"));
             };
             dir = match dir.child(OsStr::new(p), true) {

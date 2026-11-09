@@ -769,3 +769,76 @@ async fn an_upload_in_progress_is_never_listed_zipped_or_downloaded() {
     let _ = held.await;
     drop(tx);
 }
+
+#[tokio::test]
+async fn an_entry_the_filesystem_names_reserved_is_never_opened() {
+    let t = Tmp::new();
+    let held = t.root().join(".starfold-upload-held");
+    std::fs::create_dir_all(&held).unwrap();
+    std::fs::write(held.join("f"), "temp").unwrap();
+    std::fs::write(t.root().join(".starfold-upload-0a.part"), "temp").unwrap();
+    let root = Root::open(&t.root()).unwrap();
+    let top = root.dir(&[], false).unwrap();
+    // Opened by the handle layer itself, under the real name and under spellings some
+    // filesystems equate with it (HFS+ ignores U+200C): never Ok.
+    for name in [
+        ".starfold-upload-held",
+        ".\u{200C}starfold-upload-held",
+        ".STARFOLD-UPLOAD-held",
+    ] {
+        assert!(top.child(OsStr::new(name), false).is_err(), "{name:?}");
+        assert!(top.open(OsStr::new(name)).is_err(), "{name:?}");
+    }
+    assert!(matches!(
+        top.child(OsStr::new(".starfold-upload-held"), false),
+        Err(Refused::Reserved)
+    ));
+    assert!(matches!(
+        top.open(OsStr::new(".starfold-upload-0a.part")),
+        Err(Refused::Reserved)
+    ));
+    assert!(matches!(
+        root.dir(&[".starfold-upload-held"], false),
+        Err(Refused::Reserved)
+    ));
+    let f = t.files("Downloads");
+    for path in [
+        ".\u{200C}starfold-upload-held",
+        ".\u{17F}tarfold-upload-held/f",
+        "a\u{FEFF}b",
+    ] {
+        assert_eq!(
+            get_list(&f, path).await.0,
+            StatusCode::BAD_REQUEST,
+            "{path:?}"
+        );
+        assert_eq!(
+            get_file(&f, path).await.0,
+            StatusCode::BAD_REQUEST,
+            "{path:?}"
+        );
+    }
+    for name in ["a\u{200B}.txt", ".\u{200C}starfold-upload-x"] {
+        assert_eq!(
+            put(&f, &[("name", name)], "x").await.0,
+            StatusCode::BAD_REQUEST,
+            "{name:?}"
+        );
+        assert_eq!(
+            put(&f, &[("name", "ok.txt"), ("sub", name)], "x").await.0,
+            StatusCode::BAD_REQUEST,
+            "sub {name:?}"
+        );
+    }
+    let (s, list) = get_list(&f, "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!list.to_string().contains("starfold-upload"), "{list}");
+    let (s, zipped) = get_file(&f, "").await;
+    assert_eq!(s, StatusCode::OK);
+    let z = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+    assert!(
+        z.file_names().all(|n| !n.contains("starfold-upload")),
+        "{:?}",
+        z.file_names().collect::<Vec<_>>()
+    );
+}
