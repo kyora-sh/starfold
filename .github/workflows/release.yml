@@ -2,8 +2,8 @@ name: Release
 
 # A version tag (v0.4.0, ...) gets a GitHub release with GitHub's generated notes (the
 # pull requests merged since the previous tag). Nothing is published to a registry.
-# starfold links x264 (GPL-2.0-or-later), so each release carries the exact source of the x264 its
-# Linux build links (Ubuntu 24.04's package, checksum-pinned) and vcpkg's x264 port.
+# starfold links x264 (GPL-2.0-or-later), so each release attaches the exact x264 source of every
+# platform's build, from third_party/x264 (hash-checked, nothing fetched).
 # Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
 on:
   push:
@@ -31,23 +31,10 @@ jobs:
           fi
       - name: x264's source
         run: |
-          base=https://archive.ubuntu.com/ubuntu/pool/universe/x/x264
+          (cd third_party/x264 && sha256sum -c SHA256SUMS && sha512sum -c SHA512SUMS)
           mkdir x264-source
-          for f in x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164.3108+git31e19f9-1.debian.tar.xz x264_0.164.3108+git31e19f9-1.dsc; do
-            curl -fsSL --retry 3 -o "x264-source/$f" "$base/$f"
-          done
-          cd x264-source
-          sha256sum -c - <<'SUMS'
-          41606cb8e788a7f8c4514290646d4ba5c7bc68d9e1ccd1a73f446a90546913eb  x264_0.164.3108+git31e19f9.orig.tar.gz
-          7844a9b42bedec211bc9a131d0655ea52524fbb055582921d8e6d4a4d953efc6  x264_0.164.3108+git31e19f9-1.debian.tar.xz
-          27ebdf555dd61d52c20af95a39c42c02ba46bbb433178f7ba2cb180bf231c483  x264_0.164.3108+git31e19f9-1.dsc
-          SUMS
-          cd ..
-          git clone --quiet --depth 1 --branch 2026.10.16 https://github.com/microsoft/vcpkg vcpkg-port
-          tar -czf x264-source/vcpkg-2026.10.16-ports-x264.tar.gz -C vcpkg-port/ports x264
-          # TODO: attach upstream r3222 (x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz, sha256
-          # cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9), the x264 vcpkg and Homebrew
-          # build: VideoLAN refuses the runners, and where it comes from instead is the owner's call.
+          cp third_party/x264/*.tar.* third_party/x264/*.dsc x264-source/
+          tar -czf x264-source/vcpkg-2026.10.16-ports-x264.tar.gz -C third_party/x264 vcpkg-2026.10.16-ports-x264
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,14 +43,12 @@ jobs:
           ## x264 source
 
           Binaries built from this release link x264 and are GPL-2.0-or-later as a combined work.
-          The x264 source is attached: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1`, the one CI
-          builds against, upstream commit [31e19f92](https://code.videolan.org/videolan/x264/-/commit/31e19f92f00c7003fa115047ce50978bc98c3a0d).
-
-          Builds through vcpkg (Windows) or Homebrew (macOS) link upstream r3222, commit
-          [b35605ac](https://code.videolan.org/videolan/x264/-/commit/b35605ace3ddf7c1a5d67a2eb553f034aef41d55):
-          [source archive](https://code.videolan.org/videolan/x264/-/archive/b35605ace3ddf7c1a5d67a2eb553f034aef41d55/x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz),
-          sha256 `cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9`. vcpkg builds it with the
-          patches in `vcpkg-2026.10.16-ports-x264.tar.gz` (attached); Homebrew builds it unpatched.
+          The source of each x264 they link is attached (see `third_party/x264/README.md`):
+          - Linux: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1` (`.orig.tar.gz`, `.debian.tar.xz`, `.dsc`),
+            upstream commit 31e19f92f00c7003fa115047ce50978bc98c3a0d.
+          - Windows (vcpkg) and macOS (Homebrew): upstream r3222, commit b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+            (`x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz`). vcpkg 2026.10.16 builds it with the patches in
+            `vcpkg-2026.10.16-ports-x264.tar.gz`; Homebrew builds it unpatched.
           NOTES
           args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes --notes-file x264-notes.md)
           prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)

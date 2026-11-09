@@ -356,7 +356,8 @@ GPL-2.0-or-later. See [Licensing](#licensing).
 
 The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2.0-or-later),
 so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
-work. Each release carries or links the exact x264 source its builds link. A build with
+work. Each release attaches the exact x264 source its builds link
+([third_party/x264](third_party/x264/README.md)). A build with
 `--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
 no GPL component. [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their
 licences.

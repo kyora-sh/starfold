@@ -74,6 +74,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: x264 source hashes
+        working-directory: third_party/x264
+        run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
       # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for x264's bindings,
       # esbuild for build.rs.
       - name: Native libraries
