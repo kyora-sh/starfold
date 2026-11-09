@@ -126,6 +126,12 @@ async fn the_default_folder_is_listed_empty_before_it_exists() {
     assert_eq!(l["entries"], serde_json::json!([]));
     assert!(!t.root().join("Downloads").exists());
     assert_eq!(get_list(&f, "Other").await.0, StatusCode::NOT_FOUND);
+    let (s, _) = put(&f, &[("name", "a"), ("path", "Other")], "x").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(
+        !t.root().join("Other").exists(),
+        "only the default folder is made"
+    );
 }
 
 #[tokio::test]

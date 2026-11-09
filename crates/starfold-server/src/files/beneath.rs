@@ -141,7 +141,8 @@ mod unix {
         }
 
         /// `parts` in one `openat2` that refuses symlinks and anything outside this
-        /// folder; None where the kernel can't, or (with `create`) something is missing.
+        /// folder; None where the kernel can't, where a non-folder is in the way, or
+        /// (with `create`) something is missing.
         #[cfg(target_os = "linux")]
         pub(super) fn beneath(&self, parts: &[&str], create: bool) -> Result<Option<Dir>, Refused> {
             use nix::fcntl::{openat2, OpenHow, ResolveFlag};
@@ -159,9 +160,10 @@ mod unix {
                     Errno::ENOSYS | Errno::EPERM | Errno::EINVAL | Errno::E2BIG | Errno::EAGAIN,
                 ) => Ok(None),
                 Err(Errno::ENOENT) if create => Ok(None),
+                // A file or a symlink on the way: the walk tells which.
+                Err(Errno::ENOTDIR) => Ok(None),
                 Err(Errno::ENOENT) => Err(Refused::Missing),
                 Err(Errno::ELOOP | Errno::EXDEV) => Err(Refused::Link),
-                Err(Errno::ENOTDIR) => Err(Refused::NotFolder),
                 Err(e) => Err(io(e)),
             }
         }
