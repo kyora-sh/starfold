@@ -52,7 +52,7 @@ class Server:
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.seen.append(req)
         if req.headers.get("authorization") != f"Bearer {self.password}":
-            return httpx.Response(401, text="voxl needs its password")
+            return httpx.Response(401, text="starfold needs its password")
         path, q = req.url.path, req.url.params
         if path == "/screenshot":
             return httpx.Response(200, content=PNG, headers={"x-voxl-seq": "41"})

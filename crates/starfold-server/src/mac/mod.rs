@@ -82,14 +82,14 @@ pub fn init(a: &HashMap<String, String>) {
         if !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess();
             log::error!(
-                "Screen Recording permission is missing: allow voxl (or the terminal running it) \
+                "Screen Recording permission is missing: allow starfold (or the terminal running it) \
                  in System Settings > Privacy & Security > Screen Recording, then restart it"
             );
         }
         if !AXIsProcessTrusted() {
             prompt_accessibility();
             log::warn!(
-                "Accessibility permission is missing, so input is ignored: allow voxl (or the \
+                "Accessibility permission is missing, so input is ignored: allow starfold (or the \
                  terminal running it) in System Settings > Privacy & Security > Accessibility"
             );
         }

@@ -1,8 +1,8 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! starfold: low-latency desktop streaming (H.264, HEVC or AV1 over WebSocket) for the
+//! browser, from an X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
-//! The `voxl` binary calls [`main`]; other programs (the Tembo CLI's `tembo voxl`) embed
-//! the server by calling [`run`] with a command line, or [`main`] from their own `main`.
+//! The `starfold` binary calls [`main`]; other programs embed the server by calling
+//! [`run`] with a command line, or [`main`] from their own `main`.
 
 mod access;
 mod actions;

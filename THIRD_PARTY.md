@@ -6,6 +6,8 @@
   [packages/web/dav1d/COPYING-wasi-libc](packages/web/dav1d/COPYING-wasi-libc).
 - **Inter** (SIL Open Font License 1.1), the web client's font in `packages/web/inter.woff2`; the
   wordmarks in `assets/` use its outlines. Licence: [packages/web/inter-LICENSE.txt](packages/web/inter-LICENSE.txt).
-- **OpenH264** (BSD-2-Clause), built from source and linked by the default build.
-- **x264** (GPL-2.0-or-later), linked only by a build with the `x264` feature. A binary built with
-  x264 is distributed under GPL-2.0-or-later as a combined work; starfold's own source stays MIT.
+- **OpenH264** (BSD-2-Clause), built from source, in builds that include it.
+- **x264** (GPL-2.0-or-later), in builds with the `x264` feature. A binary built with x264 is
+  distributed under GPL-2.0-or-later as a combined work; starfold's own source stays MIT.
+
+`starfold --version` lists the encoders a binary includes.
