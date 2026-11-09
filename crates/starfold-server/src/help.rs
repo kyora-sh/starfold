@@ -129,7 +129,9 @@ const FILES: &str = "
 Files and recordings:
   --file-transfers              upload, download, upload,download or none
                                 (default upload,download)
-  --files-root                  folder the Files panel can see (default $HOME)
+  --files-root                  folder the Files panel can see; without it
+                                file transfer is off; symlinks in it are not
+                                followed
   --upload-dir                  folder under the root that uploads go to
                                 (default Downloads)
   --max-upload-mb               largest upload, 0 for no limit (default 0)

@@ -68,7 +68,7 @@ openh264-sys2 = { version = "=0.9.9", default-features = false, features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["fs", "poll", "time"] }
+nix = { version = "0.31", features = ["dir", "fs", "poll", "time"] }
 
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 # libva and NVENC are opened at runtime, so hosts without them start as usual.

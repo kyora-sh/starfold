@@ -643,7 +643,7 @@ mod tests {
             audio: false,
             epoch: std::time::Instant::now(),
             files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
+                root: None,
                 upload: false,
                 download: false,
                 default_dir: String::new(),

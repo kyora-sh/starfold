@@ -365,18 +365,19 @@ async fn serve(a: HashMap<String, String>) {
         .get("file-transfers")
         .cloned()
         .unwrap_or_else(|| "upload,download".into());
-    let root = a
-        .get("files-root")
-        .cloned()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .unwrap_or_else(|| "/".into());
-    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.into());
+    // No --files-root, no file transfer: there is no default folder to share.
+    let root = a.get("files-root").map(|r| {
+        files::beneath::Root::open(std::path::Path::new(r)).unwrap_or_else(|e| {
+            log::error!("--files-root {r}: {e}");
+            std::process::exit(2);
+        })
+    });
+    let shared = root.is_some();
     let files = std::sync::Arc::new(files::Files {
         root,
         // Uploading writes to the desktop, so a read-only viewer does not get it.
-        upload: !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
-        download: transfers.split(',').any(|t| t.trim() == "download"),
+        upload: shared && !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
+        download: shared && transfers.split(',').any(|t| t.trim() == "download"),
         default_dir: a
             .get("upload-dir")
             .cloned()
@@ -385,7 +386,10 @@ async fn serve(a: HashMap<String, String>) {
             .to_string(),
         max_upload_bytes: (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
     });
-    log::info!("file transfer: {transfers} under {}", files.root.display());
+    match &files.root {
+        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        None => log::info!("file transfer: off (share a folder with --files-root)"),
+    }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).

@@ -31,7 +31,8 @@ voxl runs with `--read-only`, type, click, use the clipboard and move files. So:
   `--allowed-hosts` names, and turns away browsers' requests from other sites' pages
   unless `--allowed-origins` names them. That keeps out DNS rebinding and pages that
   open a WebSocket to voxl.
-- **Files:** the Files panel only reaches `--files-root` (`$HOME` by default); nothing
-  outside it is reachable. `--file-transfers=none` turns transfers off.
+- **Files:** file transfer is off unless `--files-root` names a folder; the Files panel
+  then reaches only that folder and never follows a symlink. `--file-transfers=none`
+  turns transfers off.
 - **Watch-only viewers:** `--read-only` refuses input, clipboard writes, the
   microphone, uploads and resizing.

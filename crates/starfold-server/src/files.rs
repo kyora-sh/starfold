@@ -1,22 +1,30 @@
 //! File transfer over plain HTTP, next to the stream: list a directory, download a
 //! file or a folder (zipped on the fly), upload files, folders included. Everything is
-//! confined to one root directory (the desktop user's home by default). Transfers use their own connections, so a large upload
-//! or download never queues behind (or in front of) video frames.
+//! confined to the folder given with `--files-root` (no folder, no file transfer), and
+//! symlinks are never followed (see [`beneath`]). Transfers use their own connections, so
+//! a large upload or download never queues behind (or in front of) video frames.
+
+pub mod beneath;
+#[cfg(all(test, unix))]
+mod tests;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use beneath::{Dir, Kind, Opened, Refused, Root};
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Files {
-    pub root: PathBuf,
+    /// None: no `--files-root`, so no file transfer.
+    pub root: Option<Root>,
     pub upload: bool,
     pub download: bool,
     /// Directory (relative to root) the client opens first and uploads into by default.
@@ -41,89 +49,87 @@ fn err(code: StatusCode, msg: &str) -> Response {
         .into_response()
 }
 
-impl Files {
-    /// Resolves a client path ("Downloads/report.pdf") under the root. Absolute paths and
-    /// `..` are rejected; symlinks are followed only if they stay inside the root.
-    // The error is the HTTP response to send, as is usual with axum.
-    #[allow(clippy::result_large_err)]
-    fn resolve(&self, rel: &str, must_exist: bool) -> Result<PathBuf, Response> {
-        let bad = || err(StatusCode::BAD_REQUEST, "invalid path");
-        let mut p = self.root.clone();
-        for c in Path::new(rel).components() {
-            match c {
-                Component::Normal(s) => p.push(s),
-                Component::CurDir => {}
-                _ => return Err(bad()),
-            }
-        }
-        if rel.contains('\0') {
-            return Err(bad());
-        }
-        match p.canonicalize() {
-            Ok(c) if c.starts_with(&self.root) => Ok(c),
-            Ok(_) => Err(err(StatusCode::FORBIDDEN, "outside the shared folder")),
-            Err(_) if !must_exist => Ok(p),
-            Err(_) => Err(err(StatusCode::NOT_FOUND, "not found")),
+/// A client path ("Downloads/report.pdf") as plain names under the root: absolute paths,
+/// `..` and NULs are rejected.
+// The error is the HTTP response to send, as is usual with axum.
+#[allow(clippy::result_large_err)]
+fn parts(rel: &str) -> Result<Vec<&str>, Response> {
+    let bad = || err(StatusCode::BAD_REQUEST, "invalid path");
+    if rel.contains('\0') {
+        return Err(bad());
+    }
+    let mut v = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(s) => v.push(s.to_str().ok_or_else(bad)?),
+            Component::CurDir => {}
+            _ => return Err(bad()),
         }
     }
+    Ok(v)
+}
 
-    fn rel(&self, p: &Path) -> String {
-        p.strip_prefix(&self.root)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_default()
+fn refused(r: Refused) -> Response {
+    match r {
+        Refused::Missing => err(StatusCode::NOT_FOUND, "not found"),
+        Refused::NotFolder => err(StatusCode::NOT_FOUND, "not a folder"),
+        Refused::Link => err(StatusCode::FORBIDDEN, "symlinks are not followed"),
+        Refused::Special => err(StatusCode::BAD_REQUEST, "not a file"),
+        Refused::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            err(StatusCode::FORBIDDEN, "permission denied")
+        }
+        Refused::Io(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
+/// Runs blocking filesystem work off the async workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Response> + Send + 'static,
+) -> Result<T, Response> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|_| Err(err(StatusCode::INTERNAL_SERVER_ERROR, "file task failed")))
+}
+
 pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
-    if !f.download && !f.upload {
+    if !f.download && !f.upload || f.root.is_none() {
         return err(StatusCode::FORBIDDEN, "file transfer is disabled");
     }
-    let rel = q.get("path").map(String::as_str).unwrap_or("");
-    let dir = match f.resolve(rel, rel != f.default_dir) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    let mut entries = Vec::new();
-    match tokio::fs::read_dir(&dir).await {
-        Ok(mut rd) => {
-            while let Ok(Some(e)) = rd.next_entry().await {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                // Follow symlinks for type and size, as a file manager would, but
-                // hide links that lead outside the shared folder.
-                let Ok(md) = tokio::fs::metadata(e.path()).await else {
-                    continue;
-                };
-                if e.file_type().await.is_ok_and(|t| t.is_symlink())
-                    && !tokio::fs::canonicalize(e.path())
-                        .await
-                        .is_ok_and(|c| c.starts_with(&f.root))
-                {
-                    continue;
-                }
-                if !md.is_dir() && !md.is_file() {
-                    continue;
-                }
-                let mtime = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                entries.push(serde_json::json!({ "name": name, "dir": md.is_dir(), "size": md.len(), "mtime": mtime }));
-                if entries.len() >= 5000 {
-                    break;
-                }
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let listed = blocking(move || {
+        let root = f.root.as_ref().expect("checked");
+        let parts = parts(&rel)?;
+        let dir = match root.dir(&parts, false) {
+            Ok(d) => d,
+            // The default upload folder may not exist until something is uploaded.
+            Err(Refused::Missing) if rel == f.default_dir => return Ok((parts.join("/"), vec![])),
+            Err(r) => return Err(refused(r)),
+        };
+        let mut entries = Vec::new();
+        // Symlinks are left out: they are never followed.
+        for e in dir.entries().map_err(|e| refused(Refused::Io(e)))? {
+            let name = e.name.to_string_lossy().into_owned();
+            if name.starts_with('.') || !matches!(e.kind, Kind::Dir | Kind::File) {
+                continue;
+            }
+            let mtime = e
+                .modified
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            entries.push(serde_json::json!({ "name": name, "dir": e.kind == Kind::Dir, "size": e.len, "mtime": mtime }));
+            if entries.len() >= 5000 {
+                break;
             }
         }
-        // The default upload folder may not exist until something is uploaded.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && rel == f.default_dir => {}
-        Err(_) => return err(StatusCode::NOT_FOUND, "not a folder"),
-    }
-    let body =
-        serde_json::json!({ "path": f.rel(&dir).trim_start_matches('/'), "entries": entries });
+        Ok((parts.join("/"), entries))
+    })
+    .await;
+    let (path, entries) = match listed {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    let body = serde_json::json!({ "path": path, "entries": entries });
     (
         [
             (header::CONTENT_TYPE, "application/json"),
@@ -135,29 +141,32 @@ pub async fn list(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
 }
 
 pub async fn download(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
-    if !f.download {
+    if !f.download || f.root.is_none() {
         return err(StatusCode::FORBIDDEN, "downloads are disabled");
     }
-    let path = match f.resolve(q.get("path").map(String::as_str).unwrap_or(""), true) {
-        Ok(p) => p,
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let opened = blocking(move || {
+        let root = f.root.as_ref().expect("checked");
+        let parts = parts(&rel)?;
+        let Some((last, parent)) = parts.split_last() else {
+            let top = root.dir(&[], false).map_err(refused)?;
+            return Ok(("Home".to_string(), Opened::Dir(top)));
+        };
+        let opened = root
+            .dir(parent, false)
+            .and_then(|d| d.open(OsStr::new(last)))
+            .map_err(refused)?;
+        Ok((last.to_string(), opened))
+    })
+    .await;
+    let (name, file) = match opened {
+        Ok((name, Opened::Dir(d))) => return zip_folder(d, name),
+        Ok((name, Opened::File(file))) => (name, tokio::fs::File::from_std(file)),
         Err(e) => return e,
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Home".into());
-    if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
-        return zip_folder(path, name);
-    }
-    let Ok(file) = tokio::fs::File::open(&path).await else {
-        return err(StatusCode::NOT_FOUND, "not found");
     };
     let Ok(md) = file.metadata().await else {
         return err(StatusCode::NOT_FOUND, "not found");
     };
-    if !md.is_file() {
-        return err(StatusCode::BAD_REQUEST, "not a file");
-    }
     let stream = futures_util::stream::unfold(Some(file), |file| async move {
         let mut file = file?;
         let mut buf = Vec::with_capacity(256 << 10);
@@ -200,7 +209,7 @@ fn attachment(name: &str, content_type: &'static str) -> HeaderMap {
 /// Streams a folder as a zip, built while it downloads: nothing is staged on disk and
 /// memory stays at a few chunks however big the folder is. Symlinks are left out (they
 /// could lead outside the shared folder, or loop).
-fn zip_folder(dir: PathBuf, name: String) -> Response {
+fn zip_folder(dir: Dir, name: String) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
     let top = name.clone();
     tokio::task::spawn_blocking(move || {
@@ -208,8 +217,8 @@ fn zip_folder(dir: PathBuf, name: String) -> Response {
             tx: tx.clone(),
             buf: Vec::with_capacity(CHUNK),
         };
-        if let Err(e) = write_zip(&dir, &top, out) {
-            log::warn!("zipping {}: {e}", dir.display());
+        if let Err(e) = write_zip(dir, &top, out) {
+            log::warn!("zipping {top}: {e}");
             // Ends the response with an error, so the browser marks the download failed.
             let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
         }
@@ -295,35 +304,36 @@ fn zip_time(t: std::time::SystemTime) -> Option<zip::DateTime> {
     .ok()
 }
 
-fn write_zip(dir: &Path, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()> {
+fn write_zip(dir: Dir, top: &str, out: ChunkWriter) -> zip::result::ZipResult<()> {
     use zip::write::SimpleFileOptions;
     let mut z = zip::ZipWriter::new_stream(out);
     let base = SimpleFileOptions::default();
-    let mut todo = vec![(dir.to_path_buf(), top.to_string())];
-    while let Some((path, rel)) = todo.pop() {
+    let mut todo = vec![(dir, top.to_string())];
+    while let Some((dir, rel)) = todo.pop() {
         z.add_directory(format!("{rel}/"), base)?;
-        let mut entries: Vec<_> = match std::fs::read_dir(&path) {
-            Ok(rd) => rd.filter_map(Result::ok).collect(),
+        let mut entries = match dir.entries() {
+            Ok(v) => v,
             // Unreadable folders are left empty rather than failing the whole download.
             Err(_) => continue,
         };
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         // Pushed in reverse so folders come out in name order.
         let mut dirs = Vec::new();
         for e in entries {
-            let Ok(md) = e.path().symlink_metadata() else {
-                continue;
-            };
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = e.name.to_string_lossy().into_owned();
             let rel = format!("{rel}/{name}");
-            if md.is_dir() {
-                dirs.push((e.path(), rel));
-                continue;
-            }
-            if !md.is_file() {
-                continue;
-            }
-            let Ok(mut file) = std::fs::File::open(e.path()) else {
+            let mut file = match e.kind {
+                Kind::Dir | Kind::File => match dir.open(&e.name) {
+                    Ok(Opened::Dir(d)) => {
+                        dirs.push((d, rel));
+                        continue;
+                    }
+                    Ok(Opened::File(f)) => f,
+                    Err(_) => continue,
+                },
+                Kind::Link | Kind::Other => continue,
+            };
+            let Ok(md) = file.metadata() else {
                 continue;
             };
             let stored = Path::new(&name)
@@ -381,18 +391,17 @@ fn clean_name(name: &str) -> Option<&str> {
 }
 
 /// `name`, or `name (1).ext`, `name (2).ext`, ... if taken.
-fn unique(dir: &Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
+fn unique(dir: &Dir, name: &str) -> String {
+    if !dir.exists(OsStr::new(name)) {
+        return name.to_string();
     }
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
     (1..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|p| !dir.exists(OsStr::new(p)))
         .unwrap()
 }
 
@@ -404,7 +413,7 @@ pub async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !f.upload {
+    if !f.upload || f.root.is_none() {
         return err(StatusCode::FORBIDDEN, "uploads are disabled");
     }
     if !headers.contains_key(UPLOAD_HEADER) {
@@ -417,68 +426,55 @@ pub async fn upload(
         .get("path")
         .cloned()
         .unwrap_or_else(|| f.default_dir.clone());
-    let dir = match f.resolve(&rel, rel != f.default_dir) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    if rel == f.default_dir && tokio::fs::create_dir_all(&dir).await.is_err() {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot create the upload folder",
-        );
-    }
-    if !dir.is_dir() {
-        return err(StatusCode::NOT_FOUND, "not a folder");
-    }
-    // Folder uploads: `sub` is the file's folder inside the upload ("Photos/2024"),
-    // created as needed. Folders that already exist are merged into.
-    let sub = q.get("sub").map(String::as_str).unwrap_or("");
-    let mut dir = dir;
-    for part in sub.split('/').filter(|p| !p.is_empty()) {
-        let Some(p) = clean_name(part) else {
-            return err(StatusCode::BAD_REQUEST, "invalid folder name");
-        };
-        // One level at a time, checking each existing step: a symlink on the way could
-        // lead outside the shared folder, and nothing may be created out there. `dir` is
-        // canonical and `p` a single plain name (clean_name rejects `.` and `..`).
-        let next = dir.join(p);
-        if let Err(e) = tokio::fs::create_dir(&next).await {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("cannot create the folder: {e}"),
-                );
-            }
-        }
-        match tokio::fs::canonicalize(&next).await {
-            Ok(c) if c.starts_with(&f.root) && c.is_dir() => dir = c,
-            Ok(c) if c.starts_with(&f.root) => {
-                return err(StatusCode::CONFLICT, "a file is in the way of the folder")
-            }
-            _ => return err(StatusCode::FORBIDDEN, "outside the shared folder"),
-        }
-    }
+    let sub = q.get("sub").cloned().unwrap_or_default();
+    let name = name.to_string();
     // Write to a hidden temporary file and rename once complete, so nothing in the
     // VM sees (or opens) a half-uploaded file.
-    let part = dir.join(format!(
+    let part: OsString = format!(
         ".{name}.{}-{}.part",
         std::process::id(),
         UPLOADS.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut out = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&part)
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return err(
+    )
+    .into();
+    let fs = f.clone();
+    let part2 = part.clone();
+    let opened = blocking(move || {
+        let root = fs.root.as_ref().expect("checked");
+        let mut path = parts(&rel)?;
+        // The default upload folder is made on the first upload.
+        let mut dir = root.dir(&path, rel == fs.default_dir).map_err(refused)?;
+        // Folder uploads: `sub` is the file's folder inside the upload ("Photos/2024"),
+        // created as needed. Folders that already exist are merged into.
+        for p in sub.split('/').filter(|p| !p.is_empty()) {
+            let Some(p) = clean_name(p) else {
+                return Err(err(StatusCode::BAD_REQUEST, "invalid folder name"));
+            };
+            dir = match dir.child(OsStr::new(p), true) {
+                Err(Refused::NotFolder) => {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        "a file is in the way of the folder",
+                    ))
+                }
+                d => d.map_err(refused)?,
+            };
+            path.push(p);
+        }
+        let out = dir.create_new(&part2).map_err(|e| {
+            err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("cannot write: {e}"),
             )
-        }
+        })?;
+        let path: Vec<String> = path.into_iter().map(String::from).collect();
+        Ok((dir, path, out))
+    })
+    .await;
+    let (dir, path, out) = match opened {
+        Ok(o) => o,
+        Err(e) => return e,
     };
+    let mut out = tokio::fs::File::from_std(out);
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
     let result: Result<(), Response> = async {
@@ -505,20 +501,28 @@ pub async fn upload(
     }
     .await;
     drop(out);
-    if let Err(e) = result {
-        let _ = tokio::fs::remove_file(&part).await;
-        return e;
-    }
-    let dest = unique(&dir, name);
-    if let Err(e) = tokio::fs::rename(&part, &dest).await {
-        let _ = tokio::fs::remove_file(&part).await;
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("cannot save: {e}"),
-        );
-    }
-    log::info!("uploaded {} ({written} bytes)", dest.display());
-    let body = serde_json::json!({ "path": f.rel(&dest).trim_start_matches('/'), "size": written });
+    let saved = blocking(move || {
+        if let Err(e) = result {
+            let _ = dir.remove(&part);
+            return Err(e);
+        }
+        let dest = unique(&dir, &name);
+        if let Err(e) = dir.rename(&part, OsStr::new(&dest)) {
+            let _ = dir.remove(&part);
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("cannot save: {e}"),
+            ));
+        }
+        Ok(path.into_iter().chain([dest]).collect::<Vec<_>>().join("/"))
+    })
+    .await;
+    let dest = match saved {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    log::info!("uploaded {dest} ({written} bytes)");
+    let body = serde_json::json!({ "path": dest, "size": written });
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
