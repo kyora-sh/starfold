@@ -23,15 +23,16 @@ use std::ptr;
 /// less a share of one frame's refill, so a refill far above what the buffer holds now leaves
 /// the pass no room at all.
 const REFINE_VBV_WIDEN: i32 = 4;
-/// A pass's CRF-max over its CRF of 0. x264's row control then caps every row at CRF's own
-/// estimate plus this (`qp_absolute_max`), or lets the buffer underflow instead: with a forced
-/// QP above that cap, no row goes above the forced QP. At or below it, rows can still rise, but
-/// stay under the cap plus 1 (the row re-encode bumps `prev_row_qp + 1` only from below it).
+/// A pass's CRF-max over its CRF of 0. x264's row control then raises no row past CRF's own
+/// estimate plus this (`qp_absolute_max`, the cap), letting the buffer underflow instead; its
+/// row re-encode can still bump a row to `prev_row_qp + 1` from below the cap. Every row's
+/// QP therefore stays at or below max(forced QP, cap + 1).
 const REFINE_CRF_MAX: f32 = 0.1;
 /// x264's `f_crf_avg` for a pass is its rows' average QP less CRF's estimate. At least this
-/// proves no row went above the forced QP: had it been at or below the cap, the average would
-/// stay under REFINE_CRF_MAX + 1. Rows may still sit below it (sliced threads can lower one
-/// before slice 0 has set its first row's QP), so the QP is an upper bound, not an exact one.
+/// means the forced QP is at least CRF's estimate plus this (no average can exceed
+/// max(forced QP, cap + 1)), so cap + 1 is below the forced QP and no row went above it. Rows
+/// may still sit below it (sliced threads can lower one before slice 0 has set its first row's
+/// QP), so the QP is an upper bound, not an exact one.
 const REFINE_HELD: f64 = 1.5;
 /// What a frame outside a pass records for the blocks it coded: unknown, above any QP a pass
 /// can aim for (51 at most). VBV's row control may have raised them up to x264's emergency QPs.
