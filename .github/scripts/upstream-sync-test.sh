@@ -185,13 +185,38 @@ run_sync
 check 'failing commit hook: fails, not blocked' \
 	'[ $rc -ne 0 ] && ! grep -q "^status=blocked" "$dir/output" && ! grep -q "^::warning::" "$dir/stdout" && grep -q "failed without a conflict" "$dir/stderr" && ! has_branch'
 
+fail_git() {
+	mkdir -p "$dir/bin"
+	printf '#!/bin/sh\n[ "$1" = %s ] && exit 128\nexec %s "$@"\n' "$1" "$(command -v git)" >"$dir/bin/git"
+	chmod +x "$dir/bin/git"
+	PATH=$dir/bin:$PATH run_sync
+}
+red() { [ $rc -ne 0 ] && ! grep -q "^status=" "$dir/output" && ! grep -q "^::warning::" "$dir/stdout" && ! has_branch; }
+
 setup ls-remote
 commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
-mkdir "$dir/bin"
-printf '#!/bin/sh\n[ "$1" = ls-remote ] && exit 128\nexec %s "$@"\n' "$(command -v git)" >"$dir/bin/git"
-chmod +x "$dir/bin/git"
-PATH=$dir/bin:$PATH run_sync
-check 'ls-remote error: fails, not blocked' \
-	'[ $rc -ne 0 ] && ! grep -q "^status=" "$dir/output" && grep -q "git ls-remote exit 128" "$dir/stderr"'
+fail_git ls-remote
+check 'ls-remote error: fails, not blocked' 'red && grep -q "git ls-remote exit 128" "$dir/stderr"'
+
+setup merge-base
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+fail_git merge-base
+check 'merge-base error: fails, not "not on upstream"' \
+	'red && grep -q "merge-base --is-ancestor .* failed (exit 128)" "$dir/stderr" && ! grep -q "is not on upstream main" "$dir/stderr"'
+
+setup rev-list
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+fail_git rev-list
+check 'rev-list error: fails, not up-to-date' 'red'
+
+setup ls-tree
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+fail_git ls-tree
+check 'tree mapping error: fails, not blocked' 'red && grep -q "mapping the tree of" "$dir/stderr"'
+
+setup diff
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+fail_git diff
+check 'changed-files error: fails, nothing pushed' 'red'
 
 [ $failures -eq 0 ]
