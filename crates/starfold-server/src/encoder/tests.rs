@@ -1190,7 +1190,9 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
 /// 1080p text under a 2 Mbit/s VBV, refined as the engine does it: the ladder at its planned
 /// budget, then tail passes at the idle one while the encoder says one would still sharpen.
 /// First after the whole screen scrolled, then after only a band did, with x264 told the
-/// rest didn't change. Each settles within the tail limit, as sharp as with no VBV at all.
+/// rest didn't change. Each settles within the tail limit, about as sharp as with no VBV at
+/// all: reaching QP 12 in several steps rather than one costs up to ~0.6 dB, a block left
+/// coarse several.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_converges_under_a_tight_vbv() {
@@ -1239,7 +1241,7 @@ fn x264_converges_under_a_tight_vbv() {
     let (capped, free) = (run(2000), run(0));
     for (what, c, f) in [("whole", capped.0, free.0), ("band", capped.1, free.1)] {
         assert!(
-            c.0 > f.0 - 0.5,
+            c.0 > f.0 - 1.0,
             "{what}: {:.2} dB after {} tails at 2 Mbit/s, {:.2} dB uncapped",
             c.0,
             c.1,
