@@ -2452,6 +2452,19 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     );
 }
 
+#[cfg(feature = "x264")]
+#[test]
+fn x264_takes_the_ladder_and_its_budget() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(refines_through(x264), refines_through(H264));
+    assert!(refines_through(x264)
+        .iter()
+        .any(|(r, _)| r.is_some_and(|r| r.max_bytes.is_some())));
+}
+
 /// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
 /// the QP of every pass over `turns` still turns, each acked.
 fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {

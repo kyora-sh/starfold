@@ -11,12 +11,18 @@ mod ffi {
 }
 
 use super::h264::ParamSets;
+use super::sharpness::Sharpness;
 use super::{
     AccessUnit, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    Refine, VideoEncoder,
 };
 use std::ffi::CString;
 use std::ptr;
+
+/// How far a pass may raise the VBV rate. x264 keeps a frame within what the buffer holds
+/// less a share of one frame's refill, so a refill far above what the buffer holds now leaves
+/// the pass no room at all.
+const REFINE_VBV_WIDEN: i32 = 4;
 
 pub struct X264 {
     h: *mut ffi::x264_t,
@@ -26,6 +32,9 @@ pub struct X264 {
     pts: i64,
     width: u32,
     height: u32,
+    sharpness: Sharpness,
+    /// Nothing encoded yet: the next frame is an IDR whether asked for or not.
+    fresh: bool,
 }
 
 unsafe impl Send for X264 {}
@@ -107,7 +116,37 @@ impl X264 {
                 pts: 0,
                 width: cfg.width,
                 height: cfg.height,
+                sharpness: Sharpness::new(
+                    cfg.width.div_ceil(16) as usize * cfg.height.div_ceil(16) as usize,
+                    (cfg.best_quality.round() as i32).clamp(12, 51),
+                ),
+                fresh: true,
             })
+        }
+    }
+
+    /// Rate control as it stands, but with room for a pass of `max_bytes` (two in the buffer,
+    /// refilled at up to REFINE_VBV_WIDEN times the rate; a whole raw picture without a budget)
+    /// and a CRF that never asks for less than the pass's QP: VBV otherwise raises a forced QP
+    /// row by row towards what CRF would have picked.
+    fn widen(&mut self, max_bytes: Option<usize>, mbs: usize) -> Result<(), EncodeError> {
+        let mut p = self.param;
+        p.rc.f_rf_constant = 0.0;
+        if p.rc.i_vbv_max_bitrate > 0 {
+            let b = max_bytes.unwrap_or(mbs * 384);
+            let frame_kbit = (b * 8).div_ceil(1000) as i32;
+            let rate = p.rc.i_vbv_max_bitrate;
+            p.rc.i_vbv_max_bitrate =
+                (frame_kbit * p.i_fps_num as i32).clamp(rate, rate * REFINE_VBV_WIDEN);
+            p.rc.i_vbv_buffer_size = p.rc.i_vbv_buffer_size.max(frame_kbit * 2);
+        }
+        Self::reconfig(self.h, &mut p)
+    }
+
+    fn reconfig(h: *mut ffi::x264_t, p: &mut ffi::x264_param_t) -> Result<(), EncodeError> {
+        match unsafe { ffi::x264_encoder_reconfig(h, p) } {
+            0 => Ok(()),
+            r => Err(EncodeError(format!("x264_encoder_reconfig failed ({r})"))),
         }
     }
 
@@ -133,10 +172,7 @@ impl VideoEncoder for X264 {
             self.param.rc.i_vbv_max_bitrate = rate.max_kbps as i32;
             self.param.rc.i_vbv_buffer_size = rate.buf_kbit.max(1) as i32;
         }
-        match unsafe { ffi::x264_encoder_reconfig(self.h, &mut self.param) } {
-            0 => Ok(()),
-            r => Err(EncodeError(format!("x264_encoder_reconfig failed ({r})"))),
-        }
+        Self::reconfig(self.h, &mut self.param)
     }
 
     fn encode(
@@ -157,6 +193,21 @@ impl VideoEncoder for X264 {
                 "macroblock map has fewer than {mbs} entries"
             )));
         }
+        let idr = opts.force_keyframe || self.fresh;
+        let refine = opts.refine.filter(|_| !idr);
+        let fixed = refine.and_then(|r| self.sharpness.pick(r));
+        if refine.is_some() && fixed.is_none() {
+            self.sharpness.skipped();
+            return Ok(Vec::new());
+        }
+        if let Some(r) = refine {
+            // Nothing is lost, the picture just stays as it is.
+            if let Err(e) = self.widen(r.max_bytes, mbs) {
+                log::warn!("no more refinement on this stream: {e}");
+                self.sharpness.off = true;
+                return Ok(Vec::new());
+            }
+        }
         unsafe {
             self.pic.img.plane[0] = p.y.as_ptr() as *mut u8;
             self.pic.img.plane[1] = p.u.as_ptr() as *mut u8;
@@ -169,13 +220,13 @@ impl VideoEncoder for X264 {
             } else {
                 ffi::X264_TYPE_AUTO as i32
             };
-            self.pic.i_qpplus1 = 0;
+            self.pic.i_qpplus1 = fixed.map_or(0, |q| q + 1);
             // X264_MBINFO_CONSTANT (1) on unchanged macroblocks lets x264 skip their
             // analysis; x264 reads the map during this call only.
-            self.pic.prop.mb_info = opts
-                .static_mbs
-                .map(|m| m.as_mut_ptr())
-                .unwrap_or(ptr::null_mut());
+            let mut static_mbs = opts.static_mbs.map(|m| &mut m[..mbs]);
+            self.pic.prop.mb_info = static_mbs
+                .as_deref_mut()
+                .map_or(ptr::null_mut(), |m| m.as_mut_ptr());
             self.pic.prop.mb_info_free = None;
             // Strictly increasing pts even if the wall clock stalls.
             self.pts = opts.pts_ms.max(self.pts + 1);
@@ -185,8 +236,22 @@ impl VideoEncoder for X264 {
             let mut pic_out: ffi::x264_picture_t = std::mem::zeroed();
             let size =
                 ffi::x264_encoder_encode(self.h, &mut nals, &mut n, &mut self.pic, &mut pic_out);
+            self.pic.prop.mb_info = ptr::null_mut();
+            if fixed.is_some() {
+                Self::reconfig(self.h, &mut self.param)?;
+            }
             if size < 0 {
                 return Err(EncodeError("x264_encoder_encode failed".into()));
+            }
+            self.fresh = false;
+            if size > 0 {
+                match fixed {
+                    Some(qp) => self.sharpness.refined(qp, size as usize),
+                    None => {
+                        let map = static_mbs.as_deref().filter(|_| pic_out.b_keyframe == 0);
+                        self.sharpness.moved(pic_out.i_qpplus1 - 1, map);
+                    }
+                }
             }
             if std::env::var("VOXL_DEBUG_MARKER").is_ok() {
                 log::info!(
@@ -216,6 +281,10 @@ impl VideoEncoder for X264 {
             out.extend(self.unit(size, nals, pic_out.i_pts));
         }
         Ok(out)
+    }
+
+    fn refinable(&self, r: Refine) -> bool {
+        self.sharpness.pick(r).is_some()
     }
 }
 

@@ -868,7 +868,6 @@ fn cpu_per_stream() {
     }
 }
 
-#[cfg(feature = "openh264")]
 fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
     let se: u64 = (0..p.h)
         .flat_map(|r| (0..p.w).map(move |c| (r, c)))
@@ -880,8 +879,7 @@ fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
     }
 }
 
-/// An OpenH264 stream decoded as it goes: scrolled text, then whatever the test does.
-#[cfg(feature = "openh264")]
+/// A stream decoded as it goes: scrolled text, then whatever the test does.
 struct Refining {
     enc: Box<dyn VideoEncoder>,
     dec: ::openh264::decoder::Decoder,
@@ -891,18 +889,22 @@ struct Refining {
     last_psnr: f64,
 }
 
-#[cfg(feature = "openh264")]
 impl Refining {
-    fn config(threads: u32, fps: u32) -> EncoderConfig {
-        let mut cfg = config(Backend::OpenH264, 640, 480, 8000);
+    fn config(backend: Backend, threads: u32, fps: u32) -> EncoderConfig {
+        let mut cfg = config(backend, 640, 480, 8000);
         cfg.threads = threads;
         cfg.fps = fps;
         cfg.best_quality = 24.0;
         cfg
     }
 
+    #[cfg(feature = "openh264")]
     fn new(threads: u32, fps: u32) -> Self {
-        Self::with(open(&Self::config(threads, fps)).unwrap())
+        Self::on(Backend::OpenH264, threads, fps)
+    }
+
+    fn on(backend: Backend, threads: u32, fps: u32) -> Self {
+        Self::with(open(&Self::config(backend, threads, fps)).unwrap())
     }
 
     fn with(enc: Box<dyn VideoEncoder>) -> Self {
@@ -1060,7 +1062,7 @@ fn refining_works_above_the_rate_the_encoder_opened_with() {
 #[cfg(feature = "openh264")]
 #[test]
 fn a_refused_switch_costs_nothing() {
-    let mut enc = openh264::OpenH264::new(&Refining::config(1, 30)).unwrap();
+    let mut enc = openh264::OpenH264::new(&Refining::config(Backend::OpenH264, 1, 30)).unwrap();
     enc.break_switch = true;
     let mut broken = Refining::with(Box::new(enc));
     let mut plain = Refining::new(1, 30);
@@ -1131,7 +1133,7 @@ fn a_keyframe_stays_under_rate_control() {
 fn a_new_encoders_first_frame_stays_under_rate_control() {
     let p = Picture::new(640, 480);
     let first = |refine| {
-        let mut enc = open(&Refining::config(1, 30)).unwrap();
+        let mut enc = open(&Refining::config(Backend::OpenH264, 1, 30)).unwrap();
         let opts = EncodeOptions {
             refine,
             ..Default::default()
@@ -1147,35 +1149,143 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
-#[cfg(feature = "openh264")]
+/// x264 under VBV, as it streams: a pass at a fixed QP comes out sharper than the last, with
+/// or without a byte budget, at one thread or sliced.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
+    for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, Some(60_000))] {
+        let mut s = Refining::on(Backend::X264, threads, 30);
+        s.enc.set_rate(RateConfig::new(24.0, 3000, 30)).unwrap();
+        s.scroll(30);
+        let motion = s.last_psnr;
+        let mut prev = motion;
+        for qp in [20, 16, 12] {
+            let (n, key) = s.pass(qp, max_bytes);
+            let at = format!("t{threads} {max_bytes:?} qp {qp}");
+            assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
+            assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
+            assert!(s.last_psnr > prev, "{at}: {} after {prev}", s.last_psnr);
+            prev = s.last_psnr;
+        }
+        assert!(
+            prev > motion + 3.0,
+            "t{threads} {max_bytes:?}: {motion} -> {prev}"
+        );
+        assert!(!s.enc.refinable(Refine {
+            qp: 12,
+            max_bytes: None
+        }));
+        s.scroll(5);
+    }
+}
+
+#[cfg(feature = "x264")]
+#[test]
+fn x264_a_pass_that_cannot_fit_sends_nothing() {
+    let mut s = Refining::on(Backend::X264, 1, 30);
+    s.scroll(5);
+    let before = s.last_psnr;
+    assert!(!s.enc.refinable(Refine {
+        qp: 20,
+        max_bytes: Some(100)
+    }));
+    assert_eq!(s.pass(20, Some(100)), (0, false));
+    assert_eq!(s.last_psnr, before);
+    assert!(s.pass(20, None).0 > 0);
+}
+
+#[cfg(feature = "x264")]
+#[test]
+fn x264_a_refining_pass_with_nothing_to_gain_sends_nothing() {
+    let mut s = Refining::on(Backend::X264, 1, 30);
+    s.scroll(5);
+    assert!(s.pass(12, None).0 > 0);
+    let before = s.last_psnr;
+    assert_eq!(s.pass(16, None).0, 0);
+    assert_eq!(s.pass(12, None).0, 0);
+    assert_eq!(s.last_psnr, before);
+    s.scroll(1);
+    assert!(s.pass(12, None).0 > 0, "motion makes room again");
+}
+
+/// The pass's wider VBV and lower CRF are undone: motion after costs what it would have.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_refining_leaves_rate_control_where_it_was() {
+    let mut plain = Refining::on(Backend::X264, 1, 30);
+    let mut refined = Refining::on(Backend::X264, 1, 30);
+    for s in [&mut plain, &mut refined] {
+        s.enc.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
+        s.scroll(30);
+    }
+    for _ in 0..3 {
+        plain.step(false, None);
+    }
+    for qp in [20, 16, 12] {
+        refined.pass(qp, Some(60_000));
+    }
+    plain.scroll(10);
+    refined.scroll(10);
+    let (a, b) = (plain.scroll(110) as f64, refined.scroll(110) as f64);
+    assert!((b / a - 1.0).abs() < 0.03, "motion after: {a} vs {b} bytes");
+}
+
+#[cfg(feature = "x264")]
+#[test]
+fn x264_first_frame_and_keyframes_stay_under_rate_control() {
+    let p = Picture::new(640, 480);
+    let refine = Refine {
+        qp: 12,
+        max_bytes: None,
+    };
+    let first = |refine| {
+        let mut enc = open(&Refining::config(Backend::X264, 1, 30)).unwrap();
+        let opts = EncodeOptions {
+            refine,
+            ..Default::default()
+        };
+        let aus = enc.encode(&p.view(), opts).unwrap();
+        assert!(aus[0].keyframe);
+        aus[0].data.len()
+    };
+    assert_eq!(first(Some(refine)), first(None));
+    let mut s = Refining::on(Backend::X264, 1, 30);
+    s.scroll(5);
+    let (plain, key) = s.step(true, None);
+    assert!(key);
+    let (with, key) = s.step(true, Some(refine));
+    assert!(key);
+    assert!(with < plain * 2, "IDR at the pass's QP: {with} vs {plain}");
+}
+
 #[test]
 fn a_tight_budget_takes_a_smaller_step() {
     let refine = |qp, max_bytes| Refine {
         qp,
         max_bytes: Some(max_bytes),
     };
-    let s = openh264::Sharpness::new(8160, 24);
+    let s = sharpness::Sharpness::new(8160, 24);
     assert_eq!(s.pick(refine(20, 200_000)), Some(20));
     assert_eq!(s.pick(refine(20, 90_000)), Some(22));
     assert_eq!(s.pick(refine(20, 41_000)), Some(23));
     assert_eq!(s.pick(refine(20, 40_000)), None);
     assert_eq!(s.pick(refine(24, 200_000)), None);
     // A coarse picture sharpens far further for the same bytes.
-    let s = openh264::Sharpness::new(8160, 48);
+    let s = sharpness::Sharpness::new(8160, 48);
     assert_eq!(s.pick(refine(20, 50_000)), Some(44));
-    let mut s = openh264::Sharpness::new(8160, 24);
+    let mut s = sharpness::Sharpness::new(8160, 24);
     s.off = true;
     assert_eq!(s.pick(refine(20, 200_000)), None);
 }
 
-#[cfg(feature = "openh264")]
 #[test]
 fn the_estimate_learns_from_what_frames_cost() {
     let budget = |max_bytes| Refine {
         qp: 12,
         max_bytes: Some(max_bytes),
     };
-    let mut s = openh264::Sharpness::new(1000, 24);
+    let mut s = sharpness::Sharpness::new(1000, 24);
     assert_eq!(s.pick(budget(10_000)), Some(22));
     // More than expected counts at once, up to the most a screen costs.
     s.refined(22, 80_000);
@@ -1197,13 +1307,12 @@ fn the_estimate_learns_from_what_frames_cost() {
     }
     assert_eq!(s.pick(budget(6_000)), Some(28));
     // A skip needn't lower an estimate that was already low.
-    let mut s = openh264::Sharpness::new(1000, 24);
+    let mut s = sharpness::Sharpness::new(1000, 24);
     s.skipped();
     assert_eq!(s.pick(budget(5_000)), Some(23));
     assert_eq!(s.pick(budget(4_999)), None);
 }
 
-#[cfg(feature = "openh264")]
 #[test]
 fn the_estimate_counts_every_block_still_coarse() {
     let budget = |max_bytes| Refine {
@@ -1216,7 +1325,7 @@ fn the_estimate_counts_every_block_still_coarse() {
         map
     };
     // Only what changed moved: the rest stays as sharp as it was.
-    let mut s = openh264::Sharpness::new(1000, 12);
+    let mut s = sharpness::Sharpness::new(1000, 12);
     s.moved(24, Some(&moved(0..100)));
     assert_eq!(s.pick(budget(1_000_000)), Some(12));
     assert_eq!(s.pick(budget(500)), Some(23));
@@ -1232,7 +1341,7 @@ fn the_estimate_counts_every_block_still_coarse() {
     assert_eq!(s.pick(budget(5_000)), Some(20));
     assert_eq!(s.pick(budget(5_020)), Some(19));
     // A map that doesn't match counts as everything.
-    let mut s = openh264::Sharpness::new(1000, 12);
+    let mut s = sharpness::Sharpness::new(1000, 12);
     s.moved(24, Some(&[0u8; 10]));
     assert_eq!(s.qp.iter().filter(|&&q| q == 24).count(), 1000);
     s.refined(12, 0);
