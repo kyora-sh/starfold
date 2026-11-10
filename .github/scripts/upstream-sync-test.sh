@@ -166,7 +166,7 @@ commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 before=$(git -C "$dir/upstream" rev-parse HEAD)
 commit_files "$dir/upstream" 'feat: more' src/more.rs 'pub fn more() {}'
 skip "$(git -C "$dir/upstream" rev-parse HEAD) held: until its review"
-run_sync
+SYNC_MAX_COMMITS=2 run_sync
 check 'applied then held: pushed, marker before the held one' \
 	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$before"'
 check 'applied then held: held commit not applied' '! git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/more.rs'
@@ -177,5 +177,29 @@ commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
 run_sync
 check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+
+setup cap
+commit_files "$dir/upstream" 'feat: one' src/one.rs 'pub fn one() {}'
+first=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'chore: bump' README.md 'voxl 2'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) release bump"
+commit_files "$dir/upstream" 'feat: two' src/two.rs 'pub fn two() {}'
+run_sync
+check 'cap default: one commit applied' \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$first" && ! git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/two.rs 2>/dev/null'
+check 'cap default: body lists the rest' 'grep -qF "At most 1 applied per run; still to sync (2), oldest first:" "$dir/body.md"'
+SYNC_MAX_COMMITS=2 run_sync
+check 'cap 2: both applied, the skip between them not counted' \
+	'[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)" && git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/two.rs && ! grep -q "At most" "$dir/body.md"'
+SYNC_MAX_COMMITS=0 run_sync
+check 'cap 0: fails' '[ $rc -ne 0 ] && grep -q "SYNC_MAX_COMMITS must be a positive integer" "$dir/stderr"'
+
+setup cap-skip-first
+commit_files "$dir/upstream" 'chore: bump' README.md 'voxl 2'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) release bump"
+commit_files "$dir/upstream" 'feat: one' src/one.rs 'pub fn one() {}'
+run_sync
+check 'cap default: a leading skip does not use it up' \
+	'[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)" && git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/one.rs'
 
 [ $failures -eq 0 ]

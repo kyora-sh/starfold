@@ -6,7 +6,7 @@
 # cherry-picked in order; one listed in .github/upstream-skip ("<full sha> <reason>" per
 # line) is left out and counts as synced, while one listed as "<full sha> held: <follow-up>"
 # is never left out: the sync stops before it. Stops at the first one that is held or
-# doesn't apply, bumps the marker to the last one before it and force-pushes
+# doesn't apply, or once $SYNC_MAX_COMMITS (default 1) have been applied, bumps the marker to the last one before it and force-pushes
 # sync/upstream (never main), unless the branch already has that content or carries
 # commits the bot didn't make. Writes the pull request body to <body-file>, and
 # status=<up-to-date|human-edits|held|blocked|unchanged|pushed> plus, for the last two,
@@ -21,6 +21,11 @@ branch=sync/upstream
 marker_file=.github/upstream-sha
 skip_file=.github/upstream-skip
 bot_email=${SYNC_BOT_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}
+max_commits=${SYNC_MAX_COMMITS:-1}
+if ! [[ $max_commits =~ ^[1-9][0-9]*$ ]]; then
+	echo "SYNC_MAX_COMMITS must be a positive integer, not: $max_commits" >&2
+	exit 1
+fi
 
 output() {
 	echo "$1"
@@ -128,6 +133,7 @@ for c in "${commits[@]}"; do
 	fi
 	skipped=$(git diff --name-only "$c^1" "$c" | grep -E '^(\.github/|package-lock\.json$)' || true)
 	if [ -n "$skipped" ]; then left_out+=("$(line "$c"): $(echo "$skipped" | list)"); fi
+	if [ ${#picked[@]} -eq "$max_commits" ]; then break; fi
 done
 
 if [ -n "$last" ]; then
@@ -159,6 +165,11 @@ fi
 		else
 			echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
 		fi
+		echo
+	elif [ "$handled" -lt ${#commits[@]} ]; then
+		rest=("${commits[@]:$handled}")
+		echo "At most $max_commits applied per run; still to sync (${#rest[@]}), oldest first:"
+		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
 		echo
 	fi
 	if [ ${#left_out[@]} -gt 0 ]; then
