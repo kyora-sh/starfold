@@ -59,6 +59,15 @@ is_ancestor() {
 line() { git log -1 --format='%h %s' "$1"; }
 list() { paste -sd, - | sed 's/,/, /g'; }
 
+# The non-empty lines of $1 in the array `lines`, with no temporary file.
+split_lines() {
+	local IFS=$'\n'
+	set -f
+	# shellcheck disable=SC2206
+	lines=($1)
+	set +f
+}
+
 git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
 git fetch --quiet --no-tags "$upstream_url" "+refs/heads/main:refs/remotes/upstream/main"
 remote_branch=
@@ -83,26 +92,21 @@ if ! is_ancestor "$marker" "$upstream"; then
 fi
 
 revs=$(git rev-list --reverse --first-parent "$marker..$upstream")
-commits=()
-if [ -n "$revs" ]; then mapfile -t commits <<<"$revs"; fi
+split_lines "$revs"
+commits=("${lines[@]}")
 if [ ${#commits[@]} -eq 0 ]; then
 	output status=up-to-date
 	exit 0
 fi
 if [ -n "$remote_branch" ]; then
 	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
-	if [ -n "$committers" ]; then
-		others=0
-		grep -qvxF "$bot_email" <<<"$committers" || others=$?
-		case $others in
-		0)
+	split_lines "$committers"
+	for e in "${lines[@]}"; do
+		if [ "$e" != "$bot_email" ]; then
 			output status=human-edits
 			exit 0
-			;;
-		1) ;;
-		*) exit 1 ;;
-		esac
-	fi
+		fi
+	done
 fi
 
 git checkout --quiet -B "$branch" refs/remotes/origin/main
@@ -138,11 +142,12 @@ for c in "${commits[@]}"; do
 		break
 	fi
 	changed=$(git diff --name-only "$c^1" "$c")
-	skipped=$(grep -E '^(\.github/|package-lock\.json$)' <<<"$changed") || [ $? -eq 1 ]
-	if [ -n "$skipped" ]; then
-		files=$(list <<<"$skipped")
-		left_out+=("$label: $files")
-	fi
+	split_lines "$changed"
+	files=
+	for f in "${lines[@]}"; do
+		if [[ $f == .github/* || $f == package-lock.json ]]; then files+=${files:+, }$f; fi
+	done
+	if [ -n "$files" ]; then left_out+=("$label: $files"); fi
 done
 
 if [ ${#picked[@]} -gt 0 ]; then
@@ -182,12 +187,12 @@ fi
 } >"$body"
 
 if [ ${#picked[@]} -eq 0 ]; then
-	output status=blocked
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
 	warning="upstream sync is blocked at $stop_label, which doesn't apply here; see the job summary"
 	warning=${warning//%/%25}
 	warning=${warning//$'\r'/%0D}
 	echo "::warning::${warning//$'\n'/%0A}"
+	output status=blocked
 	exit 0
 fi
 if [ -n "$remote_branch" ] && is_ancestor refs/remotes/origin/main "$remote_branch"; then
