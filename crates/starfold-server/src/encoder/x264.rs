@@ -23,13 +23,18 @@ use std::ptr;
 /// less a share of one frame's refill, so a refill far above what the buffer holds now leaves
 /// the pass no room at all.
 const REFINE_VBV_WIDEN: i32 = 4;
-/// A pass's CRF-max over its CRF of 0: VBV may raise no row past CRF's own estimate plus this,
-/// so the forced QP holds whenever it is above that (x264 lets the buffer underflow instead).
+/// A pass's CRF-max over its CRF of 0. x264's row control then caps every row at CRF's own
+/// estimate plus this (`qp_absolute_max`), or lets the buffer underflow instead: a forced QP
+/// above that cap holds on every row. At or below it, rows can still rise, but stay under the
+/// cap plus 1 (the row re-encode bumps `prev_row_qp + 1` only from below the cap).
 const REFINE_CRF_MAX: f32 = 0.1;
-/// The CRF-max outside passes. x264 can't clear one once set, so every stream carries one
-/// this far above its CRF: VBV still raises QP up to 51 unless CRF's own estimate is
-/// under 51 - CRF.
-const CRF_MAX: f32 = 51.0;
+/// x264's `f_crf_avg` for a pass is its rows' average QP less CRF's estimate. At least this
+/// proves the forced QP held: had it been at or below the cap, the average would stay under
+/// REFINE_CRF_MAX + 1.
+const REFINE_HELD: f64 = 1.5;
+/// What a frame outside a pass records for the blocks it coded: VBV's row control may have
+/// raised them to anything up to x264's emergency QPs, and 51 is above every rung.
+const MOTION_QP: i32 = 51;
 
 pub struct X264 {
     h: *mut ffi::x264_t,
@@ -42,6 +47,10 @@ pub struct X264 {
     sharpness: Sharpness,
     /// Nothing encoded yet: the next frame is an IDR whether asked for or not.
     fresh: bool,
+    /// A pass's CRF-max is still in force: the next reconfig sets CRF-max to the CRF, which
+    /// x264 takes as none at all (setting it to 0 leaves the pass's). That needs a CRF above 0;
+    /// a capped stream that may run at CRF 0 never refines by QP (`video::qp_refinement`).
+    clear_crf_max: bool,
 }
 
 unsafe impl Send for X264 {}
@@ -85,7 +94,6 @@ impl X264 {
             } as i32;
             param.rc.i_rc_method = ffi::X264_RC_CRF as i32;
             param.rc.f_rf_constant = cfg.rate.quality;
-            param.rc.f_rf_constant_max = CRF_MAX;
             param.rc.i_lookahead = 0;
             // ultrafast's diamond search only follows motion of a few pixels, so a dragged
             // window or a fast scroll would be coded as new pixels every frame. UMH finds
@@ -129,6 +137,7 @@ impl X264 {
                     (cfg.best_quality.round() as i32).clamp(12, 51),
                 ),
                 fresh: true,
+                clear_crf_max: false,
             })
         }
     }
@@ -161,6 +170,20 @@ impl X264 {
         }
     }
 
+    /// The stream's own rate control, with a pass's CRF-max cleared if one is pending.
+    fn restore(&mut self) -> Result<(), EncodeError> {
+        let mut p = self.param;
+        if self.clear_crf_max {
+            p.rc.f_rf_constant_max = p.rc.f_rf_constant;
+        }
+        Self::reconfig(self.h, &mut p)
+    }
+
+    /// x264 lets no per-block offset raise a pass's QP: adaptive quantisation is off.
+    fn uniform(&self) -> bool {
+        self.param.rc.i_aq_mode == ffi::X264_AQ_NONE as i32 || self.param.rc.f_aq_strength == 0.0
+    }
+
     fn unit(&mut self, size: i32, nals: *mut ffi::x264_nal_t, pts: i64) -> Option<AccessUnit> {
         if size <= 0 || nals.is_null() {
             return None;
@@ -183,7 +206,7 @@ impl VideoEncoder for X264 {
             self.param.rc.i_vbv_max_bitrate = rate.max_kbps as i32;
             self.param.rc.i_vbv_buffer_size = rate.buf_kbit.max(1) as i32;
         }
-        Self::reconfig(self.h, &mut self.param)
+        self.restore()
     }
 
     fn encode(
@@ -248,8 +271,12 @@ impl VideoEncoder for X264 {
             let size =
                 ffi::x264_encoder_encode(self.h, &mut nals, &mut n, &mut self.pic, &mut pic_out);
             self.pic.prop.mb_info = ptr::null_mut();
+            if size >= 0 && fixed.is_none() && self.param.rc.f_rf_constant > 0.0 {
+                self.clear_crf_max = false;
+            }
             if fixed.is_some() {
-                Self::reconfig(self.h, &mut self.param)?;
+                self.clear_crf_max = true;
+                self.restore()?;
             }
             if size < 0 {
                 return Err(EncodeError("x264_encoder_encode failed".into()));
@@ -257,19 +284,19 @@ impl VideoEncoder for X264 {
             self.fresh = false;
             if size > 0 {
                 match fixed {
-                    // Proof that no row went above the pass's QP: x264's average QP over CRF's
-                    // estimate. Without it the pass counts for nothing, and the picture stays
-                    // as coarse as it was for the next one.
+                    // A pass counts only where it provably held its QP on every block;
+                    // otherwise the picture stays as coarse as it was for the next one.
                     Some(qp)
-                        if self.param.rc.i_vbv_max_bitrate == 0
-                            || pic_out.prop.f_crf_avg > REFINE_CRF_MAX as f64 =>
+                        if self.uniform()
+                            && (self.param.rc.i_vbv_max_bitrate == 0
+                                || pic_out.prop.f_crf_avg >= REFINE_HELD) =>
                     {
                         self.sharpness.refined(qp, size as usize)
                     }
                     Some(_) => {}
                     None => {
                         let map = static_mbs.as_deref().filter(|_| pic_out.b_keyframe == 0);
-                        self.sharpness.moved(pic_out.i_qpplus1 - 1, map);
+                        self.sharpness.moved(MOTION_QP, map);
                     }
                 }
             }
@@ -303,8 +330,9 @@ impl VideoEncoder for X264 {
         Ok(out)
     }
 
+    /// Never with adaptive quantisation: no pass could count, so tails would only repeat.
     fn refinable(&self, r: Refine) -> bool {
-        self.sharpness.pick(r).is_some()
+        self.uniform() && self.sharpness.pick(r).is_some()
     }
 }
 

@@ -921,7 +921,7 @@ impl Engine {
             viewers: Vec::new(),
             refine: Refinement::new(
                 &self.cfg,
-                cand.backend.refines_by_qp(),
+                qp_refinement(&self.cfg, cand.backend),
                 finest,
                 self.w,
                 self.h,
@@ -1732,6 +1732,13 @@ const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
 /// The ladder spaced as REFINE_RUNGS, ending at `finest`.
 fn rungs(finest: u8) -> [u8; 3] {
     REFINE_RUNGS.map(|r| (r + finest).saturating_sub(REFINE_RUNGS[2]).min(51))
+}
+
+/// Whether a cohort refines by QP. x264 can't undo a pass's rate-control change on a capped
+/// stream at CRF 0, so one that may run at it keeps its plain paint-over.
+fn qp_refinement(cfg: &VideoConfig, backend: encoder::Backend) -> bool {
+    backend.refines_by_qp()
+        && !(backend.name() == "x264" && cfg.max_kbps > 0 && cfg.crf.min(cfg.paintover_crf) <= 0.0)
 }
 
 /// x264 settles at an explicit --paintover-crf; every other ladder at REFINE_RUNGS' last.

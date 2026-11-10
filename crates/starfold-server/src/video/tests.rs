@@ -2453,6 +2453,26 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     );
 }
 
+/// A capped x264 stream that may run at CRF 0 keeps its plain paint-over; every other one
+/// refines by QP as its backend does.
+#[test]
+fn qp_refinement_needs_a_crf_above_0_on_a_capped_x264_stream() {
+    let at = |crf: f32, paintover_crf: f32, max_kbps: u32| VideoConfig {
+        crf,
+        paintover_crf,
+        max_kbps,
+        ..config()
+    };
+    assert!(qp_refinement(&at(0.0, 0.0, 30000), Backend::OpenH264));
+    #[cfg(feature = "x264")]
+    {
+        assert!(qp_refinement(&config(), Backend::X264));
+        assert!(!qp_refinement(&at(24.0, 0.0, 30000), Backend::X264));
+        assert!(!qp_refinement(&at(0.0, 16.0, 30000), Backend::X264));
+        assert!(qp_refinement(&at(24.0, 0.0, 0), Backend::X264));
+    }
+}
+
 #[test]
 fn the_ladder_ends_at_its_finest_rung() {
     assert_eq!(rungs(12), REFINE_RUNGS);

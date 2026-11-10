@@ -1156,8 +1156,9 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
-/// x264 under VBV, as it streams: a pass at a fixed QP comes out sharper than the last, with
-/// or without a byte budget, at one thread or sliced.
+/// x264 under VBV, as it streams: no pass leaves the picture worse and the ladder ends far
+/// sharper than motion left it, with or without a byte budget, at one thread or sliced. A
+/// budgeted first step may change nothing: motion counts as QP 51 until a pass proves better.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
@@ -1172,7 +1173,7 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             let at = format!("t{threads} {max_bytes:?} qp {qp}");
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
             assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
-            assert!(s.last_psnr > prev, "{at}: {} after {prev}", s.last_psnr);
+            assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
             prev = s.last_psnr;
         }
         assert!(
@@ -1248,6 +1249,115 @@ fn x264_converges_under_a_tight_vbv() {
             f.0
         );
     }
+}
+
+/// A capped x264 stream at CRF 10 may start a motion frame at QP 10 and raise its rows far past
+/// 12: whatever it started at, the blocks it coded still want sharpening once it stops.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_motion_counts_as_coarse_whatever_qp_it_started_at() {
+    let mut cfg = config(Backend::X264, 640, 480, 500);
+    cfg.rate = RateConfig::new(10.0, 500, 30);
+    cfg.best_quality = 10.0;
+    let mut s = Refining::sized(open(&cfg).unwrap(), 640, 480);
+    s.scroll(10);
+    for qp in [20, 12] {
+        let r = Refine {
+            qp,
+            max_bytes: None,
+        };
+        assert!(s.enc.refinable(r), "qp {qp}");
+    }
+}
+
+/// What x264 does with motion after passes is what it does without them: the pass's lower CRF,
+/// CRF-max and wider VBV are all undone, so under a tight cap a busy frame afterwards is held
+/// to the buffer as before, not let through by a leftover CRF-max (also across a rate change
+/// that lands before the next frame).
+#[cfg(feature = "x264")]
+#[test]
+fn x264_motion_after_passes_keeps_its_rate_control() {
+    let run = |passes: bool| {
+        let mut s = Refining::on(Backend::X264, 1, 30);
+        s.enc.set_rate(RateConfig::new(24.0, 1000, 30)).unwrap();
+        s.scroll(10);
+        for qp in [20, 16, 12] {
+            match passes {
+                true => s.pass(qp, Some(60_000)),
+                false => s.step(false, None),
+            };
+        }
+        s.enc.set_rate(RateConfig::new(24.0, 1000, 30)).unwrap();
+        (0..8)
+            .map(|f| {
+                s.pic.video(f);
+                s.step(false, None).0
+            })
+            .collect::<Vec<_>>()
+    };
+    let (with, without) = (run(true), run(false));
+    let (a, b) = (with.iter().sum::<usize>(), without.iter().sum::<usize>());
+    assert!(
+        (a as f64) < b as f64 * 1.25,
+        "busy frames after passes: {with:?} vs {without:?}"
+    );
+}
+
+/// An encoder that is asked for passes it can't fit never changes its rate control: its stream
+/// is byte for byte the one it makes without them.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_a_pass_not_taken_leaves_the_stream_byte_identical() {
+    let run = |ask: bool| {
+        let mut enc = open(&Refining::config(Backend::X264, 1, 30)).unwrap();
+        let mut p = Picture::new(640, 480);
+        let mut out = Vec::new();
+        for f in 0..20i64 {
+            if f % 5 == 4 {
+                if ask {
+                    let opts = EncodeOptions {
+                        pts_ms: f * 33,
+                        refine: Some(Refine {
+                            qp: 20,
+                            max_bytes: Some(10),
+                        }),
+                        ..Default::default()
+                    };
+                    assert!(enc.encode(&p.view(), opts).unwrap().is_empty());
+                }
+                continue;
+            }
+            p.texture(0, 0, 0, 640, 480, f as usize * 12);
+            let opts = EncodeOptions {
+                pts_ms: f * 33,
+                force_keyframe: f == 0,
+                ..Default::default()
+            };
+            out.extend(
+                enc.encode(&p.view(), opts)
+                    .unwrap()
+                    .into_iter()
+                    .map(|a| a.data),
+            );
+        }
+        out
+    };
+    assert!(run(true) == run(false));
+}
+
+/// Adaptive quantisation offsets each block's QP, so no pass could prove it held: x264 then
+/// never says a pass would sharpen.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_with_adaptive_quantisation_takes_no_tails() {
+    let mut cfg = Refining::config(Backend::X264, 1, 30);
+    cfg.preset = "superfast".into();
+    let mut s = Refining::sized(open(&cfg).unwrap(), 640, 480);
+    s.scroll(5);
+    assert!(!s.enc.refinable(Refine {
+        qp: 12,
+        max_bytes: None
+    }));
 }
 
 #[cfg(feature = "x264")]
