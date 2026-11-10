@@ -31,8 +31,8 @@ starfold runs with `--read-only`, type, click, use the clipboard and move files.
   `--allowed-hosts` names, and turns away browsers' requests from other sites' pages
   unless `--allowed-origins` names them. That keeps out DNS rebinding and pages that
   open a WebSocket to starfold.
-- **Files:** whoever signs in can download and upload files through the Files panel,
-  which opens on `--files-root` (`$HOME`, else `USERPROFILE`, else `/`).
-  `--file-transfers=none` turns transfers off, `--file-transfers=download` keeps uploads off.
+- **Files:** file transfer is off unless `--files-root` names a folder; the Files panel
+  then reaches only that folder and never follows a symlink. `--file-transfers=none`
+  turns transfers off.
 - **Watch-only viewers:** `--read-only` refuses input, clipboard writes, the
   microphone, uploads and resizing.
