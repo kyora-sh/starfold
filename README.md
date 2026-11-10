@@ -121,7 +121,8 @@ can't be looked up, so only the name in the request is checked, and the root's l
 measured at the path it was started with. On Windows a path is checked and then opened by
 name, so a folder changed in between can affect what is opened. On Linux and macOS, an upload is
 saved into the folder it was opened in, even if that folder is moved (inside the root or out
-of it) before the upload completes; on Windows such an upload fails.
+of it) before the upload completes; on Windows such an upload may fail and leave its
+temporary file in the moved folder.
 
 ### Login
 
