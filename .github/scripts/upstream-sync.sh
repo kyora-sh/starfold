@@ -63,6 +63,15 @@ is_ancestor() {
 line() { git log -1 --format='%h %s' "$1"; }
 list() { paste -sd, - | sed 's/,/, /g'; }
 
+# The non-empty lines of $1 in the array `lines`, with no temporary file.
+split_lines() {
+	local IFS=$'\n'
+	set -f
+	# shellcheck disable=SC2206
+	lines=($1)
+	set +f
+}
+
 git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
 git fetch --quiet --no-tags "$upstream_url" "+refs/heads/main:refs/remotes/upstream/main"
 remote_branch=
@@ -90,35 +99,32 @@ skip_present=$(git ls-tree --full-tree --name-only refs/remotes/origin/main -- "
 if [ -n "$skip_present" ]; then
 	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
 fi
-bad=$(grep -vE '^$|^[0-9a-f]{40} [^ ]' <<<"$skip_list") || [ $? -eq 1 ]
-held_empty=$(grep -E '^[0-9a-f]{40} held:[[:space:]]*$' <<<"$skip_list") || [ $? -eq 1 ]
-if [ -n "$bad$held_empty" ]; then
-	echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $bad$held_empty" >&2
-	exit 1
-fi
-skip_reason() { awk -v c="$1" '$1 == c { sub(/^[^ ]+ /, ""); print; exit }' <<<"$skip_list"; }
+declare -A skip_reasons=()
+split_lines "$skip_list"
+for l in "${lines[@]}"; do
+	if [[ $l =~ ^[0-9a-f]{40}\ held:[[:space:]]*$ ]] || ! [[ $l =~ ^([0-9a-f]{40})\ ([^ ].*)$ ]]; then
+		echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $l" >&2
+		exit 1
+	fi
+	skip_reasons[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+done
 
 revs=$(git rev-list --reverse --first-parent "$marker..$upstream")
-commits=()
-if [ -n "$revs" ]; then mapfile -t commits <<<"$revs"; fi
+split_lines "$revs"
+commits=("${lines[@]}")
 if [ ${#commits[@]} -eq 0 ]; then
 	output status=up-to-date
 	exit 0
 fi
 if [ -n "$remote_branch" ]; then
 	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
-	if [ -n "$committers" ]; then
-		others=0
-		grep -qvxF "$bot_email" <<<"$committers" || others=$?
-		case $others in
-		0)
+	split_lines "$committers"
+	for e in "${lines[@]}"; do
+		if [ "$e" != "$bot_email" ]; then
 			output status=human-edits
 			exit 0
-			;;
-		1) ;;
-		*) exit 1 ;;
-		esac
-	fi
+		fi
+	done
 fi
 
 git checkout --quiet -B "$branch" refs/remotes/origin/main
@@ -133,7 +139,7 @@ stop_label=
 stop_reason=
 for c in "${commits[@]}"; do
 	label=$(line "$c")
-	reason=$(skip_reason "$c")
+	reason=${skip_reasons[$c]:-}
 	if [[ $reason == held:* ]]; then
 		stop=$c
 		stop_label=$label
@@ -175,11 +181,12 @@ for c in "${commits[@]}"; do
 		break
 	fi
 	changed=$(git diff --name-only "$c^1" "$c")
-	skipped=$(grep -E '^(\.github/|package-lock\.json$)' <<<"$changed") || [ $? -eq 1 ]
-	if [ -n "$skipped" ]; then
-		files=$(list <<<"$skipped")
-		left_out+=("$label: $files")
-	fi
+	split_lines "$changed"
+	files=
+	for f in "${lines[@]}"; do
+		if [[ $f == .github/* || $f == package-lock.json ]]; then files+=${files:+, }$f; fi
+	done
+	if [ -n "$files" ]; then left_out+=("$label: $files"); fi
 done
 
 if [ -n "$last" ]; then
@@ -228,16 +235,17 @@ fi
 
 if [ -z "$last" ]; then
 	if [ -n "$held_for" ]; then
-		output status=held
+		status=held
 		warning="upstream sync is held at $stop_label: $held_for"
 	else
-		output status=blocked
+		status=blocked
 		warning="upstream sync is blocked at $stop_label, which doesn't apply here; see the job summary"
 	fi
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
 	warning=${warning//%/%25}
 	warning=${warning//$'\r'/%0D}
 	echo "::warning::${warning//$'\n'/%0A}"
+	output "status=$status"
 	exit 0
 fi
 if [ -n "$remote_branch" ] && is_ancestor refs/remotes/origin/main "$remote_branch"; then
