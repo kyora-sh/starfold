@@ -363,23 +363,51 @@ fn the_command_line_decides_whether_files_are_shared() {
 }
 
 #[tokio::test]
-async fn a_path_longer_than_the_kernel_resolves_at_once_still_works() {
+async fn a_path_past_the_limit_is_refused_before_anything_is_created() {
     let t = Tmp::new();
     let f = t.files("Downloads");
     let long = "d".repeat(200);
     let sub = vec![long.as_str(); 25].join("/");
-    let (s, b) = put(
-        &f,
-        &[("name", "a.txt"), ("path", ""), ("sub", &sub)],
-        "deep",
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "{b}");
-    let (s, listed) = get_list(&f, &sub).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(listed["entries"][0]["name"], "a.txt");
-    let (s, body) = get_file(&f, &format!("{sub}/a.txt")).await;
-    assert_eq!((s, body.as_slice()), (StatusCode::OK, b"deep".as_slice()));
+    let (s, b) = put(&f, &[("name", "a.txt"), ("sub", &sub)], "deep").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(is_empty(&t.root()), "nothing is created");
+    assert_eq!(get_list(&f, &sub).await.0, StatusCode::BAD_REQUEST);
+    let file = format!("{sub}/a.txt");
+    assert_eq!(get_file(&f, &file).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn without_a_name_lookup_uploads_and_downloads_are_refused() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.root().join("Downloads/sub")).unwrap();
+    std::fs::write(t.root().join("Downloads/a.txt"), "a").unwrap();
+    let f = t.files("Downloads");
+    beneath::LOOKUP_FAILS_UNDER.lock().unwrap().push(t.root());
+    for path in ["", "Downloads", "Downloads/sub"] {
+        let (s, b) = put(&f, &[("name", "new.txt"), ("path", path)], "x").await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{path:?}: {b}");
+    }
+    for path in ["Downloads/a.txt", "Downloads", ""] {
+        assert_eq!(
+            get_file(&f, path).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{path:?}"
+        );
+    }
+    assert_eq!(
+        get_list(&f, "Downloads").await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    beneath::LOOKUP_FAILS_UNDER
+        .lock()
+        .unwrap()
+        .retain(|r| r != &t.root());
+    let left: Vec<_> = std::fs::read_dir(t.root().join("Downloads"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(is_empty(&t.root().join("Downloads/sub")));
 }
 
 #[tokio::test]

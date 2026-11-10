@@ -192,6 +192,7 @@ pub async fn download(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
     let opened = blocking(move || {
         let root = f.root.as_ref().expect("checked");
         let parts = parts(&rel)?;
+        root.fits(&parts, 0).map_err(refused)?;
         let Some((last, parent)) = parts.split_last() else {
             let top = root.dir(&[], false).map_err(refused)?;
             return Ok(("Home".to_string(), Opened::Dir(top)));
@@ -602,11 +603,15 @@ pub async fn upload(
     let opened = blocking(move || {
         let root = fs.root.as_ref().expect("checked");
         let mut path = parts(&rel)?;
+        let subs: Vec<&str> = sub.split('/').filter(|p| !p.is_empty()).collect();
+        // Room for any name it may end up with, before anything is created.
+        root.fits(&[path.as_slice(), &subs].concat(), MAX_NAME + 1)
+            .map_err(refused)?;
         // The default upload folder is made on the first upload.
         let mut dir = root.dir(&path, rel == fs.default_dir).map_err(refused)?;
         // Folder uploads: `sub` is the file's folder inside the upload ("Photos/2024"),
         // created as needed. Folders that already exist are merged into.
-        for p in sub.split('/').filter(|p| !p.is_empty()) {
+        for p in subs {
             let Some(p) = clean_name(p).filter(|p| !refused_name(OsStr::new(p))) else {
                 return Err(err(StatusCode::BAD_REQUEST, "invalid folder name"));
             };

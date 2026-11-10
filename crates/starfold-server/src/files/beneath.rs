@@ -18,7 +18,6 @@ pub enum Refused {
     NotFolder,
     Link,
     Special,
-    #[cfg_attr(unix, allow(dead_code))]
     BadName,
     /// The filesystem calls it by a reserved name, whatever the request spelled.
     Reserved,
@@ -67,26 +66,46 @@ impl Root {
     /// The folder at `parts` (plain names) under the root; with `create`, missing
     /// folders are made on the way.
     pub fn dir(&self, parts: &[&str], create: bool) -> Result<Dir, Refused> {
+        self.fits(parts, 0)?;
         #[cfg(target_os = "linux")]
         if let Some(d) = self.dir.beneath(parts, create)? {
-            match d.reported() {
-                // Too long to report in one piece: the walk checks each step instead.
-                Some(Err(_)) => {}
-                Some(reported) => {
-                    judge_reported(reported, Some(&self.path))?;
-                    return Ok(d);
-                }
-                None => return Ok(d),
-            }
+            return self.checked(d);
         }
-        // Each step checks the name the filesystem has for what it opened.
         let mut d = self.dir.try_clone()?;
         for p in parts {
             d = d.child(OsStr::new(p), create)?;
         }
+        self.checked(d)
+    }
+
+    /// Refuses `parts`, plus a name of `leaf` bytes under them, if the whole path is more
+    /// than the filesystem can report for an open entry.
+    pub fn fits(&self, parts: &[&str], leaf: usize) -> Result<(), Refused> {
+        let len = self.path.as_os_str().len()
+            + parts.iter().map(|p| p.len() + 1).sum::<usize>()
+            + leaf
+            + 1;
+        if len > PATH_MAX {
+            return Err(Refused::BadName);
+        }
+        Ok(())
+    }
+
+    fn checked(&self, d: Dir) -> Result<Dir, Refused> {
+        if let Some(reported) = d.reported() {
+            judge_reported(reported, Some(&self.path))?;
+        }
         Ok(d)
     }
 }
+
+#[cfg(unix)]
+const PATH_MAX: usize = libc::PATH_MAX as usize;
+#[cfg(windows)]
+const PATH_MAX: usize = 32_767;
+
+#[cfg(test)]
+pub static LOOKUP_FAILS_UNDER: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Upload temporaries' names start with this; nothing a client names may resolve to one.
 pub const PART_PREFIX: &str = ".starfold-upload-";
@@ -267,8 +286,24 @@ mod unix {
 
     /// The path the filesystem reports for `fd`, in its own spelling of each name; None
     /// where the platform has no way to ask.
-    #[cfg(target_os = "linux")]
     fn reported(fd: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
+        let found = lookup(fd);
+        #[cfg(test)]
+        if let Some(Ok(p)) = &found {
+            if super::LOOKUP_FAILS_UNDER
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| p.starts_with(r))
+            {
+                return Some(Err(std::io::Error::from_raw_os_error(libc::ENOENT)));
+            }
+        }
+        found
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lookup(fd: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
         use std::os::fd::AsRawFd;
         Some(std::fs::read_link(format!(
             "/proc/self/fd/{}",
@@ -277,7 +312,7 @@ mod unix {
     }
 
     #[cfg(target_os = "macos")]
-    fn reported(fd: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
+    fn lookup(fd: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
         use std::os::fd::AsRawFd;
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
@@ -288,43 +323,15 @@ mod unix {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn reported(_: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
+    fn lookup(_: BorrowedFd) -> Option<std::io::Result<PathBuf>> {
         None
     }
 
-    /// The name `parent` lists for the entry `fd` is (same device and inode): the
-    /// filesystem's own spelling, for when the path is too long to report.
-    fn listed_name(parent: BorrowedFd, fd: BorrowedFd) -> std::io::Result<PathBuf> {
-        let st = fstat(fd)?;
-        let fresh = openat(parent, ".", DIR, Mode::empty())?;
-        let mut d = nix::dir::Dir::from_fd(fresh)?;
-        for e in d.iter() {
-            let e = e?;
-            let name = OsStr::from_bytes(e.file_name().to_bytes());
-            if e.ino() != st.st_ino as u64 || name == "." || name == ".." {
-                continue;
-            }
-            if let Ok(at) = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-                if at.st_dev == st.st_dev && at.st_ino == st.st_ino {
-                    return Ok(PathBuf::from(name));
-                }
-            }
+    /// Refuses `fd` if the filesystem's own name for it is reserved, or can't be had.
+    fn own_name(fd: OwnedFd) -> Result<OwnedFd, Refused> {
+        if let Some(reported) = reported(fd.as_fd()) {
+            judge_reported(reported, None)?;
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not listed in its folder",
-        ))
-    }
-
-    /// Refuses `fd`, opened in `parent`, if the filesystem's own name for it is reserved,
-    /// or can't be had either way.
-    fn own_name(parent: BorrowedFd, fd: OwnedFd) -> Result<OwnedFd, Refused> {
-        let name = match reported(fd.as_fd()) {
-            None => return Ok(fd),
-            Some(Ok(path)) => Ok(path),
-            Some(Err(_)) => listed_name(parent, fd.as_fd()),
-        };
-        judge_reported(name, None)?;
         Ok(fd)
     }
 
@@ -337,7 +344,6 @@ mod unix {
             Ok(Dir(self.0.try_clone()?))
         }
 
-        #[cfg(target_os = "linux")]
         pub(super) fn reported(&self) -> Option<std::io::Result<PathBuf>> {
             reported(self.0.as_fd())
         }
@@ -379,7 +385,7 @@ mod unix {
         /// The folder `name` in this one, made first if missing and `create`.
         pub fn child(&self, name: &OsStr, create: bool) -> Result<Dir, Refused> {
             match openat(self.0.as_fd(), name, DIR, Mode::empty()) {
-                Ok(fd) => Ok(Dir(own_name(self.0.as_fd(), fd)?)),
+                Ok(fd) => Ok(Dir(own_name(fd)?)),
                 Err(Errno::ENOENT) if create => {
                     match mkdirat(self.0.as_fd(), name, Mode::from_bits_truncate(0o777)) {
                         Ok(()) | Err(Errno::EEXIST) => {}
@@ -387,7 +393,7 @@ mod unix {
                     }
                     let fd = openat(self.0.as_fd(), name, DIR, Mode::empty())
                         .map_err(|e| self.why(name, e))?;
-                    Ok(Dir(own_name(self.0.as_fd(), fd)?))
+                    Ok(Dir(own_name(fd)?))
                 }
                 Err(e) => Err(self.why(name, e)),
             }
@@ -399,7 +405,7 @@ mod unix {
             let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
             let fd = openat(self.0.as_fd(), name, flags, Mode::empty())
                 .map_err(|e| self.why(name, e))?;
-            let fd = own_name(self.0.as_fd(), fd)?;
+            let fd = own_name(fd)?;
             match kind(&fstat(fd.as_fd()).map_err(io)?) {
                 Kind::Dir => Ok(Opened::Dir(Dir(fd))),
                 Kind::File => Ok(Opened::File(fd.into())),
@@ -611,6 +617,10 @@ mod windows {
 
         pub fn id(&self) -> Option<(u64, u64)> {
             None
+        }
+
+        pub(super) fn reported(&self) -> Option<std::io::Result<PathBuf>> {
+            Some(std::fs::canonicalize(&self.path))
         }
 
         /// Refuses `p` (which exists) if its long name is reserved, or can't be had: an 8.3
@@ -830,32 +840,6 @@ mod tests {
         assert!(!reports_reserved(
             Path::new("/srv/.starfold-upload-root/Downloads/f"),
             Path::new("/srv/.starfold-upload-root")
-        ));
-    }
-
-    #[test]
-    fn a_name_lookup_that_fails_refuses_the_entry() {
-        let failed = || Err(io::Error::new(io::ErrorKind::NotFound, "no /proc"));
-        assert!(matches!(
-            judge_reported(failed(), None),
-            Err(Refused::Io(_))
-        ));
-        assert!(matches!(
-            judge_reported(failed(), Some(Path::new("/srv/shared"))),
-            Err(Refused::Io(_))
-        ));
-        let ok = |p: &str| Ok(PathBuf::from(p));
-        assert!(judge_reported(ok("/srv/shared/Downloads/a.txt"), None).is_ok());
-        assert!(matches!(
-            judge_reported(ok("/srv/shared/Downloads/.starfold-upload-0a.part"), None),
-            Err(Refused::Reserved)
-        ));
-        assert!(matches!(
-            judge_reported(
-                ok("/srv/shared/.starfold-upload-d/x"),
-                Some(Path::new("/srv/shared"))
-            ),
-            Err(Refused::Reserved)
         ));
     }
 

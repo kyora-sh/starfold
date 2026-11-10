@@ -151,6 +151,9 @@ files may remain in the upload folder and can be deleted when no starfold is run
 filesystem with neither an exclusive rename nor hard links refuses uploads (501). Hiding
 those temporary files is best effort: on filesystems with short names (FAT), a signed-in
 viewer may be able to see an upload while it is in progress.
+A path longer than `PATH_MAX` is refused before anything is created, and an upload needs room
+for a 255-byte name under it. On Unix systems other than Linux and macOS, an entry's own name
+can't be looked up, so only the name in the request is checked.
 
 ### Login
 
