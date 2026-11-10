@@ -119,9 +119,9 @@ A path longer than `PATH_MAX` is refused before anything is created, and an uplo
 for a 255-byte name under it. On Unix systems other than Linux and macOS, an entry's own name
 can't be looked up, so only the name in the request is checked, and the root's length is
 measured at the path it was started with. On Windows a path is checked and then opened by
-name, so a folder changed in between can affect what is opened. An upload is saved into the
-folder it was opened in, even if that folder is moved (inside the root or out of it) before
-the upload completes.
+name, so a folder changed in between can affect what is opened. On Linux and macOS, an upload is
+saved into the folder it was opened in, even if that folder is moved (inside the root or out
+of it) before the upload completes; on Windows such an upload fails.
 
 ### Login
 
