@@ -329,6 +329,7 @@ fn config() -> VideoConfig {
         crf: 24.0,
         max_kbps: 30000,
         paintover_crf: 16.0,
+        paintover_qp: None,
         paintover_burst: 3,
         paintover_delay_ms: 150,
         min_kbps: 2000,
@@ -2452,20 +2453,97 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     );
 }
 
+/// A capped x264 stream that may run at CRF 0 keeps its plain paint-over; every other one
+/// refines by QP as its backend does.
+#[test]
+fn qp_refinement_needs_a_crf_above_0_on_a_capped_x264_stream() {
+    let at = |crf: f32, paintover_crf: f32, max_kbps: u32| VideoConfig {
+        crf,
+        paintover_crf,
+        max_kbps,
+        ..config()
+    };
+    assert!(qp_refinement(&at(0.0, 0.0, 30000), Backend::OpenH264));
+    #[cfg(feature = "x264")]
+    {
+        assert!(qp_refinement(&config(), Backend::X264));
+        assert!(!qp_refinement(&at(24.0, 0.0, 30000), Backend::X264));
+        assert!(!qp_refinement(&at(0.0, 16.0, 30000), Backend::X264));
+        assert!(qp_refinement(&at(24.0, 0.0, 0), Backend::X264));
+    }
+}
+
+#[test]
+fn the_ladder_ends_at_its_finest_rung() {
+    assert_eq!(rungs(12), REFINE_RUNGS);
+    assert_eq!(rungs(0), [8, 4, 0]);
+    assert_eq!(rungs(48), [51, 51, 48]);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::OpenH264), 12, "x264's setting");
+    assert_eq!(finest_rung(&config(), Backend::OpenH264), 12);
+}
+
+/// An explicit --paintover-crf on x264 is where its passes end, and what the encoder is
+/// asked whether it can still sharpen to.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_refines_down_to_an_explicit_paintover_crf() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(finest_rung(&config(), Backend::X264), 12);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::X264), 0);
+    let mut b = Burst {
+        finest: finest_rung(&cfg, x264.backend),
+        ..Burst::new(3, NO_DELAY, Instant::now())
+    };
+    let now = Instant::now();
+    b.moved(now);
+    assert_eq!(passes(&mut b, now), [Some(8), Some(4), Some(0)]);
+}
+
+#[cfg(feature = "x264")]
+#[test]
+fn x264_takes_the_ladder_and_its_budget() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(refines_through(x264), refines_through(H264));
+    assert!(refines_through(x264)
+        .iter()
+        .any(|(r, _)| r.is_some_and(|r| r.max_bytes.is_some())));
+}
+
 /// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
 /// the QP of every pass over `turns` still turns, each acked.
 fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {
+    tail_on(config(), H264, left, turns, motion_at)
+}
+
+fn tail_on(
+    cfg: VideoConfig,
+    cand: Candidate,
+    left: usize,
+    turns: usize,
+    motion_at: Option<usize>,
+) -> Vec<u8> {
     let seen = Refines::default();
     let hub = Hub::new();
-    let mut eng = engine(
-        &hub,
-        &[H264],
-        Opts {
-            refines: Some(seen.clone()),
-            h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
-            ..Default::default()
-        },
-    );
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[cand], fakes(opts)).unwrap();
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
     push(&mut eng);
@@ -2494,6 +2572,25 @@ fn a_still_picture_is_refined_until_the_encoder_has_nothing_left() {
 #[test]
 fn new_damage_cancels_the_tail() {
     assert_eq!(tail(100, 8, Some(5)), [20, 16, 12, 12, 20, 16]);
+}
+
+/// An x264 stream refining down to an explicit --paintover-crf below 12 under CAVLC: its passes
+/// never count as settled, so the encoder keeps offering one, and the tail limit ends them.
+#[cfg(feature = "x264")]
+#[test]
+fn an_unsettled_x264_tail_ends_at_the_limit() {
+    let cfg = VideoConfig {
+        paintover_qp: Some(8),
+        ..config()
+    };
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    let qps = tail_on(cfg, x264, usize::MAX, 200, None);
+    assert_eq!(qps.len(), 3 + REFINE_TAIL_MAX as usize);
+    assert_eq!(qps[..3], [16, 12, 8]);
+    assert!(qps[3..].iter().all(|&q| q == 8));
 }
 
 #[test]

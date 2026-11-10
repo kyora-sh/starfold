@@ -38,6 +38,8 @@ mod mf;
 mod nvenc;
 #[cfg(feature = "openh264")]
 pub(crate) mod openh264;
+#[cfg(any(feature = "openh264", feature = "x264"))]
+pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]
 mod svt;
 #[cfg(test)]
@@ -416,7 +418,12 @@ impl Backend {
 
     /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
     pub fn refines_by_qp(self) -> bool {
-        self == Backend::OpenH264
+        match self {
+            Backend::OpenH264 => true,
+            #[cfg(feature = "x264")]
+            Backend::X264 => true,
+            _ => false,
+        }
     }
 
     pub fn fits(self, width: u32, height: u32) -> bool {

@@ -35,6 +35,8 @@ pub struct VideoConfig {
     pub crf: f32,
     pub max_kbps: u32,
     pub paintover_crf: f32,
+    /// `--paintover-crf` as given: the QP x264's refinement settles a still picture at.
+    pub paintover_qp: Option<u8>,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
     pub min_kbps: u32,
@@ -283,6 +285,8 @@ struct Shared {
     /// budget and at the ladder's.
     refinable: AtomicBool,
     refinable_small: AtomicBool,
+    /// The QP its refinement settles a still picture at.
+    finest: u8,
     /// The most this cohort takes frames at: its cap until encodes can't keep up, then
     /// `base_fps` until the encoder reopens.
     fps: AtomicU32,
@@ -879,6 +883,7 @@ impl Engine {
             paintover_bytes: AtomicU64::new(0),
             refinable: AtomicBool::new(true),
             refinable_small: AtomicBool::new(true),
+            finest: finest_rung(&self.cfg, cand.backend),
             fps: AtomicU32::new(fps),
             base_fps: base_fps(&self.cfg),
             hz: AtomicU32::new(u32::MAX),
@@ -905,6 +910,7 @@ impl Engine {
         if fps > shared.base_fps {
             log::info!("cohort {}: up to {fps} fps (--high-fps)", shared.id);
         }
+        let finest = shared.finest;
         Ok(Cohort {
             shared,
             tx: Some(tx),
@@ -913,7 +919,13 @@ impl Engine {
             skipped: None,
             active: false,
             viewers: Vec::new(),
-            refine: Refinement::new(&self.cfg, cand.backend.refines_by_qp(), self.w, self.h),
+            refine: Refinement::new(
+                &self.cfg,
+                qp_refinement(&self.cfg, cand.backend),
+                finest,
+                self.w,
+                self.h,
+            ),
             pace: Pace::new(fps),
             last_take: None,
         })
@@ -1710,10 +1722,31 @@ struct Burst {
     /// Last-rung passes after the ladder, while the encoder still has something one of them
     /// could sharpen: they fill an idle link, so their bytes aren't counted in `spent`.
     tail: u32,
+    /// The last rung's QP.
+    finest: u8,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
 const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+
+/// The ladder spaced as REFINE_RUNGS, ending at `finest`.
+fn rungs(finest: u8) -> [u8; 3] {
+    REFINE_RUNGS.map(|r| (r + finest).saturating_sub(REFINE_RUNGS[2]).min(51))
+}
+
+/// Whether a cohort refines by QP. x264 can't undo a pass's rate-control change on a capped
+/// stream at CRF 0, so one that may run at it keeps its plain paint-over.
+fn qp_refinement(cfg: &VideoConfig, backend: encoder::Backend) -> bool {
+    backend.refines_by_qp()
+        && !(backend.name() == "x264" && cfg.max_kbps > 0 && cfg.crf.min(cfg.paintover_crf) <= 0.0)
+}
+
+/// x264 settles at an explicit --paintover-crf; every other ladder at REFINE_RUNGS' last.
+fn finest_rung(cfg: &VideoConfig, backend: encoder::Backend) -> u8 {
+    cfg.paintover_qp
+        .filter(|_| backend.name() == "x264")
+        .unwrap_or(REFINE_RUNGS[2])
+}
 /// The most of the bitrate cap a ladder pass may take. Ladder passes count against the share,
 /// so a stop leaves little debt and the burst after the next one isn't kept waiting.
 const REFINE_LADDER_MS: usize = 200;
@@ -1757,6 +1790,7 @@ impl Burst {
             target: 0,
             ladder: true,
             tail: 0,
+            finest: REFINE_RUNGS[2],
         }
     }
     fn moved(&mut self, now: Instant) {
@@ -1820,7 +1854,7 @@ impl Burst {
     fn rung(&self) -> Option<u8> {
         let last = REFINE_RUNGS.len() - 1;
         self.ladder
-            .then(|| REFINE_RUNGS[last.saturating_sub(self.left as usize - 1)])
+            .then(|| rungs(self.finest)[last.saturating_sub(self.left as usize - 1)])
     }
     /// Takes a pass.
     fn pass(&mut self, now: Instant) {
@@ -1860,12 +1894,13 @@ enum Step {
 }
 
 impl Refinement {
-    fn new(cfg: &VideoConfig, ladder: bool, w: u32, h: u32) -> Self {
+    fn new(cfg: &VideoConfig, ladder: bool, finest: u8, w: u32, h: u32) -> Self {
         let (w, h) = (w as usize, h as usize);
         let delay = Duration::from_millis(cfg.paintover_delay_ms);
         Refinement {
             burst: Burst {
                 ladder,
+                finest,
                 ..Burst::new(cfg.paintover_burst, delay, Instant::now())
             },
             refiner: Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16)),
@@ -1879,6 +1914,7 @@ impl Refinement {
         let b = &self.burst;
         self.burst = Burst {
             ladder: b.ladder,
+            finest: b.finest,
             ..Burst::new(b.len, b.delay, Instant::now())
         };
         self.settling = false;
@@ -2358,6 +2394,7 @@ struct StripeJob {
 #[derive(Clone, Copy)]
 struct PassBudget {
     qp: u8,
+    finest: u8,
     max_bytes: Option<usize>,
     busy: Option<usize>,
     idle: Option<usize>,
@@ -2622,14 +2659,14 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
-        let can = |max_bytes| {
+        let can = |b: PassBudget, max_bytes| {
             s.enc.refinable(Refine {
-                qp: REFINE_RUNGS[REFINE_RUNGS.len() - 1],
+                qp: b.finest,
                 max_bytes,
             })
         };
         let (refinable, refinable_small) =
-            refine.map_or((false, false), |b| (can(b.idle), can(b.busy)));
+            refine.map_or((false, false), |b| (can(b, b.idle), can(b, b.busy)));
         let r = StripeResult {
             i,
             out: res,
@@ -2728,6 +2765,7 @@ fn encode_loop(
             };
             PassBudget {
                 qp,
+                finest: sh.finest,
                 max_bytes: budget(ms),
                 busy: budget(REFINE_LADDER_MS),
                 idle: budget(REFINE_FRAME_MS),

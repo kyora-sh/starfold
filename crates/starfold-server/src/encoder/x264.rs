@@ -11,12 +11,36 @@ mod ffi {
 }
 
 use super::h264::ParamSets;
+use super::sharpness::Sharpness;
 use super::{
     AccessUnit, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    Refine, VideoEncoder,
 };
 use std::ffi::CString;
 use std::ptr;
+
+/// How far a pass may raise the VBV rate. x264 keeps a frame within what the buffer holds
+/// less a share of one frame's refill, so a refill far above what the buffer holds now leaves
+/// the pass no room at all.
+const REFINE_VBV_WIDEN: i32 = 4;
+/// A pass's CRF-max over its CRF of 0. x264's row control then raises no row past CRF's own
+/// estimate plus this (`qp_absolute_max`, the cap), letting the buffer underflow instead; its
+/// row re-encode can still bump a row to `prev_row_qp + 1` from below the cap. Every row's
+/// QP therefore stays at or below max(forced QP, cap + 1).
+const REFINE_CRF_MAX: f32 = 0.1;
+/// x264's `f_crf_avg` for a pass is its rows' average QP less CRF's estimate. At least this
+/// means the forced QP is at least CRF's estimate plus this (no average can exceed
+/// max(forced QP, cap + 1)), so cap + 1 is below the forced QP and no row went above it. Rows
+/// may still sit below it (sliced threads can lower one before slice 0 has set its first row's
+/// QP), so the QP is an upper bound, not an exact one.
+const REFINE_HELD: f64 = 1.5;
+/// What a frame outside a pass records for the blocks it coded: unknown, above any QP a pass
+/// can aim for (51 at most). VBV's row control may have raised them up to x264's emergency QPs.
+const MOTION_QP: i32 = 52;
+/// Under CAVLC without High profile x264 re-codes a block at QP + 1 when a level overflows the
+/// escape code (`encoder.c` "CAVLC level code overflow"), outside rate control. No 8-bit level
+/// reaches the overflow at QP 10 or above, luma and chroma alike; this keeps a margin.
+const CAVLC_SAFE_QP: i32 = 12;
 
 pub struct X264 {
     h: *mut ffi::x264_t,
@@ -26,6 +50,16 @@ pub struct X264 {
     pts: i64,
     width: u32,
     height: u32,
+    sharpness: Sharpness,
+    /// Nothing encoded yet: the next frame is an IDR whether asked for or not.
+    fresh: bool,
+    /// The chroma QP offset x264 applies, when it writes CAVLC: a pass then counts only at a QP
+    /// where neither luma nor chroma can overflow.
+    cavlc_chroma_offset: Option<i32>,
+    /// A pass's CRF-max is still in force: the next reconfig sets CRF-max to the CRF, which
+    /// x264 takes as none at all (setting it to 0 leaves the pass's). That needs a CRF above 0;
+    /// a capped stream that may run at CRF 0 never refines by QP (`video::qp_refinement`).
+    clear_crf_max: bool,
 }
 
 unsafe impl Send for X264 {}
@@ -96,6 +130,10 @@ impl X264 {
             if h.is_null() {
                 return Err(EncodeError("x264_encoder_open failed".into()));
             }
+            let mut applied: ffi::x264_param_t = std::mem::zeroed();
+            ffi::x264_encoder_parameters(h, &mut applied);
+            let cavlc_chroma_offset =
+                (applied.b_cabac == 0).then_some(applied.analyse.i_chroma_qp_offset);
             let mut pic: ffi::x264_picture_t = std::mem::zeroed();
             ffi::x264_picture_init(&mut pic);
             pic.img.i_csp = ffi::X264_CSP_I420 as i32;
@@ -108,8 +146,63 @@ impl X264 {
                 pts: 0,
                 width: cfg.width,
                 height: cfg.height,
+                sharpness: Sharpness::new(
+                    cfg.width.div_ceil(16) as usize * cfg.height.div_ceil(16) as usize,
+                    (cfg.best_quality.round() as i32).clamp(12, 51),
+                ),
+                fresh: true,
+                cavlc_chroma_offset,
+                clear_crf_max: false,
             })
         }
+    }
+
+    /// Rate control as it stands, but holding a pass's forced QP: CRF 0 with REFINE_CRF_MAX,
+    /// so VBV's row control can't raise it, and room for `max_bytes` (two in the buffer, and at
+    /// least two frames' refill so x264 never lowers rows below it either), refilled at up to
+    /// REFINE_VBV_WIDEN times the rate, so the motion after a pass doesn't start from an
+    /// empty buffer. A whole raw picture stands in for a missing budget.
+    fn widen(&mut self, max_bytes: Option<usize>, mbs: usize) -> Result<(), EncodeError> {
+        let mut p = self.param;
+        p.rc.f_rf_constant = 0.0;
+        p.rc.f_rf_constant_max = REFINE_CRF_MAX;
+        if p.rc.i_vbv_max_bitrate > 0 {
+            let b = max_bytes.unwrap_or(mbs * 384);
+            let frame_kbit = (b * 8).div_ceil(1000) as i32;
+            let rate = p.rc.i_vbv_max_bitrate;
+            p.rc.i_vbv_max_bitrate =
+                (frame_kbit * p.i_fps_num as i32).clamp(rate, rate * REFINE_VBV_WIDEN);
+            let refill = p.rc.i_vbv_max_bitrate / p.i_fps_num.max(1) as i32;
+            p.rc.i_vbv_buffer_size = p.rc.i_vbv_buffer_size.max(frame_kbit * 2).max(refill * 2);
+        }
+        Self::reconfig(self.h, &mut p)
+    }
+
+    fn reconfig(h: *mut ffi::x264_t, p: &mut ffi::x264_param_t) -> Result<(), EncodeError> {
+        match unsafe { ffi::x264_encoder_reconfig(h, p) } {
+            0 => Ok(()),
+            r => Err(EncodeError(format!("x264_encoder_reconfig failed ({r})"))),
+        }
+    }
+
+    /// The stream's own rate control, with a pass's CRF-max cleared if one is pending.
+    fn restore(&mut self) -> Result<(), EncodeError> {
+        let mut p = self.param;
+        if self.clear_crf_max {
+            p.rc.f_rf_constant_max = p.rc.f_rf_constant;
+        }
+        Self::reconfig(self.h, &mut p)
+    }
+
+    /// x264 lets no per-block offset raise a pass's QP: adaptive quantisation is off.
+    fn uniform(&self) -> bool {
+        self.param.rc.i_aq_mode == ffi::X264_AQ_NONE as i32 || self.param.rc.f_aq_strength == 0.0
+    }
+
+    /// No block of a pass at `qp` can have been re-coded above it for a CAVLC overflow.
+    fn overflow_free(&self, qp: i32) -> bool {
+        self.cavlc_chroma_offset
+            .is_none_or(|c| qp.min(qp + c) >= CAVLC_SAFE_QP)
     }
 
     fn unit(&mut self, size: i32, nals: *mut ffi::x264_nal_t, pts: i64) -> Option<AccessUnit> {
@@ -134,10 +227,7 @@ impl VideoEncoder for X264 {
             self.param.rc.i_vbv_max_bitrate = rate.max_kbps as i32;
             self.param.rc.i_vbv_buffer_size = rate.buf_kbit.max(1) as i32;
         }
-        match unsafe { ffi::x264_encoder_reconfig(self.h, &mut self.param) } {
-            0 => Ok(()),
-            r => Err(EncodeError(format!("x264_encoder_reconfig failed ({r})"))),
-        }
+        self.restore()
     }
 
     fn encode(
@@ -158,6 +248,21 @@ impl VideoEncoder for X264 {
                 "macroblock map has fewer than {mbs} entries"
             )));
         }
+        let idr = opts.force_keyframe || self.fresh;
+        let refine = opts.refine.filter(|_| !idr);
+        let fixed = refine.and_then(|r| self.sharpness.pick(r));
+        if refine.is_some() && fixed.is_none() {
+            self.sharpness.skipped();
+            return Ok(Vec::new());
+        }
+        if let Some(r) = refine {
+            // Nothing is lost, the picture just stays as it is.
+            if let Err(e) = self.widen(r.max_bytes, mbs) {
+                log::warn!("no more refinement on this stream: {e}");
+                self.sharpness.off = true;
+                return Ok(Vec::new());
+            }
+        }
         unsafe {
             self.pic.img.plane[0] = p.y.as_ptr() as *mut u8;
             self.pic.img.plane[1] = p.u.as_ptr() as *mut u8;
@@ -170,13 +275,13 @@ impl VideoEncoder for X264 {
             } else {
                 ffi::X264_TYPE_AUTO as i32
             };
-            self.pic.i_qpplus1 = 0;
+            self.pic.i_qpplus1 = fixed.map_or(0, |q| q + 1);
             // X264_MBINFO_CONSTANT (1) on unchanged macroblocks lets x264 skip their
             // analysis; x264 reads the map during this call only.
-            self.pic.prop.mb_info = opts
-                .static_mbs
-                .map(|m| m.as_mut_ptr())
-                .unwrap_or(ptr::null_mut());
+            let mut static_mbs = opts.static_mbs.map(|m| &mut m[..mbs]);
+            self.pic.prop.mb_info = static_mbs
+                .as_deref_mut()
+                .map_or(ptr::null_mut(), |m| m.as_mut_ptr());
             self.pic.prop.mb_info_free = None;
             // Strictly increasing pts even if the wall clock stalls.
             self.pts = opts.pts_ms.max(self.pts + 1);
@@ -186,8 +291,36 @@ impl VideoEncoder for X264 {
             let mut pic_out: ffi::x264_picture_t = std::mem::zeroed();
             let size =
                 ffi::x264_encoder_encode(self.h, &mut nals, &mut n, &mut self.pic, &mut pic_out);
+            self.pic.prop.mb_info = ptr::null_mut();
+            if size >= 0 && fixed.is_none() && self.param.rc.f_rf_constant > 0.0 {
+                self.clear_crf_max = false;
+            }
+            if fixed.is_some() {
+                self.clear_crf_max = true;
+                self.restore()?;
+            }
             if size < 0 {
                 return Err(EncodeError("x264_encoder_encode failed".into()));
+            }
+            self.fresh = false;
+            if size > 0 {
+                match fixed {
+                    // A pass counts only where no block can be above its QP; otherwise the
+                    // picture stays as coarse as it was for the next one.
+                    Some(qp)
+                        if self.uniform()
+                            && self.overflow_free(qp)
+                            && (self.param.rc.i_vbv_max_bitrate == 0
+                                || pic_out.prop.f_crf_avg >= REFINE_HELD) =>
+                    {
+                        self.sharpness.refined(qp, size as usize)
+                    }
+                    Some(_) => {}
+                    None => {
+                        let map = static_mbs.as_deref().filter(|_| pic_out.b_keyframe == 0);
+                        self.sharpness.moved(MOTION_QP, map);
+                    }
+                }
             }
             if crate::compat::is_set("STARFOLD_DEBUG_MARKER") {
                 log::info!(
@@ -217,6 +350,11 @@ impl VideoEncoder for X264 {
             out.extend(self.unit(size, nals, pic_out.i_pts));
         }
         Ok(out)
+    }
+
+    /// Never with adaptive quantisation: no pass could count, so tails would only repeat.
+    fn refinable(&self, r: Refine) -> bool {
+        self.uniform() && self.sharpness.pick(r).is_some()
     }
 }
 
