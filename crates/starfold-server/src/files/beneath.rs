@@ -79,10 +79,28 @@ impl Root {
     }
 
     /// Refuses `parts`, plus a name of `leaf` bytes under them, if the whole path is more
-    /// than the filesystem can report for an open entry.
+    /// than the filesystem can report for an open entry. The root is measured where it is
+    /// now, as its open handle reports it, not where it was at startup.
     pub fn fits(&self, parts: &[&str], leaf: usize) -> Result<(), Refused> {
-        let len = self.path.as_os_str().len()
-            + parts.iter().map(|p| p.len() + 1).sum::<usize>()
+        let live = match self.dir.reported() {
+            Some(reported) => reported.map_err(|e| {
+                Refused::Io(io::Error::new(
+                    e.kind(),
+                    format!("can't tell where the files root is: {e}"),
+                ))
+            })?,
+            None => self.path.clone(),
+        };
+        let root = live.as_os_str();
+        let trailing = root
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| std::path::is_separator(b as char));
+        let len = path_units(root) - trailing as usize
+            + parts
+                .iter()
+                .map(|p| path_units(OsStr::new(p)) + 1)
+                .sum::<usize>()
             + leaf
             + 1;
         if len > PATH_MAX {
@@ -97,6 +115,19 @@ impl Root {
         }
         Ok(d)
     }
+}
+
+/// A path's length in the units its platform limits it in: bytes on Unix, UTF-16 code
+/// units on Windows.
+#[cfg(unix)]
+fn path_units(s: &OsStr) -> usize {
+    s.len()
+}
+
+#[cfg(windows)]
+fn path_units(s: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().count()
 }
 
 #[cfg(unix)]
@@ -729,6 +760,16 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_count_utf16_units() {
+        let cjk = "\u{6587}".repeat(70);
+        assert_eq!(cjk.len(), 210);
+        assert_eq!(path_units(OsStr::new(&cjk)), 70);
+        assert_eq!(path_units(OsStr::new("\u{1F600}")), 2);
+        assert_eq!(path_units(OsStr::new("abc")), 3);
+    }
 
     #[test]
     fn windows_takes_only_plain_names() {

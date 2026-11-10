@@ -870,3 +870,40 @@ async fn an_entry_the_filesystem_names_reserved_is_never_opened() {
         z.file_names().collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn a_root_moved_somewhere_deeper_is_measured_where_it_is_now() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let limit = libc::PATH_MAX as usize;
+    let mut deep = t.0.join("moved");
+    while deep.as_os_str().len() < limit - 400 {
+        deep.push("m".repeat(100));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let moved = deep.join("root");
+    std::fs::rename(t.root(), &moved).unwrap();
+    let sub = "s".repeat(200);
+    let (s, b) = put(&f, &[("name", "a.txt"), ("sub", &sub)], "x").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(is_empty(&moved), "nothing is created");
+    std::fs::rename(&moved, t.root()).unwrap();
+}
+
+#[test]
+fn a_root_ending_in_a_separator_counts_it_once() {
+    let root = Root::open(Path::new("/")).unwrap();
+    let limit = libc::PATH_MAX as usize;
+    // "/" + components joined by "/", NUL included: exactly the limit.
+    let longest = limit - 1;
+    let mut parts = Vec::new();
+    let mut len = 0;
+    while longest - len > 202 {
+        parts.push("p".repeat(200));
+        len += 201;
+    }
+    parts.push("p".repeat(longest - len - 1));
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    assert!(root.fits(&parts, 0).is_ok());
+    assert!(root.fits(&parts, 1).is_err());
+}
