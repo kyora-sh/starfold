@@ -104,7 +104,7 @@ const PATH_MAX: usize = libc::PATH_MAX as usize;
 #[cfg(windows)]
 const PATH_MAX: usize = 32_767;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub static LOOKUP_FAILS_UNDER: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Upload temporaries' names start with this; nothing a client names may resolve to one.
