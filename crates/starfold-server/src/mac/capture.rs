@@ -109,7 +109,7 @@ impl Capturer {
         let fps = super::fps();
         let incoming = Arc::new(Mutex::new(Incoming::default()));
         let (wake_r, wake_w) = crate::hub::wake_pipe().map_err(|e| e.to_string())?;
-        let debug = std::env::var("VOXL_DEBUG_DAMAGE").is_ok();
+        let debug = crate::compat::is_set("STARFOLD_DEBUG_DAMAGE");
         let inc = incoming.clone();
         let (w, h) = (width, height);
         let on_frame = move |sb: CMSampleBufferRef, ty: OutputType| unsafe {

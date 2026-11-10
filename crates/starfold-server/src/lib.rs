@@ -1,8 +1,8 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! starfold: low-latency desktop streaming (H.264, HEVC or AV1 over WebSocket) for the
+//! browser, from an X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
-//! The `voxl` binary calls [`main`]; other programs (the Tembo CLI's `tembo voxl`) embed
-//! the server by calling [`run`] with a command line, or [`main`] from their own `main`.
+//! The `starfold` binary calls [`main`]; other programs embed the server by calling
+//! [`run`] with a command line, or [`main`] from their own `main`.
 
 mod access;
 mod actions;
@@ -10,6 +10,7 @@ mod actions;
 mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
+mod compat;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
@@ -104,7 +105,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     let a = parse_args(args);
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
-    // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
+    // A panic on any thread ends the process, as in starfold's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
     {
@@ -283,8 +284,8 @@ async fn serve(a: HashMap<String, String>) {
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let mut candidates = negotiate::candidates(&encoders, encoder);
-    // VOXL_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if std::env::var_os("VOXL_TEST_HOOKS").is_some() && encoder != encoder::SOFTWARE_H264 {
+    // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE_H264 {
         let fallback = negotiate::Candidate {
             codec: encoder::Codec::H264,
             backend: encoder::SOFTWARE_H264,
@@ -370,36 +371,30 @@ async fn serve(a: HashMap<String, String>) {
         .get("file-transfers")
         .cloned()
         .unwrap_or_else(|| "upload,download".into());
-    let root = a
-        .get("files-root")
-        .cloned()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .unwrap_or_else(|| "/".into());
-    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.into());
-    let files = std::sync::Arc::new(files::Files {
-        root,
-        // Uploading writes to the desktop, so a read-only viewer does not get it.
-        upload: !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
-        download: transfers.split(',').any(|t| t.trim() == "download"),
-        default_dir: a
-            .get("upload-dir")
-            .cloned()
-            .unwrap_or_else(|| "Downloads".into())
-            .trim_matches('/')
-            .to_string(),
-        max_upload_bytes: (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    // No --files-root, no file transfer: there is no default folder to share.
+    let files = files::Files::new(
+        a.get("files-root").map(String::as_str),
+        &transfers,
+        read_only,
+        a.get("upload-dir").map_or("Downloads", String::as_str),
+        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    )
+    .unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(2);
     });
-    log::info!("file transfer: {transfers} under {}", files.root.display());
+    let files = std::sync::Arc::new(files);
+    match &files.root {
+        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        None => log::info!("file transfer: off (share a folder with --files-root)"),
+    }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).
     #[cfg(target_os = "linux")]
-    let mic_sink = Some(
-        a.get("microphone-fifo")
-            .cloned()
-            .unwrap_or_else(|| "/tmp/voxl-mic.fifo".into()),
-    );
+    let mic_sink = Some(compat::mic_fifos(
+        a.get("microphone-fifo").map(String::as_str),
+    ));
     #[cfg(target_os = "macos")]
     let mic_sink = truthy(a.get("microphone-enabled"), false)
         .then(|| mac::mic::find_device(a.get("microphone-device").map(|s| s.as_str())))
@@ -421,10 +416,7 @@ async fn serve(a: HashMap<String, String>) {
         if read_only {
             extra.insert("readOnly".into(), true.into());
         }
-        extra.insert(
-            "files".into(),
-            serde_json::json!({"upload": files.upload, "download": files.download, "dir": files.default_dir}),
-        );
+        extra.insert("files".into(), files.hello());
         if resize_on {
             extra.insert(
                 "resize".into(),
@@ -432,7 +424,7 @@ async fn serve(a: HashMap<String, String>) {
             );
         }
     }
-    // --favicon: the tab's icon (default: voxl's own).
+    // --favicon: the tab's icon (default: starfold's own).
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
@@ -452,15 +444,12 @@ async fn serve(a: HashMap<String, String>) {
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
         ),
         // --title: the browser tab's title.
-        index: server::index_html(
-            a.get("title")
-                .map_or("Voxl Computer Stream", |t| t.as_str()),
-        ),
+        index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
         favicon_type,
         encoders,
     };
-    // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
+    // --allowed-hosts and --allowed-origins: the host names and other sites starfold answers
     // besides IP addresses, localhost and its own page (see access.rs).
     let access = std::sync::Arc::new(access::Access::new(
         a.get("allowed-hosts").map(|s| s.as_str()),
@@ -492,7 +481,7 @@ async fn serve(a: HashMap<String, String>) {
     };
     match &login {
         Some((l, true)) => log::info!(
-            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or VOXL_PASSWORD)",
+            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",
             l.password()
         ),
         Some((_, false)) => log::info!(

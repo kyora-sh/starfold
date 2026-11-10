@@ -70,7 +70,7 @@ def server_args():
 @pytest.fixture
 def desktop(tmp_path, server_args):
     marker = secrets.token_hex(8)
-    env = {**os.environ, "STARFOLD_TEST_RUN": marker, "VOXL_TEST_HOOKS": "1"}
+    env = {**os.environ, "STARFOLD_TEST_RUN": marker, "STARFOLD_TEST_HOOKS": "1"}
     procs: list[subprocess.Popen] = []
 
     def start(args, **kw):
@@ -94,7 +94,7 @@ def desktop(tmp_path, server_args):
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         password = secrets.token_hex(16)
-        env["VOXL_PASSWORD"] = password
+        env["STARFOLD_PASSWORD"] = password
         files = tmp_path / "files"
         files.mkdir()
         server = start(

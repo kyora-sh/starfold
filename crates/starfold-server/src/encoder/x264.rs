@@ -92,14 +92,15 @@ impl X264 {
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
-            param.i_log_level = if std::env::var("VOXL_X264_INFO").as_deref() == Ok("debug") {
-                // Per-frame QP, macroblock types and size.
-                ffi::X264_LOG_DEBUG
-            } else if std::env::var("VOXL_X264_INFO").is_ok() {
-                ffi::X264_LOG_INFO
-            } else {
-                ffi::X264_LOG_WARNING
-            } as i32;
+            param.i_log_level =
+                if crate::compat::env("STARFOLD_X264_INFO").as_deref() == Some("debug") {
+                    // Per-frame QP, macroblock types and size.
+                    ffi::X264_LOG_DEBUG
+                } else if crate::compat::is_set("STARFOLD_X264_INFO") {
+                    ffi::X264_LOG_INFO
+                } else {
+                    ffi::X264_LOG_WARNING
+                } as i32;
             param.rc.i_rc_method = ffi::X264_RC_CRF as i32;
             param.rc.f_rf_constant = cfg.rate.quality;
             param.rc.i_lookahead = 0;
@@ -109,7 +110,7 @@ impl X264 {
             param.analyse.i_me_method = ffi::X264_ME_UMH as i32;
             param.analyse.i_me_range = 64;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
-            param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
+            param.analyse.b_mb_info = (!crate::compat::is_set("STARFOLD_NO_MBINFO")) as i32;
             param.i_sync_lookahead = 0;
             param.rc.b_mb_tree = 0;
             if cfg.rate.max_kbps > 0 {
@@ -320,7 +321,7 @@ impl VideoEncoder for X264 {
                     }
                 }
             }
-            if std::env::var("VOXL_DEBUG_MARKER").is_ok() {
+            if crate::compat::is_set("STARFOLD_DEBUG_MARKER") {
                 log::info!(
                     "x264 out {} bytes, delayed {}, pts in {} out {}",
                     size,

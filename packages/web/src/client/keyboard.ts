@@ -186,7 +186,7 @@ export function setupKeyboard(
 		}
 		toPng(file)
 			.then((png) => app.sendBin(Bin.ClipImageUp, new Uint8Array(png)))
-			.catch((err) => console.warn('[voxl] image paste failed', err))
+			.catch((err) => console.warn('[starfold] image paste failed', err))
 			.finally(flushPaste);
 	});
 

@@ -54,7 +54,7 @@ pub fn index_html(title: &str) -> Bytes {
     Bytes::from(include_str!("../../../packages/web/index.html").replace("{{title}}", &escaped))
 }
 
-/// The page's icon (--favicon): that file's bytes and content type, or voxl's own icon.
+/// The page's icon (--favicon): that file's bytes and content type, or starfold's own icon.
 pub fn favicon(path: Option<&str>) -> Result<(Bytes, &'static str), String> {
     let Some(path) = path else {
         return Ok((
@@ -163,10 +163,10 @@ pub fn router(state: AppState) -> Router {
     let wait_routes = Router::new()
         .route("/wait", get(crate::wait::wait))
         .with_state(state.hub.clone());
-    // VOXL_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
+    // STARFOLD_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
     // epoch (a codec switch, even to the same codec), and POST /debug/fail-h264 makes the
     // H.264 encoder fall back to the next one, for end-to-end tests.
-    let debug_routes: Router = if std::env::var_os("VOXL_TEST_HOOKS").is_some() {
+    let debug_routes: Router = if crate::compat::is_set("STARFOLD_TEST_HOOKS") {
         Router::new()
             .route("/debug/renegotiate", axum::routing::post(renegotiate))
             .route("/debug/fail-h264", axum::routing::post(fail_h264))
@@ -303,7 +303,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         client.send(Out::Bin(c));
     }
     let writer = tokio::spawn(async move {
-        let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+        let dbg = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
         while let Some(m) = rx.recv().await {
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
@@ -614,7 +614,7 @@ mod tests {
             audio: true,
             epoch: Instant::now(),
             files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
+                root: None,
                 upload: false,
                 download: false,
                 default_dir: String::new(),
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(content_type, "image/x-icon");
         assert!(!bytes.is_empty());
 
-        let dir = std::env::temp_dir().join(format!("voxl-favicon-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("starfold-favicon-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("icon.PNG");
         std::fs::write(&png, b"\\x89PNG").unwrap();

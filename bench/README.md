@@ -1,7 +1,7 @@
 # Benchmarks
 
-Tools used to compare voxl with selkies and KasmVNC. Everything runs on a separate Xvfb display
-(`:2` by default, `BENCH_DISPLAY` to change it), so a live desktop isn't disturbed.
+Tools used to compare starfold with selkies, KasmVNC, noVNC and Neko. Everything runs on a separate Xvfb display (`:2` by default, `BENCH_DISPLAY` to change it), so a
+live desktop isn't disturbed.
 
 ## Setup
 
@@ -9,22 +9,22 @@ Tools used to compare voxl with selkies and KasmVNC. Everything runs on a separa
 cc -O2 -o loadgen loadgen.c -lX11 -lXext      # 60 Hz animation with a frame/time marker
 cc -O2 -o rootlat rootlat.c -lX11             # marker latency on the root window
 env/xvfb.sh & sleep 1; env/openbox.sh &       # 2560x1600 @ 144 DPI, like production
-env/voxl.sh                                   # voxl on :6902 (VOXL_BIN to override)
+env/starfold.sh                               # starfold on :6902 (STARFOLD_BIN to override)
 SELKIES_BIN=/path/to/selkies env/selkies.sh & # selkies on :6912
 KASMVNC=/path/to/kasmvncserver XKB_DIR=/path/to/xkb env/kasmvnc.sh &  # KasmVNC (own X server) :5, port 6922
 sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
 ```
 
-`KASMVNC` is the monorepo's `nix/packages/kasmvnc` build; `XKB_DIR` is
-`xkeyboard_config`'s `share/X11/xkb`. `env/kasmvnc.sh` passes the flags Tembo's
-`kasmvnc.yaml` expands to.
+`KASMVNC` is a KasmVNC server package (the directory with `bin/Xvnc` and `share/kasmvnc/www`);
+`XKB_DIR` is `xkeyboard_config`'s `share/X11/xkb`. `env/kasmvnc.sh` runs its Xvnc directly with the
+settings listed in the script (60 fps cap, JPEG/WebP quality 8-9, video mode up to 1920x1080).
 
 `*.mjs` need Playwright (`PLAYWRIGHT_NODE_MODULES`) and Chromium (`CHROMIUM`).
 `py.sh` runs Python with PyAV and websockets through nix-shell.
 
 ## Measuring
 
-- `nclient.py voxl|selkies host:port secs [x y]`: native client (FFmpeg decode)
+- `nclient.py starfold|selkies host:port secs [x y]`: native client (FFmpeg decode)
   that reads the marker at (x, y). Reports unique FPS, latency and Mbps.
 - `kclient.py host:port secs [x y]`: native KasmVNC client. Speaks RFB over its
   WebSocket the way KasmVNC's web client does (same pixel format and encodings,
@@ -44,14 +44,14 @@ sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
   with x11vnc + noVNC) with the workloads in it, measured with `kclient.py` through
   Daytona's signed preview proxy (`KC_URL`, `KC_HEADERS`; `KC_CONNECT` to go through
   `shaper.py`). Needs the `daytona` SDK and `DAYTONA_API_KEY`.
-- `suite.sh`: every config (`CONFIGS`: selkies with and without picom, voxl and
+- `suite.sh`: every config (`CONFIGS`: selkies with and without picom, starfold and
   KasmVNC with and without picom) x workload
   (Chromium scroll, 1080p and full-screen animation) x link (LAN, 10 Mbps/40 ms,
   5 Mbps/60 ms) via `shaper.py`, a userspace bottleneck proxy.
-- `ab.sh <workload> <reps>`: interleaved voxl vs selkies runs.
+- `ab.sh <workload> <reps>`: interleaved starfold vs selkies runs.
 - `cpusuite.sh`: server CPU (X server + streamer) per workload with one client connected.
 - `scroll.html`: the long page `scrolltarget.mjs` smooth-scrolls, with a marker drawn every frame.
-- `cpu.sh <pid> <secs>`, `rate.sh <secs>` (voxl `/stats`), `srcfps.py` (true
+- `cpu.sh <pid> <secs>`, `rate.sh <secs>` (starfold `/stats`), `srcfps.py` (true
   source frame rate from the Xvfb framebuffer), `measure.mjs` (in-browser unique FPS; `VIEWPORT=WxH`).
 - `inputtest.mjs`, `keytest.sh`: input and clipboard checks through the web client.
 - `vs/set.sh <link> <rounds> <run> <results>`: one run of a `bench/vs` set on a VM, CALIB before and after.
@@ -62,9 +62,9 @@ sleep 1; BENCH_DISPLAY=:5 env/openbox.sh &
 
 ## Feature tests
 
-`tests/` drives the web client with Playwright against a running voxl
-(`VOXL_PORT`, default 6903, started with `--enable-basic-auth=false`) on a test display
-(`BENCH_DISPLAY`, default `:3`). The tests that start their own voxl say so below.
+`tests/` drives the web client with Playwright against a running starfold
+(`STARFOLD_PORT`, default 6903, started with `--enable-basic-auth=false`) on a test display
+(`BENCH_DISPLAY`, default `:3`). The tests that start their own starfold say so below.
 For smooth scrolling, start that display with the patched server:
 `XVFB=$(nix-build -E 'with import <nixpkgs> {}; callPackage ../xvfb.nix {}')/bin/Xvfb BENCH_DISPLAY=:3 env/xvfb.sh`.
 
@@ -75,17 +75,17 @@ For smooth scrolling, start that display with the patched server:
   (`TEST_PNG`, needs `xclip`).
 - `fstest.mjs`, `fsiframe.mjs`: fullscreen toolbar and Keyboard Lock, top level and embedded.
 - `resizetest.mjs`: re-fit in a resizable sidebar iframe and at several tab sizes.
-- `filestest.mjs`: file panel, uploads (button and drag and drop) and downloads; starts its own voxl.
+- `filestest.mjs`: file panel, uploads (button and drag and drop) and downloads; starts its own starfold.
 - `foldertest.mjs`: folders download as zips (checked byte for byte) and upload through
-  the API and the folder picker, merged and confined to the root; starts its own voxl.
-- `resizedyn.mjs`: dynamic resolution end to end with its own Xvfb (`XVFB`) and voxl:
+  the API and the folder picker, merged and confined to the root; starts its own starfold.
+- `resizedyn.mjs`: dynamic resolution end to end with its own Xvfb (`XVFB`) and starfold:
   desktop follows the window, clamping, decoded size, pointer mapping, zero-copy capture.
 - `mictest.mjs`: microphone end to end with a fake 440 Hz microphone, a private PulseAudio
-  pipe source and its own voxl (`PULSEAUDIO`: the pulseaudio package).
+  pipe source and its own starfold (`PULSEAUDIO`: the pulseaudio package).
 
 ## macOS
 
-`macos/` tests voxl on a Mac against a running instance (`PORT`, default 6960, started
+`macos/` tests starfold on a Mac against a running instance (`PORT`, default 6960, started
 with `--enable-basic-auth=false`), as raw WebSocket clients plus Playwright
 (`playwright-core` and Google Chrome) where a page is the target. They act on the real
 desktop (pointer, keyboard, clipboard), so run them when nobody is using the Mac.
@@ -96,5 +96,5 @@ desktop (pointer, keyboard, clipboard), so run them when nobody is using the Mac
 - `input.js`: clicks, typing (symbols, accents, CJK, emoji), Command shortcuts, drag
   selection, pixel and wheel scrolling, cursor shape, on a page in a temporary Chrome.
 - `clipimage.js`: clipboard images both ways.
-- `mic.js`: a 440 Hz tone through the microphone path (see voxl's log for drops).
+- `mic.js`: a 440 Hz tone through the microphone path (see starfold's log for drops).
 - `perf.js`: full-screen animation; viewer FPS, pipeline and encode times.

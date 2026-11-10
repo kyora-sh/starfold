@@ -2,9 +2,9 @@
 # suite.sh : streaming servers across configs, workloads and links on the benchmark displays.
 # Appends JSON lines to $OUT. Start the servers under test first:
 #   selkies: env/xvfb.sh, env/openbox.sh, env/selkies.sh (display :2, port 6912)
-#   voxl:    env/xvfb.sh, env/openbox.sh, env/voxl.sh    (display :2, port 6902)
+#   starfold: env/xvfb.sh, env/openbox.sh, env/starfold.sh (display :2, port 6902)
 #   kasmvnc: env/kasmvnc.sh, BENCH_DISPLAY=:5 env/openbox.sh (display :5, port 6922)
-# Configs: py_picom py_nopicom (selkies), voxl voxl_picom, kasm kasm_picom.
+# Configs: py_picom py_nopicom (selkies), starfold starfold_picom, kasm kasm_picom.
 # *_picom runs picom from env/picom-start.sh (PICOM, PICOM_CONF; selkies' picom config
 # by default, PICOM_CONF=picom-damage.conf for today's Computer preview).
 cd "$(dirname "$(readlink -f "$0")")"
@@ -30,10 +30,10 @@ run_one() { # config client port workload net
   echo "{\"config\":\"$cfg\",\"workload\":\"$wl\",\"net\":\"$net\",\"r\":${res:-null}}" | tee -a $OUT
   sleep 9
 }
-for cfg in ${CONFIGS:-py_picom py_nopicom voxl}; do
+for cfg in ${CONFIGS:-py_picom py_nopicom starfold}; do
   case $cfg in
     kasm*) cli=kasmvnc; port=6922; BD=${KASM_DISPLAY:-:5} ;;
-    voxl*) cli=voxl; port=6902; BD=${BD_X:-:2} ;;
+    starfold*) cli=starfold; port=6902; BD=${BD_X:-:2} ;;
     *) cli=selkies; port=6912; BD=${BD_X:-:2} ;;
   esac
   export BD BENCH_DISPLAY=$BD
