@@ -75,7 +75,7 @@ jobs:
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           deps() { aptq 180 update && aptq 720 install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
-          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -107,7 +107,7 @@ jobs:
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           deps() { aptq 180 update && aptq 720 install -y libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
-          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -136,7 +136,7 @@ jobs:
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           deps() { aptq 180 update && aptq 720 install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++; }
-          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -173,7 +173,7 @@ jobs:
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
-          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
           path: .vcpkg-cache
