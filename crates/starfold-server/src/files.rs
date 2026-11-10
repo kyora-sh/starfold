@@ -10,9 +10,9 @@ mod tests;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use beneath::{Dir, Entry, Kind, Opened, PART_PREFIX, Refused, Root, reserved};
+use beneath::{reserved, Dir, Entry, Kind, Opened, Refused, Root, PART_PREFIX};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -620,7 +620,7 @@ pub async fn upload(
                     return Err(err(
                         StatusCode::CONFLICT,
                         "a file is in the way of the folder",
-                    ));
+                    ))
                 }
                 d => d.map_err(refused)?,
             };
@@ -697,16 +697,16 @@ pub async fn upload(
                 return Err(err(
                     StatusCode::CONFLICT,
                     "another upload took that name first",
-                ));
+                ))
             }
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                return Err(err(StatusCode::NOT_IMPLEMENTED, &e.to_string()));
+                return Err(err(StatusCode::NOT_IMPLEMENTED, &e.to_string()))
             }
             Err(e) => {
                 return Err(err(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("cannot save: {e}"),
-                ));
+                ))
             }
         }
         Ok(path.into_iter().chain([dest]).collect::<Vec<_>>().join("/"))

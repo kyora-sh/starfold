@@ -535,11 +535,9 @@ async fn a_folder_too_deep_fails_its_download_rather_than_truncating_it() {
     let f = t.files("Downloads");
     let r = download(State(f.clone()), q(&[("path", "top")])).await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(
-        axum::body::to_bytes(r.into_body(), usize::MAX)
-            .await
-            .is_err()
-    );
+    assert!(axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
