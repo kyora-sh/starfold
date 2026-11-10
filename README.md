@@ -13,22 +13,6 @@ baseline, and the server and the browser negotiate HEVC or AV1 where both have t
 mouse, keyboard and touch, the clipboard, audio and the microphone, file transfer and dynamic resolution.
 Agents get HTTP APIs for screenshots, recordings, input and waiting until the screen settles.
 
-## How kyora uses it
-
-[kyora](https://kyora.sh) runs desktop sandboxes in microVMs with no GPU and no network ports in the
-guest: a relay carries each viewer's connection over vsock. In kyora's integration starfold runs
-inside the sandbox, encodes on the CPU and serves its viewers through that relay, with what kyora's
-platform handles itself, or a sandbox viewer should not reach, turned off:
-
-```sh
-starfold --enable-basic-auth=false --file-transfers none --enable-clipboard false \
-  --audio-enabled false --microphone-enabled false --enable-resize false \
-  --encoder auto --framerate 30
-```
-
-The relay passes binary WebSocket messages only, so kyora's integration serves starfold on a unix
-socket with every message framed as binary; that listener is being added.
-
 ## Quick start
 
 ```sh
@@ -277,7 +261,7 @@ and Windows restores the original mode when starfold exits.
 ## FAQ
 
 **Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through reverse
-proxies, tunnels, sandbox preview URLs and relays like kyora's, with no TURN servers or UDP ports to
+proxies, tunnels and sandbox preview URLs, with no TURN servers or UDP ports to
 open. The browser decodes each frame the moment it arrives with WebCodecs, without a jitter buffer,
 and starfold runs its own rate control, which keeps latency low on a clean link. The trade-off is TCP:
 on a link that drops packets a lost packet holds up the frames behind it, where WebRTC can skip ahead.
@@ -312,6 +296,5 @@ one with `--encoder vaapi`, `nvenc` or `mediafoundation`; `/stats` shows what th
 
 The source code is MIT ([LICENSE](LICENSE)). The software H.264 encoders are OpenH264
 (BSD-2-Clause) and x264 (GPL-2.0-or-later). Which of them a binary includes depends on the cargo
-features it was built with; `starfold --version` lists them, and so do the release notes for
-released binaries. A binary that includes x264 is GPL-2.0-or-later as a combined work.
+features it was built with; `starfold --version` lists them. A binary that includes x264 is GPL-2.0-or-later as a combined work.
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.
