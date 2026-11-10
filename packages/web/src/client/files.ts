@@ -44,7 +44,9 @@ const svg = (d: string) =>
 	`<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
 const ICON_DIR = svg('<path d="M3 4.5H9.5L11.5 7H21V19.5H3Z"/>');
 const ICON_FILE = svg('<path d="M6 3H14L19 8V21H6Z"/><path d="M14 3V8H19"/>');
-const ICON_DOWNLOAD = svg('<path d="M12 4V14"/><path d="M8 10L12 14L16 10"/><path d="M5 19H19"/>');
+const ICON_DOWNLOAD = svg(
+	'<path d="M12 4V14"/><path d="M8 10L12 14L16 10"/><path d="M5 19H19"/>'
+);
 const ICON_CHEVRON = svg('<path d="M10 8L14 12L10 16"/>');
 
 // The password from a sign-in link (/?token=...), passed on as the socket gets it.
