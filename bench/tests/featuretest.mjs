@@ -3,7 +3,7 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 const exe = process.env.CHROMIUM || 'chromium';
 const HERE = new URL('.', import.meta.url).pathname;
-const PORT = process.env.VOXL_PORT || '6903';
+const PORT = process.env.STARFOLD_PORT || '6903';
 const DISPLAY = process.env.BENCH_DISPLAY || ':3';
 const target = await chromium.launch({ executablePath: exe, headless: false, env: { ...process.env, DISPLAY: process.env.BENCH_DISPLAY || ':3' },
   args: ['--no-sandbox', '--window-position=0,0', '--window-size=1600,1000', '--no-first-run'] });
@@ -15,7 +15,7 @@ const drv = await chromium.launch({ executablePath: exe, args: ['--no-sandbox'] 
 // 1) Mouse wheel / trackpad through the client
 const ctx1 = await drv.newContext({ viewport: { width: 1280, height: 800 } });
 const p = await ctx1.newPage();
-await p.goto('http://localhost:' + (process.env.VOXL_PORT || '6903') + '/'); await p.waitForTimeout(2500);
+await p.goto('http://localhost:' + (process.env.STARFOLD_PORT || '6903') + '/'); await p.waitForTimeout(2500);
 await p.mouse.move(640, 400);
 const ys = [(await st()).y];
 for (let i = 0; i < 8; i++) { await p.mouse.wheel(0, 12); await p.waitForTimeout(60); ys.push((await st()).y); }
@@ -29,7 +29,7 @@ await ctx1.close();
 await tp.evaluate(() => scrollTo(0, 0)); await tp.waitForTimeout(200);
 const ctx2 = await drv.newContext({ viewport: { width: 1280, height: 800 }, hasTouch: true, isMobile: false });
 const t = await ctx2.newPage();
-await t.goto('http://localhost:' + (process.env.VOXL_PORT || '6903') + '/'); await t.waitForTimeout(2500);
+await t.goto('http://localhost:' + (process.env.STARFOLD_PORT || '6903') + '/'); await t.waitForTimeout(2500);
 const cdp = await ctx2.newCDPSession(t);
 const touch = (type, pts) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: pts.map(([x, y], id) => ({ x, y, id })) });
 const before = await st();
@@ -45,6 +45,6 @@ await touch('touchStart', [[400, 300]]); await t.waitForTimeout(800); await touc
 console.log('long press -> contextmenu', afterScroll.ctx, '->', (await st()).ctx);
 const toolsVisible = await t.evaluate(() => { const e = document.getElementById('tools'); return e.classList.contains('touch') && getComputedStyle(document.getElementById('kb-btn')).display !== 'none'; });
 console.log('touch toolbar with keyboard button visible:', toolsVisible);
-await t.screenshot({ path: '/tmp/voxl-touch-ui.png' });
+await t.screenshot({ path: '/tmp/starfold-touch-ui.png' });
 await ctx2.close();
 await drv.close(); await target.close();

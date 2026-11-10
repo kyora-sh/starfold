@@ -28,7 +28,7 @@ pub struct Files {
 
 /// Uploads must carry this header. Browsers only send custom headers cross-origin
 /// after a CORS preflight, which we never answer, so other sites can't upload.
-pub const UPLOAD_HEADER: &str = "x-voxl-upload";
+pub const UPLOAD_HEADER: &str = "x-starfold-upload";
 
 type Q = Query<HashMap<String, String>>;
 
@@ -407,7 +407,7 @@ pub async fn upload(
     if !f.upload {
         return err(StatusCode::FORBIDDEN, "uploads are disabled");
     }
-    if !headers.contains_key(UPLOAD_HEADER) {
+    if !crate::compat::has_header(&headers, UPLOAD_HEADER) {
         return err(StatusCode::FORBIDDEN, "missing upload header");
     }
     let Some(name) = q.get("name").and_then(|n| clean_name(n)) else {

@@ -12,18 +12,18 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function go() {
   const saved = sh('pbpaste');
   // A real PNG: a 64x64 screenshot crop of the menu bar area.
-  sh('screencapture -x -R0,0,64,64 -t png /tmp/voxl-clip.png');
-  const png = fs.readFileSync('/tmp/voxl-clip.png');
+  sh('screencapture -x -R0,0,64,64 -t png /tmp/starfold-clip.png');
+  const png = fs.readFileSync('/tmp/starfold-clip.png');
   s.write(frame(2, Buffer.concat([Buffer.from([0x11]), png])));
   await sleep(500);
   const info = sh(`osascript -e 'clipboard info'`);
   console.log((/PNGf/.test(info) && /TIFF/.test(info) ? 'PASS' : 'FAIL') + ' viewer -> Mac image: ' + info.slice(0, 80));
   got = null;
   // A different image than the one just pasted (that one is not echoed back).
-  sh('screencapture -x -R64,0,48,48 -t png /tmp/voxl-clip.png');
-  sh(`osascript -e 'set the clipboard to (read (POSIX file "/tmp/voxl-clip.png") as «class PNGf»)'`);
+  sh('screencapture -x -R64,0,48,48 -t png /tmp/starfold-clip.png');
+  sh(`osascript -e 'set the clipboard to (read (POSIX file "/tmp/starfold-clip.png") as «class PNGf»)'`);
   await sleep(800);
   console.log((got && got.subarray(1, 4).toString() === 'PNG' ? 'PASS' : 'FAIL') + ` Mac -> viewer image (${got ? got.length : 0} bytes PNG)`);
-  sh(`printf '%s' ${JSON.stringify(saved)} | pbcopy`); fs.unlinkSync('/tmp/voxl-clip.png');
+  sh(`printf '%s' ${JSON.stringify(saved)} | pbcopy`); fs.unlinkSync('/tmp/starfold-clip.png');
   process.exit(0);
 }

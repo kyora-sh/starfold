@@ -184,7 +184,7 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
                         cfg.setCapturesAudio(true);
                         cfg.setSampleRate(RATE as isize);
                         cfg.setChannelCount(2);
-                        // voxl plays no audio itself, but a viewer on this Mac would loop.
+                        // starfold plays no audio itself, but a viewer on this Mac would loop.
                         cfg.setExcludesCurrentProcessAudio(true);
                         cfg.setWidth(2);
                         cfg.setHeight(2);

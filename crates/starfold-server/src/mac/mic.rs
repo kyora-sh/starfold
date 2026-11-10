@@ -155,7 +155,7 @@ pub fn play(uid: &str, queue: Arc<Mutex<Queue>>) {
         mBitsPerChannel: 16,
         mReserved: 0,
     };
-    // Lives as long as the queue, which runs until voxl exits.
+    // Lives as long as the queue, which runs until starfold exits.
     let ctx = Box::into_raw(Box::new(Ctx {
         queue,
         frame: vec![0; FRAME],

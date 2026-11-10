@@ -358,7 +358,7 @@ export function createFiles(app: App) {
 		xhr.open('PUT', api('upload', q));
 		// Required by the server: browsers only send custom headers cross-origin after a
 		// CORS preflight, which it never answers, so other sites can't upload.
-		xhr.setRequestHeader('X-Voxl-Upload', '1');
+		xhr.setRequestHeader('X-Starfold-Upload', '1');
 		const g = u.group;
 		xhr.upload.addEventListener('progress', (e) => {
 			if (!e.lengthComputable) return;

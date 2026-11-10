@@ -18,7 +18,7 @@ Server:
 
 Login:
   --enable-basic-auth           ask for a password (default true)
-  --basic-auth-password         the password (default: $VOXL_PASSWORD, else
+  --basic-auth-password         the password (default: $STARFOLD_PASSWORD, else
                                 $SELKIES_BASIC_AUTH_PASSWORD, else one is made up
                                 and printed at startup)
   --basic-auth-user             the user name a browser's sign-in has to give
@@ -76,7 +76,7 @@ Desktop (the X11 display in $DISPLAY):
   --microphone-enabled          the browser's microphone into the desktop
                                 (default false)
   --microphone-fifo             FIFO a PulseAudio pipe source reads
-                                (default /tmp/voxl-mic.fifo)
+                                (default /tmp/starfold-mic.fifo)
   --enable-resize               the desktop follows the viewer's window
                                 (default false)
   --resize-scale                desktop pixels per CSS pixel (default 1.5)

@@ -1,5 +1,5 @@
 //! macOS backend: the same modules as the X11 one (capture, desktop, input, audio,
-//! screen) on Apple's APIs, so the rest of voxl (encoder, flow control, server, web
+//! screen) on Apple's APIs, so the rest of starfold (encoder, flow control, server, web
 //! client) runs unchanged.
 //!
 //! - capture: ScreenCaptureKit, NV12 frames with dirty rectangles
@@ -22,7 +22,7 @@ use ffi::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-/// The captured display and how its points map to the desktop pixels voxl streams.
+/// The captured display and how its points map to the desktop pixels starfold streams.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub display: u32,
@@ -57,7 +57,7 @@ static SETTINGS: Mutex<Settings> = Mutex::new(Settings {
     fps: 60,
 });
 
-/// Reads the macOS options and checks the privacy permissions voxl needs.
+/// Reads the macOS options and checks the privacy permissions starfold needs.
 pub fn init(a: &HashMap<String, String>) {
     let display = pick_display(a.get("display").map(|s| s.as_str()));
     {

@@ -1,6 +1,6 @@
-//! Which requests voxl answers. Browsers let any web page open a WebSocket to voxl or send
-//! it requests, and a page whose own domain is made to resolve to voxl's address (DNS
-//! rebinding) even counts as voxl's own page. So voxl only answers a `Host` that can't be
+//! Which requests starfold answers. Browsers let any web page open a WebSocket to starfold or send
+//! it requests, and a page whose own domain is made to resolve to starfold's address (DNS
+//! rebinding) even counts as starfold's own page. So starfold only answers a `Host` that can't be
 //! rebound (an IP address or localhost) or that `--allowed-hosts` names, and turns away
 //! what a browser sends from another site's page (its `Origin`) unless `--allowed-origins`
 //! names that site. Programs that aren't browsers send no `Origin` and get through.
@@ -64,7 +64,7 @@ impl Access {
         if self.origins.iter().any(|o| o == "*" || *o == key) {
             return None;
         }
-        // voxl's own page: the origin the browser loaded it from is the host it asks for.
+        // starfold's own page: the origin the browser loaded it from is the host it asks for.
         let own = host.is_some()
             && split_origin(&lower).is_some_and(|(n, p, default)| {
                 n == name && p.unwrap_or(default) == port.unwrap_or(default)
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn unlisted_host_names_are_refused() {
         let a = Access::new(None, None);
-        // A host name voxl wasn't told to serve.
+        // A host name starfold wasn't told to serve.
         assert!(!served(&a, "other.example:6901", None));
         assert!(!served(
             &a,
@@ -161,7 +161,7 @@ mod tests {
             "[::1]:6901",
             "10.0.0.5",
             "localhost:6901",
-            "voxl.localhost",
+            "starfold.localhost",
         ] {
             assert!(served(&a, host, None), "{host}");
         }
@@ -178,7 +178,7 @@ mod tests {
         assert!(!served(&a, "127.0.0.1:6901", Some("null")));
         // Another app on the same machine is another site.
         assert!(!served(&a, "localhost:6901", Some("http://localhost:3000")));
-        // voxl's own page, and programs that send no Origin.
+        // starfold's own page, and programs that send no Origin.
         assert!(served(&a, "127.0.0.1:6901", Some("http://127.0.0.1:6901")));
         assert!(served(&a, "[::1]:6901", Some("http://[::1]:6901")));
         assert!(served(&a, "127.0.0.1:6901", None));

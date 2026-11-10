@@ -1,5 +1,5 @@
-// macOS microphone: 2 s of a 440 Hz tone as PCM at real-time pace; voxl logs how
-// much was dropped (start voxl with --microphone-enabled [--microphone-device NAME]).
+// macOS microphone: 2 s of a 440 Hz tone as PCM at real-time pace; starfold logs how
+// much was dropped (start starfold with --microphone-enabled [--microphone-device NAME]).
 // Usage: PORT=6960 node mic.js
 const net = require('net');
 const s = net.connect(+(process.env.PORT || 6960), '127.0.0.1'); let up = false, buf = Buffer.alloc(0), micOn = null;
