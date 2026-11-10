@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: '23 5 * * *'
   workflow_dispatch:
+    inputs:
+      max_commits:
+        description: Upstream commits to apply in this run (scheduled runs apply 1)
+        type: number
+        default: 1
 
 permissions:
   contents: write
@@ -26,6 +31,8 @@ jobs:
           fetch-depth: 0
       - name: Rebuild sync/upstream
         id: sync
+        env:
+          SYNC_MAX_COMMITS: ${{ inputs.max_commits }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
