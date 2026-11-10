@@ -7,7 +7,9 @@
 # the last one that did and force-pushes sync/upstream, unless the branch already has
 # that content or carries commits the bot didn't make. Writes the pull request body to
 # <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|pushed> plus, for
-# the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT.
+# the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT. When the first new commit
+# doesn't apply (blocked), the body also goes to $GITHUB_STEP_SUMMARY with one warning
+# naming that commit, and the run still succeeds; any other failure exits non-zero.
 set -euo pipefail
 
 upstream_url=$1
@@ -127,6 +129,11 @@ fi
 
 if [ ${#picked[@]} -eq 0 ]; then
 	output status=blocked
+	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
+	warning="upstream sync is blocked at $(line "$stop"), which doesn't apply here; see the job summary"
+	warning=${warning//%/%25}
+	warning=${warning//$'\r'/%0D}
+	echo "::warning::${warning//$'\n'/%0A}"
 	exit 0
 fi
 if [ -n "$remote_branch" ] && git merge-base --is-ancestor refs/remotes/origin/main "$remote_branch" &&
