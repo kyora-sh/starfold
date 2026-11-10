@@ -117,7 +117,7 @@ check 'failing commit hook: fails, not blocked' \
 
 fail_git() {
 	mkdir -p "$dir/bin"
-	printf '#!/bin/sh\n[ "$1" = %s ] && exit 128\nexec %s "$@"\n' "$1" "$(command -v git)" >"$dir/bin/git"
+	printf '#!/bin/sh\ncase "$*" in "%s "*) exit 128 ;; esac\nexec %s "$@"\n' "$1" "$(command -v git)" >"$dir/bin/git"
 	chmod +x "$dir/bin/git"
 	PATH=$dir/bin:$PATH run_sync
 }
@@ -141,7 +141,7 @@ check 'rev-list error: fails, not up-to-date' 'red'
 
 setup ls-tree
 commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
-fail_git ls-tree
+fail_git 'ls-tree -r'
 check 'tree mapping error: fails, not blocked' 'red && grep -q "mapping the tree of" "$dir/stderr"'
 
 setup diff
