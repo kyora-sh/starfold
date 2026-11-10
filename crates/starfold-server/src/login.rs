@@ -1,4 +1,4 @@
-//! The login: every request needs voxl's password, except the scripts and assets the page
+//! The login: every request needs starfold's password, except the scripts and assets the page
 //! loads before it can present one and the health check. A browser signs in at its own
 //! prompt (HTTP Basic, with any user name unless --basic-auth-user names one) or opens a
 //! link with the password in `?token=`, which the page passes on to its socket and its
@@ -38,9 +38,10 @@ impl Login {
     }
 
     /// From --enable-basic-auth (on unless false), --basic-auth-user and the password:
-    /// --basic-auth-password, else VOXL_PASSWORD or SELKIES_BASIC_AUTH_PASSWORD, else a
+    /// --basic-auth-password, else STARFOLD_PASSWORD (or VOXL_PASSWORD) or
+    /// SELKIES_BASIC_AUTH_PASSWORD, else a
     /// random one. `None` with the login off; the flag says whether the password was made
-    /// up here, so the only way to learn it is the link voxl prints.
+    /// up here, so the only way to learn it is the link starfold prints.
     pub fn from_args(a: &HashMap<String, String>) -> Option<(Self, bool)> {
         if !crate::truthy(a.get("enable-basic-auth"), true) {
             return None;
@@ -48,7 +49,7 @@ impl Login {
         let given = a
             .get("basic-auth-password")
             .cloned()
-            .or_else(|| std::env::var("VOXL_PASSWORD").ok())
+            .or_else(|| crate::compat::env("STARFOLD_PASSWORD"))
             .or_else(|| std::env::var("SELKIES_BASIC_AUTH_PASSWORD").ok())
             .filter(|p| !p.is_empty());
         let generated = given.is_none();
@@ -130,9 +131,9 @@ pub async fn check(State(login): State<Arc<Login>>, req: Request, next: Next) ->
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
-            r#"Basic realm="voxl", charset="UTF-8""#,
+            r#"Basic realm="starfold", charset="UTF-8""#,
         )],
-        "voxl needs its password: open the link voxl printed when it started, sign in when \
+        "starfold needs its password: open the link starfold printed when it started, sign in when \
          the browser asks, or send Authorization: Bearer <password>",
     )
         .into_response()
@@ -158,7 +159,7 @@ mod tests {
         )
     }
 
-    /// A login with a password made up at runtime, as voxl makes one, and the password.
+    /// A login with a password made up at runtime, as starfold makes one, and the password.
     fn with_random_password(user: Option<&str>) -> (Login, String) {
         let password = random_password();
         (
@@ -256,7 +257,8 @@ mod tests {
         assert_eq!((login.password(), generated), (given.as_str(), false));
         // Without a password from the environment, an empty one counts as none and each
         // start makes up a different one.
-        if std::env::var_os("VOXL_PASSWORD").is_none()
+        if std::env::var_os("STARFOLD_PASSWORD").is_none()
+            && std::env::var_os("VOXL_PASSWORD").is_none()
             && std::env::var_os("SELKIES_BASIC_AUTH_PASSWORD").is_none()
         {
             let (a, generated) = Login::from_args(&args(&[("basic-auth-password", "")])).unwrap();

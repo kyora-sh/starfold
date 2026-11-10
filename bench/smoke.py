@@ -1,14 +1,14 @@
-"""End-to-end smoke test of a running voxl: screenshot, hello, video, cursor, input and
+"""End-to-end smoke test of a running starfold: screenshot, hello, video, cursor, input and
 clipboard. Typing must change the screen, so run it with a text editor focused (CI
 opens Notepad). Exits non-zero on failure. SMOKE_SHOT=<path> saves the last screenshot;
-VOXL_PASSWORD is the password voxl was started with.
+STARFOLD_PASSWORD is the password starfold was started with.
 Usage: smoke.py <host:port> [expected os]"""
 import asyncio, json, os, sys, time, urllib.parse, urllib.request
 import websockets
 
 hostport = sys.argv[1]
 want_os = sys.argv[2] if len(sys.argv) > 2 else None
-password = os.environ.get('VOXL_PASSWORD', '')
+password = os.environ.get('STARFOLD_PASSWORD', '')
 fails = []
 
 
@@ -75,7 +75,7 @@ async def main():
         await frames(ws, 1, stats)
         check(stats['cursor'] >= 1, f"cursor image received ({stats['cursor']})")
         before = stats['video']
-        for c in 'voxl smoke test ':
+        for c in 'starfold smoke test ':
             await ws.send(f'k,{ord(c)},1')
             await ws.send(f'k,{ord(c)},0')
             await frames(ws, 0.05, stats)
@@ -87,7 +87,7 @@ async def main():
         await ws.send('k,86,0')
         await ws.send('k,65505,0')
         # Clipboard from the viewer.
-        await ws.send('c,voxl-clipboard-check')
+        await ws.send('c,starfold-clipboard-check')
         await frames(ws, 1, stats)
     after = screenshot()
     check(after != png, 'screen changed after input')

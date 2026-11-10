@@ -1,8 +1,8 @@
 // Dynamic resolution end to end: starts a patched-or-stock Xvfb (XVFB) at 2560x1600
-// with its own voxl --enable-resize, then checks that the desktop follows the
+// with its own starfold --enable-resize, then checks that the desktop follows the
 // browser window: size, clamping, decoded video size, pointer mapping, and that
 // capture stays on the direct framebuffer path after each resize.
-// Usage: node resizedyn.mjs   (XVFB, XRANDR = xrandr binary, VOXL_BIN, CHROMIUM,
+// Usage: node resizedyn.mjs   (XVFB, XRANDR = xrandr binary, STARFOLD_BIN, CHROMIUM,
 // PLAYWRIGHT_NODE_MODULES)
 import { createRequire } from 'module';
 import { spawn, execFileSync } from 'child_process';
@@ -12,10 +12,10 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
+const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
 const DISPLAY = process.env.RESIZE_DISPLAY || ':8';
-const port = process.env.VOXL_PORT || '6908';
-const log = '/tmp/voxl-resizedyn.log';
+const port = process.env.STARFOLD_PORT || '6908';
+const log = '/tmp/starfold-resizedyn.log';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
 const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if (!ok) failed++; };
@@ -23,7 +23,7 @@ const xsize = () => execFileSync(process.env.XRANDR || 'xrandr', [], { env: { ..
 
 const xvfb = spawn(process.env.XVFB || 'Xvfb', [DISPLAY, '-screen', '0', '2560x1600x24', '-dpi', '144', '-shmem', '-ac', '-nolisten', 'tcp'], { stdio: 'ignore' });
 await sleep(1000);
-const voxl = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--enable-resize=true'], { env: { ...process.env, DISPLAY }, stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')] });
+const starfold = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--enable-resize=true'], { env: { ...process.env, DISPLAY }, stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')] });
 let b;
 try {
 	for (let i = 0; i < 50; i++) { try { if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) break; } catch {} await sleep(100); }
@@ -68,7 +68,7 @@ try {
 	check(ids.length === 1 && Number(owner(ids[0])) === xvfb.pid, `framebuffer belongs to this Xvfb (shmid ${ids.join(',')}, creator ${owner(ids[0])}, Xvfb ${xvfb.pid})`);
 } finally {
 	if (b) await b.close();
-	voxl.kill();
+	starfold.kill();
 	xvfb.kill();
 }
 console.log(failed ? `${failed} failed` : 'all passed');

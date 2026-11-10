@@ -102,7 +102,7 @@ impl State {
         if self.shaped.get(&win) == Some(&want) {
             return;
         }
-        if std::env::var("VOXL_DEBUG_CORNERS").is_ok() {
+        if crate::compat::is_set("STARFOLD_DEBUG_CORNERS") {
             log::info!(
                 "corners: window {win:#x} {width}x{height} -> {want:?} (was {:?})",
                 self.shaped.get(&win)
@@ -211,7 +211,7 @@ pub fn spawn(
                         }
                     }
                     Ok(Event::ConfigureNotify(e)) if e.event == st.root => {
-                        if std::env::var("VOXL_DEBUG_CORNERS").is_ok() {
+                        if crate::compat::is_set("STARFOLD_DEBUG_CORNERS") {
                             log::info!(
                                 "configure {:#x} {}x{} at {},{}",
                                 e.window,
