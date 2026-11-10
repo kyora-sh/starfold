@@ -1,4 +1,5 @@
 47bb94ec4d253638c1470eb81906676e1bef4b00 release version bump (0.3.3); versions here are set independently
+9d004076f73cb374bdb87ff96d2e23e44b9f47b9 ported in #50 (a3f4fa9dffb983a0c2777a8e7341a8477b4b83f7)
 730fb17c20bd4fb3b65ec9d1893fad01587fea43 Sunshine/Moonlight bench (scripts + README results); ideas reviewed separately
 cf6c6fcdf7eb19a8d155d229b6eada41a4cabb32 ported in #46 (2e9ae4472f2a49bb031821e7aa583c4c1b38a9cd)
 c0f1ac06a61f998345ca0d4e4acc4f28fd8937fc ported in #46 (2e9ae4472f2a49bb031821e7aa583c4c1b38a9cd)
