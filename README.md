@@ -175,8 +175,9 @@ curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id
 
 A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
 encoding with any viewers taking H.264, and with none it starts an H.264 encoding of its
-own. It needs `--stripes=1` (otherwise 409), doesn't include the cursor (viewers draw it),
-and a resize ends it.
+own. It needs `--stripes=1` (otherwise 409), and a resize ends it. It doesn't include the
+cursor, which viewers draw, except on macOS with `--show-cursor` (the default with
+`--read-only`), where the cursor is in the video.
 
 If another encoder takes over mid-recording (a hardware encoder failing over to OpenH264,
 say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to

@@ -13,7 +13,8 @@
 //! A recording is the H.264 stream starfold already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
-//! the screen changes, and it doesn't include the cursor (viewers draw it locally).
+//! the screen changes, and it doesn't include the cursor (viewers draw it locally),
+//! except on macOS with `--show-cursor`, where the capture carries it.
 
 use crate::hub::{Client, Hub, Out};
 use crate::mp4;

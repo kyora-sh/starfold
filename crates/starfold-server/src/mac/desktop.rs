@@ -93,7 +93,12 @@ pub fn spawn(
         state: state.clone(),
         to_server: mode.to_server,
     };
-    if !super::show_cursor() {
+    if super::show_cursor() {
+        // An empty shape: viewers hide their own pointer, since the video carries the cursor.
+        *hub.cursor.lock() = Some(Bytes::from_static(&[
+            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]));
+    } else {
         let h = hub.clone();
         std::thread::Builder::new()
             .name("cursor".into())
