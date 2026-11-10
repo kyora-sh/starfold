@@ -12,7 +12,7 @@
 # naming that commit, and the run still succeeds; any other failure, including any git
 # command failing, exits non-zero.
 set -euo pipefail
-shopt -s inherit_errexit
+shopt -s inherit_errexit lastpipe
 
 upstream_url=$1
 body=$2
@@ -99,10 +99,10 @@ if [ ${#commits[@]} -eq 0 ]; then
 	exit 0
 fi
 if [ -n "$remote_branch" ]; then
-	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
+	committers=$(git log --format=x%ce "refs/remotes/origin/main..$remote_branch")
 	split_lines "$committers"
 	for e in "${lines[@]}"; do
-		if [ "$e" != "$bot_email" ]; then
+		if [ "$e" != "x$bot_email" ]; then
 			output status=human-edits
 			exit 0
 		fi
@@ -141,10 +141,8 @@ for c in "${commits[@]}"; do
 		git cherry-pick --abort
 		break
 	fi
-	changed=$(git diff --name-only "$c^1" "$c")
-	split_lines "$changed"
 	files=
-	for f in "${lines[@]}"; do
+	git diff -z --name-only "$c^1" "$c" | while IFS= read -r -d '' f; do
 		if [[ $f == .github/* || $f == package-lock.json ]]; then files+=${files:+, }$f; fi
 	done
 	if [ -n "$files" ]; then left_out+=("$label: $files"); fi
