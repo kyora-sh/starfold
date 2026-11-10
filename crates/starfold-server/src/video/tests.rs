@@ -2526,17 +2526,24 @@ fn x264_takes_the_ladder_and_its_budget() {
 /// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
 /// the QP of every pass over `turns` still turns, each acked.
 fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {
+    tail_on(config(), H264, left, turns, motion_at)
+}
+
+fn tail_on(
+    cfg: VideoConfig,
+    cand: Candidate,
+    left: usize,
+    turns: usize,
+    motion_at: Option<usize>,
+) -> Vec<u8> {
     let seen = Refines::default();
     let hub = Hub::new();
-    let mut eng = engine(
-        &hub,
-        &[H264],
-        Opts {
-            refines: Some(seen.clone()),
-            h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
-            ..Default::default()
-        },
-    );
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[cand], fakes(opts)).unwrap();
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
     push(&mut eng);
@@ -2565,6 +2572,25 @@ fn a_still_picture_is_refined_until_the_encoder_has_nothing_left() {
 #[test]
 fn new_damage_cancels_the_tail() {
     assert_eq!(tail(100, 8, Some(5)), [20, 16, 12, 12, 20, 16]);
+}
+
+/// An x264 stream refining down to an explicit --paintover-crf below 12 under CAVLC: its passes
+/// never count as settled, so the encoder keeps offering one, and the tail limit ends them.
+#[cfg(feature = "x264")]
+#[test]
+fn an_unsettled_x264_tail_ends_at_the_limit() {
+    let cfg = VideoConfig {
+        paintover_qp: Some(8),
+        ..config()
+    };
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    let qps = tail_on(cfg, x264, usize::MAX, 200, None);
+    assert_eq!(qps.len(), 3 + REFINE_TAIL_MAX as usize);
+    assert_eq!(qps[..3], [16, 12, 8]);
+    assert!(qps[3..].iter().all(|&q| q == 8));
 }
 
 #[test]

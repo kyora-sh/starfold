@@ -39,14 +39,15 @@ impl Sharpness {
         }
     }
 
-    /// Macroblock-steps from where the picture stands to `qp`, in units of `cost`.
+    /// Macroblock-steps from where the picture stands to `qp`, in units of `cost`. A block at
+    /// 52 is one an encoder can't vouch for: it is a step above 51.
     fn steps(&self, qp: i32) -> f64 {
-        let mut count = [0usize; 52];
+        let mut count = [0usize; 53];
         for &q in &self.qp {
-            count[q.min(51) as usize] += 1;
+            count[q.min(52) as usize] += 1;
         }
         let (mut total, mut below) = (0.0, 0);
-        for q in (qp.max(0)..51).rev() {
+        for q in (qp.max(0)..52).rev() {
             below += count[q as usize + 1];
             total += below as f64 * ((52 - q) as f64 / 24.0).min(1.0);
         }

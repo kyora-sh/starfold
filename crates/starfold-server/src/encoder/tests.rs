@@ -1360,6 +1360,50 @@ fn x264_with_adaptive_quantisation_takes_no_tails() {
     }));
 }
 
+/// ultrafast writes CAVLC, where x264 may re-code a block at a higher QP to fit a level into
+/// the escape code: a pass below QP 12 still runs at its QP and sharpens, but never counts as
+/// settled, so the encoder keeps offering one (the tail limit ends them).
+#[cfg(feature = "x264")]
+#[test]
+fn x264_a_cavlc_pass_below_12_runs_but_never_settles() {
+    let mut s = Refining::on(Backend::X264, 1, 30);
+    s.scroll(5);
+    let motion = s.last_psnr;
+    let below = Refine {
+        qp: 8,
+        max_bytes: None,
+    };
+    for i in 0..5 {
+        let (n, key) = s.step(false, Some(below));
+        assert!(n > 0 && !key, "pass {i}: {n} bytes");
+        assert!(s.enc.refinable(below), "pass {i} counted as settled");
+    }
+    assert!(s.last_psnr > motion + 3.0, "{motion} -> {}", s.last_psnr);
+    assert!(s.pass(12, None).0 > 0);
+    assert!(!s.enc.refinable(Refine {
+        qp: 12,
+        max_bytes: None
+    }));
+}
+
+/// Motion counts as unknown, above 51: with --paintover-crf=51 a pass at 51 still runs after it,
+/// and then counts as settled.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_motion_still_gets_a_pass_at_51() {
+    let mut s = Refining::on(Backend::X264, 1, 30);
+    s.enc.set_rate(RateConfig::new(24.0, 500, 30)).unwrap();
+    s.scroll(10);
+    let at51 = Refine {
+        qp: 51,
+        max_bytes: None,
+    };
+    assert!(s.enc.refinable(at51));
+    let (n, key) = s.step(false, Some(at51));
+    assert!(n > 0 && !key, "{n} bytes");
+    assert!(!s.enc.refinable(at51));
+}
+
 #[cfg(feature = "x264")]
 #[test]
 fn x264_a_pass_that_cannot_fit_sends_nothing() {

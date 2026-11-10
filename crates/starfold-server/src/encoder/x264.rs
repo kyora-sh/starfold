@@ -24,17 +24,22 @@ use std::ptr;
 /// the pass no room at all.
 const REFINE_VBV_WIDEN: i32 = 4;
 /// A pass's CRF-max over its CRF of 0. x264's row control then caps every row at CRF's own
-/// estimate plus this (`qp_absolute_max`), or lets the buffer underflow instead: a forced QP
-/// above that cap holds on every row. At or below it, rows can still rise, but stay under the
-/// cap plus 1 (the row re-encode bumps `prev_row_qp + 1` only from below the cap).
+/// estimate plus this (`qp_absolute_max`), or lets the buffer underflow instead: with a forced
+/// QP above that cap, no row goes above the forced QP. At or below it, rows can still rise, but
+/// stay under the cap plus 1 (the row re-encode bumps `prev_row_qp + 1` only from below it).
 const REFINE_CRF_MAX: f32 = 0.1;
 /// x264's `f_crf_avg` for a pass is its rows' average QP less CRF's estimate. At least this
-/// proves the forced QP held: had it been at or below the cap, the average would stay under
-/// REFINE_CRF_MAX + 1.
+/// proves no row went above the forced QP: had it been at or below the cap, the average would
+/// stay under REFINE_CRF_MAX + 1. Rows may still sit below it (sliced threads can lower one
+/// before slice 0 has set its first row's QP), so the QP is an upper bound, not an exact one.
 const REFINE_HELD: f64 = 1.5;
-/// What a frame outside a pass records for the blocks it coded: VBV's row control may have
-/// raised them to anything up to x264's emergency QPs, and 51 is above every rung.
-const MOTION_QP: i32 = 51;
+/// What a frame outside a pass records for the blocks it coded: unknown, above any QP a pass
+/// can aim for (51 at most). VBV's row control may have raised them up to x264's emergency QPs.
+const MOTION_QP: i32 = 52;
+/// Under CAVLC without High profile x264 re-codes a block at QP + 1 when a level overflows the
+/// escape code (`encoder.c` "CAVLC level code overflow"), outside rate control. No 8-bit level
+/// reaches the overflow at QP 10 or above, luma and chroma alike; this keeps a margin.
+const CAVLC_SAFE_QP: i32 = 12;
 
 pub struct X264 {
     h: *mut ffi::x264_t,
@@ -47,6 +52,9 @@ pub struct X264 {
     sharpness: Sharpness,
     /// Nothing encoded yet: the next frame is an IDR whether asked for or not.
     fresh: bool,
+    /// The chroma QP offset x264 applies, when it writes CAVLC: a pass then counts only at a QP
+    /// where neither luma nor chroma can overflow.
+    cavlc_chroma_offset: Option<i32>,
     /// A pass's CRF-max is still in force: the next reconfig sets CRF-max to the CRF, which
     /// x264 takes as none at all (setting it to 0 leaves the pass's). That needs a CRF above 0;
     /// a capped stream that may run at CRF 0 never refines by QP (`video::qp_refinement`).
@@ -120,6 +128,10 @@ impl X264 {
             if h.is_null() {
                 return Err(EncodeError("x264_encoder_open failed".into()));
             }
+            let mut applied: ffi::x264_param_t = std::mem::zeroed();
+            ffi::x264_encoder_parameters(h, &mut applied);
+            let cavlc_chroma_offset =
+                (applied.b_cabac == 0).then_some(applied.analyse.i_chroma_qp_offset);
             let mut pic: ffi::x264_picture_t = std::mem::zeroed();
             ffi::x264_picture_init(&mut pic);
             pic.img.i_csp = ffi::X264_CSP_I420 as i32;
@@ -137,6 +149,7 @@ impl X264 {
                     (cfg.best_quality.round() as i32).clamp(12, 51),
                 ),
                 fresh: true,
+                cavlc_chroma_offset,
                 clear_crf_max: false,
             })
         }
@@ -182,6 +195,12 @@ impl X264 {
     /// x264 lets no per-block offset raise a pass's QP: adaptive quantisation is off.
     fn uniform(&self) -> bool {
         self.param.rc.i_aq_mode == ffi::X264_AQ_NONE as i32 || self.param.rc.f_aq_strength == 0.0
+    }
+
+    /// No block of a pass at `qp` can have been re-coded above it for a CAVLC overflow.
+    fn overflow_free(&self, qp: i32) -> bool {
+        self.cavlc_chroma_offset
+            .is_none_or(|c| qp.min(qp + c) >= CAVLC_SAFE_QP)
     }
 
     fn unit(&mut self, size: i32, nals: *mut ffi::x264_nal_t, pts: i64) -> Option<AccessUnit> {
@@ -284,10 +303,11 @@ impl VideoEncoder for X264 {
             self.fresh = false;
             if size > 0 {
                 match fixed {
-                    // A pass counts only where it provably held its QP on every block;
-                    // otherwise the picture stays as coarse as it was for the next one.
+                    // A pass counts only where no block can be above its QP; otherwise the
+                    // picture stays as coarse as it was for the next one.
                     Some(qp)
                         if self.uniform()
+                            && self.overflow_free(qp)
                             && (self.param.rc.i_vbv_max_bitrate == 0
                                 || pic_out.prop.f_crf_avg >= REFINE_HELD) =>
                     {
