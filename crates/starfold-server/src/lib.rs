@@ -1,8 +1,8 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! starfold: low-latency desktop streaming (H.264, HEVC or AV1 over WebSocket) for the
+//! browser, from an X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
-//! The `voxl` binary calls [`main`]; other programs (the Tembo CLI's `tembo voxl`) embed
-//! the server by calling [`run`] with a command line, or [`main`] from their own `main`.
+//! The `starfold` binary calls [`main`]; other programs embed the server by calling
+//! [`run`] with a command line, or [`main`] from their own `main`.
 
 mod access;
 mod actions;
@@ -427,7 +427,7 @@ async fn serve(a: HashMap<String, String>) {
             );
         }
     }
-    // --favicon: the tab's icon (default: voxl's own).
+    // --favicon: the tab's icon (default: starfold's own).
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
@@ -447,10 +447,7 @@ async fn serve(a: HashMap<String, String>) {
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
         ),
         // --title: the browser tab's title.
-        index: server::index_html(
-            a.get("title")
-                .map_or("Voxl Computer Stream", |t| t.as_str()),
-        ),
+        index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
         favicon_type,
         encoders,

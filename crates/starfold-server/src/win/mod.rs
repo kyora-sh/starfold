@@ -111,7 +111,7 @@ pub fn output() -> Option<Output> {
 pub fn init(a: &HashMap<String, String>) {
     if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_err()
     {
-        log::warn!("could not make voxl DPI aware; a scaled display may stream blurry");
+        log::warn!("could not make starfold DPI aware; a scaled display may stream blurry");
     }
     let outs = outputs();
     for (i, o) in outs.iter().enumerate() {

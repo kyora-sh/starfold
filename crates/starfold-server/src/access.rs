@@ -55,7 +55,7 @@ impl Access {
         // Browsers always send a Host, so one without it comes from another kind of client.
         if host.is_some() && !self.host_allowed(&name) {
             return Some(format!(
-                "voxl doesn't answer for the host {name:?}. To serve it under that name, start voxl with --allowed-hosts={name}"
+                "starfold doesn't answer for the host {name:?}. To serve it under that name, start starfold with --allowed-hosts={name}"
             ));
         }
         let origin = origin?.trim();
@@ -71,7 +71,7 @@ impl Access {
             });
         (!own).then(|| {
             format!(
-                "voxl only takes requests from its own page, not from {origin}. To let that site connect, start voxl with --allowed-origins={origin}"
+                "starfold only takes requests from its own page, not from {origin}. To let that site connect, start starfold with --allowed-origins={origin}"
             )
         })
     }

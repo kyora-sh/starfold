@@ -215,7 +215,10 @@ fn video(mp4: Vec<u8>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "video/mp4"),
-            (header::CONTENT_DISPOSITION, "inline; filename=\"voxl.mp4\""),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=\"starfold.mp4\"",
+            ),
         ],
         mp4,
     )
@@ -307,7 +310,7 @@ async fn respond(done: Recording, zip: bool, route: &str, id: Option<u64>) -> Re
                 (header::CONTENT_TYPE, "application/zip"),
                 (
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"voxl.zip\"",
+                    "attachment; filename=\"starfold.zip\"",
                 ),
             ],
             z,

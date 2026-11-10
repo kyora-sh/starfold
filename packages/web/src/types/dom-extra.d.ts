@@ -1,4 +1,4 @@
-// Browser APIs voxl uses that TypeScript's DOM library doesn't include yet.
+// Browser APIs starfold uses that TypeScript's DOM library doesn't include yet.
 
 // Insertable streams for video (Chromium): write VideoFrames into a MediaStreamTrack.
 interface MediaStreamTrackGenerator extends MediaStreamTrack {

@@ -41,7 +41,7 @@ function main() {
 	// plain HTTP from another machine can't decode the stream whatever the browser.
 	if (!window.isSecureContext) {
 		statusEl.textContent =
-			'voxl needs HTTPS or localhost: browsers only decode video on secure pages. Serve it over HTTPS, or forward the port and open localhost.';
+			'starfold needs HTTPS or localhost: browsers only decode video on secure pages. Serve it over HTTPS, or forward the port and open localhost.';
 		return;
 	}
 	// Which codecs decode is the worker's to find out; it needs OffscreenCanvas.
@@ -216,7 +216,7 @@ function main() {
 				}
 				break;
 			case 'log':
-				console.warn('[voxl]', m.s);
+				console.warn('[starfold]', m.s);
 				break;
 		}
 	});

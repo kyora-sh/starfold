@@ -130,9 +130,9 @@ pub async fn check(State(login): State<Arc<Login>>, req: Request, next: Next) ->
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
-            r#"Basic realm="voxl", charset="UTF-8""#,
+            r#"Basic realm="starfold", charset="UTF-8""#,
         )],
-        "voxl needs its password: open the link voxl printed when it started, sign in when \
+        "starfold needs its password: open the link starfold printed when it started, sign in when \
          the browser asks, or send Authorization: Bearer <password>",
     )
         .into_response()

@@ -1,7 +1,7 @@
 //! `--help` and `--version`: printed instead of starting the server.
 
 const USAGE: &str = "
-Usage: voxl [--flag=value]...
+Usage: starfold [--flag=value]...
 
 Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
 WebSocket, and prints a link that signs you in. Flags take --name=value or
@@ -9,28 +9,32 @@ WebSocket, and prints a link that signs you in. Flags take --name=value or
 
 Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
-  --title                       the page's title (default: Voxl Computer Stream)
+  --title                       the page's title (default: starfold)
   --favicon                     the page's icon: an .ico, .png, .gif, .webp or .svg
-                                file (default: voxl's own)
+                                file (default: starfold's own)
   --allowed-hosts               host names to answer for besides IP addresses and
                                 localhost (.example.com covers subdomains, * any)
   --allowed-origins             other sites whose pages may connect (* any)
 
 Login:
   --enable-basic-auth           ask for a password (default true)
-  --basic-auth-password         the password (default: $VOXL_PASSWORD, else one is
-                                made up and printed at startup)
+  --basic-auth-password         the password (default: $VOXL_PASSWORD, else
+                                $SELKIES_BASIC_AUTH_PASSWORD, else one is made up
+                                and printed at startup)
   --basic-auth-user             the user name a browser's sign-in has to give
                                 (default: any)
 
 Video:
   --framerate                   max frames per second (default 60)
-  --high-fps                    up to 120 frames per second on hardware
-                                VideoToolbox; other encoders take 60 at most
+  --high-fps                    hardware VideoToolbox streams take 120 frames
+                                per second (or --framerate if higher); other
+                                encoders take --framerate up to 60
                                 (default false)
-  --crf                         base quality (default 24)
+  --crf                         x264's base quality; OpenH264's lowest QP in
+                                motion; other encoders ignore it (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
-                                (default 30000, 2000)
+                                (default 30000, 2000); --video-bitrate is
+                                the same as --max-kbps
   --encoder                     auto: each codec from its hardware encoder,
                                 H.264 from OpenH264 where there is none
                                 (default); or the H.264 encoder: openh264,
@@ -48,12 +52,13 @@ Video:
                                 Media Foundation, each in a child process
                                 (default false)
   --preset                      x264 preset (default ultrafast)
-  --encoder-threads             sliced threads (default min(4, cores/4))
+  --encoder-threads             sliced threads (default cores/4, from 1 to 4)
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
   --paintover-crf, --paintover-burst, --paintover-delay-ms
                                 sharpening once the screen goes still
-                                (default 16, 3, 150)
+                                (default 16, 3, 150); --paintover-crf is
+                                x264's, other encoders ignore it
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us
@@ -63,6 +68,7 @@ Video:
 #[cfg(not(any(target_os = "macos", windows)))]
 const DESKTOP: &str = "
 Desktop (the X11 display in $DISPLAY):
+  --display                     X display to stream when $DISPLAY is unset
   --enable-clipboard            true, in, out or false (default true)
   --audio-enabled               desktop audio (default true)
   --audio-device-name           PulseAudio source (default output.monitor)
@@ -129,7 +135,8 @@ const FILES: &str = "
 Files and recordings:
   --file-transfers              upload, download, upload,download or none
                                 (default upload,download)
-  --files-root                  folder the Files panel can see (default $HOME)
+  --files-root                  folder the Files panel opens on (default
+                                $HOME, else $USERPROFILE, else /)
   --upload-dir                  folder under the root that uploads go to
                                 (default Downloads)
   --max-upload-mb               largest upload, 0 for no limit (default 0)
@@ -139,8 +146,17 @@ Files and recordings:
   -V, --version                 print the version and exit
 
 Agents and scripts can use GET /screenshot, /record and /wait and POST /input; see
-https://github.com/tembo/voxl#for-agents-and-scripts
+https://github.com/kyora-sh/starfold#for-agents-and-scripts
 ";
+
+/// The software H.264 encoders this build includes.
+fn software_encoders() -> Vec<&'static str> {
+    let mut v = vec!["openh264"];
+    if cfg!(feature = "x264") {
+        v.push("x264");
+    }
+    v
+}
 
 /// Which of the two the arguments ask for, if either. Help wins over version.
 #[derive(Debug, PartialEq)]
@@ -171,13 +187,16 @@ pub fn print_if_asked(args: &[String]) -> bool {
                 "127.0.0.1"
             };
             print!(
-                "voxl {version}: low-latency desktop streaming for the browser.\n{}{DESKTOP}{FILES}",
+                "starfold {version}: low-latency desktop streaming for the browser.\n{}{DESKTOP}{FILES}",
                 USAGE.replace("ADDR_DEFAULT", addr)
             );
             true
         }
         Some(Request::Version) => {
-            println!("voxl {version}");
+            println!(
+                "starfold {version} (encoders: {})",
+                software_encoders().join(", ")
+            );
             true
         }
         None => false,
@@ -205,6 +224,13 @@ mod tests {
             request(&args(&["--version", "--help"])),
             Some(Request::Help)
         );
+    }
+
+    #[test]
+    fn version_lists_the_software_encoders_built_in() {
+        let v = software_encoders();
+        assert!(v.contains(&"openh264"));
+        assert_eq!(v.contains(&"x264"), cfg!(feature = "x264"));
     }
 
     #[test]
