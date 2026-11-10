@@ -15,6 +15,7 @@ export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=bot GIT_COMMITTER_EMAIL=bot@example.com SYNC_BOT_EMAIL=bot@example.com
 
 failures=0
+case_n=0
 check() {
 	if eval "$2"; then echo "ok   $1"; else
 		echo "FAIL $1"
@@ -178,13 +179,16 @@ skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
 run_sync
 check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr"'
 
-# A skip list made of $1 with S standing for the next upstream commit's sha.
+# A skip list made of $1, with S standing for the next upstream commit's sha and U for
+# the same in upper case.
 list_case() {
-	setup "list-$RANDOM"
+	case_n=$((case_n + 1))
+	setup "list-$case_n"
 	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
-	local sha
+	local sha list
 	sha=$(git -C "$dir/upstream" rev-parse HEAD)
-	skip "${1//S/$sha}"
+	list=${1//S/$sha}
+	skip "${list//U/${sha^^}}"
 	run_sync
 }
 for c in $'S held: review\nS release bump' $'S release bump\nS other reason' $'S held: one\nS held: two'; do
@@ -202,6 +206,33 @@ check 'blank lines around a skip: allowed, the commit is skipped' \
 	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && grep -qF ": release bump" "$dir/body.md"'
 list_case 'S held: review it'
 check 'held line with single spaces: held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
+zwsp=$'\xe2\x80\x8b' nbsp=$'\xc2\xa0'
+for c in "S ${zwsp}held: review" "S $zwsp" "S${nbsp}release bump" "S release ${zwsp}bump" 'U release bump'; do
+	list_case "$c"
+	check "non-ASCII or upper-case line ${c@Q}: fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+done
+if locale -a 2>/dev/null | grep -qiEx 'en_us\.utf-?8'; then
+	LC_ALL=en_US.UTF-8 list_case 'U release bump'
+	check 'upper-case sha under en_US.UTF-8: fails, nothing pushed' \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+	LC_ALL=en_US.UTF-8 list_case "S ${zwsp}held: review"
+	check 'zero-width space before held: under en_US.UTF-8: fails' \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+else
+	echo "note en_US.UTF-8 isn't installed; the locale cases ran under the default locale only"
+fi
+
+case_n=$((case_n + 1))
+setup "list-$case_n"
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+printf '%s release\0bump\n' "$(git -C "$dir/upstream" rev-parse HEAD)" >"$dir/seed/.github/upstream-skip"
+git -C "$dir/seed" add .github/upstream-skip
+git -C "$dir/seed" commit -qm 'skip list with a NUL'
+git -C "$dir/seed" push -q "$dir/origin.git" main
+run_sync
+check 'NUL byte in the skip list: fails, nothing pushed' \
+	'[ $rc -ne 0 ] && grep -q "upstream-skip contains a NUL byte" "$dir/stderr" && ! has_branch'
 setup hook
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 printf '#!/bin/sh\nexit 1\n' >"$dir/work/.git/hooks/prepare-commit-msg"
@@ -285,7 +316,7 @@ branch_by() {
 	git -C "$dir/seed" push -q "$dir/origin.git" "$commit:refs/heads/sync/upstream"
 }
 for who in 'Person <>' 'Person' 'Person < >' 'bot <BOT@EXAMPLE.COM>'; do
-	setup "committer-$RANDOM"
+	case_n=$((case_n + 1)); setup "committer-$case_n"
 	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 	branch_by "$who"
 	before=$(git -C "$dir/origin.git" rev-parse sync/upstream)

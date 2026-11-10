@@ -97,23 +97,33 @@ fi
 skip_list=
 skip_present=$(git ls-tree --full-tree --name-only refs/remotes/origin/main -- "$skip_file")
 if [ -n "$skip_present" ]; then
+	nul=$(git show "refs/remotes/origin/main:$skip_file" | tr -cd '\000' | wc -c)
+	if [ $((nul)) -ne 0 ]; then
+		echo "$skip_file contains a NUL byte" >&2
+		exit 1
+	fi
 	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
 fi
 declare -A skip_reasons=()
-split_lines "$skip_list"
-for l in "${lines[@]}"; do
-	if [[ $l == *[[:cntrl:]]* ]] || ! [[ $l =~ ^([0-9a-f]{40})\ (held:\ )?([[:graph:]].*)$ ]] ||
-		[[ -z ${BASH_REMATCH[2]} && ${BASH_REMATCH[3]} == held:* ]]; then
-		echo "$skip_file: each line is '<full sha> <reason>' or '<full sha> held: <follow-up>', single spaces, no tabs or CRs; not: ${l@Q}" >&2
-		exit 1
-	fi
-	sha=${BASH_REMATCH[1]}
-	if [ -n "${skip_reasons[$sha]+x}" ]; then
-		echo "$skip_file: $sha is listed more than once" >&2
-		exit 1
-	fi
-	skip_reasons[$sha]=${BASH_REMATCH[2]}${BASH_REMATCH[3]}
-done
+# Each line is "<full sha> <reason>" or "<full sha> held: <follow-up>", printable ASCII only.
+parse_skip_list() {
+	local LC_ALL=C l sha
+	split_lines "$1"
+	for l in "${lines[@]}"; do
+		if [[ $l == *[!\ -~]* ]] || ! [[ $l =~ ^([0123456789abcdef]{40})\ (held:\ )?([[:graph:]].*)$ ]] ||
+			[[ -z ${BASH_REMATCH[2]} && ${BASH_REMATCH[3]} == held:* ]]; then
+			echo "$skip_file: each line is '<full sha> <reason>' or '<full sha> held: <follow-up>', single spaces, printable ASCII only; not: ${l@Q}" >&2
+			exit 1
+		fi
+		sha=${BASH_REMATCH[1]}
+		if [ -n "${skip_reasons[$sha]+x}" ]; then
+			echo "$skip_file: $sha is listed more than once" >&2
+			exit 1
+		fi
+		skip_reasons[$sha]=${BASH_REMATCH[2]}${BASH_REMATCH[3]}
+	done
+}
+parse_skip_list "$skip_list"
 
 revs=$(git rev-list --reverse --first-parent "$marker..$upstream")
 split_lines "$revs"
