@@ -12,8 +12,10 @@
 # status=<up-to-date|human-edits|held|blocked|unchanged|pushed> plus, for the last two,
 # head=<sync/upstream sha> to $GITHUB_OUTPUT. When the first commit to sync is held or
 # doesn't apply, the body also goes to $GITHUB_STEP_SUMMARY with one warning naming
-# that commit, and the run still succeeds; any other failure exits non-zero.
+# that commit, and the run still succeeds; any other failure, including any git command
+# failing, exits non-zero.
 set -euo pipefail
+shopt -s inherit_errexit
 
 upstream_url=$1
 body=$2
@@ -35,18 +37,32 @@ output() {
 # A commit's tree with upstream paths moved to where they live here. Upstream's .github
 # (its CI) and package-lock.json (bun.lock here) are left out.
 map_tree() {
-	local index
+	local index tree
 	index=$(mktemp -u)
-	git ls-tree -r -z --full-tree "$1" | perl -0 -ne '
+	if ! git ls-tree -r -z --full-tree "$1" | perl -0 -ne '
 		chomp;
 		my ($meta, $path) = split /\t/, $_, 2;
 		next if $path =~ m{^\.github/} || $path eq "package-lock.json";
 		$path = "crates/starfold-server/$path" if $path =~ m{^src/} || $path eq "build.rs" || $path eq "Cargo.toml";
 		$path = "packages/$path" if $path =~ m{^web/};
 		print "$meta\t$path\0";
-	' | GIT_INDEX_FILE=$index git update-index -z --index-info
-	GIT_INDEX_FILE=$index git write-tree
+	' | GIT_INDEX_FILE=$index git update-index -z --index-info; then
+		echo "mapping the tree of $1 failed" >&2
+		rm -f "$index"
+		return 1
+	fi
+	tree=$(GIT_INDEX_FILE=$index git write-tree)
 	rm -f "$index"
+	echo "$tree"
+}
+
+# 0 when $1 is an ancestor of $2, 1 when it isn't; any other git failure exits.
+is_ancestor() {
+	local rc=0
+	git merge-base --is-ancestor "$1" "$2" || rc=$?
+	case $rc in 0 | 1) return "$rc" ;; esac
+	echo "git merge-base --is-ancestor $1 $2 failed (exit $rc)" >&2
+	exit 1
 }
 
 line() { git log -1 --format='%h %s' "$1"; }
@@ -70,31 +86,43 @@ case $listed in
 esac
 upstream=$(git rev-parse refs/remotes/upstream/main)
 marker=$(git show "refs/remotes/origin/main:$marker_file")
-if ! git merge-base --is-ancestor "$marker" "$upstream"; then
+if ! is_ancestor "$marker" "$upstream"; then
 	echo "$marker_file ($marker) is not on upstream main ($upstream)" >&2
 	exit 1
 fi
 skip_list=
-if git cat-file -e "refs/remotes/origin/main:$skip_file" 2>/dev/null; then
+skip_present=$(git ls-tree --full-tree --name-only refs/remotes/origin/main -- "$skip_file")
+if [ -n "$skip_present" ]; then
 	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
 fi
-if bad=$(grep -vE '^[0-9a-f]{40} [^ ]' <<<"$skip_list" | grep -v '^$' || grep -E '^[0-9a-f]{40} held:[[:space:]]*$' <<<"$skip_list"); then
-	echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $bad" >&2
+bad=$(grep -vE '^$|^[0-9a-f]{40} [^ ]' <<<"$skip_list") || [ $? -eq 1 ]
+held_empty=$(grep -E '^[0-9a-f]{40} held:[[:space:]]*$' <<<"$skip_list") || [ $? -eq 1 ]
+if [ -n "$bad$held_empty" ]; then
+	echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $bad$held_empty" >&2
 	exit 1
 fi
 skip_reason() { awk -v c="$1" '$1 == c { sub(/^[^ ]+ /, ""); print; exit }' <<<"$skip_list"; }
 
+revs=$(git rev-list --reverse --first-parent "$marker..$upstream")
 commits=()
-while IFS= read -r c; do commits+=("$c"); done < <(git rev-list --reverse --first-parent "$marker..$upstream")
+if [ -n "$revs" ]; then mapfile -t commits <<<"$revs"; fi
 if [ ${#commits[@]} -eq 0 ]; then
 	output status=up-to-date
 	exit 0
 fi
 if [ -n "$remote_branch" ]; then
 	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
-	if [ -n "$committers" ] && grep -qvxF "$bot_email" <<<"$committers"; then
-		output status=human-edits
-		exit 0
+	if [ -n "$committers" ]; then
+		others=0
+		grep -qvxF "$bot_email" <<<"$committers" || others=$?
+		case $others in
+		0)
+			output status=human-edits
+			exit 0
+			;;
+		1) ;;
+		*) exit 1 ;;
+		esac
 	fi
 fi
 
@@ -106,30 +134,34 @@ last=
 handled=0
 held_for=
 stop=
+stop_label=
 stop_reason=
 for c in "${commits[@]}"; do
+	label=$(line "$c")
 	reason=$(skip_reason "$c")
 	if [[ $reason == held:* ]]; then
 		stop=$c
+		stop_label=$label
 		held_for=${reason#held:}
 		held_for=${held_for# }
 		stop_reason="held in \`$skip_file\`: $held_for"
 		break
 	fi
 	if [ -n "$reason" ]; then
-		skipped_listed+=("$(line "$c"): $reason")
+		skipped_listed+=("$label: $reason")
 		last=$c
 		handled=$((handled + 1))
 		continue
 	fi
-	base=$(git commit-tree "$(map_tree "$c^1")" -m base)
-	mapped=$(
-		GIT_AUTHOR_NAME=$(git log -1 --format=%an "$c") \
-			GIT_AUTHOR_EMAIL=$(git log -1 --format=%ae "$c") \
-			GIT_AUTHOR_DATE=$(git log -1 --format=%ad --date=raw "$c") \
-			git commit-tree "$(map_tree "$c")" -p "$base" \
-			-m "$(git log -1 --format=%B "$c")" -m "Upstream: tembo/voxl@$c"
-	)
+	parent_tree=$(map_tree "$c^1")
+	base=$(git commit-tree "$parent_tree" -m base)
+	tree=$(map_tree "$c")
+	author_name=$(git log -1 --format=%an "$c")
+	author_email=$(git log -1 --format=%ae "$c")
+	author_date=$(git log -1 --format=%ad --date=raw "$c")
+	message=$(git log -1 --format=%B "$c")
+	mapped=$(GIT_AUTHOR_NAME=$author_name GIT_AUTHOR_EMAIL=$author_email GIT_AUTHOR_DATE=$author_date \
+		git commit-tree "$tree" -p "$base" -m "$message" -m "Upstream: tembo/voxl@$c")
 	if pick_log=$(git cherry-pick --keep-redundant-commits "$mapped" 2>&1); then
 		picked+=("$c")
 		last=$c
@@ -137,17 +169,22 @@ for c in "${commits[@]}"; do
 	else
 		conflicts=$(git ls-files -u | cut -f2 | sort -u | list)
 		if [ -z "$conflicts" ]; then
-			echo "cherry-picking $(line "$c") failed without a conflict:" >&2
+			echo "cherry-picking $label failed without a conflict:" >&2
 			echo "$pick_log" >&2
 			exit 1
 		fi
 		stop=$c
+		stop_label=$label
 		stop_reason="conflicts in $conflicts"
 		git cherry-pick --abort
 		break
 	fi
-	skipped=$(git diff --name-only "$c^1" "$c" | grep -E '^(\.github/|package-lock\.json$)' || true)
-	if [ -n "$skipped" ]; then left_out+=("$(line "$c"): $(echo "$skipped" | list)"); fi
+	changed=$(git diff --name-only "$c^1" "$c")
+	skipped=$(grep -E '^(\.github/|package-lock\.json$)' <<<"$changed") || [ $? -eq 1 ]
+	if [ -n "$skipped" ]; then
+		files=$(list <<<"$skipped")
+		left_out+=("$label: $files")
+	fi
 	if [ ${#picked[@]} -eq "$max_commits" ]; then break; fi
 done
 
@@ -162,7 +199,10 @@ fi
 	echo
 	if [ ${#picked[@]} -gt 0 ]; then
 		echo "Applied (${#picked[@]}), with upstream paths moved into this repo's layout:"
-		for c in "${picked[@]}"; do echo "- $(line "$c")"; done
+		for c in "${picked[@]}"; do
+			l=$(line "$c")
+			echo "- $l"
+		done
 		echo
 	fi
 	if [ ${#skipped_listed[@]} -gt 0 ]; then
@@ -172,8 +212,11 @@ fi
 	fi
 	if [ -n "$stop" ]; then
 		rest=("${commits[@]:$handled}")
-		echo "**Stopped at $(line "$stop")**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
-		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
+		echo "**Stopped at $stop_label**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
+		for c in "${rest[@]}"; do
+			l=$(line "$c")
+			echo "- $l"
+		done
 		echo
 		if [ -n "$held_for" ]; then
 			echo "It and everything after it wait until its line is removed from \`$skip_file\`."
@@ -184,7 +227,10 @@ fi
 	elif [ "$handled" -lt ${#commits[@]} ]; then
 		rest=("${commits[@]:$handled}")
 		echo "At most $max_commits applied per run; still to sync (${#rest[@]}), oldest first:"
-		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
+		for c in "${rest[@]}"; do
+			l=$(line "$c")
+			echo "- $l"
+		done
 		echo
 	fi
 	if [ ${#left_out[@]} -gt 0 ]; then
@@ -197,10 +243,10 @@ fi
 if [ -z "$last" ]; then
 	if [ -n "$held_for" ]; then
 		output status=held
-		warning="upstream sync is held at $(line "$stop"): $held_for"
+		warning="upstream sync is held at $stop_label: $held_for"
 	else
 		output status=blocked
-		warning="upstream sync is blocked at $(line "$stop"), which doesn't apply here; see the job summary"
+		warning="upstream sync is blocked at $stop_label, which doesn't apply here; see the job summary"
 	fi
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
 	warning=${warning//%/%25}
@@ -208,12 +254,16 @@ if [ -z "$last" ]; then
 	echo "::warning::${warning//$'\n'/%0A}"
 	exit 0
 fi
-if [ -n "$remote_branch" ] && git merge-base --is-ancestor refs/remotes/origin/main "$remote_branch" &&
-	[ "$(git rev-parse "$remote_branch^{tree}")" = "$(git rev-parse "HEAD^{tree}")" ]; then
-	output "head=$remote_branch"
-	output status=unchanged
-	exit 0
+if [ -n "$remote_branch" ] && is_ancestor refs/remotes/origin/main "$remote_branch"; then
+	remote_tree=$(git rev-parse "$remote_branch^{tree}")
+	head_tree=$(git rev-parse "HEAD^{tree}")
+	if [ "$remote_tree" = "$head_tree" ]; then
+		output "head=$remote_branch"
+		output status=unchanged
+		exit 0
+	fi
 fi
 git push --quiet --force-with-lease="refs/heads/$branch:$remote_branch" origin "HEAD:refs/heads/$branch"
-output "head=$(git rev-parse HEAD)"
+head=$(git rev-parse HEAD)
+output "head=$head"
 output status=pushed
