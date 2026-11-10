@@ -39,7 +39,7 @@ interface Upload {
 	group?: Group;
 }
 
-// Icons from the Tembo UI package's icon set (16px with 2px padding).
+// Icons from upstream voxl (MIT), 16px with 2px padding.
 const svg = (d: string) =>
 	`<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
 const ICON_DIR = svg(
