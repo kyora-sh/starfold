@@ -69,13 +69,15 @@ is_ancestor() {
 # Bare (#NN) references are upstream's; here they would link to this repo's own.
 qualify() { sed -E 's|\(#([0123456789]+)\)|(tembo/voxl#\1)|g'; }
 line() { git log -1 --format='%h %s' "$1" | qualify; }
-# Upstream's message for this repo: the subject and the plain text after it, up to the
-# first line that starts with optional whitespace and '<' (badges, images, links), without
-# trailing blank lines.
+# Upstream's message for this repo: its first non-blank line as the subject, then the
+# plain text after it up to the first line that starts with optional whitespace and '<'
+# (badges, images, links), without trailing blank lines. Reads to the end either way.
 clean_message() {
 	git log -1 --format=%B "$1" | awk '
-		NR == 1 { print; next }
-		/^[[:space:]]*</ { exit }
+		cut { next }
+		!subject && /^[[:space:]]*$/ { next }
+		!subject { print; subject = 1; next }
+		/^[[:space:]]*</ { cut = 1; next }
 		/^[[:space:]]*$/ { blank = blank $0 "\n"; next }
 		{ printf "%s%s\n", blank, $0; blank = "" }
 	' | qualify

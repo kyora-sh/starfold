@@ -406,6 +406,24 @@ message_case $'docs: plain\n\nJust text, (tembo/voxl#3) already qualified.\n  an
 check 'message: no HTML, kept as is' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
 message_case $'feat: touch (#68)\n\nTested.\n \n  \n\n <br />' $'feat: touch (tembo/voxl#68)\n\nTested.'
 check 'message: whitespace-only lines before the HTML dropped' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+message_case $'\n\n<b>bold</b> subject (#3)\n\nbody text\n<p>x</p>' $'<b>bold</b> subject (tembo/voxl#3)\n\nbody text'
+check 'message: leading blank lines skipped, a subject starting with < kept' \
+	'[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+
+case_n=$((case_n + 1))
+setup "message-$case_n"
+printf 'pub fn m() {}\n' >"$dir/upstream/src/m.rs"
+{
+	printf 'feat: big (#1)\n\nShort text.\n\n'
+	printf '<p><img src="https://example.com/badge.svg"></p>\n%.0s' $(seq 40000)
+} >"$dir/message"
+git -C "$dir/upstream" add -A
+git -C "$dir/upstream" commit -q --cleanup=verbatim -F "$dir/message"
+sha=$(git -C "$dir/upstream" rev-parse HEAD)
+expected=$'feat: big (tembo/voxl#1)\n\nShort text.\n\nUpstream: tembo/voxl@'"$sha"
+run_sync
+check "message: a $(($(wc -c <"$dir/message") / 1024)) KiB HTML tail is cut, and the sync goes through" \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && [ "$(synced_message)" = "$expected" ]'
 
 case_n=$((case_n + 1))
 setup "kinds-$case_n"
