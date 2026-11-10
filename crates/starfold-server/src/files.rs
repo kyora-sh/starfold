@@ -679,7 +679,7 @@ pub async fn upload(
         result?;
         let dest = unique(&part.dir, &name);
         #[cfg(all(test, unix))]
-        tests::before_publish(&dest);
+        tests::before_publish(&part.dir, &dest);
         // The folder (or the root) may have moved since the upload began: measure the
         // final path where the folder is now.
         let parts: Vec<&str> = path.iter().map(String::as_str).collect();

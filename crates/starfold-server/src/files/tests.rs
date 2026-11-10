@@ -680,22 +680,32 @@ fn a_zip_needs_one_descriptor_per_level_not_per_folder() {
     assert!(stdout.contains("FILES 200"), "{stdout}");
 }
 
-/// Uploads whose destination is `.0` wait here twice, after choosing it and before
-/// publishing, until `.1` of them (or the test) have each time.
-static BEFORE_PUBLISH: std::sync::Mutex<Option<(String, Arc<std::sync::Barrier>)>> =
-    std::sync::Mutex::new(None);
+/// A hook on one destination: the folder's device and inode, and the file name.
+type Hook = ((u64, u64), String, Arc<std::sync::Barrier>);
+
+/// Uploads publishing that name in that folder wait here twice, after choosing it and
+/// before publishing, until the barrier's other parties (uploads or the test) have each
+/// time. Other tests' uploads never match: their folders are elsewhere.
+static BEFORE_PUBLISH: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
 /// Held for the whole of each test that sets [`BEFORE_PUBLISH`], so they run one at a time.
 static HOOK_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub(super) fn before_publish(dest: &str) {
+pub(super) fn before_publish(dir: &Dir, dest: &str) {
     let hook = BEFORE_PUBLISH.lock().unwrap().clone();
-    if let Some((name, all_chosen)) = hook {
-        if name == dest {
+    if let Some((folder, name, all_chosen)) = hook {
+        if name == dest && dir.id() == Some(folder) {
             all_chosen.wait();
             all_chosen.wait();
         }
     }
+}
+
+/// The device and inode of `p`, as [`Dir::id`] gives them.
+fn folder_id(p: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).unwrap();
+    (m.dev(), m.ino())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -704,7 +714,12 @@ async fn two_uploads_publishing_one_name_get_one_save_and_one_conflict() {
     let t = Tmp::new();
     let f = t.files("Downloads");
     let name = "collide-two-uploads.txt";
-    *BEFORE_PUBLISH.lock().unwrap() = Some((name.into(), Arc::new(std::sync::Barrier::new(2))));
+    std::fs::create_dir_all(t.root().join("Downloads")).unwrap();
+    *BEFORE_PUBLISH.lock().unwrap() = Some((
+        folder_id(&t.root().join("Downloads")),
+        name.into(),
+        Arc::new(std::sync::Barrier::new(2)),
+    ));
     let (a, b) = {
         let (fa, fb) = (f.clone(), f.clone());
         tokio::join!(
@@ -909,7 +924,7 @@ async fn a_root_moved_during_an_upload_is_measured_again_before_publishing() {
     let moved = deep.join("root");
     let name = format!("{}.txt", "a".repeat(MAX_NAME - 4));
     let gate = Arc::new(std::sync::Barrier::new(2));
-    *BEFORE_PUBLISH.lock().unwrap() = Some((name.clone(), gate.clone()));
+    *BEFORE_PUBLISH.lock().unwrap() = Some((folder_id(&t.root()), name.clone(), gate.clone()));
     let (fu, n) = (f.clone(), name.clone());
     let upload =
         tokio::spawn(async move { put(&fu, &[("name", n.as_str()), ("path", "")], "x").await });
@@ -946,7 +961,8 @@ async fn a_folder_moved_during_an_upload_is_measured_where_it_is_now() {
     let moved = deep.join("d");
     let name = format!("{}.txt", "b".repeat(MAX_NAME - 4));
     let gate = Arc::new(std::sync::Barrier::new(2));
-    *BEFORE_PUBLISH.lock().unwrap() = Some((name.clone(), gate.clone()));
+    *BEFORE_PUBLISH.lock().unwrap() =
+        Some((folder_id(&t.root().join("d")), name.clone(), gate.clone()));
     let (fu, n) = (f.clone(), name.clone());
     let upload =
         tokio::spawn(async move { put(&fu, &[("name", n.as_str()), ("path", "d")], "x").await });
