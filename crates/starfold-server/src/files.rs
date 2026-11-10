@@ -680,16 +680,13 @@ pub async fn upload(
         let dest = unique(&part.dir, &name);
         #[cfg(all(test, unix))]
         tests::before_publish(&dest);
-        // The root may have moved since the upload began: measure the final path again.
-        let whole: Vec<&str> = path
-            .iter()
-            .map(String::as_str)
-            .chain([dest.as_str()])
-            .collect();
+        // The folder (or the root) may have moved since the upload began: measure the
+        // final path where the folder is now.
+        let parts: Vec<&str> = path.iter().map(String::as_str).collect();
         fs.root
             .as_ref()
             .expect("checked")
-            .fits(&whole, 0)
+            .fits_in(&part.dir, &parts, &dest)
             .map_err(refused)?;
         match part.publish(OsStr::new(&dest)) {
             Ok(()) => {}

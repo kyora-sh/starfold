@@ -117,7 +117,9 @@ those temporary files is best effort: on filesystems with short names (FAT), a s
 viewer may be able to see an upload while it is in progress.
 A path longer than `PATH_MAX` is refused before anything is created, and an upload needs room
 for a 255-byte name under it. On Unix systems other than Linux and macOS, an entry's own name
-can't be looked up, so only the name in the request is checked.
+can't be looked up, so only the name in the request is checked, and the root's length is
+measured at the path it was started with. On Windows a path is checked and then opened by
+name, so a folder changed in between can affect what is opened.
 
 ### Login
 

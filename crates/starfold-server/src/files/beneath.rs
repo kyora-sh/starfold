@@ -109,6 +109,32 @@ impl Root {
         Ok(())
     }
 
+    /// Refuses `name` in `dir` if that path, measured where `dir` is now, is more than the
+    /// filesystem can report for an open entry. Where a folder's location can't be looked
+    /// up, `parts` under the root are measured instead.
+    pub fn fits_in(&self, dir: &Dir, parts: &[&str], name: &str) -> Result<(), Refused> {
+        let Some(reported) = dir.reported() else {
+            let whole: Vec<&str> = parts.iter().copied().chain([name]).collect();
+            return self.fits(&whole, 0);
+        };
+        let at = reported.map_err(|e| {
+            Refused::Io(io::Error::new(
+                e.kind(),
+                format!("can't tell where the upload folder is: {e}"),
+            ))
+        })?;
+        let at = at.as_os_str();
+        let trailing = at
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| std::path::is_separator(b as char));
+        let len = path_units(at) - trailing as usize + 1 + path_units(OsStr::new(name)) + 1;
+        if len > PATH_MAX {
+            return Err(Refused::BadName);
+        }
+        Ok(())
+    }
+
     fn checked(&self, d: Dir) -> Result<Dir, Refused> {
         if let Some(reported) = d.reported() {
             judge_reported(reported, Some(&self.path))?;
