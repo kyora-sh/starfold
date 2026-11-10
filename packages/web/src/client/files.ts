@@ -39,21 +39,15 @@ interface Upload {
 	group?: Group;
 }
 
-// Icons from the Tembo UI package's icon set (16px with 2px padding).
+// starfold's own icons: plain strokes on a 24-unit grid, drawn at 16px with 2px padding.
 const svg = (d: string) =>
 	`<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
-const ICON_DIR = svg(
-	'<path d="M3 6V17C3 18.1046 3.89543 19 5 19H19C20.1046 19 21 18.1046 21 17V9C21 7.89543 20.1046 7 19 7H12.5352C12.2008 7 11.8886 6.8329 11.7031 6.5547L10.5937 4.8906C10.2228 4.3342 9.59834 4 8.92963 4H5C3.89543 4 3 4.89543 3 6Z"/>'
-);
-const ICON_FILE = svg(
-	'<path d="M12.1716 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V9.82843C19 9.29799 18.7893 8.78929 18.4142 8.41421L13.5858 3.58579C13.2107 3.21071 12.702 3 12.1716 3Z"/><path d="M13 3.5V7C13 8.10457 13.8954 9 15 9H18.5"/>'
-);
+const ICON_DIR = svg('<path d="M3 4.5H9.5L11.5 7H21V19.5H3Z"/>');
+const ICON_FILE = svg('<path d="M6 3H14L19 8V21H6Z"/><path d="M14 3V8H19"/>');
 const ICON_DOWNLOAD = svg(
-	'<path d="M12 4V15"/><path d="M7 10.5L12 15.5L17 10.5"/><path d="M5 20H19"/>'
+	'<path d="M12 4V14"/><path d="M8 10L12 14L16 10"/><path d="M5 19H19"/>'
 );
-const ICON_CHEVRON = svg(
-	'<path d="M10 16L13.2929 12.7071C13.6834 12.3166 13.6834 11.6834 13.2929 11.2929L10 8"/>'
-);
+const ICON_CHEVRON = svg('<path d="M10 8L14 12L10 16"/>');
 
 // The password from a sign-in link (/?token=...), passed on as the socket gets it.
 const token = new URLSearchParams(location.search).get('token');
