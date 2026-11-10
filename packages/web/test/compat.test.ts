@@ -7,7 +7,13 @@ test('window.voxlStats reads starfoldStats and warns once', () => {
 	aliasVoxlStats(w, (m) => warnings.push(m));
 	expect(warnings).toEqual([]);
 	w.starfoldStats = { fps: 30 };
-	expect((w as unknown as { voxlStats: unknown }).voxlStats).toEqual({ fps: 30 });
-	expect((w as unknown as { voxlStats: unknown }).voxlStats).toBe(w.starfoldStats);
-	expect(warnings).toEqual(['[starfold] window.voxlStats is deprecated: use window.starfoldStats']);
+	expect((w as unknown as { voxlStats: unknown }).voxlStats).toEqual({
+		fps: 30,
+	});
+	expect((w as unknown as { voxlStats: unknown }).voxlStats).toBe(
+		w.starfoldStats
+	);
+	expect(warnings).toEqual([
+		'[starfold] window.voxlStats is deprecated: use window.starfoldStats',
+	]);
 });
