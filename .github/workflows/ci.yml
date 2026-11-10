@@ -64,6 +64,14 @@ jobs:
       - name: Test
         run: uv run --locked pytest
 
+  upstream-sync:
+    name: Upstream sync script
+    runs-on: kyora-8x16
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/scripts/upstream-sync-test.sh
+
   rust:
     name: Rust (rustfmt, clippy, test)
     runs-on: kyora-8x16

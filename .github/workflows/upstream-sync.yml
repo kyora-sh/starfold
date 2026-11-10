@@ -53,9 +53,3 @@ jobs:
           if [ "$runs" = 0 ]; then
             gh workflow run ci.yml --ref sync/upstream
           fi
-      - name: Report a commit that needs a hand
-        if: steps.sync.outputs.status == 'blocked'
-        run: |
-          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::the next upstream commit doesn't apply; see the summary"
-          exit 1
