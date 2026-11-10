@@ -23,6 +23,13 @@ use std::ptr;
 /// less a share of one frame's refill, so a refill far above what the buffer holds now leaves
 /// the pass no room at all.
 const REFINE_VBV_WIDEN: i32 = 4;
+/// A pass's CRF-max over its CRF of 0: VBV may raise no row past CRF's own estimate plus this,
+/// so the forced QP holds whenever it is above that (x264 lets the buffer underflow instead).
+const REFINE_CRF_MAX: f32 = 0.1;
+/// The CRF-max outside passes. x264 can't clear one once set, so every stream carries one
+/// this far above its CRF: VBV still raises QP up to 51 unless CRF's own estimate is
+/// under 51 - CRF.
+const CRF_MAX: f32 = 51.0;
 
 pub struct X264 {
     h: *mut ffi::x264_t,
@@ -78,6 +85,7 @@ impl X264 {
             } as i32;
             param.rc.i_rc_method = ffi::X264_RC_CRF as i32;
             param.rc.f_rf_constant = cfg.rate.quality;
+            param.rc.f_rf_constant_max = CRF_MAX;
             param.rc.i_lookahead = 0;
             // ultrafast's diamond search only follows motion of a few pixels, so a dragged
             // window or a fast scroll would be coded as new pixels every frame. UMH finds
@@ -125,20 +133,23 @@ impl X264 {
         }
     }
 
-    /// Rate control as it stands, but with room for a pass of `max_bytes` (two in the buffer,
-    /// refilled at up to REFINE_VBV_WIDEN times the rate; a whole raw picture without a budget)
-    /// and a CRF that never asks for less than the pass's QP: VBV otherwise raises a forced QP
-    /// row by row towards what CRF would have picked.
+    /// Rate control as it stands, but holding a pass's forced QP: CRF 0 with REFINE_CRF_MAX,
+    /// so VBV's row control can't raise it, and room for `max_bytes` (two in the buffer, and at
+    /// least two frames' refill so x264 never lowers rows below it either), refilled at up to
+    /// REFINE_VBV_WIDEN times the rate, so the motion after a pass doesn't start from an
+    /// empty buffer. A whole raw picture stands in for a missing budget.
     fn widen(&mut self, max_bytes: Option<usize>, mbs: usize) -> Result<(), EncodeError> {
         let mut p = self.param;
         p.rc.f_rf_constant = 0.0;
+        p.rc.f_rf_constant_max = REFINE_CRF_MAX;
         if p.rc.i_vbv_max_bitrate > 0 {
             let b = max_bytes.unwrap_or(mbs * 384);
             let frame_kbit = (b * 8).div_ceil(1000) as i32;
             let rate = p.rc.i_vbv_max_bitrate;
             p.rc.i_vbv_max_bitrate =
                 (frame_kbit * p.i_fps_num as i32).clamp(rate, rate * REFINE_VBV_WIDEN);
-            p.rc.i_vbv_buffer_size = p.rc.i_vbv_buffer_size.max(frame_kbit * 2);
+            let refill = p.rc.i_vbv_max_bitrate / p.i_fps_num.max(1) as i32;
+            p.rc.i_vbv_buffer_size = p.rc.i_vbv_buffer_size.max(frame_kbit * 2).max(refill * 2);
         }
         Self::reconfig(self.h, &mut p)
     }
@@ -246,7 +257,16 @@ impl VideoEncoder for X264 {
             self.fresh = false;
             if size > 0 {
                 match fixed {
-                    Some(qp) => self.sharpness.refined(qp, size as usize),
+                    // Proof that no row went above the pass's QP: x264's average QP over CRF's
+                    // estimate. Without it the pass counts for nothing, and the picture stays
+                    // as coarse as it was for the next one.
+                    Some(qp)
+                        if self.param.rc.i_vbv_max_bitrate == 0
+                            || pic_out.prop.f_crf_avg > REFINE_CRF_MAX as f64 =>
+                    {
+                        self.sharpness.refined(qp, size as usize)
+                    }
+                    Some(_) => {}
                     None => {
                         let map = static_mbs.as_deref().filter(|_| pic_out.b_keyframe == 0);
                         self.sharpness.moved(pic_out.i_qpplus1 - 1, map);

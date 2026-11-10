@@ -887,6 +887,8 @@ struct Refining {
     pts: i64,
     scrolled: usize,
     last_psnr: f64,
+    /// What each frame tells the encoder didn't change (x264 marks up its copy).
+    map: Option<Vec<u8>>,
 }
 
 impl Refining {
@@ -908,14 +910,18 @@ impl Refining {
     }
 
     fn with(enc: Box<dyn VideoEncoder>) -> Self {
-        let (w, h) = (640, 480);
+        Self::sized(enc, 640, 480)
+    }
+
+    fn sized(enc: Box<dyn VideoEncoder>, w: usize, h: usize) -> Self {
         let mut me = Refining {
             enc,
             dec: ::openh264::decoder::Decoder::new().unwrap(),
-            pic: Picture::new(w as usize, h as usize),
+            pic: Picture::new(w, h),
             pts: 0,
             scrolled: 0,
             last_psnr: 0.0,
+            map: None,
         };
         me.step(true, None);
         me
@@ -925,6 +931,7 @@ impl Refining {
     fn step(&mut self, force_keyframe: bool, refine: Option<Refine>) -> (usize, bool) {
         use ::openh264::formats::YUVSource;
         self.pts += 33;
+        let mut map = self.map.clone();
         let aus = self
             .enc
             .encode(
@@ -932,7 +939,7 @@ impl Refining {
                 EncodeOptions {
                     pts_ms: self.pts,
                     force_keyframe,
-                    static_mbs: None,
+                    static_mbs: map.as_deref_mut(),
                     refine,
                 },
             )
@@ -1177,6 +1184,67 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             max_bytes: None
         }));
         s.scroll(5);
+    }
+}
+
+/// 1080p text under a 2 Mbit/s VBV, refined as the engine does it: the ladder at its planned
+/// budget, then tail passes at the idle one while the encoder says one would still sharpen.
+/// First after the whole screen scrolled, then after only a band did, with x264 told the
+/// rest didn't change. Each settles within the tail limit, as sharp as with no VBV at all.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_converges_under_a_tight_vbv() {
+    let (w, h): (usize, usize) = (1920, 1080);
+    let cols = w / 16;
+    let band = 20..48;
+    let still_outside: Vec<u8> = (0..h.div_ceil(16))
+        .flat_map(|r| std::iter::repeat_n(u8::from(!band.contains(&r)), cols))
+        .collect();
+    let run = |kbps: u32| {
+        let mut cfg = config(Backend::X264, w as u32, h as u32, kbps);
+        cfg.best_quality = 24.0;
+        let mut s = Refining::sized(open(&cfg).unwrap(), w, h);
+        let budget = |ms: usize| (kbps > 0).then_some(kbps as usize * ms / 8 * 55 / 100);
+        let settle = |s: &mut Refining| {
+            for qp in [20, 16, 12] {
+                s.pass(qp, budget(200));
+            }
+            let tail = Refine {
+                qp: 12,
+                max_bytes: budget(1000),
+            };
+            let mut tails = 0;
+            while s.enc.refinable(tail) {
+                assert!(
+                    tails < 64,
+                    "{kbps} kbit/s: still refinable after {tails} tails"
+                );
+                s.step(false, Some(tail));
+                tails += 1;
+            }
+            (s.last_psnr, tails)
+        };
+        s.scroll(30);
+        let whole = settle(&mut s);
+        s.map = Some(still_outside.clone());
+        for _ in 0..10 {
+            s.scrolled += 12;
+            s.pic
+                .texture(0, 0, band.start * 16, w, band.end * 16, s.scrolled);
+            s.step(false, None);
+        }
+        let banded = settle(&mut s);
+        (whole, banded)
+    };
+    let (capped, free) = (run(2000), run(0));
+    for (what, c, f) in [("whole", capped.0, free.0), ("band", capped.1, free.1)] {
+        assert!(
+            c.0 > f.0 - 0.5,
+            "{what}: {:.2} dB after {} tails at 2 Mbit/s, {:.2} dB uncapped",
+            c.0,
+            c.1,
+            f.0
+        );
     }
 }
 

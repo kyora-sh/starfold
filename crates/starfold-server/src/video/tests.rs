@@ -329,6 +329,7 @@ fn config() -> VideoConfig {
         crf: 24.0,
         max_kbps: 30000,
         paintover_crf: 16.0,
+        paintover_qp: None,
         paintover_burst: 3,
         paintover_delay_ms: 150,
         min_kbps: 2000,
@@ -2450,6 +2451,43 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
         stripe_share(START_KBPS as u32, 1) * 2,
         "paint-over rate applied"
     );
+}
+
+#[test]
+fn the_ladder_ends_at_its_finest_rung() {
+    assert_eq!(rungs(12), REFINE_RUNGS);
+    assert_eq!(rungs(0), [8, 4, 0]);
+    assert_eq!(rungs(48), [51, 51, 48]);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::OpenH264), 12, "x264's setting");
+    assert_eq!(finest_rung(&config(), Backend::OpenH264), 12);
+}
+
+/// An explicit --paintover-crf on x264 is where its passes end, and what the encoder is
+/// asked whether it can still sharpen to.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_refines_down_to_an_explicit_paintover_crf() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(finest_rung(&config(), Backend::X264), 12);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::X264), 0);
+    let mut b = Burst {
+        finest: finest_rung(&cfg, x264.backend),
+        ..Burst::new(3, NO_DELAY, Instant::now())
+    };
+    let now = Instant::now();
+    b.moved(now);
+    assert_eq!(passes(&mut b, now), [Some(8), Some(4), Some(0)]);
 }
 
 #[cfg(feature = "x264")]

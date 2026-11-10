@@ -53,7 +53,9 @@ Video:
                                 sustained heavy motion (default false)
   --paintover-crf, --paintover-burst, --paintover-delay-ms
                                 sharpening once the screen goes still
-                                (default 16, 3, 150)
+                                (default 16, 3, 150); with x264, a given
+                                --paintover-crf is also the QP a still
+                                picture is refined down to (default 12)
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us
