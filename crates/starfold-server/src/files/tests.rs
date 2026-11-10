@@ -535,9 +535,11 @@ async fn a_folder_too_deep_fails_its_download_rather_than_truncating_it() {
     let f = t.files("Downloads");
     let r = download(State(f.clone()), q(&[("path", "top")])).await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(axum::body::to_bytes(r.into_body(), usize::MAX)
-        .await
-        .is_err());
+    assert!(
+        axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -680,8 +682,8 @@ fn a_zip_needs_one_descriptor_per_level_not_per_folder() {
     assert!(stdout.contains("FILES 200"), "{stdout}");
 }
 
-/// Uploads whose destination is `.0` wait here, after choosing it and before publishing,
-/// until `.1` of them have.
+/// Uploads whose destination is `.0` wait here twice, after choosing it and before
+/// publishing, until `.1` of them (or the test) have each time.
 static BEFORE_PUBLISH: std::sync::Mutex<Option<(String, Arc<std::sync::Barrier>)>> =
     std::sync::Mutex::new(None);
 
@@ -689,6 +691,7 @@ pub(super) fn before_publish(dest: &str) {
     let hook = BEFORE_PUBLISH.lock().unwrap().clone();
     if let Some((name, all_chosen)) = hook {
         if name == dest {
+            all_chosen.wait();
             all_chosen.wait();
         }
     }
@@ -887,6 +890,41 @@ async fn a_root_moved_somewhere_deeper_is_measured_where_it_is_now() {
     let (s, b) = put(&f, &[("name", "a.txt"), ("sub", &sub)], "x").await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
     assert!(is_empty(&moved), "nothing is created");
+    std::fs::rename(&moved, t.root()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_root_moved_during_an_upload_is_measured_again_before_publishing() {
+    let t = Tmp::new();
+    let f = t.files("Downloads");
+    let limit = libc::PATH_MAX as usize;
+    let mut deep = t.0.join("moved");
+    while deep.as_os_str().len() < limit - 200 {
+        deep.push("m".repeat(100));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let moved = deep.join("root");
+    let name = format!("{}.txt", "a".repeat(MAX_NAME - 4));
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    *BEFORE_PUBLISH.lock().unwrap() = Some((name.clone(), gate.clone()));
+    let (fu, n) = (f.clone(), name.clone());
+    let upload =
+        tokio::spawn(async move { put(&fu, &[("name", n.as_str()), ("path", "")], "x").await });
+    let (root, to) = (t.root(), moved.clone());
+    tokio::task::spawn_blocking(move || {
+        gate.wait();
+        std::fs::rename(root, to).unwrap();
+        gate.wait();
+    })
+    .await
+    .unwrap();
+    let (s, b) = upload.await.unwrap();
+    *BEFORE_PUBLISH.lock().unwrap() = None;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        is_empty(&moved),
+        "the temporary is gone and nothing is published"
+    );
     std::fs::rename(&moved, t.root()).unwrap();
 }
 
