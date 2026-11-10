@@ -4,14 +4,15 @@
 # Rebuilds sync/upstream from origin/main: each upstream main commit after the one in
 # .github/upstream-sha (first parent), moved into this repo's layout by map_tree, is
 # cherry-picked in order; one listed in .github/upstream-skip ("<full sha> <reason>" per
-# line) is left out and counts as synced. Stops at the first one that doesn't apply,
-# bumps the marker to the last one before it and force-pushes sync/upstream, unless the
-# branch already has that content or carries commits the bot didn't make. Writes the
-# pull request body to <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|
-# pushed> plus, for the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT. When the
-# first commit to sync doesn't apply (blocked), the body also goes to
-# $GITHUB_STEP_SUMMARY with one warning naming that commit, and the run still succeeds;
-# any other failure exits non-zero.
+# line) is left out and counts as synced, while one listed as "<full sha> held: <follow-up>"
+# is never left out: the sync stops before it. Stops at the first one that is held or
+# doesn't apply, bumps the marker to the last one before it and force-pushes
+# sync/upstream (never main), unless the branch already has that content or carries
+# commits the bot didn't make. Writes the pull request body to <body-file>, and
+# status=<up-to-date|human-edits|held|blocked|unchanged|pushed> plus, for the last two,
+# head=<sync/upstream sha> to $GITHUB_OUTPUT. When the first commit to sync is held or
+# doesn't apply, the body also goes to $GITHUB_STEP_SUMMARY with one warning naming
+# that commit, and the run still succeeds; any other failure exits non-zero.
 set -euo pipefail
 
 upstream_url=$1
@@ -63,8 +64,8 @@ skip_list=
 if git cat-file -e "refs/remotes/origin/main:$skip_file" 2>/dev/null; then
 	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
 fi
-if bad=$(grep -vE '^[0-9a-f]{40} [^ ]' <<<"$skip_list" | grep -v '^$'); then
-	echo "$skip_file: each line needs a full sha and a reason, not: $bad" >&2
+if bad=$(grep -vE '^[0-9a-f]{40} [^ ]' <<<"$skip_list" | grep -v '^$' || grep -E '^[0-9a-f]{40} held:[[:space:]]*$' <<<"$skip_list"); then
+	echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $bad" >&2
 	exit 1
 fi
 skip_reason() { awk -v c="$1" '$1 == c { sub(/^[^ ]+ /, ""); print; exit }' <<<"$skip_list"; }
@@ -89,10 +90,18 @@ skipped_listed=()
 left_out=()
 last=
 handled=0
+held_for=
 stop=
 stop_reason=
 for c in "${commits[@]}"; do
 	reason=$(skip_reason "$c")
+	if [[ $reason == held:* ]]; then
+		stop=$c
+		held_for=${reason#held:}
+		held_for=${held_for# }
+		stop_reason="held in \`$skip_file\`: $held_for"
+		break
+	fi
 	if [ -n "$reason" ]; then
 		skipped_listed+=("$(line "$c"): $reason")
 		last=$c
@@ -145,7 +154,11 @@ fi
 		echo "**Stopped at $(line "$stop")**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
 		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
 		echo
-		echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
+		if [ -n "$held_for" ]; then
+			echo "It and everything after it wait until its line is removed from \`$skip_file\`."
+		else
+			echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
+		fi
 		echo
 	fi
 	if [ ${#left_out[@]} -gt 0 ]; then
@@ -156,9 +169,14 @@ fi
 } >"$body"
 
 if [ -z "$last" ]; then
-	output status=blocked
+	if [ -n "$held_for" ]; then
+		output status=held
+		warning="upstream sync is held at $(line "$stop"): $held_for"
+	else
+		output status=blocked
+		warning="upstream sync is blocked at $(line "$stop"), which doesn't apply here; see the job summary"
+	fi
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
-	warning="upstream sync is blocked at $(line "$stop"), which doesn't apply here; see the job summary"
 	warning=${warning//%/%25}
 	warning=${warning//$'\r'/%0D}
 	echo "::warning::${warning//$'\n'/%0A}"

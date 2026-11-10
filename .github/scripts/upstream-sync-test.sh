@@ -149,4 +149,33 @@ skip "$(git -C "$dir/upstream" rev-parse --short HEAD) short sha"
 run_sync
 check 'malformed skip list: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
 
+setup held
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+held=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: more' src/more.rs 'pub fn more() {}'
+skip "$held held: until its review"
+run_sync
+check 'held first: exits 0, status=held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
+check 'held first: one warning naming it' \
+	'[ "$(grep -c "^::warning::" "$dir/stdout")" = 1 ] && grep -qF "::warning::upstream sync is held at ${held:0:7} feat: extra: until its review" "$dir/stdout"'
+check 'held first: summary names it' 'grep -qF "held in \`.github/upstream-skip\`: until its review. Still to sync (2)" "$dir/summary"'
+check 'held first: nothing pushed' '! has_branch'
+
+setup applied-then-held
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+before=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: more' src/more.rs 'pub fn more() {}'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) held: until its review"
+run_sync
+check 'applied then held: pushed, marker before the held one' \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$before"'
+check 'applied then held: held commit not applied' '! git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/more.rs'
+check 'applied then held: body says it waits' 'grep -qF "wait until its line is removed" "$dir/body.md"'
+
+setup held-empty
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
+run_sync
+check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+
 [ $failures -eq 0 ]
