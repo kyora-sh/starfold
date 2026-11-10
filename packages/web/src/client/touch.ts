@@ -5,6 +5,14 @@ import type { App } from './app';
 
 const SLOP = 10;
 const LONG_PRESS = 550;
+/** A tap this soon (GTK's and Qt's double-click time) and this close (CSS px) after
+ * the last one clicks the same spot, so double-taps double-click even though the
+ * finger lands a little off. */
+const MULTI_TAP_MS = 400;
+const MULTI_TAP_PX = 24;
+/** ...and only this close on the desktop, so a scaled-down view doesn't merge taps on
+ * targets that are distinct there. */
+const MULTI_TAP_DESK_PX = 32;
 
 interface Hooks {
 	/** Move the remote pointer to a client (CSS pixel) position. */
@@ -20,6 +28,14 @@ export function createTouch(app: App, hooks: Hooks) {
 	let start = { x: 0, y: 0 };
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let lastMid: [number, number] = [0, 0];
+	/** The last tap, while the next one may chain onto it: any other gesture or a change
+	 * of the surface's geometry ends the chain. */
+	let lastTap: { x: number; y: number; t: number; geometry: string } | null =
+		null;
+	const geometry = () => {
+		const r = app.surface.getBoundingClientRect();
+		return `${r.left},${r.top},${r.width},${r.height},${hooks.deskPerPx()}`;
+	};
 	const mid = (): [number, number] => {
 		let x = 0,
 			y = 0;
@@ -44,6 +60,7 @@ export function createTouch(app: App, hooks: Hooks) {
 			start = { x: e.clientX, y: e.clientY };
 			timer = setTimeout(() => {
 				if (mode !== 'pending') return;
+				lastTap = null;
 				hooks.moveTo(start.x, start.y);
 				click(3);
 				mode = 'done';
@@ -51,6 +68,7 @@ export function createTouch(app: App, hooks: Hooks) {
 			}, LONG_PRESS);
 		} else if (pts.size === 2) {
 			clearTimeout(timer);
+			lastTap = null;
 			if (mode === 'drag') send(cmd.button(1, false));
 			mode = 'scroll';
 			lastMid = mid();
@@ -63,6 +81,7 @@ export function createTouch(app: App, hooks: Hooks) {
 		p.y = e.clientY;
 		if (mode === 'pending' && Math.hypot(p.x - start.x, p.y - start.y) > SLOP) {
 			clearTimeout(timer);
+			lastTap = null;
 			mode = 'drag';
 			hooks.moveTo(start.x, start.y);
 			send(cmd.button(1, true));
@@ -79,7 +98,21 @@ export function createTouch(app: App, hooks: Hooks) {
 		if (!pts.delete(e.pointerId)) return;
 		if (mode === 'pending') {
 			clearTimeout(timer);
-			hooks.moveTo(start.x, start.y);
+			const now = performance.now();
+			const g = geometry();
+			const d = lastTap
+				? Math.hypot(start.x - lastTap.x, start.y - lastTap.y)
+				: Infinity;
+			const at =
+				lastTap &&
+				lastTap.geometry === g &&
+				now - lastTap.t < MULTI_TAP_MS &&
+				d < MULTI_TAP_PX &&
+				d * hooks.deskPerPx() < MULTI_TAP_DESK_PX
+					? lastTap
+					: start;
+			lastTap = { x: at.x, y: at.y, t: now, geometry: g };
+			hooks.moveTo(at.x, at.y);
 			click(1);
 			mode = 'done';
 		} else if (mode === 'drag') {
@@ -90,6 +123,7 @@ export function createTouch(app: App, hooks: Hooks) {
 	}
 	function cancel(e: PointerEvent) {
 		clearTimeout(timer);
+		lastTap = null;
 		if (mode === 'drag') send(cmd.button(1, false));
 		pts.delete(e.pointerId);
 		if (pts.size === 0) mode = null;
