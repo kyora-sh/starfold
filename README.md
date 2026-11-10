@@ -111,8 +111,9 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 
 ### File transfer
 
-File transfer is off unless `--files-root` names a folder. The Files panel then lists,
-downloads and uploads inside that folder only, and refuses a path through a symlink.
+File transfer is off unless `--files-root` names a folder. The Files panel then resolves
+every path it is given beneath that folder and refuses a path through a symlink, subject to
+the limits below.
 
 - An upload is written to a hidden `.starfold-upload-*` file and renamed when complete, never
   over an existing file; a name taken meanwhile gets 409.

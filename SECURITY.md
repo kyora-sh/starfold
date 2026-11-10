@@ -32,8 +32,9 @@ starfold runs with `--read-only`, type, click, use the clipboard and move files.
   unless `--allowed-origins` names them. That keeps out DNS rebinding and pages that
   open a WebSocket to starfold.
 - **Files:** file transfer is off unless `--files-root` names a folder; the Files panel
-  then works inside that folder and refuses paths through symlinks (see the README's
-  [File transfer](README.md#file-transfer) section for its limits). `--file-transfers=none`
+  then resolves every path it is given beneath that folder and refuses paths through
+  symlinks, subject to the limits in the README's
+  [File transfer](README.md#file-transfer) section. `--file-transfers=none`
   turns transfers off.
 - **Watch-only viewers:** `--read-only` refuses input, clipboard writes, the
   microphone, uploads and resizing.
