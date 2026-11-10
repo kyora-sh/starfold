@@ -175,8 +175,9 @@ curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id
 
 A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
 encoding with any viewers taking H.264, and with none it starts an H.264 encoding of its
-own. It needs `--stripes=1` (otherwise 409), doesn't include the cursor (viewers draw it),
-and a resize ends it.
+own. It needs `--stripes=1` (otherwise 409), and a resize ends it. It doesn't include the
+cursor, which viewers draw, except on macOS when the cursor is in the video: with
+`--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
 
 If another encoder takes over mid-recording (a hardware encoder failing over to OpenH264,
 say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
@@ -244,6 +245,7 @@ apps that should hear you.
 | `--max-capture-pixels` | `4096000` (2560x1600)       | pixel budget for the automatic scale, which bounds the encoding work on large displays |
 | `--microphone-device`  | first loopback device found | output device (name or prefix) to play the browser microphone into                     |
 | `--resize-scale`       | the capture scale           | so a viewer's window maps to the same number of points on the Mac                      |
+| `--show-cursor`        | off; on with `--read-only`  | include the host cursor in the video stream (for viewers/observers)                    |
 
 The other flags work as on Linux; `--audio-device-name`, `--microphone-fifo` and the
 rounded-corner flags don't apply.
