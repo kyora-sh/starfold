@@ -15,6 +15,7 @@ export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=bot GIT_COMMITTER_EMAIL=bot@example.com SYNC_BOT_EMAIL=bot@example.com
 
 failures=0
+case_n=0
 check() {
 	if eval "$2"; then echo "ok   $1"; else
 		echo "FAIL $1"
@@ -107,6 +108,131 @@ commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
 run_sync "$dir/upstream" "$dir/missing/body.md"
 check 'script error while blocked: fails' '[ $rc -ne 0 ] && ! grep -q "^::warning::" "$dir/stdout"'
 
+skip() {
+	commit_files "$dir/seed" 'skip list' .github/upstream-skip "$1"
+	git -C "$dir/seed" push -q "$dir/origin.git" main
+}
+marker_on_branch() { [ "$(git -C "$dir/origin.git" show sync/upstream:.github/upstream-sha)" = "$1" ]; }
+
+setup skip
+commit_files "$dir/upstream" 'chore: bump' src/main.rs 'fn main() { voxl::run(); }'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$skipped release bump"
+run_sync
+check 'skip: exits 0' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output"'
+check 'skip: later commit applied' 'git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/extra.rs'
+check 'skip: listed commit left out' \
+	'[ "$(git -C "$dir/origin.git" show sync/upstream:crates/starfold-server/src/main.rs)" = "fn main() { starfold::run() }" ]'
+check 'skip: marker past both' 'marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)"'
+check 'skip: body lists it with the reason' \
+	'grep -qF "Skipped (1), listed in \`.github/upstream-skip\`:" "$dir/body.md" && grep -qF -- "- ${skipped:0:7} chore: bump: release bump" "$dir/body.md"'
+
+setup skip-only
+commit_files "$dir/upstream" 'chore: bump' src/main.rs 'fn main() { voxl::run(); }'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+skip "$skipped release bump"
+run_sync
+check 'skip only: pushed, marker advanced' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$skipped"'
+
+setup skip-then-stop
+commit_files "$dir/upstream" 'chore: bump' README.md 'voxl 2'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+skip "$skipped release bump"
+run_sync
+check 'skip then stop: pushed, marker at the skipped one' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$skipped"'
+check 'skip then stop: body names the stop' 'grep -qF "fix: run**: conflicts in crates/starfold-server/src/main.rs. Still to sync (1)" "$dir/body.md"'
+
+setup skip-malformed
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$(git -C "$dir/upstream" rev-parse --short HEAD) short sha"
+run_sync
+check 'malformed skip list: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr"'
+
+setup held
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+held=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: more' src/more.rs 'pub fn more() {}'
+skip "$held held: until its review"
+run_sync
+check 'held first: exits 0, status=held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
+check 'held first: one warning naming it' \
+	'[ "$(grep -c "^::warning::" "$dir/stdout")" = 1 ] && grep -qF "::warning::upstream sync is held at ${held:0:7} feat: extra: until its review" "$dir/stdout"'
+check 'held first: summary names it' 'grep -qF "held in \`.github/upstream-skip\`: until its review. Still to sync (2)" "$dir/summary"'
+check 'held first: nothing pushed' '! has_branch'
+
+setup applied-then-held
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+before=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: more' src/more.rs 'pub fn more() {}'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) held: until its review"
+run_sync
+check 'applied then held: pushed, marker before the held one' \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$before"'
+check 'applied then held: held commit not applied' '! git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/more.rs'
+check 'applied then held: body says it waits' 'grep -qF "wait until its line is removed" "$dir/body.md"'
+
+setup held-empty
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
+run_sync
+check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr"'
+
+# A skip list made of $1, with S standing for the next upstream commit's sha and U for
+# the same in upper case.
+list_case() {
+	case_n=$((case_n + 1))
+	setup "list-$case_n"
+	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+	local sha list
+	sha=$(git -C "$dir/upstream" rev-parse HEAD)
+	list=${1//S/$sha}
+	skip "${list//U/${sha^^}}"
+	run_sync
+}
+for c in $'S held: review\nS release bump' $'S release bump\nS other reason' $'S held: one\nS held: two'; do
+	list_case "$c"
+	check "duplicate sha (${c//$'\n'/ | }): fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "is listed more than once" "$dir/stderr" && ! has_branch'
+done
+for c in $'S release bump\r' $'S\theld: review' $'S held:\treview' 'S  release bump' 'S held:review' 'S held:  review' 'S    ' '# a comment'; do
+	list_case "$c"
+	check "malformed line ${c@Q}: fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+done
+list_case $'\nS release bump\n\n'
+check 'blank lines around a skip: allowed, the commit is skipped' \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && grep -qF ": release bump" "$dir/body.md"'
+list_case 'S held: review it'
+check 'held line with single spaces: held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
+zwsp=$'\xe2\x80\x8b' nbsp=$'\xc2\xa0'
+for c in "S ${zwsp}held: review" "S $zwsp" "S${nbsp}release bump" "S release ${zwsp}bump" 'U release bump'; do
+	list_case "$c"
+	check "non-ASCII or upper-case line ${c@Q}: fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+done
+if locale -a 2>/dev/null | grep -qiEx 'en_us\.utf-?8'; then
+	LC_ALL=en_US.UTF-8 list_case 'U release bump'
+	check 'upper-case sha under en_US.UTF-8: fails, nothing pushed' \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+	LC_ALL=en_US.UTF-8 list_case "S ${zwsp}held: review"
+	check 'zero-width space before held: under en_US.UTF-8: fails' \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+else
+	echo "note en_US.UTF-8 isn't installed; the locale cases ran under the default locale only"
+fi
+
+case_n=$((case_n + 1))
+setup "list-$case_n"
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+printf '%s release\0bump\n' "$(git -C "$dir/upstream" rev-parse HEAD)" >"$dir/seed/.github/upstream-skip"
+git -C "$dir/seed" add .github/upstream-skip
+git -C "$dir/seed" commit -qm 'skip list with a NUL'
+git -C "$dir/seed" push -q "$dir/origin.git" main
+run_sync
+check 'NUL byte in the skip list: fails, nothing pushed' \
+	'[ $rc -ne 0 ] && grep -q "upstream-skip contains a NUL byte" "$dir/stderr" && ! has_branch'
 setup hook
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 printf '#!/bin/sh\nexit 1\n' >"$dir/work/.git/hooks/prepare-commit-msg"
@@ -190,7 +316,7 @@ branch_by() {
 	git -C "$dir/seed" push -q "$dir/origin.git" "$commit:refs/heads/sync/upstream"
 }
 for who in 'Person <>' 'Person' 'Person < >' 'bot <BOT@EXAMPLE.COM>'; do
-	setup "committer-$RANDOM"
+	case_n=$((case_n + 1)); setup "committer-$case_n"
 	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 	branch_by "$who"
 	before=$(git -C "$dir/origin.git" rev-parse sync/upstream)

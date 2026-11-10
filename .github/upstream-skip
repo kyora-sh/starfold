@@ -1,0 +1,10 @@
+47bb94ec4d253638c1470eb81906676e1bef4b00 release version bump (0.3.3); versions here are set independently
+730fb17c20bd4fb3b65ec9d1893fad01587fea43 Sunshine/Moonlight bench (scripts + README results); ideas reviewed separately
+cf6c6fcdf7eb19a8d155d229b6eada41a4cabb32 ported in #46 (2e9ae4472f2a49bb031821e7aa583c4c1b38a9cd)
+c0f1ac06a61f998345ca0d4e4acc4f28fd8937fc ported in #46 (2e9ae4472f2a49bb031821e7aa583c4c1b38a9cd)
+291bc1bfd47acb7775be91739db9b0f571423335 held: until the x264 encoder bench in #41 is reported
+176f8befef4c4420e7bc6df5f143886a0f023b8a release version bump (0.3.4); versions here are set independently
+3051e8a7759c72d0e1af481e8c566fb93e91f9e2 ported in #47 (d40a1ac94342eef4f718fc90d55f1238b7a64725)
+b963394c2fde0d4a3c3dcc8664ad5b5df9bebed7 formatting only (oxfmt on the README's macOS flags table)
+3eda62874b2b3f160bc0b2e1ea20c434e0de5325 Selkies bench setup; ideas reviewed separately
+b00f3b8b8c156b14e0c75abdfcf5cae9a14a865f held: for its own pull request with a focused review of --tls
