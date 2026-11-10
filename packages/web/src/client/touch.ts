@@ -26,6 +26,7 @@ export function createTouch(app: App, hooks: Hooks) {
 	const pts = new Map<number, { x: number; y: number }>();
 	let mode: 'pending' | 'drag' | 'scroll' | 'done' | null = null;
 	let start = { x: 0, y: 0 };
+	let startGeometry = '';
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let lastMid: [number, number] = [0, 0];
 	/** The last tap, while the next one may chain onto it: any other gesture or a change
@@ -58,6 +59,8 @@ export function createTouch(app: App, hooks: Hooks) {
 		if (pts.size === 1) {
 			mode = 'pending';
 			start = { x: e.clientX, y: e.clientY };
+			startGeometry = geometry();
+			if (lastTap && lastTap.geometry !== startGeometry) lastTap = null;
 			timer = setTimeout(() => {
 				if (mode !== 'pending') return;
 				lastTap = null;
@@ -106,6 +109,7 @@ export function createTouch(app: App, hooks: Hooks) {
 			const at =
 				lastTap &&
 				lastTap.geometry === g &&
+				startGeometry === g &&
 				now - lastTap.t < MULTI_TAP_MS &&
 				d < MULTI_TAP_PX &&
 				d * hooks.deskPerPx() < MULTI_TAP_DESK_PX

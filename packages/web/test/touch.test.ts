@@ -36,6 +36,7 @@ function setup(deskPerPx = 1) {
 		tap,
 		rect,
 		k,
+		moves,
 		wait: (ms: number) => {
 			now += ms;
 		},
@@ -123,5 +124,26 @@ describe('touch multi-tap', () => {
 		t.k.deskPerPx = 2;
 		t.wait(100);
 		expect(t.tap(106, 100)).toEqual([106, 100]);
+	});
+
+	test('a geometry change while the next finger is down ends the chain, even if it changes back', () => {
+		const t = setup();
+		t.tap(100, 100);
+		t.rect.width = 700;
+		t.touch.down(ev(1, 104, 100));
+		t.rect.width = 800;
+		t.wait(100);
+		t.touch.up(ev(1, 104, 100));
+		expect(t.moves.at(-1)).toEqual([104, 100]);
+	});
+
+	test('a geometry change between the next finger going down and lifting ends the chain', () => {
+		const t = setup();
+		t.tap(100, 100);
+		t.touch.down(ev(1, 104, 100));
+		t.rect.width = 700;
+		t.wait(100);
+		t.touch.up(ev(1, 104, 100));
+		expect(t.moves.at(-1)).toEqual([104, 100]);
 	});
 });
