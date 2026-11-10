@@ -103,26 +103,35 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--read-only`                                                  | `false`                                                               | viewers only watch: input, clipboard writes, the microphone, uploads and resizing (`--enable-resize`) are refused                                                                                         |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
-| `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; nothing outside it is reachable and symlinks are not followed                                                                                                             |
+| `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
-An upload is written to a hidden `.starfold-upload-*` file and renamed when complete, never over
-an existing file (a name taken meanwhile gets 409). After a crash, hidden `.starfold-upload-*`
-files may remain in the upload folder and can be deleted when no starfold is running. A
-filesystem with neither an exclusive rename nor hard links refuses uploads (501). Hiding
-those temporary files is best effort: on filesystems with short names (FAT), a signed-in
-viewer may be able to see an upload while it is in progress.
-A path longer than `PATH_MAX` is refused before anything is created, and an upload needs room
-for a 255-byte name under it. On Unix systems other than Linux and macOS, an entry's own name
-can't be looked up, so only the name in the request is checked, and the root's length is
-measured at the path it was started with. On Windows a path is checked and then opened by
-name, so a folder changed in between can affect what is opened. On Linux and macOS, an upload is
-saved into the folder it was opened in, even if that folder is moved (inside the root or out
-of it) before the upload completes; on Windows such an upload may fail and leave its
-temporary file in the moved folder.
+### File transfer
+
+File transfer is off unless `--files-root` names a folder. The Files panel then resolves
+every path it is given beneath that folder and refuses a path through a symlink, subject to
+the limits below.
+
+- An upload is written to a hidden `.starfold-upload-*` file and renamed when complete, never
+  over an existing file; a name taken meanwhile gets 409.
+- After a crash, hidden `.starfold-upload-*` files may remain in the upload folder. They can be
+  deleted when no starfold is running.
+- A filesystem with neither an exclusive rename nor hard links refuses uploads (501).
+- Hiding those temporary files is best effort: on filesystems with short names (FAT), a
+  signed-in viewer may be able to see an upload while it is in progress.
+- A path longer than `PATH_MAX` is refused before anything is created, and an upload needs room
+  for a 255-byte name under it.
+- On Linux and macOS, an upload is saved into the folder it was opened in, even if that folder
+  is moved (inside the root or out of it) before the upload completes. On Windows such an
+  upload may fail and leave its temporary file in the moved folder.
+- On Unix systems other than Linux and macOS, an entry's own name can't be looked up, so only
+  the name in the request is checked, and the root's length is measured at the path it was
+  started with.
+- On Windows a path is checked and then opened by name, so a folder changed in between can
+  affect what is opened.
 
 ### Login
 

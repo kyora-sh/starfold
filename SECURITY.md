@@ -10,7 +10,7 @@ and how to reproduce it. We'll confirm we got it and keep you posted while we fi
 
 ## Supported versions
 
-Fixes go into the latest release, so upgrade to get them.
+Fixes land on main; there are no tagged releases yet.
 
 ## What starfold protects, and what it leaves to you
 
@@ -32,7 +32,9 @@ starfold runs with `--read-only`, type, click, use the clipboard and move files.
   unless `--allowed-origins` names them. That keeps out DNS rebinding and pages that
   open a WebSocket to starfold.
 - **Files:** file transfer is off unless `--files-root` names a folder; the Files panel
-  then reaches only that folder and never follows a symlink. `--file-transfers=none`
+  then resolves every path it is given beneath that folder and refuses paths through
+  symlinks, subject to the limits in the README's
+  [File transfer](README.md#file-transfer) section. `--file-transfers=none`
   turns transfers off.
 - **Watch-only viewers:** `--read-only` refuses input, clipboard writes, the
   microphone, uploads and resizing.
