@@ -5,7 +5,7 @@ const b = await chromium.launch({ executablePath: process.env.CHROMIUM || 'chrom
 const report = async (frame, label) => {
   const r = await frame.evaluate(() => {
     const s = document.getElementById('surface').getBoundingClientRect();
-    return { vw: innerWidth, vh: innerHeight, surface: [Math.round(s.width), Math.round(s.height)], ratio: +(s.width / s.height).toFixed(3), fps: window.voxlStats && Math.round(window.voxlStats.fps) };
+    return { vw: innerWidth, vh: innerHeight, surface: [Math.round(s.width), Math.round(s.height)], ratio: +(s.width / s.height).toFixed(3), fps: (window.starfoldStats || window.voxlStats) && Math.round((window.starfoldStats || window.voxlStats).fps) };
   });
   console.log(label, JSON.stringify(r));
 };
@@ -21,7 +21,7 @@ for (const w of [640, 420, 960]) {
 }
 // 2) Opened directly as a tab at several window sizes
 const t = await b.newPage({ viewport: { width: 1280, height: 800 } });
-await t.goto('http://localhost:' + (process.env.VOXL_PORT || '6902') + '/'); await t.waitForTimeout(3000);
+await t.goto('http://localhost:' + (process.env.STARFOLD_PORT || '6902') + '/'); await t.waitForTimeout(3000);
 for (const [w, h] of [[1280, 800], [1920, 1080], [900, 1100]]) {
   await t.setViewportSize({ width: w, height: h }); await t.waitForTimeout(1500);
   await report(t.mainFrame(), `tab ${w}x${h}:`);

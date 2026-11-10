@@ -2,7 +2,7 @@
 //! fits the viewer's window. Displays only offer fixed modes (a VM's virtual display
 //! offers many), so the desktop takes the largest one that fits rather than the exact
 //! size. Changes are temporary (CDS_FULLSCREEN): Windows restores the user's mode
-//! when voxl exits, even on a crash.
+//! when starfold exits, even on a crash.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};

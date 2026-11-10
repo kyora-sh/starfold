@@ -1,15 +1,15 @@
-// Run with a voxl server and X display already running. Set DISPLAY, VOXL_URL,
-// VOXL_TOKEN, RESIZE_MODE_A and RESIZE_MODE_B; the modes must already exist.
-// Example: DISPLAY=:97 VOXL_URL=ws://127.0.0.1:6997/ws VOXL_TOKEN=... \
+// Run with a starfold server and X display already running. Set DISPLAY, STARFOLD_URL,
+// STARFOLD_TOKEN, RESIZE_MODE_A and RESIZE_MODE_B; the modes must already exist.
+// Example: DISPLAY=:97 STARFOLD_URL=ws://127.0.0.1:6997/ws STARFOLD_TOKEN=... \
 //   RESIZE_MODE_A=1920x1200 RESIZE_MODE_B=1280x800_60.00 node bench/tests/external-resize.mjs
 import { execFileSync } from 'node:child_process';
 
-const { VOXL_URL, VOXL_TOKEN, RESIZE_MODE_A, RESIZE_MODE_B } = process.env;
-if (!VOXL_URL || !VOXL_TOKEN || !RESIZE_MODE_A || !RESIZE_MODE_B || !process.env.DISPLAY) {
-  throw new Error('Set DISPLAY, VOXL_URL, VOXL_TOKEN, RESIZE_MODE_A and RESIZE_MODE_B');
+const { STARFOLD_URL, STARFOLD_TOKEN, RESIZE_MODE_A, RESIZE_MODE_B } = process.env;
+if (!STARFOLD_URL || !STARFOLD_TOKEN || !RESIZE_MODE_A || !RESIZE_MODE_B || !process.env.DISPLAY) {
+  throw new Error('Set DISPLAY, STARFOLD_URL, STARFOLD_TOKEN, RESIZE_MODE_A and RESIZE_MODE_B');
 }
-const url = new URL(VOXL_URL);
-url.searchParams.set('token', VOXL_TOKEN);
+const url = new URL(STARFOLD_URL);
+url.searchParams.set('token', STARFOLD_TOKEN);
 const ws = new WebSocket(url);
 let latest = '';
 let frameSize = '';

@@ -63,7 +63,7 @@ settings listed in the script (60 fps cap, JPEG/WebP quality 8-9, video mode up 
 ## Feature tests
 
 `tests/` drives the web client with Playwright against a running starfold
-(`VOXL_PORT`, default 6903, started with `--enable-basic-auth=false`) on a test display
+(`STARFOLD_PORT`, default 6903, started with `--enable-basic-auth=false`) on a test display
 (`BENCH_DISPLAY`, default `:3`). The tests that start their own starfold say so below.
 For smooth scrolling, start that display with the patched server:
 `XVFB=$(nix-build -E 'with import <nixpkgs> {}; callPackage ../xvfb.nix {}')/bin/Xvfb BENCH_DISPLAY=:3 env/xvfb.sh`.

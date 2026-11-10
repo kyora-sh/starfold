@@ -21,7 +21,9 @@ interface Navigator {
 // Read by the bench tools (measure.mjs) and handy in the console.
 interface Window {
 	fps: number;
-	voxlStats: unknown;
+	starfoldStats: unknown;
+	/** Deprecated: starfoldStats. */
+	readonly voxlStats: unknown;
 	/** performance.now() when the first frame was painted (`starfold:firstframe`). */
 	starfoldFirstFrame?: number;
 }

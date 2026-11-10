@@ -1,4 +1,4 @@
-//! Minimal MP4 writer for recordings: the H.264 voxl already sends, rewrapped without
+//! Minimal MP4 writer for recordings: the H.264 starfold already sends, rewrapped without
 //! re-encoding. Frames arrive only when the screen changes, so each sample lasts until
 //! the next one (variable frame rate).
 

@@ -84,9 +84,7 @@ DISPLAY=:1 ./target/release/starfold --port=6901
 Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
 (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for pixel-precise scroll
 input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag with its default, and
-`starfold --version` prints the version. `VOXL_PASSWORD`, the `X-Voxl-*` headers and
-`/tmp/voxl-mic.fifo` are being renamed to `STARFOLD_PASSWORD`, `X-Starfold-*` and
-`/tmp/starfold-mic.fifo`; the old names stay as deprecated aliases.
+`starfold --version` prints the version.
 
 | Flag                                                           | Default                                                           |                                                                                                                                                                                                           |
 | -------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -95,7 +93,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--title`                                                      | `starfold`                                                        | the page's title: the browser tab, and the app's name if a viewer installs it                                                                                                                             |
 | `--favicon`                                                    | starfold's icon                                                   | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                                                                                                         |
 | `--enable-basic-auth`                                          | `true`                                                            | ask for a password (see [Login](#login)); `false` serves without one                                                                                                                                      |
-| `--basic-auth-password`                                        | `VOXL_PASSWORD`, else `SELKIES_BASIC_AUTH_PASSWORD`, else made up | the password                                                                                                                                                                                              |
+| `--basic-auth-password`                                        | `STARFOLD_PASSWORD`, else `SELKIES_BASIC_AUTH_PASSWORD`, else made up | the password                                                                                                                                                                                              |
 | `--basic-auth-user`                                            | any                                                               | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                              | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                           | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
@@ -111,7 +109,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--enable-clipboard`                                           | `true`                                                            | `true`, `in`, `out` or `false`                                                                                                                                                                            |
 | `--audio-enabled`, `--audio-device-name`, `--audio-bitrate`    | `true`, `output.monitor`, `128000`                                | desktop audio                                                                                                                                                                                             |
 | `--enable-resize`, `--resize-scale`                            | `false`, `1.5`                                                    | desktop follows the viewer's window; desktop pixels per CSS pixel                                                                                                                                         |
-| `--microphone-enabled`, `--microphone-fifo`                    | `false`, `/tmp/voxl-mic.fifo`                                     | browser microphone into the FIFO a PulseAudio pipe source reads                                                                                                                                           |
+| `--microphone-enabled`, `--microphone-fifo`                    | `false`, `/tmp/starfold-mic.fifo`                                     | browser microphone into the FIFO a PulseAudio pipe source reads                                                                                                                                           |
 | `--round-corners`                                              | `0` (off)                                                         | corner radius in pixels for top-level windows                                                                                                                                                             |
 | `--round-windows`                                              | none                                                              | `title:radius,...` rounds windows with that title, docks included                                                                                                                                         |
 | `--adaptive-threads`                                           | `false`                                                           | encode on one thread, fanning out only under sustained heavy motion                                                                                                                                       |
@@ -130,7 +128,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 ### Login
 
 starfold asks for a password before it shows the desktop or takes input, files or API
-calls. Give it one with `--basic-auth-password`, `VOXL_PASSWORD` or `SELKIES_BASIC_AUTH_PASSWORD`;
+calls. Give it one with `--basic-auth-password`, `STARFOLD_PASSWORD` or `SELKIES_BASIC_AUTH_PASSWORD`;
 otherwise it makes one up when it starts and prints a link that signs you in. There are three ways in:
 
 - **The link**: `http://host:6901/?token=<password>`. The page passes the password on to
@@ -154,17 +152,17 @@ usual. A refused request gets a 403 that names the flag to add.
 
 ### For agents and scripts
 
-Screenshots and recordings (start starfold with `VOXL_PASSWORD` set, and send it along):
+Screenshots and recordings (start starfold with `STARFOLD_PASSWORD` set, and send it along):
 
 ```sh
 # the screen as a PNG
-curl -u ":$VOXL_PASSWORD" -o shot.png localhost:6901/screenshot
+curl -u ":$STARFOLD_PASSWORD" -o shot.png localhost:6901/screenshot
 # an MP4 of the next 10 s
-curl -u ":$VOXL_PASSWORD" -o clip.mp4 "localhost:6901/record?seconds=10"
+curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 "localhost:6901/record?seconds=10"
 # or start...
-id=$(curl -u ":$VOXL_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
+id=$(curl -u ":$STARFOLD_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
 # ...and stop when done
-curl -u ":$VOXL_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
+curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
 ```
 
 A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
@@ -177,19 +175,19 @@ say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` t
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
-`segment_lost` or `closed`). Without it you get the first MP4, with `x-voxl-segments` and
-`x-voxl-record-end` headers when there were more.
+`segment_lost` or `closed`). Without it you get the first MP4, with `x-starfold-segments` and
+`x-starfold-record-end` headers when there were more.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
 after every action and hope it was long enough:
 
 ```sh
 # once nothing changed for 300 ms
-curl -u ":$VOXL_PASSWORD" localhost:6901/wait
+curl -u ":$STARFOLD_PASSWORD" localhost:6901/wait
 # still for 1 s, giving up after 30 s
-curl -u ":$VOXL_PASSWORD" "localhost:6901/wait?idle=1000&timeout=30000"
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?idle=1000&timeout=30000"
 # the first change in that rectangle
-curl -u ":$VOXL_PASSWORD" "localhost:6901/wait?change&region=0,0,800,600"
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?change&region=0,0,800,600"
 # {"changed":true,"timed_out":false,"seq":812,"waited_ms":340}
 ```
 
@@ -198,7 +196,7 @@ request at the earliest so an action just taken has time to show; `change` retur
 the first change instead. `region=x,y,w,h` only watches that rectangle (to the 16-pixel
 block) and `timeout` (ms, default 10000) gives up. `changed` says whether anything
 changed while waiting. A change can land before the request does, so to wait for what an
-action caused, pass `since` the `seq` of an earlier `/wait` or the `X-Voxl-Seq` header of
+action caused, pass `since` the `seq` of an earlier `/wait` or the `X-Starfold-Seq` header of
 a screenshot: `/wait?change&since=812` returns at once if anything changed after it. A
 blinking text caret redraws about twice a second, so keep `idle` under 500 ms or leave
 the caret out of `region`. starfold already knows which parts of the screen change (XDamage,
@@ -209,7 +207,7 @@ order) and answers with the `seq` from before them, so `/wait?change&since=` see
 did. A `--read-only` server refuses it with 403. `python/starfold` wraps all of this.
 
 ```sh
-curl -u ":$VOXL_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
+curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
   -d '[{"type":"click","x":400,"y":300},{"type":"type","text":"hello\n"},{"type":"key","key":"ctrl+s"}]'
 # {"seq":812,"events":19}
 ```

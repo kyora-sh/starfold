@@ -1,5 +1,6 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
+import { aliasVoxlStats } from '../compat';
 import { displayHz } from '../pace';
 import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
@@ -35,7 +36,8 @@ function main() {
 	const statsEl = el('stats');
 	const params = new URLSearchParams(location.search);
 	window.fps = 0;
-	window.voxlStats = {};
+	window.starfoldStats = {};
+	aliasVoxlStats(window);
 
 	// Browsers only offer WebCodecs on HTTPS pages and localhost, so a page opened over
 	// plain HTTP from another machine can't decode the stream whatever the browser.
@@ -203,7 +205,7 @@ function main() {
 				break;
 			case 'stats':
 				window.fps = Math.round(m.fps);
-				window.voxlStats = m;
+				window.starfoldStats = m;
 				if (params.has('stats')) {
 					statsEl.style.display = 'block';
 					statsEl.textContent = [

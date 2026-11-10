@@ -18,7 +18,7 @@ Whoever signs in to starfold gets the desktop it streams: they see the screen an
 starfold runs with `--read-only`, type, click, use the clipboard and move files. So:
 
 - **Login:** on by default. Every request needs the password except the page's scripts
-  and assets and `/healthz`. Without `--basic-auth-password`, `VOXL_PASSWORD` or
+  and assets and `/healthz`. Without `--basic-auth-password`, `STARFOLD_PASSWORD` or
   `SELKIES_BASIC_AUTH_PASSWORD`, starfold makes up a random 128-bit one when it starts.
   A `?token=` link carries the password, so treat the link like the password. `--enable-basic-auth=false` turns the login off;
   only do that behind a proxy that signs people in itself.

@@ -10,6 +10,7 @@ mod actions;
 mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
+mod compat;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
@@ -104,7 +105,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     let a = parse_args(args);
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
-    // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
+    // A panic on any thread ends the process, as in starfold's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
     {
@@ -278,8 +279,8 @@ async fn serve(a: HashMap<String, String>) {
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let mut candidates = negotiate::candidates(&encoders, encoder);
-    // VOXL_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if std::env::var_os("VOXL_TEST_HOOKS").is_some() && encoder != encoder::Backend::OpenH264 {
+    // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::Backend::OpenH264 {
         let fallback = negotiate::Candidate {
             codec: encoder::Codec::H264,
             backend: encoder::Backend::OpenH264,
@@ -390,11 +391,9 @@ async fn serve(a: HashMap<String, String>) {
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).
     #[cfg(target_os = "linux")]
-    let mic_sink = Some(
-        a.get("microphone-fifo")
-            .cloned()
-            .unwrap_or_else(|| "/tmp/voxl-mic.fifo".into()),
-    );
+    let mic_sink = Some(compat::mic_fifos(
+        a.get("microphone-fifo").map(String::as_str),
+    ));
     #[cfg(target_os = "macos")]
     let mic_sink = truthy(a.get("microphone-enabled"), false)
         .then(|| mac::mic::find_device(a.get("microphone-device").map(|s| s.as_str())))
@@ -452,7 +451,7 @@ async fn serve(a: HashMap<String, String>) {
         favicon_type,
         encoders,
     };
-    // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
+    // --allowed-hosts and --allowed-origins: the host names and other sites starfold answers
     // besides IP addresses, localhost and its own page (see access.rs).
     let access = std::sync::Arc::new(access::Access::new(
         a.get("allowed-hosts").map(|s| s.as_str()),
@@ -484,7 +483,7 @@ async fn serve(a: HashMap<String, String>) {
     };
     match &login {
         Some((l, true)) => log::info!(
-            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or VOXL_PASSWORD)",
+            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",
             l.password()
         ),
         Some((_, false)) => log::info!(
