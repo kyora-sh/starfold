@@ -50,10 +50,19 @@ list() { paste -sd, - | sed 's/,/, /g'; }
 git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
 git fetch --quiet --no-tags "$upstream_url" "+refs/heads/main:refs/remotes/upstream/main"
 remote_branch=
-if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+listed=0
+git ls-remote --exit-code --heads origin "$branch" >/dev/null || listed=$?
+case $listed in
+0)
 	git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
 	remote_branch=$(git rev-parse "refs/remotes/origin/$branch")
-fi
+	;;
+2) ;;
+*)
+	echo "listing $branch on origin failed (git ls-remote exit $listed)" >&2
+	exit 1
+	;;
+esac
 upstream=$(git rev-parse refs/remotes/upstream/main)
 marker=$(git show "refs/remotes/origin/main:$marker_file")
 if ! git merge-base --is-ancestor "$marker" "$upstream"; then
@@ -116,13 +125,19 @@ for c in "${commits[@]}"; do
 			git commit-tree "$(map_tree "$c")" -p "$base" \
 			-m "$(git log -1 --format=%B "$c")" -m "Upstream: tembo/voxl@$c"
 	)
-	if git cherry-pick --keep-redundant-commits "$mapped" >/dev/null 2>&1; then
+	if pick_log=$(git cherry-pick --keep-redundant-commits "$mapped" 2>&1); then
 		picked+=("$c")
 		last=$c
 		handled=$((handled + 1))
 	else
+		conflicts=$(git ls-files -u | cut -f2 | sort -u | list)
+		if [ -z "$conflicts" ]; then
+			echo "cherry-picking $(line "$c") failed without a conflict:" >&2
+			echo "$pick_log" >&2
+			exit 1
+		fi
 		stop=$c
-		stop_reason="conflicts in $(git diff --name-only --diff-filter=U | list)"
+		stop_reason="conflicts in $conflicts"
 		git cherry-pick --abort
 		break
 	fi

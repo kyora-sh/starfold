@@ -177,5 +177,21 @@ commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
 run_sync
 check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+setup hook
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+printf '#!/bin/sh\nexit 1\n' >"$dir/work/.git/hooks/prepare-commit-msg"
+chmod +x "$dir/work/.git/hooks/prepare-commit-msg"
+run_sync
+check 'failing commit hook: fails, not blocked' \
+	'[ $rc -ne 0 ] && ! grep -q "^status=blocked" "$dir/output" && ! grep -q "^::warning::" "$dir/stdout" && grep -q "failed without a conflict" "$dir/stderr" && ! has_branch'
+
+setup ls-remote
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+mkdir "$dir/bin"
+printf '#!/bin/sh\n[ "$1" = ls-remote ] && exit 128\nexec %s "$@"\n' "$(command -v git)" >"$dir/bin/git"
+chmod +x "$dir/bin/git"
+PATH=$dir/bin:$PATH run_sync
+check 'ls-remote error: fails, not blocked' \
+	'[ $rc -ne 0 ] && ! grep -q "^status=" "$dir/output" && grep -q "git ls-remote exit 128" "$dir/stderr"'
 
 [ $failures -eq 0 ]
