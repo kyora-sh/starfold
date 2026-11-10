@@ -1,11 +1,11 @@
+<img src="assets/starfold-header.svg" width="100%" alt="starfold: low-latency desktop streaming to the browser">
+
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/starfold-wordmark-dark.svg">
-    <img alt="kyora starfold" src="assets/starfold-wordmark-light.svg" width="360">
-  </picture>
+  <a href="LICENSE"><img alt="source licence: MIT" src="https://img.shields.io/badge/source-MIT-000000"></a>
+  <a href="https://github.com/kyora-sh/starfold/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kyora-sh/starfold/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
-<p align="center">Low-latency desktop streaming to the browser.</p>
+<img src="assets/starfold-demo.gif" width="100%" alt="a terminal and starfold's help text, typed in and scrolled through a starfold stream">
 
 kyora starfold streams a desktop to a plain browser tab over one WebSocket: an X11 display (Xvfb
 included), a Mac's screen or a Windows desktop. The browser decodes with WebCodecs. H.264 is the
