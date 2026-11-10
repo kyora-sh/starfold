@@ -83,6 +83,7 @@ function get2dContext(
 		try {
 			return c.getContext('2d');
 		} catch {
+			post({ t: 'log', s: 'no video: the canvas has no 2d context' });
 			return null;
 		}
 	}
@@ -473,7 +474,7 @@ function present(id: number, parts: Part<Picture>[], t0: number) {
 			if (ctx && !noDraw) g.pic.draw(ctx, g.y, width || Infinity, h);
 			g.pic.close();
 		}
-		if (!painted) {
+		if (!painted && (ctx || noDraw)) {
 			painted = true;
 			post({ t: 'painted' });
 		}
