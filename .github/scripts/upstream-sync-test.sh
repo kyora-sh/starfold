@@ -273,4 +273,34 @@ run_sync
 check 'human edits: left alone' \
 	'[ $rc -eq 0 ] && grep -qx status=human-edits "$dir/output" && [ "$(git -C "$dir/origin.git" rev-parse sync/upstream)" = "$before" ]'
 
+# A sync/upstream holding one commit on main whose committer line is exactly $1.
+branch_by() {
+	local main tree commit
+	main=$(git -C "$dir/seed" rev-parse main)
+	tree=$(git -C "$dir/seed" rev-parse "main^{tree}")
+	commit=$(printf 'tree %s\nparent %s\nauthor A <a@example.com> 1700000000 +0000\ncommitter %s 1700000000 +0000\n\nby hand\n' \
+		"$tree" "$main" "$1" | git -C "$dir/seed" hash-object -t commit -w --literally --stdin)
+	git -C "$dir/seed" push -q "$dir/origin.git" "$commit:refs/heads/sync/upstream"
+}
+for who in 'Person <>' 'Person' 'Person < >' 'bot <BOT@EXAMPLE.COM>'; do
+	setup "committer-$RANDOM"
+	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+	branch_by "$who"
+	before=$(git -C "$dir/origin.git" rev-parse sync/upstream)
+	run_sync
+	check "committer \"$who\": human edits, left alone" \
+		'[ $rc -eq 0 ] && grep -qx status=human-edits "$dir/output" && [ "$(git -C "$dir/origin.git" rev-parse sync/upstream)" = "$before" ]'
+done
+setup committer-bot
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+branch_by 'bot <bot@example.com>'
+run_sync
+check 'committer exactly the bot: synced' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output"'
+
+setup quoted
+commit_files "$dir/upstream" 'chore: odd names' '.github/a"b' 'x' 'src/c"d.rs' 'pub fn d() {}'
+run_sync
+check 'quoted names: listed as they are, the rest applied' \
+	'[ $rc -eq 0 ] && grep -qF ": .github/a\"b" "$dir/body.md" && git -C "$dir/origin.git" cat-file -e "sync/upstream:crates/starfold-server/src/c\"d.rs"'
+
 [ $failures -eq 0 ]
