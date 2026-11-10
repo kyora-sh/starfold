@@ -102,11 +102,17 @@ fi
 declare -A skip_reasons=()
 split_lines "$skip_list"
 for l in "${lines[@]}"; do
-	if [[ $l =~ ^[0-9a-f]{40}\ held:[[:space:]]*$ ]] || ! [[ $l =~ ^([0-9a-f]{40})\ ([^ ].*)$ ]]; then
-		echo "$skip_file: each line needs a full sha and a reason (or held: and its follow-up), not: $l" >&2
+	if [[ $l == *[[:cntrl:]]* ]] || ! [[ $l =~ ^([0-9a-f]{40})\ (held:\ )?([[:graph:]].*)$ ]] ||
+		[[ -z ${BASH_REMATCH[2]} && ${BASH_REMATCH[3]} == held:* ]]; then
+		echo "$skip_file: each line is '<full sha> <reason>' or '<full sha> held: <follow-up>', single spaces, no tabs or CRs; not: ${l@Q}" >&2
 		exit 1
 	fi
-	skip_reasons[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+	sha=${BASH_REMATCH[1]}
+	if [ -n "${skip_reasons[$sha]+x}" ]; then
+		echo "$skip_file: $sha is listed more than once" >&2
+		exit 1
+	fi
+	skip_reasons[$sha]=${BASH_REMATCH[2]}${BASH_REMATCH[3]}
 done
 
 revs=$(git rev-list --reverse --first-parent "$marker..$upstream")

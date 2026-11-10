@@ -147,7 +147,7 @@ setup skip-malformed
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 skip "$(git -C "$dir/upstream" rev-parse --short HEAD) short sha"
 run_sync
-check 'malformed skip list: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+check 'malformed skip list: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr"'
 
 setup held
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
@@ -176,7 +176,32 @@ setup held-empty
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 skip "$(git -C "$dir/upstream" rev-parse HEAD) held: "
 run_sync
-check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+check 'held without a follow-up: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr"'
+
+# A skip list made of $1 with S standing for the next upstream commit's sha.
+list_case() {
+	setup "list-$RANDOM"
+	commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+	local sha
+	sha=$(git -C "$dir/upstream" rev-parse HEAD)
+	skip "${1//S/$sha}"
+	run_sync
+}
+for c in $'S held: review\nS release bump' $'S release bump\nS other reason' $'S held: one\nS held: two'; do
+	list_case "$c"
+	check "duplicate sha (${c//$'\n'/ | }): fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "is listed more than once" "$dir/stderr" && ! has_branch'
+done
+for c in $'S release bump\r' $'S\theld: review' $'S held:\treview' 'S  release bump' 'S held:review' 'S held:  review' 'S    ' '# a comment'; do
+	list_case "$c"
+	check "malformed line ${c@Q}: fails, nothing pushed" \
+		'[ $rc -ne 0 ] && grep -q "upstream-skip: each line is" "$dir/stderr" && ! has_branch'
+done
+list_case $'\nS release bump\n\n'
+check 'blank lines around a skip: allowed, the commit is skipped' \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && grep -qF ": release bump" "$dir/body.md"'
+list_case 'S held: review it'
+check 'held line with single spaces: held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
 setup hook
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
 printf '#!/bin/sh\nexit 1\n' >"$dir/work/.git/hooks/prepare-commit-msg"
