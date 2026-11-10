@@ -1209,7 +1209,8 @@ fn x264_a_refining_pass_with_nothing_to_gain_sends_nothing() {
     assert!(s.pass(12, None).0 > 0, "motion makes room again");
 }
 
-/// The pass's wider VBV and lower CRF are undone: motion after costs what it would have.
+/// The pass's wider VBV and lower CRF are undone: motion after costs no more than it would
+/// have (a sharper reference may make it a little cheaper).
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_leaves_rate_control_where_it_was() {
@@ -1228,7 +1229,10 @@ fn x264_refining_leaves_rate_control_where_it_was() {
     plain.scroll(10);
     refined.scroll(10);
     let (a, b) = (plain.scroll(110) as f64, refined.scroll(110) as f64);
-    assert!((b / a - 1.0).abs() < 0.03, "motion after: {a} vs {b} bytes");
+    assert!(
+        (-0.10..0.03).contains(&(b / a - 1.0)),
+        "motion after: {a} vs {b} bytes"
+    );
 }
 
 #[cfg(feature = "x264")]
