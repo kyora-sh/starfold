@@ -107,4 +107,46 @@ commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
 run_sync "$dir/upstream" "$dir/missing/body.md"
 check 'script error while blocked: fails' '[ $rc -ne 0 ] && ! grep -q "^::warning::" "$dir/stdout"'
 
+skip() {
+	commit_files "$dir/seed" 'skip list' .github/upstream-skip "$1"
+	git -C "$dir/seed" push -q "$dir/origin.git" main
+}
+marker_on_branch() { [ "$(git -C "$dir/origin.git" show sync/upstream:.github/upstream-sha)" = "$1" ]; }
+
+setup skip
+commit_files "$dir/upstream" 'chore: bump' src/main.rs 'fn main() { voxl::run(); }'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$skipped release bump"
+run_sync
+check 'skip: exits 0' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output"'
+check 'skip: later commit applied' 'git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/extra.rs'
+check 'skip: listed commit left out' \
+	'[ "$(git -C "$dir/origin.git" show sync/upstream:crates/starfold-server/src/main.rs)" = "fn main() { starfold::run() }" ]'
+check 'skip: marker past both' 'marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)"'
+check 'skip: body lists it with the reason' \
+	'grep -qF "Skipped (1), listed in \`.github/upstream-skip\`:" "$dir/body.md" && grep -qF -- "- ${skipped:0:7} chore: bump: release bump" "$dir/body.md"'
+
+setup skip-only
+commit_files "$dir/upstream" 'chore: bump' src/main.rs 'fn main() { voxl::run(); }'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+skip "$skipped release bump"
+run_sync
+check 'skip only: pushed, marker advanced' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$skipped"'
+
+setup skip-then-stop
+commit_files "$dir/upstream" 'chore: bump' README.md 'voxl 2'
+skipped=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+skip "$skipped release bump"
+run_sync
+check 'skip then stop: pushed, marker at the skipped one' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$skipped"'
+check 'skip then stop: body names the stop' 'grep -qF "fix: run**: conflicts in crates/starfold-server/src/main.rs. Still to sync (1)" "$dir/body.md"'
+
+setup skip-malformed
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+skip "$(git -C "$dir/upstream" rev-parse --short HEAD) short sha"
+run_sync
+check 'malformed skip list: fails' '[ $rc -ne 0 ] && grep -q "upstream-skip: each line needs" "$dir/stderr"'
+
 [ $failures -eq 0 ]

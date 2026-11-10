@@ -1,0 +1,4 @@
+47bb94ec4d253638c1470eb81906676e1bef4b00 release version bump (0.3.3); versions here are set independently
+c0f1ac06a61f998345ca0d4e4acc4f28fd8937fc formatting only (oxfmt on worker.ts)
+176f8befef4c4420e7bc6df5f143886a0f023b8a release version bump (0.3.4); versions here are set independently
+b963394c2fde0d4a3c3dcc8664ad5b5df9bebed7 formatting only (oxfmt on the README's macOS flags table)

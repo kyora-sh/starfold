@@ -3,19 +3,22 @@
 #
 # Rebuilds sync/upstream from origin/main: each upstream main commit after the one in
 # .github/upstream-sha (first parent), moved into this repo's layout by map_tree, is
-# cherry-picked in order. Stops at the first one that doesn't apply, bumps the marker to
-# the last one that did and force-pushes sync/upstream, unless the branch already has
-# that content or carries commits the bot didn't make. Writes the pull request body to
-# <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|pushed> plus, for
-# the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT. When the first new commit
-# doesn't apply (blocked), the body also goes to $GITHUB_STEP_SUMMARY with one warning
-# naming that commit, and the run still succeeds; any other failure exits non-zero.
+# cherry-picked in order; one listed in .github/upstream-skip ("<full sha> <reason>" per
+# line) is left out and counts as synced. Stops at the first one that doesn't apply,
+# bumps the marker to the last one before it and force-pushes sync/upstream, unless the
+# branch already has that content or carries commits the bot didn't make. Writes the
+# pull request body to <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|
+# pushed> plus, for the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT. When the
+# first commit to sync doesn't apply (blocked), the body also goes to
+# $GITHUB_STEP_SUMMARY with one warning naming that commit, and the run still succeeds;
+# any other failure exits non-zero.
 set -euo pipefail
 
 upstream_url=$1
 body=$2
 branch=sync/upstream
 marker_file=.github/upstream-sha
+skip_file=.github/upstream-skip
 bot_email=${SYNC_BOT_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}
 
 output() {
@@ -56,6 +59,15 @@ if ! git merge-base --is-ancestor "$marker" "$upstream"; then
 	echo "$marker_file ($marker) is not on upstream main ($upstream)" >&2
 	exit 1
 fi
+skip_list=
+if git cat-file -e "refs/remotes/origin/main:$skip_file" 2>/dev/null; then
+	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
+fi
+if bad=$(grep -vE '^[0-9a-f]{40} [^ ]' <<<"$skip_list" | grep -v '^$'); then
+	echo "$skip_file: each line needs a full sha and a reason, not: $bad" >&2
+	exit 1
+fi
+skip_reason() { awk -v c="$1" '$1 == c { sub(/^[^ ]+ /, ""); print; exit }' <<<"$skip_list"; }
 
 commits=()
 while IFS= read -r c; do commits+=("$c"); done < <(git rev-list --reverse --first-parent "$marker..$upstream")
@@ -73,10 +85,20 @@ fi
 
 git checkout --quiet -B "$branch" refs/remotes/origin/main
 picked=()
+skipped_listed=()
 left_out=()
+last=
+handled=0
 stop=
 stop_reason=
 for c in "${commits[@]}"; do
+	reason=$(skip_reason "$c")
+	if [ -n "$reason" ]; then
+		skipped_listed+=("$(line "$c"): $reason")
+		last=$c
+		handled=$((handled + 1))
+		continue
+	fi
 	base=$(git commit-tree "$(map_tree "$c^1")" -m base)
 	mapped=$(
 		GIT_AUTHOR_NAME=$(git log -1 --format=%an "$c") \
@@ -87,6 +109,8 @@ for c in "${commits[@]}"; do
 	)
 	if git cherry-pick --keep-redundant-commits "$mapped" >/dev/null 2>&1; then
 		picked+=("$c")
+		last=$c
+		handled=$((handled + 1))
 	else
 		stop=$c
 		stop_reason="conflicts in $(git diff --name-only --diff-filter=U | list)"
@@ -97,8 +121,7 @@ for c in "${commits[@]}"; do
 	if [ -n "$skipped" ]; then left_out+=("$(line "$c"): $(echo "$skipped" | list)"); fi
 done
 
-if [ ${#picked[@]} -gt 0 ]; then
-	last=${picked[${#picked[@]} - 1]}
+if [ -n "$last" ]; then
 	echo "$last" >"$marker_file"
 	git add "$marker_file"
 	git commit --quiet -m "chore: upstream sync through tembo/voxl@${last:0:7}"
@@ -112,8 +135,13 @@ fi
 		for c in "${picked[@]}"; do echo "- $(line "$c")"; done
 		echo
 	fi
+	if [ ${#skipped_listed[@]} -gt 0 ]; then
+		echo "Skipped (${#skipped_listed[@]}), listed in \`$skip_file\`:"
+		for l in "${skipped_listed[@]}"; do echo "- $l"; done
+		echo
+	fi
 	if [ -n "$stop" ]; then
-		rest=("${commits[@]:${#picked[@]}}")
+		rest=("${commits[@]:$handled}")
 		echo "**Stopped at $(line "$stop")**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
 		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
 		echo
@@ -127,7 +155,7 @@ fi
 	fi
 } >"$body"
 
-if [ ${#picked[@]} -eq 0 ]; then
+if [ -z "$last" ]; then
 	output status=blocked
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
 	warning="upstream sync is blocked at $(line "$stop"), which doesn't apply here; see the job summary"
