@@ -14,7 +14,8 @@
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally),
-//! except on macOS with `--show-cursor`, where the capture carries it.
+//! except on macOS with `--show-cursor` or when the system cursor can't be read, where
+//! the capture carries it.
 
 use crate::hub::{Client, Hub, Out};
 use crate::mp4;
