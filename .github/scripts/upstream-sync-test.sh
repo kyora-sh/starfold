@@ -288,8 +288,28 @@ check 'cap default: body lists the rest' 'grep -qF "At most 1 applied per run; s
 SYNC_MAX_COMMITS=2 run_sync
 check 'cap 2: both applied, the skip between them not counted' \
 	'[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)" && git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/two.rs && ! grep -q "At most" "$dir/body.md"'
-SYNC_MAX_COMMITS=0 run_sync
-check 'cap 0: fails' '[ $rc -ne 0 ] && grep -q "SYNC_MAX_COMMITS must be a positive integer" "$dir/stderr"'
+before=$(git -C "$dir/origin.git" rev-parse sync/upstream)
+for n in 0 1000 9223372036854775808 01 -1 ' 1' 1x; do
+	SYNC_MAX_COMMITS=$n run_sync
+	check "cap ${n@Q}: fails, branch untouched" \
+		'[ $rc -ne 0 ] && grep -q "SYNC_MAX_COMMITS must be a whole number from 1 to 999" "$dir/stderr" && [ "$(git -C "$dir/origin.git" rev-parse sync/upstream)" = "$before" ]'
+done
+
+setup cap-empty
+commit_files "$dir/upstream" 'feat: one' src/one.rs 'pub fn one() {}'
+first=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: two' src/two.rs 'pub fn two() {}'
+SYNC_MAX_COMMITS='' run_sync
+check 'cap empty (a scheduled run): defaults to 1' '[ $rc -eq 0 ] && marker_on_branch "$first"'
+setup cap-999
+commit_files "$dir/upstream" 'feat: one' src/one.rs 'pub fn one() {}'
+commit_files "$dir/upstream" 'feat: two' src/two.rs 'pub fn two() {}'
+SYNC_MAX_COMMITS=999 run_sync
+check 'cap 999: accepted, applies both' '[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)"'
+
+workflow=$(cd "$(dirname "$0")/../workflows" && pwd)/upstream-sync.yml
+check 'workflow passes max_commits through with no fallback' \
+	'grep -qxF "          SYNC_MAX_COMMITS: \${{ inputs.max_commits }}" "$workflow" && ! grep -q "max_commits ||" "$workflow"'
 
 setup cap-skip-first
 commit_files "$dir/upstream" 'chore: bump' README.md 'voxl 2'
