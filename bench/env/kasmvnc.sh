@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # KasmVNC (its own X server, Xvnc) on the benchmark display :5, WebSocket on :6922, with
-# the settings Tembo's kasmvnc.yaml expands to (kasmvncserver's generated command line):
-# 60 fps cap, JPEG/WebP quality 8-9, video mode scaled to at most 1920x1080, client
-# overrides ignored. KASMVNC: the kasmvncserver package (nix/packages/kasmvnc in the monorepo).
+# a production-like configuration: 60 fps cap, JPEG/WebP quality 8-9, video mode scaled
+# to at most 1920x1080, client overrides ignored. KASMVNC: a KasmVNC server package
+# (with bin/Xvnc and share/kasmvnc/www).
 K=${KASMVNC:?set KASMVNC to the kasmvncserver package}
 D=${KASM_DISPLAY:-:5}
 exec "$K/bin/Xvnc" $D -geometry 2560x1600 -depth 24 -ac -websocketPort ${KASM_PORT:-6922} -interface 127.0.0.1 \

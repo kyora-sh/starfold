@@ -1,7 +1,7 @@
-// Folder transfer end to end: starts its own voxl on BENCH_DISPLAY with a temporary
+// Folder transfer end to end: starts its own starfold on BENCH_DISPLAY with a temporary
 // --files-root, downloads a folder as a zip (checked against the originals) and
 // uploads folders through the HTTP API and the Files panel's folder picker.
-// Usage: node foldertest.mjs   (VOXL_BIN, BENCH_DISPLAY, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
+// Usage: node foldertest.mjs   (STARFOLD_BIN, BENCH_DISPLAY, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
 import { createRequire } from 'module';
 import { spawn, execFileSync } from 'child_process';
 import crypto from 'crypto';
@@ -12,11 +12,11 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
-const port = process.env.VOXL_PORT || '6906';
+const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
+const port = process.env.STARFOLD_PORT || '6906';
 const base = `http://127.0.0.1:${port}`;
-const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voxl-folders-'));
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'voxl-folders-tmp-'));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'starfold-folders-'));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'starfold-folders-tmp-'));
 const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
 
 // A project-like tree: nested folders, an empty folder, a dotfile, a large random
@@ -33,7 +33,7 @@ fs.symlinkSync('/etc', path.join(proj, 'etc-link'));
 let failed = 0;
 const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if (!ok) failed++; };
 
-const voxl = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', `--files-root=${root}`],
+const starfold = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', `--files-root=${root}`],
 	{ env: { ...process.env, DISPLAY: process.env.BENCH_DISPLAY || ':2' }, stdio: 'ignore' });
 let b;
 try {
@@ -57,7 +57,7 @@ try {
 	check((await fetch(`${base}/files/download?path=project/etc-link`)).status === 403, 'a symlinked folder leading outside the root is refused');
 
 	// Folder upload through the API: sub creates folders, merges, and stays inside the root.
-	const up = (q, body) => fetch(`${base}/files/upload?${new URLSearchParams(q)}`, { method: 'PUT', headers: { 'X-Voxl-Upload': '1' }, body });
+	const up = (q, body) => fetch(`${base}/files/upload?${new URLSearchParams(q)}`, { method: 'PUT', headers: { 'X-Starfold-Upload': '1' }, body });
 	check((await up({ path: '', name: 'a.txt', sub: 'Up/one/two' }, 'A')).ok && fs.readFileSync(path.join(root, 'Up/one/two/a.txt'), 'utf8') === 'A', 'upload with sub creates nested folders');
 	check((await up({ path: '', name: 'b.txt', sub: 'Up/one' }, 'B')).ok && fs.existsSync(path.join(root, 'Up/one/two/a.txt')) && fs.existsSync(path.join(root, 'Up/one/b.txt')), 'an existing folder is merged into');
 	check((await up({ path: '', name: 'x', sub: 'Up/../..' }, 'x')).status === 400, 'sub rejects ..');
@@ -95,7 +95,7 @@ try {
 	await p.screenshot({ path: process.env.SHOT || path.join(tmp, 'panel.png') });
 } finally {
 	if (b) await b.close();
-	voxl.kill();
+	starfold.kill();
 	fs.rmSync(root, { recursive: true, force: true });
 	fs.rmSync(tmp, { recursive: true, force: true });
 }

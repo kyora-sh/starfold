@@ -5,14 +5,14 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 const exe = process.env.CHROMIUM || 'chromium';
 const HERE = new URL('.', import.meta.url).pathname;
-const PORT = process.env.VOXL_PORT || '6903';
+const PORT = process.env.STARFOLD_PORT || '6903';
 const DISPLAY = process.env.BENCH_DISPLAY || ':3';
 const b = await chromium.launch({ executablePath: exe, args: ['--no-sandbox'] });
 const ctx = await b.newContext({ viewport: { width: 1280, height: 800 } });
-await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://localhost:' + (process.env.VOXL_PORT || '6903') + '' });
+await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://localhost:' + (process.env.STARFOLD_PORT || '6903') + '' });
 const p = await ctx.newPage();
 p.on('console', m => m.type() !== 'log' && !m.text().includes('AudioContext') && console.log('[page]', m.text()));
-await p.goto('http://localhost:' + (process.env.VOXL_PORT || '6903') + '/'); await p.waitForTimeout(2500);
+await p.goto('http://localhost:' + (process.env.STARFOLD_PORT || '6903') + '/'); await p.waitForTimeout(2500);
 await p.mouse.click(1200, 700); await p.waitForTimeout(300);
 // remote -> local: an X app (xclip) owns CLIPBOARD with a PNG
 const xclip = spawn('nix-shell', ['-p', 'xclip', '--run', `DISPLAY=${process.env.BENCH_DISPLAY || ':3'} xclip -selection clipboard -t image/png -i ${process.env.TEST_PNG || '/tmp/test.png'} -loops 3`], { stdio: 'ignore' });

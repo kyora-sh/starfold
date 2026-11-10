@@ -8,9 +8,9 @@
 //! Another encoder taking over mid-recording (new SPS/PPS) starts a new MP4 segment at
 //! its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
 //! every `segment-k.mp4`; without it the response is the first segment, as an MP4, and
-//! `x-voxl-segments` and `x-voxl-record-end` say when there was more.
+//! `x-starfold-segments` and `x-starfold-record-end` say when there was more.
 //!
-//! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
+//! A recording is the H.264 stream starfold already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally).
@@ -215,7 +215,10 @@ fn video(mp4: Vec<u8>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "video/mp4"),
-            (header::CONTENT_DISPOSITION, "inline; filename=\"voxl.mp4\""),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=\"starfold.mp4\"",
+            ),
         ],
         mp4,
     )
@@ -254,8 +257,11 @@ pub async fn screenshot(State(r): State<Arc<Recorder>>) -> Response {
             )
                 .into_response();
             // For `/wait?change&since=`: changes after this screenshot.
-            res.headers_mut()
-                .insert("x-voxl-seq", header::HeaderValue::from(seq));
+            crate::compat::insert_header(
+                res.headers_mut(),
+                "x-starfold-seq",
+                header::HeaderValue::from(seq),
+            );
             res
         }
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -271,10 +277,14 @@ fn first_segment(clip: Clip) -> Response {
     };
     let mut res = video(first.mp4);
     if n > 1 || clip.end == End::SegmentLost {
-        res.headers_mut()
-            .insert("x-voxl-segments", header::HeaderValue::from(n));
-        res.headers_mut().insert(
-            "x-voxl-record-end",
+        crate::compat::insert_header(
+            res.headers_mut(),
+            "x-starfold-segments",
+            header::HeaderValue::from(n),
+        );
+        crate::compat::insert_header(
+            res.headers_mut(),
+            "x-starfold-record-end",
             header::HeaderValue::from_static(clip.end.name()),
         );
     }
@@ -307,7 +317,7 @@ async fn respond(done: Recording, zip: bool, route: &str, id: Option<u64>) -> Re
                 (header::CONTENT_TYPE, "application/zip"),
                 (
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"voxl.zip\"",
+                    "attachment; filename=\"starfold.zip\"",
                 ),
             ],
             z,
@@ -740,6 +750,8 @@ mod tests {
         assert_eq!(c.end, End::SegmentLost);
         assert_eq!(c.segments.len(), 2);
         let r = first_segment(c);
+        assert_eq!(r.headers()["x-starfold-segments"], "2");
+        assert_eq!(r.headers()["x-starfold-record-end"], "segment_lost");
         assert_eq!(r.headers()["x-voxl-segments"], "2");
         assert_eq!(r.headers()["x-voxl-record-end"], "segment_lost");
     }
@@ -774,8 +786,8 @@ mod tests {
         let mp4 = c.segments[0].mp4.clone();
         let r = first_segment(c);
         assert_eq!(r.headers()[header::CONTENT_TYPE], "video/mp4");
-        assert!(r.headers().get("x-voxl-segments").is_none());
-        assert!(r.headers().get("x-voxl-record-end").is_none());
+        assert!(r.headers().get("x-starfold-segments").is_none());
+        assert!(r.headers().get("x-starfold-record-end").is_none());
         assert_eq!(body(r).await, mp4);
     }
 
@@ -784,8 +796,8 @@ mod tests {
         let c = clip(&[Some((100, 40)), Some((66, 40))]).await;
         let mp4 = c.segments[0].mp4.clone();
         let r = first_segment(c);
-        assert_eq!(r.headers()["x-voxl-segments"], "2");
-        assert_eq!(r.headers()["x-voxl-record-end"], "resized");
+        assert_eq!(r.headers()["x-starfold-segments"], "2");
+        assert_eq!(r.headers()["x-starfold-record-end"], "resized");
         assert_eq!(body(r).await, mp4);
     }
 

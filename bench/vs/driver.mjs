@@ -246,7 +246,7 @@ async function run(arm, wl, readback = true) {
 		await sleep(KEY_CAP_MS);
 		const r = await p.evaluate(() => {
 			const vs = window.vs;
-			return { ws: vs.ws ?? null, frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: window.voxlStats ? { codec: window.voxlStats.codec, implementation: window.voxlStats.implementation, hw: window.voxlStats.hw, encoder: window.voxlStats.encoder, dropped: window.voxlStats.dropped } : null };
+			return { ws: vs.ws ?? null, frames: vs.frames, tags: vs.tags, keys: vs.keys, bad: vs.bad, ticks: vs.ticks, long: vs.long, longMs: vs.longMs, sync: vs.sync, noFrames: !!vs.noFrames, format: vs.format, stats: (window.starfoldStats || window.voxlStats) ? { codec: (window.starfoldStats || window.voxlStats).codec, implementation: (window.starfoldStats || window.voxlStats).implementation, hw: (window.starfoldStats || window.voxlStats).hw, encoder: (window.starfoldStats || window.voxlStats).encoder, dropped: (window.starfoldStats || window.voxlStats).dropped } : null };
 		});
 		const tr = swapsOf(await b.stopTracing());
 		const off = tr.sync === null ? null : tr.sync - r.sync;
@@ -388,7 +388,7 @@ async function soak(arm, seconds) {
 		const scores = JSON.parse(execFileSync('python3', ['bench/vs/quality.py', dir, 'typing', '/tmp/vs-dump.raw'], { encoding: 'utf8', maxBuffer: 1 << 24 }));
 		fs.rmSync(dir, { recursive: true, force: true });
 		const viewerCount = await viewers(arm);
-		const stats = await p.evaluate(() => (window.voxlStats ? { dropped: window.voxlStats.dropped, codec: window.voxlStats.codec, implementation: window.voxlStats.implementation } : null));
+		const stats = await p.evaluate(() => ((window.starfoldStats || window.voxlStats) ? { dropped: (window.starfoldStats || window.voxlStats).dropped, codec: (window.starfoldStats || window.voxlStats).codec, implementation: (window.starfoldStats || window.voxlStats).implementation } : null));
 		return { ...scores, total: statsDelta(s0, s1), windows, decodeErrs: decodeErrs.slice(0, 5), decodeErrCount: decodeErrs.length, errs: errs.slice(0, 5), viewerCount, stats };
 	} finally {
 		await ctx.close();

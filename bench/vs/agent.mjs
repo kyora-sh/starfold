@@ -69,7 +69,7 @@ async function start(arm, wl) {
 	} else {
 		const log = fs.openSync('/tmp/vs-starfold.log', 'a');
 		const a = armOf(arm);
-		run.push(group(a.bin ? process.env[a.bin] : bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...(a.args ?? STARFOLD_ARGS)], { env: { VOXL_PASSWORD: pw, RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
+		run.push(group(a.bin ? process.env[a.bin] : bin, ['--addr=127.0.0.1', `--port=${STARFOLD_PORT}`, ...(a.args ?? STARFOLD_ARGS)], { env: { ...(a.bin ? { VOXL_PASSWORD: pw } : { STARFOLD_PASSWORD: pw }), RUST_LOG: 'warn' }, stdio: ['ignore', log, log] }));
 		await listening(STARFOLD_PORT);
 	}
 }

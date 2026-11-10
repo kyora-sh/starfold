@@ -10,7 +10,7 @@
 //   drawbox=x=40+t*200:y=120:w=96:h=96:c=white:t=fill,scale=out_color_matrix=bt709:out_range=tv,
 //   format=yuv420p" -c:v libaom-av1 -usage realtime -cpu-used 8 -lag-in-frames 0 -g 1000
 //   -b:v 300k -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv av1-640x360.ivf
-// Usage: node decode.mjs   (XVFB, VOXL_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
+// Usage: node decode.mjs   (XVFB, STARFOLD_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import crypto from 'crypto';
@@ -28,12 +28,12 @@ try {
 const { chromium } = pw;
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
+const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
 const DISPLAY = process.env.DECODE_DISPLAY || ':10';
-const port = Number(process.env.VOXL_PORT || 6910);
+const port = Number(process.env.STARFOLD_PORT || 6910);
 const stubPort = port + 1;
 const base = `http://127.0.0.1:${port}`;
-const log = '/tmp/voxl-decode.log';
+const log = '/tmp/starfold-decode.log';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
 const check = (ok, what) => {
@@ -255,7 +255,7 @@ try {
 		p.on('console', (m) => {
 			const t = m.text();
 			if (/decoder error|configure failed|decode threw|no video|fell behind|unavailable/.test(t)) errors.push(t);
-			if (/\[voxl\]/.test(t)) console.log('[page]', t);
+			if (/\[(starfold|voxl)\]/.test(t)) console.log('[page]', t);
 		});
 		p.on('pageerror', (e) => errors.push(String(e)));
 		await p.addInitScript(() => {
@@ -271,7 +271,7 @@ try {
 		check(loaded, `${url}: first frame painted, then the load event`);
 		return { ctx, p, errors, requests };
 	};
-	const report = (p) => p.evaluate(() => window.voxlStats || {});
+	const report = (p) => p.evaluate(() => (window.starfoldStats || window.voxlStats) || {});
 	const steady = async (p, what) => {
 		await p.evaluate(() => (window.longTasks.length = 0));
 		await sleep(3000);

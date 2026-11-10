@@ -2126,7 +2126,7 @@ fn capture_loop(
     let mut last_capture = Instant::now() - Duration::from_secs(1);
     let mut had_clients = false;
     let mut full_next = true;
-    let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+    let debug_marker = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
 
     loop {
         if hub.resize_req.lock().is_some() || cap.needs_rebuild() {
@@ -2657,7 +2657,7 @@ fn encode_loop(
     let start = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
-    let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
+    let debug_stripes = crate::compat::is_set("STARFOLD_DEBUG_STRIPES");
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
         stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
@@ -2988,8 +2988,7 @@ fn thread_cpu_us() -> i64 {
 
 fn marker_probe(buf: &[u8], stride: usize, what: &str) -> i64 {
     let mut v: u64 = 0;
-    let (mx, my) = std::env::var("VOXL_DEBUG_MARKER")
-        .ok()
+    let (mx, my) = crate::compat::env("STARFOLD_DEBUG_MARKER")
         .and_then(|s| {
             s.split_once(',')
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
