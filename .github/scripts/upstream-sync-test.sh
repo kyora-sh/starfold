@@ -52,7 +52,7 @@ run_sync() {
 	: >"$dir/output"
 	: >"$dir/summary"
 	rc=0
-	(cd "$dir/work" && GITHUB_OUTPUT=$dir/output GITHUB_STEP_SUMMARY=$dir/summary "$script" "$url" "$body") \
+	(cd "$dir/work" && GITHUB_OUTPUT=$dir/output GITHUB_STEP_SUMMARY=${SUMMARY:-$dir/summary} "$script" "$url" "$body") \
 		>"$dir/stdout" 2>"$dir/stderr" || rc=$?
 }
 
@@ -242,5 +242,35 @@ commit_files "$dir/upstream" 'feat: one' src/one.rs 'pub fn one() {}'
 run_sync
 check 'cap default: a leading skip does not use it up' \
 	'[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)" && git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/one.rs'
+setup summary
+commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
+SUMMARY=$dir/missing/summary.md run_sync
+check 'summary write error while blocked: fails, no status, no warning' 'red'
+
+setup left-out
+commit_files "$dir/upstream" 'chore: ci and lockfiles' .github/workflows/ci.yml 'on: push' package-lock.json '{}' \
+	docs/package-lock.json '{}' .githubx/a 'a' src/extra.rs 'pub fn extra() {}'
+run_sync
+check 'left out: pushed' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output"'
+check 'left out: names only upstream CI and the root lockfile' \
+	'grep -qF -- ": .github/workflows/ci.yml, package-lock.json" "$dir/body.md" && ! grep -q "docs/package-lock.json\|githubx" "$dir/body.md"'
+check 'left out: the rest is applied' \
+	'git -C "$dir/origin.git" cat-file -e sync/upstream:docs/package-lock.json && git -C "$dir/origin.git" cat-file -e sync/upstream:.githubx/a && ! git -C "$dir/origin.git" cat-file -e sync/upstream:.github/workflows/ci.yml 2>/dev/null'
+
+setup none-left-out
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+run_sync
+check 'nothing left out: no such section' '[ $rc -eq 0 ] && ! grep -q "Left out" "$dir/body.md"'
+
+setup human
+commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
+git -C "$dir/seed" checkout -q -b sync/upstream
+commit_files "$dir/seed" 'resolve by hand' README.md 'voxl, by hand'
+GIT_COMMITTER_EMAIL=person@example.com git -C "$dir/seed" commit -q --amend --no-edit
+git -C "$dir/seed" push -q "$dir/origin.git" sync/upstream
+before=$(git -C "$dir/origin.git" rev-parse sync/upstream)
+run_sync
+check 'human edits: left alone' \
+	'[ $rc -eq 0 ] && grep -qx status=human-edits "$dir/output" && [ "$(git -C "$dir/origin.git" rev-parse sync/upstream)" = "$before" ]'
 
 [ $failures -eq 0 ]
