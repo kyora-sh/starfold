@@ -126,7 +126,7 @@ check 'skip: listed commit left out' \
 	'[ "$(git -C "$dir/origin.git" show sync/upstream:crates/starfold-server/src/main.rs)" = "fn main() { starfold::run() }" ]'
 check 'skip: marker past both' 'marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)"'
 check 'skip: body lists it with the reason' \
-	'grep -qF "Skipped (1), listed in \`.github/upstream-skip\`:" "$dir/body.md" && grep -qF -- "- ${skipped:0:7} chore: bump: release bump" "$dir/body.md"'
+	'grep -qF "Passed over in this run, as \`.github/upstream-skip\` lists them:" "$dir/body.md" && grep -qF -- "- ${skipped:0:7} chore: bump: release bump" "$dir/body.md"'
 
 setup skip-only
 commit_files "$dir/upstream" 'chore: bump' src/main.rs 'fn main() { voxl::run(); }'
@@ -142,7 +142,7 @@ commit_files "$dir/upstream" 'fix: run' src/main.rs 'fn main() { voxl::run(); }'
 skip "$skipped release bump"
 run_sync
 check 'skip then stop: pushed, marker at the skipped one' '[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$skipped"'
-check 'skip then stop: body names the stop' 'grep -qF "fix: run**: conflicts in crates/starfold-server/src/main.rs. Still to sync (1)" "$dir/body.md"'
+check 'skip then stop: body names the stop' 'grep -qF "fix: run**: conflicts in crates/starfold-server/src/main.rs." "$dir/body.md" && grep -qF "Still to sync (1), oldest first:" "$dir/body.md"'
 
 setup skip-malformed
 commit_files "$dir/upstream" 'feat: extra' src/extra.rs 'pub fn extra() {}'
@@ -159,7 +159,7 @@ run_sync
 check 'held first: exits 0, status=held' '[ $rc -eq 0 ] && grep -qx status=held "$dir/output"'
 check 'held first: one warning naming it' \
 	'[ "$(grep -c "^::warning::" "$dir/stdout")" = 1 ] && grep -qF "::warning::upstream sync is held at ${held:0:7} feat: extra: until its review" "$dir/stdout"'
-check 'held first: summary names it' 'grep -qF "held in \`.github/upstream-skip\`: until its review. Still to sync (2)" "$dir/summary"'
+check 'held first: summary names it' 'grep -qF "held in \`.github/upstream-skip\`: until its review." "$dir/summary" && grep -qF "Still to sync (1), oldest first:" "$dir/summary" && grep -qF "Held (1):" "$dir/summary"'
 check 'held first: nothing pushed' '! has_branch'
 
 setup applied-then-held
@@ -284,7 +284,7 @@ commit_files "$dir/upstream" 'feat: two' src/two.rs 'pub fn two() {}'
 run_sync
 check 'cap default: one commit applied' \
 	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && marker_on_branch "$first" && ! git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/two.rs 2>/dev/null'
-check 'cap default: body lists the rest' 'grep -qF "At most 1 applied per run; still to sync (2), oldest first:" "$dir/body.md"'
+check 'cap default: body lists the rest' 'grep -qF "At most 1 applied per run." "$dir/body.md" && grep -qF "Still to sync (1), oldest first:" "$dir/body.md" && grep -qF "Skipped (1):" "$dir/body.md"'
 SYNC_MAX_COMMITS=2 run_sync
 check 'cap 2: both applied, the skip between them not counted' \
 	'[ $rc -eq 0 ] && marker_on_branch "$(git -C "$dir/upstream" rev-parse HEAD)" && git -C "$dir/origin.git" cat-file -e sync/upstream:crates/starfold-server/src/two.rs && ! grep -q "At most" "$dir/body.md"'
@@ -378,5 +378,74 @@ commit_files "$dir/upstream" 'chore: odd names' '.github/a"b' 'x' 'src/c"d.rs' '
 run_sync
 check 'quoted names: listed as they are, the rest applied' \
 	'[ $rc -eq 0 ] && grep -qF ": .github/a\"b" "$dir/body.md" && git -C "$dir/origin.git" cat-file -e "sync/upstream:crates/starfold-server/src/c\"d.rs"'
+
+# An upstream commit with message $1, kept byte for byte, synced; the synced message is
+# then compared with $2 plus the trailer.
+message_case() {
+	case_n=$((case_n + 1))
+	setup "message-$case_n"
+	printf 'pub fn m() {}\n' >"$dir/upstream/src/m.rs"
+	git -C "$dir/upstream" add -A
+	git -C "$dir/upstream" commit -q --cleanup=verbatim -m "$1"
+	sha=$(git -C "$dir/upstream" rev-parse HEAD)
+	expected="$2"$'\n\n'"Upstream: tembo/voxl@$sha"
+	run_sync
+}
+synced_message() { git -C "$dir/origin.git" log -1 --format=%B sync/upstream~1; }
+
+message_case $'feat: thing (#5)\n\nPlain text (#6), (tembo/voxl#7) and (other/repo#8).\n\nA bare #9 stays.\n\n  <p align="center"><img src="x"></p>\n\nafter the html' \
+	$'feat: thing (tembo/voxl#5)\n\nPlain text (tembo/voxl#6), (tembo/voxl#7) and (other/repo#8).\n\nA bare #9 stays.'
+check 'message: cut at an HTML block mid-body, refs qualified' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+check 'message: author kept' \
+	'[ "$(git -C "$dir/origin.git" log -1 --format="%an %ae %ad" sync/upstream~1)" = "$(git -C "$dir/upstream" log -1 --format="%an %ae %ad")" ]'
+check 'body: applied subject qualified' 'grep -qF -- "- ${sha:0:7} feat: thing (tembo/voxl#5)" "$dir/body.md"'
+message_case $'fix: tiny (#10)\n\n<img src="badge">\n<br />' $'fix: tiny (tembo/voxl#10)'
+check 'message: only HTML after the subject' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+message_case $'docs: plain\n\nJust text, (tembo/voxl#3) already qualified.\n  an indented line\n\nEnd.' \
+	$'docs: plain\n\nJust text, (tembo/voxl#3) already qualified.\n  an indented line\n\nEnd.'
+check 'message: no HTML, kept as is' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+message_case $'feat: touch (#68)\n\nTested.\n \n  \n\n <br />' $'feat: touch (tembo/voxl#68)\n\nTested.'
+check 'message: whitespace-only lines before the HTML dropped' '[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+message_case $'\n\n<b>bold</b> subject (#3)\n\nbody text\n<p>x</p>' $'<b>bold</b> subject (tembo/voxl#3)\n\nbody text'
+check 'message: leading blank lines skipped, a subject starting with < kept' \
+	'[ $rc -eq 0 ] && [ "$(synced_message)" = "$expected" ]'
+
+case_n=$((case_n + 1))
+setup "message-$case_n"
+printf 'pub fn m() {}\n' >"$dir/upstream/src/m.rs"
+{
+	printf 'feat: big (#1)\n\nShort text.\n\n'
+	printf '<p><img src="https://example.com/badge.svg"></p>\n%.0s' $(seq 40000)
+} >"$dir/message"
+git -C "$dir/upstream" add -A
+git -C "$dir/upstream" commit -q --cleanup=verbatim -F "$dir/message"
+sha=$(git -C "$dir/upstream" rev-parse HEAD)
+expected=$'feat: big (tembo/voxl#1)\n\nShort text.\n\nUpstream: tembo/voxl@'"$sha"
+run_sync
+check "message: a $(($(wc -c <"$dir/message") / 1024)) KiB HTML tail is cut, and the sync goes through" \
+	'[ $rc -eq 0 ] && grep -qx status=pushed "$dir/output" && [ "$(synced_message)" = "$expected" ]'
+
+case_n=$((case_n + 1))
+setup "kinds-$case_n"
+commit_files "$dir/upstream" 'feat: a' src/a.rs 'pub fn a() {}'
+commit_files "$dir/upstream" 'chore: b (#2)' README.md 'voxl b'
+b=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'fix: c' src/c.rs 'pub fn c() {}'
+c=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'fix: d' src/d.rs 'pub fn d() {}'
+d=$(git -C "$dir/upstream" rev-parse HEAD)
+commit_files "$dir/upstream" 'feat: e' src/e.rs 'pub fn e() {}'
+e=$(git -C "$dir/upstream" rev-parse HEAD)
+skip "$b release bump"$'\n'"$c ported in #46 (abc)"$'\n'"$d held: later"
+run_sync
+check 'body: still to sync lists only the unmarked commit' \
+	'grep -A1 -F "Still to sync (1), oldest first:" "$dir/body.md" | grep -qF -- "- ${e:0:7} feat: e" && [ "$(grep -c -F -- "- ${b:0:7}" "$dir/body.md")" = 1 ]'
+check 'body: marked commits listed by kind' \
+	'grep -A1 -F "Held (1):" "$dir/body.md" | grep -qF -- "- ${d:0:7} fix: d: later" &&
+	grep -A1 -F "Ported (1):" "$dir/body.md" | grep -qF -- "- ${c:0:7} fix: c: ported in #46 (abc)" &&
+	grep -A1 -F "Skipped (1):" "$dir/body.md" | grep -qF -- "- ${b:0:7} chore: b (tembo/voxl#2): release bump"'
+SYNC_MAX_COMMITS=5 run_sync
+check 'body: commits passed over in a run listed by kind' \
+	'grep -qF "Passed over in this run" "$dir/body.md" && grep -A1 -F "Ported (1):" "$dir/body.md" | grep -qF -- "- ${c:0:7}" && grep -qF "**Stopped at ${d:0:7} fix: d**: held" "$dir/body.md"'
 
 [ $failures -eq 0 ]

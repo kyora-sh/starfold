@@ -66,8 +66,51 @@ is_ancestor() {
 	exit 1
 }
 
-line() { git log -1 --format='%h %s' "$1"; }
+# Bare (#NN) references are upstream's; here they would link to this repo's own.
+qualify() { sed -E 's|\(#([0123456789]+)\)|(tembo/voxl#\1)|g'; }
+line() { git log -1 --format='%h %s' "$1" | qualify; }
+# Upstream's message for this repo: its first non-blank line as the subject, then the
+# plain text after it up to the first line that starts with optional whitespace and '<'
+# (badges, images, links), without trailing blank lines. Reads to the end either way.
+clean_message() {
+	git log -1 --format=%B "$1" | awk '
+		cut { next }
+		!subject && /^[[:space:]]*$/ { next }
+		!subject { print; subject = 1; next }
+		/^[[:space:]]*</ { cut = 1; next }
+		/^[[:space:]]*$/ { blank = blank $0 "\n"; next }
+		{ printf "%s%s\n", blank, $0; blank = "" }
+	' | qualify
+}
 list() { paste -sd, - | sed 's/,/, /g'; }
+
+# The commits among "$@" that the skip list marks, as lists of held, ported and skipped.
+print_marked() {
+	local c held=() ported=() skipped=()
+	for c in "$@"; do
+		case ${skip_reasons[$c]:-} in
+		'') ;;
+		held:*) held+=("$c") ;;
+		'ported in '*) ported+=("$c") ;;
+		*) skipped+=("$c") ;;
+		esac
+	done
+	print_kind Held "${held[@]}"
+	print_kind Ported "${ported[@]}"
+	print_kind Skipped "${skipped[@]}"
+}
+print_kind() {
+	local kind=$1 c l reason
+	shift
+	if [ $# -eq 0 ]; then return 0; fi
+	echo "$kind ($#):"
+	for c in "$@"; do
+		l=$(line "$c")
+		reason=${skip_reasons[$c]}
+		echo "- $l: ${reason#held: }"
+	done
+	echo
+}
 
 # The non-empty lines of $1 in the array `lines`, with no temporary file.
 split_lines() {
@@ -171,7 +214,7 @@ for c in "${commits[@]}"; do
 		break
 	fi
 	if [ -n "$reason" ]; then
-		skipped_listed+=("$label: $reason")
+		skipped_listed+=("$c")
 		last=$c
 		handled=$((handled + 1))
 		continue
@@ -182,7 +225,7 @@ for c in "${commits[@]}"; do
 	author_name=$(git log -1 --format=%an "$c")
 	author_email=$(git log -1 --format=%ae "$c")
 	author_date=$(git log -1 --format=%ad --date=raw "$c")
-	message=$(git log -1 --format=%B "$c")
+	message=$(clean_message "$c")
 	mapped=$(GIT_AUTHOR_NAME=$author_name GIT_AUTHOR_EMAIL=$author_email GIT_AUTHOR_DATE=$author_date \
 		git commit-tree "$tree" -p "$base" -m "$message" -m "Upstream: tembo/voxl@$c")
 	if pick_log=$(git cherry-pick --keep-redundant-commits "$mapped" 2>&1); then
@@ -228,17 +271,17 @@ fi
 		echo
 	fi
 	if [ ${#skipped_listed[@]} -gt 0 ]; then
-		echo "Skipped (${#skipped_listed[@]}), listed in \`$skip_file\`:"
-		for l in "${skipped_listed[@]}"; do echo "- $l"; done
+		echo "Passed over in this run, as \`$skip_file\` lists them:"
 		echo
+		print_marked "${skipped_listed[@]}"
 	fi
+	rest=("${commits[@]:$handled}")
+	pending=()
+	for c in "${rest[@]}"; do
+		if [ -z "${skip_reasons[$c]:-}" ]; then pending+=("$c"); fi
+	done
 	if [ -n "$stop" ]; then
-		rest=("${commits[@]:$handled}")
-		echo "**Stopped at $stop_label**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
-		for c in "${rest[@]}"; do
-			l=$(line "$c")
-			echo "- $l"
-		done
+		echo "**Stopped at $stop_label**: $stop_reason."
 		echo
 		if [ -n "$held_for" ]; then
 			echo "It and everything after it wait until its line is removed from \`$skip_file\`."
@@ -246,14 +289,22 @@ fi
 			echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
 		fi
 		echo
-	elif [ "$handled" -lt ${#commits[@]} ]; then
-		rest=("${commits[@]:$handled}")
-		echo "At most $max_commits applied per run; still to sync (${#rest[@]}), oldest first:"
-		for c in "${rest[@]}"; do
+	elif [ ${#rest[@]} -gt 0 ]; then
+		echo "At most $max_commits applied per run."
+		echo
+	fi
+	if [ ${#pending[@]} -gt 0 ]; then
+		echo "Still to sync (${#pending[@]}), oldest first:"
+		for c in "${pending[@]}"; do
 			l=$(line "$c")
 			echo "- $l"
 		done
 		echo
+	fi
+	if [ ${#rest[@]} -gt ${#pending[@]} ]; then
+		echo "Further on, as \`$skip_file\` lists them:"
+		echo
+		print_marked "${rest[@]}"
 	fi
 	if [ ${#left_out[@]} -gt 0 ]; then
 		echo "Left out of the applied commits (upstream's CI and npm lockfile; port by hand if wanted):"
