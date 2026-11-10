@@ -73,9 +73,9 @@ jobs:
       # libyuv, Opus, PulseAudio and xcb for linking, nasm for OpenH264, esbuild for build.rs.
       - name: Native libraries
         run: |
-          apt() { timeout -k 10 300 sudo DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { apt update && apt install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
-          deps || { echo "::warning::package install failed or stalled; retrying once"; deps; }
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -105,9 +105,9 @@ jobs:
       # As above, plus x264 and libclang for its bindings.
       - name: Native libraries
         run: |
-          apt() { timeout -k 10 300 sudo DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { apt update && apt install -y libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
-          deps || { echo "::warning::package install failed or stalled; retrying once"; deps; }
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -134,9 +134,9 @@ jobs:
       # Checked, not linked: musl-gcc for the C dependencies, the host g++ for OpenH264's C++.
       - name: Native libraries
         run: |
-          apt() { timeout -k 10 300 sudo DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { apt update && apt install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++; }
-          deps || { echo "::warning::package install failed or stalled; retrying once"; deps; }
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -171,9 +171,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: MinGW, NASM and vcpkg's build tools
         run: |
-          apt() { timeout -k 10 300 sudo DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { apt update && apt install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
-          deps || { echo "::warning::package install failed or stalled; retrying once"; deps; }
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
           path: .vcpkg-cache
