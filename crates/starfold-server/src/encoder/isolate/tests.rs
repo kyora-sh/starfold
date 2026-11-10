@@ -3,6 +3,8 @@ use crate::encoder::caps::{Acceleration, Chroma, ProbeStatus, ProfileCapability}
 #[cfg(unix)]
 use crate::encoder::caps::{Registry, Software};
 use crate::encoder::Codec;
+#[cfg(unix)]
+use crate::encoder::SOFTWARE_H264;
 
 fn good(backend: Backend) -> EncoderCapability {
     let mut c = EncoderCapability::new(Codec::H264, backend, Acceleration::Hardware, "gpu0");
@@ -184,7 +186,7 @@ fn hung_child_is_killed_at_the_timeout() {
 fn registry_keeps_the_rest_when_children_fail() {
     let vt = report(Backend::VideoToolbox, vec![good(Backend::VideoToolbox)]);
     let providers: Vec<Box<dyn ProbeProvider>> = vec![
-        Box::new(Software(Backend::OpenH264)),
+        Box::new(Software(SOFTWARE_H264)),
         Box::new(child(
             Backend::VideoToolbox,
             format!("echo '{vt}'"),
@@ -202,7 +204,7 @@ fn registry_keeps_the_rest_when_children_fail() {
         )),
     ];
     let r = Registry::probe(providers, Duration::from_secs(10));
-    assert!(r.check(Backend::OpenH264, Codec::H264).is_ok());
+    assert!(r.check(SOFTWARE_H264, Codec::H264).is_ok());
     let vt = r
         .encoders
         .iter()

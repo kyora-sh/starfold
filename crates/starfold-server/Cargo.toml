@@ -22,9 +22,12 @@ name = "starfold"
 path = "src/main.rs"
 
 [features]
-default = []
-# libx264 (GPL-2.0) as an optional encoder, picked with --encoder x264.
+default = ["x264"]
+# libx264 (GPL-2.0-or-later), the software H.264 encoder: a build with it is GPL-2.0-or-later.
 x264 = ["dep:bindgen"]
+# OpenH264 (BSD-2-Clause) built from its bundled source, not Cisco's downloadable binary:
+# the software H.264 encoder of a build without x264 (`--no-default-features --features openh264`).
+openh264 = ["dep:openh264-sys2"]
 # Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
 sw-arm = ["dep:bindgen"]
 libvpx = ["sw-arm"]
@@ -62,8 +65,7 @@ getrandom = "0.3"
 zip = { version = "7", default-features = false, features = [
 	"deflate-flate2-zlib-rs",
 ] }
-# OpenH264 (BSD-2-Clause) built from its bundled source, not Cisco's downloadable binary.
-openh264-sys2 = { version = "=0.9.9", default-features = false, features = [
+openh264-sys2 = { version = "=0.9.9", optional = true, default-features = false, features = [
 	"source",
 ] }
 

@@ -1,4 +1,4 @@
-//! libx264 (GPL-2.0, only with the `x264` feature) tuned for low-latency desktop streaming.
+//! libx264 (GPL-2.0-or-later, the default `x264` feature) tuned for low-latency desktop streaming.
 
 #![allow(
     non_camel_case_types,

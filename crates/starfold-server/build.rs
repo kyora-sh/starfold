@@ -10,7 +10,9 @@ fn main() {
     x264_bindings(&x264.expect("x264"), &out);
     #[cfg(not(feature = "x264"))]
     let _ = x264;
-    nasm_check();
+    if cfg!(feature = "openh264") {
+        nasm_check();
+    }
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
 }
@@ -167,9 +169,9 @@ fn unix_libs(target: &str) -> X264 {
     x264.map(|l| l.include_paths)
 }
 
-/// x264 (with the feature), libyuv and Opus from vcpkg (`vcpkg install libyuv opus`,
-/// plus `x264` for the feature; triplet from VCPKGRS_TRIPLET, e.g. x64-windows-static-md
-/// for a self-contained starfold.exe). Capture, audio and input use system DLLs.
+/// x264 (with the feature), libyuv and Opus from vcpkg (`vcpkg install x264 libyuv opus`;
+/// triplet from VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained
+/// starfold.exe). Capture, audio and input use system DLLs.
 fn windows_libs() -> X264 {
     if cfg!(feature = "sw-arm") {
         panic!("the bench's software encoders build on Linux and macOS only");

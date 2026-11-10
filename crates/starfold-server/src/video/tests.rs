@@ -2083,7 +2083,7 @@ fn hevc_nal_types(d: &[u8]) -> Vec<u8> {
 fn videotoolbox_hevc_negotiated() {
     use crate::encoder::caps::{host_providers, Registry, PROBE_TIMEOUT};
     let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
-    let cands = negotiate::candidates(&reg, Backend::OpenH264);
+    let cands = negotiate::candidates(&reg, encoder::SOFTWARE_H264);
     if !cands.iter().any(|c| c.codec == Codec::Hevc) {
         assert!(
             std::env::var_os("STARFOLD_EXPECT_HEVC").is_none(),
@@ -3046,6 +3046,7 @@ fn a_pass_stays_a_rate_change_for_other_encoders() {
 
 /// Real OpenH264 through the engine: whether the library takes the switch or refuses it,
 /// a viewer gets no keyframe beyond its first and the stream carries on.
+#[cfg(feature = "openh264")]
 fn passes_through_openh264(break_switch: bool) -> (u64, u64, u32, bool) {
     let hub = Hub::new();
     let open: Open = Arc::new(move |c: &EncoderConfig| {
@@ -3082,12 +3083,14 @@ fn passes_through_openh264(break_switch: bool) -> (u64, u64, u32, bool) {
     )
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn a_refused_switch_is_no_keyframe_storm() {
     let (keys, _, failures, needs_key) = passes_through_openh264(true);
     assert_eq!((keys, failures, needs_key), (1, 0, false));
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn the_switch_through_the_engine_sends_its_frames() {
     let (keys, frames, failures, needs_key) = passes_through_openh264(false);

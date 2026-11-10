@@ -16,7 +16,7 @@ Agents get HTTP APIs for screenshots, recordings, input and waiting until the sc
 ## Quick start
 
 ```sh
-cargo install --locked --path crates/starfold-server   # needs nasm, libyuv, Opus, PulseAudio and esbuild (see Build)
+cargo install --locked --path crates/starfold-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Build)
 DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
@@ -37,10 +37,11 @@ caveats and raw cells are in the results file.
 
 ## Build
 
-Rust, a C++ compiler, nasm, pkg-config, libyuv, libopus, libpulse and esbuild;
+Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esbuild;
 `nix-shell --arg withRust true` provides them all (plain `nix-shell` all but Rust, for your own
-toolchain). The cargo features pick the software H.264 encoders a build includes: OpenH264,
-built from source, and x264 (`--features x264`, needs x264 and clang); see [Licensing](#licensing).
+toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
+`--features openh264` adds it beside x264 (`--encoder openh264`), and
+`--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
 
 ```sh
 nix-shell --arg withRust true
@@ -81,7 +82,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--basic-auth-user`                                            | any                                                                   | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                                  | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                               | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
-| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else OpenH264; or the H.264 one: `openh264`, `videotoolbox`, `x264` (x264 builds), or the experimental `vaapi`, `nvenc`, `mediafoundation` |
+| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else x264; or the H.264 one: `x264`, `videotoolbox`, `openh264` (openh264 builds), or the experimental `vaapi`, `nvenc`, `mediafoundation` |
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
 | `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC and Media Foundation, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                                     |
 | `--preset`                                                     | `ultrafast`                                                           | x264 preset                                                                                                                                                                                               |
@@ -178,7 +179,7 @@ encoding with any viewers taking H.264, and with none it starts an H.264 encodin
 own. It needs `--stripes=1` (otherwise 409), doesn't include the cursor (viewers draw it),
 and a resize ends it.
 
-If another encoder takes over mid-recording (a hardware encoder failing over to OpenH264,
+If another encoder takes over mid-recording (a hardware encoder failing over to x264,
 say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
@@ -255,7 +256,7 @@ Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and i
 WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
-vcpkg install libyuv opus --triplet x64-windows-static-md
+vcpkg install x264 libyuv opus --triplet x64-windows-static-md
 $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
 npm install -g esbuild
 cargo build --release
@@ -309,14 +310,21 @@ Phones and tablets get touch input and an on-screen keyboard.
 
 **Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
-**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU. `--encoder auto` uses
-a hardware encoder that isn't experimental where it finds one (VideoToolbox on macOS). The VA-API,
-NVENC and Media Foundation encoders are experimental: start with `--experimental-hw-probes` and name
-one with `--encoder vaapi`, `nvenc` or `mediafoundation`; `/stats` shows what the probe found.
+**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264.
+`--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
+macOS). The VA-API, NVENC and Media Foundation encoders are experimental: start with
+`--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc` or `mediafoundation`;
+`/stats` shows what the probe found.
+
+**What's the license?** The code is MIT; a default build links x264 and is
+GPL-2.0-or-later. See [Licensing](#licensing).
 
 ## Licensing
 
-The source code is MIT ([LICENSE](LICENSE)). The software H.264 encoders are OpenH264
-(BSD-2-Clause) and x264 (GPL-2.0-or-later). Which of them a binary includes depends on the cargo
-features it was built with; `starfold --version` lists them. A binary that includes x264 is GPL-2.0-or-later as a combined work.
+The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2.0-or-later),
+so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
+work. Each release attaches the exact x264 source its builds link
+([third_party/x264](third_party/x264/README.md)). A build with
+`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
+no GPL component; `starfold --version` lists the encoders a binary includes.
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.

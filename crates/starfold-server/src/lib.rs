@@ -280,10 +280,10 @@ async fn serve(a: HashMap<String, String>) {
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let mut candidates = negotiate::candidates(&encoders, encoder);
     // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::Backend::OpenH264 {
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE_H264 {
         let fallback = negotiate::Candidate {
             codec: encoder::Codec::H264,
-            backend: encoder::Backend::OpenH264,
+            backend: encoder::SOFTWARE_H264,
             hardware: false,
         };
         if !candidates.contains(&fallback) {

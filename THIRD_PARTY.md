@@ -8,8 +8,11 @@
   [packages/web/inter-LICENSE.txt](packages/web/inter-LICENSE.txt).
 - **Geist** (SIL Open Font License 1.1, The Geist Project Authors,
   [vercel/geist-font](https://github.com/vercel/geist-font)): the lettering in `assets/` uses its outlines.
-- **OpenH264** (BSD-2-Clause), built from source, in builds that include it.
-- **x264** (GPL-2.0-or-later), in builds with the `x264` feature. A binary built with x264 is
-  distributed under GPL-2.0-or-later as a combined work; starfold's own source stays MIT.
+- **x264** (GPL-2.0-or-later), linked by the default build (the `x264` feature). A binary built with
+  x264 is distributed under GPL-2.0-or-later as a combined work; starfold's own source stays MIT. Each
+  release attaches the exact x264 source of its Linux, macOS and Windows builds, kept in
+  [third_party/x264](third_party/x264/README.md).
+- **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
+  feature. `--no-default-features --features openh264` builds without x264.
 
 `starfold --version` lists the encoders a binary includes.

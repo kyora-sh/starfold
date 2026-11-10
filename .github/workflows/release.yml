@@ -2,6 +2,8 @@ name: Release
 
 # A version tag (v0.4.0, ...) gets a GitHub release with GitHub's generated notes (the
 # pull requests merged since the previous tag). Nothing is published to a registry.
+# starfold links x264 (GPL-2.0-or-later), so each release attaches the exact x264 source of every
+# platform's build, from third_party/x264 (hash-checked, nothing fetched).
 # Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
 on:
   push:
@@ -27,13 +29,30 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
             exit 1
           fi
+      - name: x264's source
+        run: |
+          (cd third_party/x264 && sha256sum -c SHA256SUMS && sha512sum -c SHA512SUMS)
+          mkdir x264-source
+          cp third_party/x264/*.tar.* third_party/x264/*.dsc x264-source/
+          tar -czf x264-source/vcpkg-2026.10.16-ports-x264.tar.gz -C third_party/x264 vcpkg-2026.10.16-ports-x264
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes)
+          cat > x264-notes.md <<'NOTES'
+          ## x264 source
+
+          Binaries built from this release link x264 and are GPL-2.0-or-later as a combined work.
+          The source of each x264 they link is attached (see `third_party/x264/README.md`):
+          - Linux: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1` (`.orig.tar.gz`, `.debian.tar.xz`, `.dsc`),
+            upstream commit 31e19f92f00c7003fa115047ce50978bc98c3a0d.
+          - Windows (vcpkg) and macOS (Homebrew): upstream r3222, commit b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+            (`x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz`). vcpkg 2026.10.16 builds it with the patches in
+            `vcpkg-2026.10.16-ports-x264.tar.gz`; Homebrew builds it unpatched.
+          NOTES
+          args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes --notes-file x264-notes.md)
           prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
           if [ -n "$prev" ]; then
             args+=(--notes-start-tag "$prev")
           fi
-          gh release create "$GITHUB_REF_NAME" "${args[@]}"
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" x264-source/*

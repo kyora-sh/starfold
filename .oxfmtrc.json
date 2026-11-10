@@ -15,6 +15,7 @@
 		"*.rs",
 		"*.nix",
 		"patches/**",
-		"bench/**"
+		"bench/**",
+		"third_party/**"
 	]
 }
