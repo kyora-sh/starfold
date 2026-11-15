@@ -311,7 +311,7 @@ impl Runtime for Fake {
     }
 
     fn surface(&mut self, f: &FrameView<'_>, ts: u64) -> Result<*mut FrameSurface1, Fault> {
-        self.call();
+        drop(self.call());
         if let Some(Some(fault)) = self.surface.pop_front() {
             return Err(fault);
         }
