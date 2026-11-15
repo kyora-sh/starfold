@@ -154,11 +154,33 @@ https://github.com/kyora-sh/starfold#for-agents-and-scripts
 
 /// The software H.264 encoders this build includes.
 fn software_encoders() -> Vec<&'static str> {
-    let mut v = vec!["openh264"];
+    let mut v = Vec::new();
     if cfg!(feature = "x264") {
         v.push("x264");
     }
+    if cfg!(feature = "openh264") {
+        v.push("openh264");
+    }
     v
+}
+
+/// The licence of this binary: linking x264 (or the bench's x265) makes it GPL-2.0-or-later as a
+/// combined work.
+fn binary_licence() -> &'static str {
+    if cfg!(any(feature = "x264", feature = "x265")) {
+        "GPL-2.0-or-later"
+    } else {
+        "MIT"
+    }
+}
+
+/// `--version`'s line: the version, the software encoders built in and the binary's licence.
+fn version_line(version: &str) -> String {
+    format!(
+        "starfold {version} (encoders: {}; licence: {})",
+        software_encoders().join(", "),
+        binary_licence()
+    )
 }
 
 /// Which of the two the arguments ask for, if either. Help wins over version.
@@ -196,10 +218,7 @@ pub fn print_if_asked(args: &[String]) -> bool {
             true
         }
         Some(Request::Version) => {
-            println!(
-                "starfold {version} (encoders: {})",
-                software_encoders().join(", ")
-            );
+            println!("{}", version_line(version));
             true
         }
         None => false,
@@ -232,8 +251,19 @@ mod tests {
     #[test]
     fn version_lists_the_software_encoders_built_in() {
         let v = software_encoders();
-        assert!(v.contains(&"openh264"));
+        assert_eq!(v.contains(&"openh264"), cfg!(feature = "openh264"));
         assert_eq!(v.contains(&"x264"), cfg!(feature = "x264"));
+    }
+
+    #[test]
+    fn version_names_the_licence_x264_makes_gpl() {
+        let line = version_line("1.2.3");
+        assert!(line.starts_with("starfold 1.2.3 (encoders: "));
+        if cfg!(any(feature = "x264", feature = "x265")) {
+            assert!(line.ends_with("; licence: GPL-2.0-or-later)"), "{line}");
+        } else {
+            assert!(line.ends_with("; licence: MIT)"), "{line}");
+        }
     }
 
     #[test]

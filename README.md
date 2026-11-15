@@ -328,5 +328,6 @@ so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later 
 work. Each release attaches the exact x264 source its builds link
 ([third_party/x264](third_party/x264/README.md)). A build with
 `--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
-no GPL component; `starfold --version` lists the encoders a binary includes.
+no GPL component, so the binary stays under starfold's MIT licence; `starfold --version` lists
+the encoders a binary includes and its licence.
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.
