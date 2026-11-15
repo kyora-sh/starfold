@@ -274,7 +274,9 @@ mod windows_impl {
     use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus, PROBE_TIMEOUT};
     use super::super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
     use super::driver::MfxRuntime;
-    use super::{caps, ffi, locate, pick, read_impl, session, Adapter, ImplInfo, GATE};
+    use super::{
+        caps, ffi, locate, pick, read_impl, runtime_path, session, Adapter, ImplInfo, GATE,
+    };
 
     fn given_up() -> Option<String> {
         GATE.given_up()
