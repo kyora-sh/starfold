@@ -818,8 +818,6 @@ fn the_runtime_loads_only_from_its_driver_store_path() {
     let dir = r"C:\Windows\System32\DriverStore\FileRepository\iigd_dch.inf_amd64_0123\";
     let path = format!("{dir}libmfx64-gen.dll");
     assert_eq!(runtime_path(Ok(path.clone()), &a), Ok(path));
-    let unc = r"\\host\share\libmfx64-gen.dll".to_string();
-    assert_eq!(runtime_path(Ok(unc.clone()), &a), Ok(unc));
     let e = runtime_path(Err("the VEN_8086&DEV_46D1 driver names none".into()), &a).unwrap_err();
     assert!(
         e.starts_with("no DriverStorePathForVPL for luid:0000000000001234 Intel(R) UHD Graphics"),
@@ -831,10 +829,13 @@ fn the_runtime_loads_only_from_its_driver_store_path() {
         r"C:libmfx64-gen.dll",
     ] {
         let e = runtime_path(Ok(relative.into()), &a).unwrap_err();
-        assert!(e.contains("not an absolute path"), "{e}");
-        let refused = unsafe { ffi::load_restricted(relative) }.err().unwrap();
-        assert!(refused.contains("refusing to search"), "{refused}");
+        assert!(
+            e.contains("is unusable") && e.contains("not an absolute DLL path"),
+            "{e}"
+        );
     }
+    let unc = runtime_path(Ok(r"\\host\share\libmfx64-gen.dll".into()), &a).unwrap_err();
+    assert!(unc.contains("a network or device path"), "{unc}");
 }
 
 #[test]

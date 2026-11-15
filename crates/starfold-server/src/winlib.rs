@@ -26,10 +26,6 @@ pub unsafe fn system(name: &str) -> Result<Library, String> {
 /// resolve from its directory and System32.
 #[cfg(windows)]
 #[allow(
-    dead_code,
-    reason = "for driver runtimes outside System32, none loaded yet"
-)]
-#[allow(
     clippy::disallowed_methods,
     reason = "the crate's Windows loader, with an explicit search path"
 )]
@@ -56,7 +52,7 @@ fn check_bare_name(name: &str) -> Result<(), String> {
 /// `C:\...` (either separator) or `\\?\C:\...`. Drive-relative (`C:x`) and root-relative
 /// (`\x`) paths depend on the current drive or directory; UNC (`\\host\share`,
 /// `\\?\UNC\...`) and device (`\\.\...`) paths leave the local disk. All of those fail.
-fn check_absolute(path: &str) -> Result<(), String> {
+pub(crate) fn check_absolute(path: &str) -> Result<(), String> {
     let sep = |c: u8| c == b'\\' || c == b'/';
     let drive = |b: &[u8]| b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2]);
     let b = path.as_bytes();

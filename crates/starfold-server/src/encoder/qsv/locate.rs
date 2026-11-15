@@ -7,8 +7,8 @@
 //! loaded at runtime from System32, as the dispatcher loads them. There is no search-path
 //! fallback: a driver that names no folder has no runtime here.
 
-use super::ffi::load_system;
 use super::{intel_device, Adapter};
+use crate::winlib::system as load_system;
 use std::ffi::c_void;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 

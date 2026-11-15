@@ -86,17 +86,18 @@ pub fn intel_device(instance: &str) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok().filter(|&d| d != 0)
 }
 
-/// The runtime to load for `a`: only the absolute path its driver's DriverStore entry gives,
-/// never a name looked up on the DLL search path (where a planted DLL would load first).
+/// The runtime to load for `a`: only the absolute local path its driver's DriverStore entry
+/// gives (as [`crate::winlib::absolute`] takes it), never a name looked up on the DLL search
+/// path (where a planted DLL would load first).
 pub fn runtime_path(found: Result<String, String>, a: &Adapter) -> Result<String, String> {
-    match found {
-        Ok(p) if ffi::windows_absolute(&p) => Ok(p),
-        Ok(p) => Err(format!(
-            "the DriverStorePathForVPL of {} is not an absolute path: {p}",
+    let p = found.map_err(|e| format!("no DriverStorePathForVPL for {}: {e}", a.label()))?;
+    crate::winlib::check_absolute(&p).map_err(|e| {
+        format!(
+            "the DriverStorePathForVPL of {} is unusable: {e}",
             a.label()
-        )),
-        Err(e) => Err(format!("no DriverStorePathForVPL for {}: {e}", a.label())),
-    }
+        )
+    })?;
+    Ok(p)
 }
 
 /// The codecs this encoder takes from the runtime's list: H.264 and HEVC, never others.

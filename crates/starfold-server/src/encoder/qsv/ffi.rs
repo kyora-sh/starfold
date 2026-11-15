@@ -477,11 +477,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Loads the runtime at the absolute `path`, its dependencies from its own folder and
-    /// System32 only; fails unless it exports the oneVPL 2.x entry points.
+    /// Loads the runtime at the absolute local `path` through [`crate::winlib::absolute`]
+    /// (its dependencies from its own folder and System32 only); fails unless it exports the
+    /// oneVPL 2.x entry points.
+    #[cfg(windows)]
     pub fn load(path: &str) -> Result<Runtime, String> {
         unsafe {
-            let lib = load_restricted(path)?;
+            let lib = crate::winlib::absolute(path)?;
             macro_rules! f {
                 ($name:literal) => {
                     *lib.get(concat!($name, "\0").as_bytes()).map_err(|e| {
@@ -507,49 +509,6 @@ impl Runtime {
             })
         }
     }
-}
-
-/// Whether `p` is an absolute Windows path: a drive (`C:\`) or a UNC share (`\\server`).
-pub fn windows_absolute(p: &str) -> bool {
-    let b = p.as_bytes();
-    let drive =
-        b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
-    drive || p.starts_with(r"\\")
-}
-
-/// The library at the absolute `path`, never one found by name on the search path; on
-/// Windows its dependencies come from its own folder and System32 only.
-pub unsafe fn load_restricted(path: &str) -> Result<Library, String> {
-    if !windows_absolute(path) {
-        return Err(format!(
-            "{path}: not an absolute path; refusing to search for it"
-        ));
-    }
-    #[cfg(windows)]
-    {
-        use libloading::os::windows::{
-            Library as WinLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-        };
-        WinLibrary::load_with_flags(
-            path,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-        .map(Library::from)
-        .map_err(|e| format!("{path}: {e}"))
-    }
-    #[cfg(not(windows))]
-    {
-        Library::new(path).map_err(|e| format!("{path}: {e}"))
-    }
-}
-
-/// A Windows system DLL, from System32 only.
-#[cfg(windows)]
-pub unsafe fn load_system(name: &str) -> Result<Library, String> {
-    use libloading::os::windows::{Library as WinLibrary, LOAD_LIBRARY_SEARCH_SYSTEM32};
-    WinLibrary::load_with_flags(name, LOAD_LIBRARY_SEARCH_SYSTEM32)
-        .map(Library::from)
-        .map_err(|e| format!("{name}: {e}"))
 }
 
 /// The NUL-terminated string in `s`.
