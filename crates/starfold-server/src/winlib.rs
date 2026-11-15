@@ -11,6 +11,10 @@ use libloading::Library;
 
 /// A system DLL by file name, from System32 only.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the crate's Windows loader, with an explicit search path"
+)]
 pub unsafe fn system(name: &str) -> Result<Library, String> {
     check_bare_name(name)?;
     WinLibrary::load_with_flags(name, LOAD_LIBRARY_SEARCH_SYSTEM32)
@@ -18,12 +22,16 @@ pub unsafe fn system(name: &str) -> Result<Library, String> {
         .map_err(|e| format!("{name}: {e}"))
 }
 
-/// A driver runtime at an absolute path (e.g. in the DriverStore). Its own imports
+/// A driver runtime at an absolute local path (e.g. in the DriverStore). Its own imports
 /// resolve from its directory and System32.
 #[cfg(windows)]
 #[allow(
     dead_code,
     reason = "for driver runtimes outside System32, none loaded yet"
+)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the crate's Windows loader, with an explicit search path"
 )]
 pub unsafe fn absolute(path: &str) -> Result<Library, String> {
     check_absolute(path)?;
@@ -45,15 +53,23 @@ fn check_bare_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// `C:\...` (either separator) or a UNC / `\\?\` path. Drive-relative (`C:x`) and
-/// root-relative (`\x`) paths depend on the current drive or directory, so they fail.
+/// `C:\...` (either separator) or `\\?\C:\...`. Drive-relative (`C:x`) and root-relative
+/// (`\x`) paths depend on the current drive or directory; UNC (`\\host\share`,
+/// `\\?\UNC\...`) and device (`\\.\...`) paths leave the local disk. All of those fail.
 fn check_absolute(path: &str) -> Result<(), String> {
-    let b = path.as_bytes();
     let sep = |c: u8| c == b'\\' || c == b'/';
-    let drive = b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2]);
-    let unc = b.len() > 2 && sep(b[0]) && sep(b[1]);
-    if (drive || unc) && !path.contains('\0') {
+    let drive = |b: &[u8]| {
+        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2])
+    };
+    let b = path.as_bytes();
+    let local = match path.strip_prefix(r"\\?\") {
+        Some(rest) => drive(rest.as_bytes()),
+        None => drive(b),
+    };
+    if local && !path.contains('\0') {
         Ok(())
+    } else if b.len() > 1 && sep(b[0]) && sep(b[1]) {
+        Err(format!("{path:?}: a network or device path, not a local DLL path"))
     } else {
         Err(format!("{path:?}: not an absolute DLL path"))
     }
@@ -92,12 +108,11 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_pass() {
+    fn absolute_local_paths_pass() {
         for path in [
             "C:\\Windows\\System32\\DriverStore\\FileRepository\\x\\libmfx64-gen.dll",
             "c:/drivers/x.dll",
             "\\\\?\\C:\\drivers\\x.dll",
-            "\\\\host\\share\\x.dll",
         ] {
             assert_eq!(check_absolute(path), Ok(()), "{path}");
         }
@@ -121,6 +136,21 @@ mod tests {
         ] {
             let err = check_absolute(path).unwrap_err();
             assert!(err.contains("not an absolute DLL path"), "{path:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn network_and_device_paths_fail() {
+        for path in [
+            "\\\\host\\share\\x.dll",
+            "//host/share/x.dll",
+            "\\\\?\\UNC\\host\\share\\x.dll",
+            "\\\\.\\C:\\x.dll",
+            "\\\\?\\GLOBALROOT\\Device\\x.dll",
+            "\\\\?\\C:x.dll",
+        ] {
+            let err = check_absolute(path).unwrap_err();
+            assert!(err.contains("a network or device path"), "{path:?}: {err}");
         }
     }
 }

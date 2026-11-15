@@ -1,4 +1,7 @@
 disallowed-methods = [
 	{ path = "libloading::Library::new", reason = "on Windows this searches the executable's and current directory; load DLLs through crate::winlib::system or crate::winlib::absolute", allow-invalid = true },
 	{ path = "libloading::os::windows::Library::new", reason = "this searches the executable's and current directory; load DLLs through crate::winlib::system or crate::winlib::absolute", allow-invalid = true },
+	{ path = "libloading::os::windows::Library::load_with_flags", reason = "load DLLs through crate::winlib::system or crate::winlib::absolute, which check the name or path and set the search flags", allow-invalid = true },
+	{ path = "libloading::os::unix::Library::new", reason = "load libraries through libloading::Library::new at an allowed call site, or crate::winlib on Windows", allow-invalid = true },
+	{ path = "libloading::os::unix::Library::open", reason = "load libraries through libloading::Library::new at an allowed call site, or crate::winlib on Windows", allow-invalid = true },
 ]
