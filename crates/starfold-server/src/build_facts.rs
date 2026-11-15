@@ -5,12 +5,15 @@
 
 use crate::encoder::SOFTWARE_H264;
 
-/// One software encoder feature of Cargo.toml: whether this build has it, and what it makes
-/// of the flags the encoders share.
+/// One software encoder feature of Cargo.toml, or one hardware encoder: whether this build has
+/// it, and what it makes of the flags the encoders share.
 pub struct Encoder {
-    /// The cargo feature, which is also the backend's name.
+    /// The cargo feature, which is also the backend's name; a hardware encoder's backend name.
     pub name: &'static str,
+    /// A software encoder's feature is on; a hardware encoder is built on this platform.
     pub built: bool,
+    /// A hardware encoder: no cargo feature, found by its probe at startup.
+    pub hardware: bool,
     /// An H.264 encoder `--encoder` can pin and `auto` can fall back to; else a bench arm.
     pub h264: bool,
     /// What `--crf` is to it.
@@ -27,6 +30,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "x264",
         built: cfg!(feature = "x264"),
+        hardware: false,
         h264: true,
         crf: Some("base quality"),
         preset: Some("a preset name, ultrafast by default"),
@@ -36,6 +40,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "openh264",
         built: cfg!(feature = "openh264"),
+        hardware: false,
         h264: true,
         crf: Some("lowest QP in motion"),
         preset: None,
@@ -45,6 +50,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "libvpx",
         built: cfg!(feature = "libvpx"),
+        hardware: false,
         h264: false,
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 8 by default"),
@@ -54,6 +60,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "libaom",
         built: cfg!(feature = "libaom"),
+        hardware: false,
         h264: false,
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 10 by default"),
@@ -63,6 +70,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "svt-av1",
         built: cfg!(feature = "svt-av1"),
+        hardware: false,
         h264: false,
         crf: Some("lowest QP"),
         preset: Some("a preset number, 12 by default"),
@@ -72,6 +80,7 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "kvazaar",
         built: cfg!(feature = "kvazaar"),
+        hardware: false,
         h264: false,
         crf: None,
         preset: Some("ultrafast (default), superfast or veryfast"),
@@ -81,13 +90,34 @@ pub const ENCODERS: &[Encoder] = &[
     Encoder {
         name: "x265",
         built: cfg!(feature = "x265"),
+        hardware: false,
         h264: false,
         crf: Some("lowest QP"),
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
         gpl: true,
     },
+    hardware("videotoolbox", cfg!(target_os = "macos")),
+    hardware("vaapi", cfg!(target_os = "linux")),
+    hardware("nvenc", cfg!(any(target_os = "linux", windows))),
+    hardware("mediafoundation", cfg!(windows)),
+    hardware("qsv", cfg!(windows)),
 ];
+
+/// A hardware H.264 encoder built on this platform when `built`; it reads none of the shared
+/// flags and links nothing.
+const fn hardware(name: &'static str, built: bool) -> Encoder {
+    Encoder {
+        name,
+        built,
+        hardware: true,
+        h264: true,
+        crf: None,
+        preset: None,
+        paintover_crf: false,
+        gpl: false,
+    }
+}
 
 /// The flags whose meaning depends on the encoder.
 pub const FLAGS: [&str; 3] = ["preset", "crf", "paintover-crf"];
@@ -96,14 +126,18 @@ fn built() -> impl Iterator<Item = &'static Encoder> {
     ENCODERS.iter().filter(|e| e.built)
 }
 
+fn software() -> impl Iterator<Item = &'static Encoder> {
+    built().filter(|e| !e.hardware)
+}
+
 /// Every software encoder this binary includes, H.264 and bench arms, by feature name.
 pub fn software_encoders() -> Vec<&'static str> {
-    built().map(|e| e.name).collect()
+    software().map(|e| e.name).collect()
 }
 
 /// The software H.264 encoders `--encoder` can pin.
 pub fn h264_encoders() -> Vec<&'static str> {
-    built().filter(|e| e.h264).map(|e| e.name).collect()
+    software().filter(|e| e.h264).map(|e| e.name).collect()
 }
 
 /// The bench arms `--encoder` can name.
@@ -126,18 +160,7 @@ pub fn encoder_names() -> Vec<&'static str> {
 /// The hardware encoders `--encoder` can name on this platform; each still needs its probe to
 /// find a device.
 pub fn hardware_encoders() -> Vec<&'static str> {
-    use crate::encoder::Backend;
-    [
-        Backend::VideoToolbox,
-        Backend::Vaapi,
-        Backend::Nvenc,
-        Backend::MediaFoundation,
-        Backend::Qsv,
-    ]
-    .into_iter()
-    .filter(|b| Backend::parse(b.name()).is_ok())
-    .map(Backend::name)
-    .collect()
+    built().filter(|e| e.hardware).map(|e| e.name).collect()
 }
 
 /// The software H.264 encoder `--encoder auto` falls back to where there is no hardware one.
@@ -211,7 +234,11 @@ mod tests {
     fn every_encoder_feature_in_cargo_toml_is_described() {
         let mut features = cargo_features();
         features.sort();
-        let mut described: Vec<String> = ENCODERS.iter().map(|e| e.name.to_string()).collect();
+        let mut described: Vec<String> = ENCODERS
+            .iter()
+            .filter(|e| !e.hardware)
+            .map(|e| e.name.to_string())
+            .collect();
         described.sort();
         assert_eq!(features, described);
     }
@@ -232,7 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn hardware_encoders_follow_the_platform() {
+    fn hardware_rows_are_the_platforms_hardware_backends() {
+        use crate::encoder::Backend;
+        for e in ENCODERS.iter().filter(|e| e.hardware) {
+            let parsed = Backend::parse(e.name);
+            assert_eq!(parsed.is_ok(), e.built, "{}", e.name);
+            assert!(parsed.is_ok_and(|b| b.name() == e.name) || !e.built);
+            assert!(e.h264 && !e.gpl && FLAGS.iter().all(|f| !reads(e.name, f)));
+        }
         let hw = hardware_encoders();
         assert_eq!(hw.contains(&"videotoolbox"), cfg!(target_os = "macos"));
         assert_eq!(hw.contains(&"vaapi"), cfg!(target_os = "linux"));
@@ -242,7 +276,7 @@ mod tests {
         );
         assert_eq!(hw.contains(&"mediafoundation"), cfg!(windows));
         assert_eq!(hw.contains(&"qsv"), cfg!(windows));
-        let e = crate::encoder::Backend::parse("bogus").unwrap_err();
+        let e = Backend::parse("bogus").unwrap_err();
         for name in hw {
             assert!(e.contains(name), "{e}");
         }
@@ -253,7 +287,7 @@ mod tests {
         for flag in FLAGS {
             let w = flag_ignored(flag, "videotoolbox");
             assert!(w.starts_with(&format!("--{flag} ")), "{w}");
-            for e in ENCODERS {
+            for e in ENCODERS.iter().filter(|e| !e.hardware) {
                 assert!(!w.contains(e.name) || e.built, "{w}");
             }
         }

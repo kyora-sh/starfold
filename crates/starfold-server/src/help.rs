@@ -309,7 +309,7 @@ mod tests {
         );
         let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let lower = words.to_lowercase();
-        for e in build_facts::ENCODERS {
+        for e in build_facts::ENCODERS.iter().filter(|e| !e.hardware) {
             assert_eq!(lower.contains(e.name), e.built, "{}:\n{text}", e.name);
         }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
