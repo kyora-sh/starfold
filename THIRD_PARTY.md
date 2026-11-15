@@ -13,6 +13,7 @@
   release attaches the exact x264 source of its Linux, macOS and Windows builds, kept in
   [third_party/x264](third_party/x264/README.md).
 - **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
-  feature. `--no-default-features --features openh264` builds without x264.
+  feature. `--no-default-features --features openh264` builds without x264, and that binary stays
+  under starfold's MIT licence.
 
-`starfold --version` lists the encoders a binary includes.
+`starfold --version` lists the encoders a binary includes and its licence.

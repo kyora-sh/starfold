@@ -3243,6 +3243,58 @@ fn high_fps_caps_hardware_videotoolbox_only() {
     assert_eq!(encoder_config(&on, H264, W, H, 1).fps, 60);
 }
 
+const SOFTWARE: Candidate = Candidate {
+    codec: Codec::H264,
+    backend: encoder::SOFTWARE_H264,
+    hardware: false,
+};
+
+#[test]
+fn preset_goes_only_to_the_encoder_it_was_given_for() {
+    let pinned = VideoConfig {
+        selection: encoder::Selection::Pinned(Backend::VideoToolbox),
+        preset: "12".into(),
+        ..config()
+    };
+    assert_eq!(encoder_config(&pinned, H264_HW, W, H, 1).preset, "12");
+    assert_eq!(
+        encoder_config(&pinned, SOFTWARE, W, H, 1).preset,
+        encoder::DEFAULT_PRESET
+    );
+    let auto = VideoConfig {
+        preset: "veryfast".into(),
+        ..config()
+    };
+    assert_eq!(encoder_config(&auto, SOFTWARE, W, H, 1).preset, "veryfast");
+    assert_eq!(
+        encoder_config(&auto, H264_HW, W, H, 1).preset,
+        encoder::DEFAULT_PRESET
+    );
+}
+
+#[cfg(feature = "sw-arm")]
+#[test]
+fn a_bench_arms_preset_stays_off_its_h264_cohort() {
+    for &(name, backend, codec) in encoder::ARMS {
+        let cfg = VideoConfig {
+            selection: encoder::Selection::Arm(name, backend, codec),
+            preset: "12".into(),
+            ..config()
+        };
+        let arm = Candidate {
+            codec,
+            backend,
+            hardware: false,
+        };
+        assert_eq!(encoder_config(&cfg, arm, W, H, 1).preset, "12", "{name}");
+        assert_eq!(
+            encoder_config(&cfg, SOFTWARE, W, H, 1).preset,
+            encoder::DEFAULT_PRESET,
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn framerate_above_60_without_high_fps_warns() {
     assert_eq!(

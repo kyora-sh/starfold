@@ -542,7 +542,11 @@ fn encoder_config(
         },
         rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,
-        preset: cfg.preset.clone(),
+        preset: if cand.backend == cfg.selection.preset_backend() {
+            cfg.preset.clone()
+        } else {
+            encoder::DEFAULT_PRESET.into()
+        },
     }
 }
 
@@ -1727,7 +1731,7 @@ struct Burst {
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
-const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+pub(crate) const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
 
 /// The ladder spaced as REFINE_RUNGS, ending at `finest`.
 fn rungs(finest: u8) -> [u8; 3] {
@@ -1741,10 +1745,11 @@ fn qp_refinement(cfg: &VideoConfig, backend: encoder::Backend) -> bool {
         && !(backend.name() == "x264" && cfg.max_kbps > 0 && cfg.crf.min(cfg.paintover_crf) <= 0.0)
 }
 
-/// x264 settles at an explicit --paintover-crf; every other ladder at REFINE_RUNGS' last.
+/// An encoder whose build-facts row says so (x264) settles at an explicit --paintover-crf;
+/// every other ladder at REFINE_RUNGS' last.
 fn finest_rung(cfg: &VideoConfig, backend: encoder::Backend) -> u8 {
     cfg.paintover_qp
-        .filter(|_| backend.name() == "x264")
+        .filter(|_| crate::build_facts::refines_to_paintover_crf(backend.name()))
         .unwrap_or(REFINE_RUNGS[2])
 }
 /// The most of the bitrate cap a ladder pass may take. Ladder passes count against the share,

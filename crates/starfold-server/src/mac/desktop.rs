@@ -93,11 +93,18 @@ pub fn spawn(
         state: state.clone(),
         to_server: mode.to_server,
     };
-    let h = hub.clone();
-    std::thread::Builder::new()
-        .name("cursor".into())
-        .spawn(move || cursor_loop(h))
-        .unwrap();
+    if super::show_cursor() {
+        // An empty shape: viewers hide their own pointer, since the video carries the cursor.
+        *hub.cursor.lock() = Some(Bytes::from_static(&[
+            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]));
+    } else {
+        let h = hub.clone();
+        std::thread::Builder::new()
+            .name("cursor".into())
+            .spawn(move || cursor_loop(h))
+            .unwrap();
+    }
     if mode.to_client {
         std::thread::Builder::new()
             .name("clipboard".into())

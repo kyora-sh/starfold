@@ -2,8 +2,8 @@ name: Release
 
 # A version tag (v0.4.0, ...) gets a GitHub release with GitHub's generated notes (the
 # pull requests merged since the previous tag). Nothing is published to a registry.
-# starfold links x264 (GPL-2.0-or-later), so each release attaches the exact x264 source of every
-# platform's build, from third_party/x264 (hash-checked, nothing fetched).
+# A default build links x264 (GPL-2.0-or-later), so each release attaches the exact x264 source of
+# every platform's build, from third_party/x264 (hash-checked, nothing fetched).
 # Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
 on:
   push:
@@ -42,8 +42,9 @@ jobs:
           cat > x264-notes.md <<'NOTES'
           ## x264 source
 
-          Binaries built from this release link x264 and are GPL-2.0-or-later as a combined work.
-          The source of each x264 they link is attached (see `third_party/x264/README.md`):
+          A default build of this release links x264 and is GPL-2.0-or-later as a combined work; an
+          OpenH264-only build (`--no-default-features --features openh264`) has no x264 and stays MIT.
+          The source of each x264 a default build links is attached (see `third_party/x264/README.md`):
           - Linux: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1` (`.orig.tar.gz`, `.debian.tar.xz`, `.dsc`),
             upstream commit 31e19f92f00c7003fa115047ce50978bc98c3a0d.
           - Windows (vcpkg) and macOS (Homebrew): upstream r3222, commit b35605ace3ddf7c1a5d67a2eb553f034aef41d55

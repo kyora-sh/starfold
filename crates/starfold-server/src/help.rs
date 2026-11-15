@@ -1,5 +1,7 @@
 //! `--help` and `--version`: printed instead of starting the server.
 
+use crate::build_facts;
+
 const USAGE: &str = "
 Usage: starfold [--flag=value]...
 
@@ -30,37 +32,21 @@ Video:
                                 per second (or --framerate if higher); other
                                 encoders take --framerate up to 60
                                 (default false)
-  --crf                         x264's base quality; OpenH264's lowest QP in
-                                motion; other encoders ignore it (default 24)
+CRF_ENTRY
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
                                 (default 30000, 2000); --video-bitrate is
                                 the same as --max-kbps
-  --encoder                     auto: each codec from its hardware encoder,
-                                H.264 from x264 where there is none
-                                (default); or the H.264 encoder: x264,
-                                videotoolbox (macOS hardware), openh264 in
-                                a build with the openh264 feature, vaapi
-                                (Linux), nvenc (Linux, Windows) or
-                                mediafoundation (Windows); vaapi, nvenc and
-                                mediafoundation are experimental, need
-                                --experimental-hw-probes and auto never
-                                picks them; /stats shows what the probe
-                                found
+ENCODER_ENTRY
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
   --experimental-hw-probes      experimental: also probe VA-API, NVENC and
                                 Media Foundation, each in a child process
                                 (default false)
-  --preset                      x264 preset (default ultrafast)
+PRESET_ENTRY
   --encoder-threads             sliced threads (default cores/4, from 1 to 4)
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
-  --paintover-crf, --paintover-burst, --paintover-delay-ms
-                                sharpening once the screen goes still
-                                (default 16, 3, 150); --paintover-crf is
-                                x264's, other encoders ignore it; given, it
-                                is also the QP a still picture is refined
-                                down to (default 12)
+PAINTOVER_ENTRY
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us
@@ -109,6 +95,8 @@ Desktop (this Mac's screen):
   --resize-scale                display pixels per CSS pixel (default: the
                                 capture scale)
   --read-only                   viewers only watch (default false)
+  --show-cursor                 include the host cursor in the video stream
+                                (default: true with --read-only, else false)
   --scroll-px-per-notch         pixels one wheel notch scrolls (default 180)
 ";
 
@@ -152,13 +140,111 @@ Agents and scripts can use GET /screenshot, /record and /wait and POST /input; s
 https://github.com/kyora-sh/starfold#for-agents-and-scripts
 ";
 
-/// The software H.264 encoders this build includes.
-fn software_encoders() -> Vec<&'static str> {
-    let mut v = vec!["openh264"];
-    if cfg!(feature = "x264") {
-        v.push("x264");
+/// One flag's help entry: the description wrapped beside the flag, or under it when the flag
+/// is too long to share its line.
+fn entry(flag: &str, text: &str) -> String {
+    const COLUMN: usize = 32;
+    const WIDTH: usize = 46;
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(l) if l.len() + 1 + word.len() <= WIDTH => {
+                l.push(' ');
+                l.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
     }
-    v
+    let indent = " ".repeat(COLUMN);
+    let head = if flag.len() + 2 < COLUMN {
+        format!("  {flag:<width$}", width = COLUMN - 2)
+    } else {
+        format!("  {flag}\n{indent}")
+    };
+    format!("{head}{}\n", lines.join(&format!("\n{indent}")))
+}
+
+/// The entries that name software encoders, from what this build includes.
+fn encoder_entries(usage: &str) -> String {
+    let sw = build_facts::software_h264();
+    let arms = build_facts::bench_arms();
+    let arms = match arms.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; or a bench arm, streamed beside {sw}: {}",
+            arms.join(", ")
+        ),
+    };
+    let encoder = format!(
+        "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
+         (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
+         nvenc (Linux, Windows) or mediafoundation (Windows){arms}; vaapi, nvenc and \
+         mediafoundation are experimental, need --experimental-hw-probes and auto never picks \
+         them; /stats shows what the probe found",
+        build_facts::h264_encoders().join(", ")
+    );
+    let crf: Vec<String> = build_facts::readers("crf")
+        .into_iter()
+        .map(|(name, what)| format!("{name}'s {what};"))
+        .collect();
+    let crf = format!("{} other encoders ignore it (default 24)", crf.join(" "));
+    let presets: Vec<String> = build_facts::readers("preset")
+        .into_iter()
+        .map(|(name, what)| format!("{name}: {what}"))
+        .collect();
+    let preset = match presets.is_empty() {
+        true => "ignored: this build's encoders take no preset".to_string(),
+        false => format!(
+            "for the encoder --encoder names (under auto, {sw}); the others keep their own \
+             default. {}",
+            presets.join("; ")
+        ),
+    };
+    let paintover: Vec<&str> = build_facts::readers("paintover-crf")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let paintover = match paintover.is_empty() {
+        true => "this build's encoders ignore --paintover-crf".to_string(),
+        false => format!(
+            "--paintover-crf reaches {}, other encoders ignore it",
+            paintover.join(", ")
+        ),
+    };
+    let finest = build_facts::refining_to_paintover_crf();
+    let finest = match finest.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; given, it is also the QP {} refines a still picture down to (default {})",
+            finest.join(", "),
+            crate::video::REFINE_RUNGS[2]
+        ),
+    };
+    let paintover =
+        format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
+    let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
+    usage
+        .replace("CRF_ENTRY\n", &entry("--crf", &crf))
+        .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
+        .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
+        .replace("PAINTOVER_ENTRY\n", &entry(paintover_flags, &paintover))
+}
+
+/// `--help`'s text, with `addr` as the default listen address.
+fn help_text(version: &str, addr: &str) -> String {
+    format!(
+        "starfold {version}: low-latency desktop streaming for the browser.\n{}{DESKTOP}{FILES}",
+        encoder_entries(&USAGE.replace("ADDR_DEFAULT", addr))
+    )
+}
+
+/// `--version`'s line: the version, the software encoders built in and the binary's licence.
+fn version_line(version: &str) -> String {
+    format!(
+        "starfold {version} (encoders: {}; licence: {})",
+        build_facts::software_encoders().join(", "),
+        build_facts::licence()
+    )
 }
 
 /// Which of the two the arguments ask for, if either. Help wins over version.
@@ -189,17 +275,11 @@ pub fn print_if_asked(args: &[String]) -> bool {
             } else {
                 "127.0.0.1"
             };
-            print!(
-                "starfold {version}: low-latency desktop streaming for the browser.\n{}{DESKTOP}{FILES}",
-                USAGE.replace("ADDR_DEFAULT", addr)
-            );
+            print!("{}", help_text(version, addr));
             true
         }
         Some(Request::Version) => {
-            println!(
-                "starfold {version} (encoders: {})",
-                software_encoders().join(", ")
-            );
+            println!("{}", version_line(version));
             true
         }
         None => false,
@@ -230,10 +310,54 @@ mod tests {
     }
 
     #[test]
-    fn version_lists_the_software_encoders_built_in() {
-        let v = software_encoders();
-        assert!(v.contains(&"openh264"));
-        assert_eq!(v.contains(&"x264"), cfg!(feature = "x264"));
+    fn help_and_version_name_only_the_software_encoders_built_in() {
+        let text = format!(
+            "{}\n{}",
+            help_text("1.2.3", "0.0.0.0"),
+            version_line("1.2.3")
+        );
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lower = words.to_lowercase();
+        for e in build_facts::ENCODERS {
+            assert_eq!(lower.contains(e.name), e.built, "{}:\n{text}", e.name);
+        }
+        assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
+        assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
+        assert!(
+            words.contains(&format!(
+                "H.264 from {} where there is none",
+                build_facts::software_h264()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("_ENTRY"), "{text}");
+    }
+
+    #[test]
+    fn long_flags_get_their_own_line() {
+        let e = entry("--a-flag-much-longer-than-the-column", "text");
+        assert_eq!(
+            e,
+            format!(
+                "  --a-flag-much-longer-than-the-column\n{}text\n",
+                " ".repeat(32)
+            )
+        );
+        assert_eq!(
+            entry("--crf", "text"),
+            format!("  --crf{}text\n", " ".repeat(25))
+        );
+    }
+
+    #[test]
+    fn version_names_the_licence_x264_makes_gpl() {
+        let line = version_line("1.2.3");
+        assert!(line.starts_with("starfold 1.2.3 (encoders: "));
+        if cfg!(any(feature = "x264", feature = "x265")) {
+            assert!(line.ends_with("; licence: GPL-2.0-or-later)"), "{line}");
+        } else {
+            assert!(line.ends_with("; licence: MIT)"), "{line}");
+        }
     }
 
     #[test]
