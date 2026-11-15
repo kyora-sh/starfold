@@ -1,19 +1,126 @@
 //! What this binary was built with, from its cargo features. Every user-visible statement
-//! about its software encoders and its licence (`--help`, `--version`, the startup log, the
-//! unknown-encoder error) comes from here, so none of them names an encoder it doesn't have.
+//! about its software encoders, the flags they read and its licence (`--help`, `--version`,
+//! the startup warnings, the unknown-encoder error) comes from here, so none of them names an
+//! encoder the binary doesn't have.
 
 use crate::encoder::SOFTWARE_H264;
 
-/// The software H.264 encoders this binary includes, by `--encoder` name.
+/// One software encoder feature of Cargo.toml: whether this build has it, and what it makes
+/// of the flags the encoders share.
+pub struct Encoder {
+    /// The cargo feature, which is also the backend's name.
+    pub name: &'static str,
+    pub built: bool,
+    /// An H.264 encoder `--encoder` can pin and `auto` can fall back to; else a bench arm.
+    pub h264: bool,
+    /// What `--crf` is to it.
+    pub crf: Option<&'static str>,
+    /// What `--preset` is to it.
+    pub preset: Option<&'static str>,
+    /// Whether it takes the quality again on the fly, so `--paintover-crf` reaches it.
+    pub paintover_crf: bool,
+    /// GPL: a binary that links it is GPL-2.0-or-later as a combined work.
+    pub gpl: bool,
+}
+
+pub const ENCODERS: &[Encoder] = &[
+    Encoder {
+        name: "x264",
+        built: cfg!(feature = "x264"),
+        h264: true,
+        crf: Some("base quality"),
+        preset: Some("a preset name, ultrafast by default"),
+        paintover_crf: true,
+        gpl: true,
+    },
+    Encoder {
+        name: "openh264",
+        built: cfg!(feature = "openh264"),
+        h264: true,
+        crf: Some("lowest QP in motion"),
+        preset: None,
+        paintover_crf: false,
+        gpl: false,
+    },
+    Encoder {
+        name: "libvpx",
+        built: cfg!(feature = "libvpx"),
+        h264: false,
+        crf: Some("lowest quantizer"),
+        preset: Some("a speed, 8 by default"),
+        paintover_crf: true,
+        gpl: false,
+    },
+    Encoder {
+        name: "libaom",
+        built: cfg!(feature = "libaom"),
+        h264: false,
+        crf: Some("lowest quantizer"),
+        preset: Some("a speed, 10 by default"),
+        paintover_crf: true,
+        gpl: false,
+    },
+    Encoder {
+        name: "svt-av1",
+        built: cfg!(feature = "svt-av1"),
+        h264: false,
+        crf: Some("lowest QP"),
+        preset: Some("a preset number, 12 by default"),
+        paintover_crf: false,
+        gpl: false,
+    },
+    Encoder {
+        name: "kvazaar",
+        built: cfg!(feature = "kvazaar"),
+        h264: false,
+        crf: None,
+        preset: Some("ultrafast (default), superfast or veryfast"),
+        paintover_crf: false,
+        gpl: false,
+    },
+    Encoder {
+        name: "x265",
+        built: cfg!(feature = "x265"),
+        h264: false,
+        crf: Some("lowest QP"),
+        preset: Some("ultrafast (default), superfast or veryfast"),
+        paintover_crf: false,
+        gpl: true,
+    },
+];
+
+/// The flags whose meaning depends on the encoder.
+pub const FLAGS: [&str; 3] = ["preset", "crf", "paintover-crf"];
+
+fn built() -> impl Iterator<Item = &'static Encoder> {
+    ENCODERS.iter().filter(|e| e.built)
+}
+
+/// Every software encoder this binary includes, H.264 and bench arms, by feature name.
 pub fn software_encoders() -> Vec<&'static str> {
-    let mut v = Vec::new();
-    if cfg!(feature = "x264") {
-        v.push("x264");
+    built().map(|e| e.name).collect()
+}
+
+/// The software H.264 encoders `--encoder` can pin.
+pub fn h264_encoders() -> Vec<&'static str> {
+    built().filter(|e| e.h264).map(|e| e.name).collect()
+}
+
+/// The bench arms `--encoder` can name.
+pub fn bench_arms() -> Vec<&'static str> {
+    #[cfg(feature = "sw-arm")]
+    {
+        crate::encoder::ARMS.iter().map(|a| a.0).collect()
     }
-    if cfg!(feature = "openh264") {
-        v.push("openh264");
+    #[cfg(not(feature = "sw-arm"))]
+    {
+        Vec::new()
     }
-    v
+}
+
+/// The software names `--encoder` takes: the H.264 encoders, then the bench arms.
+pub fn encoder_names() -> Vec<&'static str> {
+    [h264_encoders(), bench_arms()].concat()
 }
 
 /// The software H.264 encoder `--encoder auto` falls back to where there is no hardware one.
@@ -21,30 +128,49 @@ pub fn software_h264() -> &'static str {
     SOFTWARE_H264.name()
 }
 
-pub fn has_x264() -> bool {
-    cfg!(feature = "x264")
+fn meaning(e: &Encoder, flag: &str) -> Option<&'static str> {
+    match flag {
+        "preset" => e.preset,
+        "crf" => e.crf,
+        "paintover-crf" => e.paintover_crf.then_some("paint-over quality"),
+        _ => None,
+    }
 }
 
-pub fn has_openh264() -> bool {
-    cfg!(feature = "openh264")
+/// Whether the encoder named `encoder` reads `flag`; a hardware encoder reads none of them.
+pub fn reads(encoder: &str, flag: &str) -> bool {
+    ENCODERS
+        .iter()
+        .any(|e| e.name == encoder && meaning(e, flag).is_some())
 }
 
-/// The licence of this binary: linking x264 (or the bench's x265) makes it GPL-2.0-or-later as a
-/// combined work.
+/// This build's encoders that read `flag`, each with what the flag is to it.
+pub fn readers(flag: &str) -> Vec<(&'static str, &'static str)> {
+    built()
+        .filter_map(|e| meaning(e, flag).map(|m| (e.name, m)))
+        .collect()
+}
+
+/// The licence of this binary: linking a GPL encoder makes it GPL-2.0-or-later as a combined
+/// work; otherwise it stays under starfold's MIT licence.
 pub fn licence() -> &'static str {
-    if cfg!(any(feature = "x264", feature = "x265")) {
+    if built().any(|e| e.gpl) {
         "GPL-2.0-or-later"
     } else {
         "MIT"
     }
 }
 
-/// The startup warning for an x264-only flag given while `encoder` encodes H.264.
-pub fn x264_flag_ignored(flag: &str, encoder: &str) -> String {
-    if has_x264() {
-        format!("--{flag} is an x264 setting; {encoder} ignores it")
+/// The startup warning for `--flag` given while `encoder`, which ignores it, encodes H.264.
+pub fn flag_ignored(flag: &str, encoder: &str) -> String {
+    let readers: Vec<&str> = readers(flag).into_iter().map(|r| r.0).collect();
+    if readers.is_empty() {
+        format!("--{flag} has no effect in this build: {encoder} ignores it")
     } else {
-        format!("--{flag} has no effect: {encoder} ignores it")
+        format!(
+            "--{flag} is for {}; {encoder} ignores it",
+            readers.join(", ")
+        )
     }
 }
 
@@ -52,21 +178,50 @@ pub fn x264_flag_ignored(flag: &str, encoder: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn facts_follow_the_features() {
-        let v = software_encoders();
-        assert_eq!(v.contains(&"x264"), cfg!(feature = "x264"));
-        assert_eq!(v.contains(&"openh264"), cfg!(feature = "openh264"));
-        assert!(v.contains(&software_h264()));
-        let gpl = cfg!(any(feature = "x264", feature = "x265"));
-        assert_eq!(licence() == "GPL-2.0-or-later", gpl);
-        assert_eq!(licence() == "MIT", !gpl);
+    /// The encoder features Cargo.toml declares: every feature but `default` and `sw-arm`.
+    fn cargo_features() -> Vec<String> {
+        let toml = include_str!("../Cargo.toml");
+        let section = toml.split("[features]").nth(1).expect("[features]");
+        let section = section.split("\n[").next().unwrap_or(section);
+        section
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
+            .filter(|k| !k.starts_with('#') && k != "default" && k != "sw-arm")
+            .collect()
     }
 
     #[test]
-    fn the_ignored_flag_warning_names_x264_only_in_a_build_with_it() {
-        let w = x264_flag_ignored("preset", "videotoolbox");
-        assert!(w.starts_with("--preset "), "{w}");
-        assert_eq!(w.contains("x264"), cfg!(feature = "x264"), "{w}");
+    fn every_encoder_feature_in_cargo_toml_is_described() {
+        let mut features = cargo_features();
+        features.sort();
+        let mut described: Vec<String> = ENCODERS.iter().map(|e| e.name.to_string()).collect();
+        described.sort();
+        assert_eq!(features, described);
+    }
+
+    #[test]
+    fn facts_follow_the_features() {
+        assert!(h264_encoders().contains(&software_h264()));
+        assert_eq!(
+            licence() == "GPL-2.0-or-later",
+            cfg!(any(feature = "x264", feature = "x265"))
+        );
+        for arm in bench_arms() {
+            assert!(
+                software_encoders().iter().any(|e| arm.starts_with(e)),
+                "{arm}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ignored_flag_warning_names_only_encoders_built_in() {
+        for flag in FLAGS {
+            let w = flag_ignored(flag, "videotoolbox");
+            assert!(w.starts_with(&format!("--{flag} ")), "{w}");
+            for e in ENCODERS {
+                assert!(!w.contains(e.name) || e.built, "{w}");
+            }
+        }
     }
 }
