@@ -293,6 +293,7 @@ impl Runtime for Fake {
             let s = unsafe { *(*par.ext_param as *const ExtVideoSignalInfo) };
             log.signal.push(s);
         }
+        drop(log);
         self.init.pop_front().unwrap_or(0)
     }
 
