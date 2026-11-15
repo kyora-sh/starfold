@@ -1,7 +1,7 @@
 //! The oneVPL calls an encode session makes, behind a trait so the session logic runs
 //! against a fake on hosts without an Intel GPU.
 
-use super::ffi::{self, Bitstream, EncodeCtrl, FrameSurface1, Status, SyncPoint, VideoParam};
+use super::ffi::{Bitstream, EncodeCtrl, FrameSurface1, Status, SyncPoint, VideoParam};
 use crate::encoder::FrameView;
 
 /// What went wrong outside a plain status: the call and its status, or a description.
@@ -39,6 +39,7 @@ pub use real::MfxRuntime;
 
 #[cfg(windows)]
 mod real {
+    use super::super::ffi;
     use super::*;
     use crate::encoder::hw::write_nv12;
     use ffi::{InitializationParam, Session};

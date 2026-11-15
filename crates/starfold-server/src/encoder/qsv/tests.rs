@@ -387,6 +387,14 @@ fn encode(enc: &mut dyn VideoEncoder, w: u32, h: u32, key: bool) -> Vec<AccessUn
     try_encode(enc, w, h, key).unwrap()
 }
 
+/// The error a 640x480 encode gives.
+fn fails(enc: &mut dyn VideoEncoder, key: bool) -> EncodeError {
+    match try_encode(enc, 640, 480, key) {
+        Ok(_) => panic!("the encode passed"),
+        Err(e) => e,
+    }
+}
+
 const IDR: Option<u16> = Some(ffi::FRAMETYPE_I | ffi::FRAMETYPE_REF | ffi::FRAMETYPE_IDR);
 
 #[test]
@@ -569,11 +577,11 @@ fn more_data_and_plain_errors_fail_the_frame_only() {
     fake.surface = VecDeque::from([None, None, None, Some(Fault::Status("Map", -7))]);
     let mut enc = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000)).unwrap();
     encode(enc.as_mut(), 640, 480, false);
-    let e = try_encode(enc.as_mut(), 640, 480, false).unwrap_err();
+    let e = fails(enc.as_mut(), false);
     assert!(e.0.contains("MFX_ERR_MORE_DATA"), "{e}");
-    let e = try_encode(enc.as_mut(), 640, 480, false).unwrap_err();
+    let e = fails(enc.as_mut(), false);
     assert!(e.0.contains("Async failed: MFX_ERR_UNKNOWN"), "{e}");
-    let e = try_encode(enc.as_mut(), 640, 480, false).unwrap_err();
+    let e = fails(enc.as_mut(), false);
     assert!(e.0.contains("Map failed: MFX_ERR_LOCK_MEMORY"), "{e}");
     let k = encode(enc.as_mut(), 640, 480, false);
     assert!(k[0].keyframe, "a failed encode restarts with an IDR");
@@ -597,11 +605,11 @@ fn a_hung_or_lost_device_ends_the_session_for_good() {
         fake.sync = VecDeque::from([0, sync_status]);
         let mut enc = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000)).unwrap();
         encode(enc.as_mut(), 640, 480, false);
-        let e = try_encode(enc.as_mut(), 640, 480, false).unwrap_err();
+        let e = fails(enc.as_mut(), false);
         let stopped = e.0.starts_with("Quick Sync stopped: ");
         assert!(stopped && e.0.contains(said), "{e}");
         let calls = log.lock().unwrap().frame_types.len();
-        let again = try_encode(enc.as_mut(), 640, 480, true).unwrap_err();
+        let again = fails(enc.as_mut(), true);
         assert_eq!(again, e, "the device is not asked again");
         assert!(enc.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
         let l = log.lock().unwrap();

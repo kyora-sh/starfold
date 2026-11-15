@@ -164,10 +164,12 @@ pub fn pick(impls: &[ImplInfo], a: &Adapter) -> Result<ImplInfo, String> {
         .copied()
         .filter(|i| i.device_id.map(u32::from) == Some(a.device_id))
         .collect();
-    let only = |v: &[&ImplInfo]| match v {
-        [i] => Some(*i),
-        _ => None,
-    };
+    fn only<'a>(v: &[&'a ImplInfo]) -> Option<&'a ImplInfo> {
+        match v {
+            [i] => Some(*i),
+            _ => None,
+        }
+    }
     hw.iter()
         .copied()
         .find(|i| i.luid == Some(a.luid))
