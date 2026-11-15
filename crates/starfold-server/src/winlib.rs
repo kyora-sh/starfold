@@ -58,9 +58,7 @@ fn check_bare_name(name: &str) -> Result<(), String> {
 /// `\\?\UNC\...`) and device (`\\.\...`) paths leave the local disk. All of those fail.
 fn check_absolute(path: &str) -> Result<(), String> {
     let sep = |c: u8| c == b'\\' || c == b'/';
-    let drive = |b: &[u8]| {
-        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2])
-    };
+    let drive = |b: &[u8]| b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2]);
     let b = path.as_bytes();
     let local = match path.strip_prefix(r"\\?\") {
         Some(rest) => drive(rest.as_bytes()),
@@ -69,7 +67,9 @@ fn check_absolute(path: &str) -> Result<(), String> {
     if local && !path.contains('\0') {
         Ok(())
     } else if b.len() > 1 && sep(b[0]) && sep(b[1]) {
-        Err(format!("{path:?}: a network or device path, not a local DLL path"))
+        Err(format!(
+            "{path:?}: a network or device path, not a local DLL path"
+        ))
     } else {
         Err(format!("{path:?}: not an absolute DLL path"))
     }
