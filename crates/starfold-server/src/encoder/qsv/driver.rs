@@ -2,7 +2,9 @@
 //! against a fake on hosts without an Intel GPU.
 
 use super::ffi::{Bitstream, EncodeCtrl, FrameSurface1, Status, SyncPoint, VideoParam};
+use super::Gate;
 use crate::encoder::FrameView;
+use std::mem::ManuallyDrop;
 
 /// What went wrong outside a plain status: the call and its status, or a description.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,99 @@ pub trait Runtime: Send {
     ) -> Status;
     /// Waits at most `wait_ms` for `sync`.
     fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Status;
+}
+
+/// What the runtime answers once Quick Sync is given up: the reason, and no call made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stopped(pub String);
+
+/// The runtime as a session sees it, and the only way a session reaches it. Every call,
+/// dropping included, first asks the process's [`Gate`]; once Quick Sync is given up it calls
+/// nothing, answers [`Stopped`], and never drops (closes, unloads) the runtime.
+pub struct Gated {
+    inner: ManuallyDrop<Box<dyn Runtime>>,
+    gate: &'static Gate,
+}
+
+impl Gated {
+    /// `rt` behind `gate`; refused, without a call or a close, if Quick Sync is given up.
+    pub fn new(rt: Box<dyn Runtime>, gate: &'static Gate) -> Result<Gated, Stopped> {
+        if let Some(why) = gate.given_up() {
+            std::mem::forget(rt);
+            return Err(Stopped(why));
+        }
+        Ok(Gated {
+            inner: ManuallyDrop::new(rt),
+            gate,
+        })
+    }
+
+    fn open(&mut self) -> Result<&mut dyn Runtime, Stopped> {
+        match self.gate.given_up() {
+            Some(why) => Err(Stopped(why)),
+            None => Ok(&mut **self.inner),
+        }
+    }
+
+    /// Gives Quick Sync up for the process; the first reason stays.
+    pub fn give_up(&self, why: &str) {
+        self.gate.give_up(why);
+    }
+
+    pub fn stopped(&self) -> Option<Stopped> {
+        self.gate.given_up().map(Stopped)
+    }
+
+    pub fn query(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
+        Ok(self.open()?.query(par))
+    }
+
+    pub fn init(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
+        Ok(self.open()?.init(par))
+    }
+
+    pub fn reset(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
+        Ok(self.open()?.reset(par))
+    }
+
+    pub fn video_param(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
+        Ok(self.open()?.video_param(par))
+    }
+
+    pub fn surface(
+        &mut self,
+        f: &FrameView<'_>,
+        ts: u64,
+    ) -> Result<Result<*mut FrameSurface1, Fault>, Stopped> {
+        Ok(self.open()?.surface(f, ts))
+    }
+
+    pub fn release(&mut self, s: *mut FrameSurface1) -> Result<(), Stopped> {
+        self.open()?.release(s);
+        Ok(())
+    }
+
+    pub fn encode(
+        &mut self,
+        ctrl: Option<&mut EncodeCtrl>,
+        s: *mut FrameSurface1,
+        bs: &mut Bitstream,
+        sync: &mut SyncPoint,
+    ) -> Result<Status, Stopped> {
+        Ok(self.open()?.encode(ctrl, s, bs, sync))
+    }
+
+    pub fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Result<Status, Stopped> {
+        Ok(self.open()?.sync(sync, wait_ms))
+    }
+}
+
+impl Drop for Gated {
+    fn drop(&mut self) {
+        if self.gate.given_up().is_none() {
+            unsafe { ManuallyDrop::drop(&mut self.inner) };
+        }
+    }
 }
 
 #[cfg(windows)]

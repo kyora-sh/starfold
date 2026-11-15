@@ -224,6 +224,8 @@ struct Log {
     calls: usize,
     /// The runtime was dropped: in a real one, the session closed and the library released.
     dropped: bool,
+    /// Calls (a drop included) made after the watched gate gave Quick Sync up.
+    after: usize,
 }
 
 // The logged parameters' extension list pointers are only compared, never followed.
@@ -244,6 +246,12 @@ struct Fake {
     /// IDRs after the first come without parameter sets.
     sets_once: bool,
     idrs: usize,
+    /// The gate whose give-up the log watches: every call after it counts in `after`.
+    gate: Option<&'static Gate>,
+    /// Gives `gate` up when this many encode calls have answered busy: another session
+    /// stopping Quick Sync while this one waits on the device.
+    give_up_at_busy: Option<usize>,
+    busy: usize,
 }
 
 // `got` holds a null extension list pointer and nothing else.
@@ -265,17 +273,26 @@ impl Fake {
                 got: None,
                 sets_once: false,
                 idrs: 0,
+                gate: None,
+                give_up_at_busy: None,
+                busy: 0,
             },
             log,
         )
+    }
+
+    fn given_up(&self) -> bool {
+        self.gate.is_some_and(|g| g.given_up().is_some())
     }
 }
 
 impl Fake {
     /// The log, counting one call into the runtime.
     fn call(&self) -> std::sync::MutexGuard<'_, Log> {
+        let after = self.given_up();
         let mut log = self.log.lock().unwrap();
         log.calls += 1;
+        log.after += after as usize;
         log
     }
 }
@@ -338,6 +355,14 @@ impl Runtime for Fake {
         let ft = ctrl.map(|c| c.frame_type);
         self.call().frame_types.push(ft);
         let r = self.encode.pop_front().unwrap_or(0);
+        if r == ffi::WRN_DEVICE_BUSY {
+            self.busy += 1;
+            if let (Some(g), Some(n)) = (self.gate, self.give_up_at_busy) {
+                if self.busy == n {
+                    g.give_up("Quick Sync stopped: another session's GPU did not finish a frame");
+                }
+            }
+        }
         if r < 0 || r == ffi::WRN_DEVICE_BUSY {
             return r;
         }
@@ -363,7 +388,10 @@ impl Runtime for Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
-        self.log.lock().unwrap().dropped = true;
+        let after = self.given_up();
+        let mut log = self.log.lock().unwrap();
+        log.dropped = true;
+        log.after += after as usize;
     }
 }
 
@@ -668,6 +696,69 @@ fn a_hung_or_lost_device_ends_quick_sync_and_keeps_what_the_gpu_can_reach() {
         assert_eq!(l.calls, 0, "without calling the runtime");
         assert!(!l.dropped, "or closing it");
     }
+}
+
+/// Once Quick Sync is given up, no path of any open session reaches the runtime: not an
+/// encode, a keyframe, a rate change, the busy-retry loop's exit, a drop of a session never
+/// called again, nor a new session.
+#[test]
+fn after_a_give_up_no_session_calls_the_runtime_on_any_path() {
+    let g = gate();
+    let watched = |codec| {
+        let (mut f, log) = Fake::new(codec);
+        f.gate = Some(g);
+        (f, log)
+    };
+    let c264 = cfg(Codec::H264, 640, 480, 2000);
+    let (idle, idle_log) = watched(Codec::H264);
+    let (used, used_log) = watched(Codec::H264);
+    let (mut hevc, hevc_log) = watched(Codec::Hevc);
+    hevc.sync = VecDeque::from([0, ffi::WRN_IN_EXECUTION]);
+    let (mut busy, busy_log) = watched(Codec::H264);
+    busy.encode = VecDeque::from([0, ffi::WRN_DEVICE_BUSY, ffi::WRN_DEVICE_BUSY]);
+    busy.give_up_at_busy = Some(2);
+    let mut idle = super::session(Box::new(idle), &c264, g).unwrap();
+    let mut used = super::session(Box::new(used), &c264, g).unwrap();
+    let mut hevc = super::session(Box::new(hevc), &cfg(Codec::Hevc, 640, 480, 0), g).unwrap();
+    let mut busy = super::session(Box::new(busy), &c264, g).unwrap();
+    for s in [&mut idle, &mut used, &mut hevc, &mut busy] {
+        encode(s.as_mut(), 640, 480, false);
+    }
+
+    let e = fails(busy.as_mut(), false);
+    assert_eq!(Some(e.0.clone()), g.given_up(), "given up while busy: {e}");
+    assert_eq!(fails(hevc.as_mut(), false), e);
+    assert_eq!(fails(used.as_mut(), true), e, "a keyframe");
+    assert_eq!(fails(used.as_mut(), false), e);
+    assert!(used.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
+    assert!(used.set_rate(RateConfig::new(24.0, 500, 30)).is_err());
+    drop(idle);
+    drop(used);
+    drop(hevc);
+    drop(busy);
+    let (fresh, fresh_log) = watched(Codec::H264);
+    assert_eq!(super::session(Box::new(fresh), &c264, g).err(), Some(e));
+
+    for (name, log) in [
+        ("idle", &idle_log),
+        ("used", &used_log),
+        ("hevc", &hevc_log),
+        ("busy", &busy_log),
+        ("fresh", &fresh_log),
+    ] {
+        let l = log.lock().unwrap();
+        assert_eq!(l.after, 0, "{name}: runtime calls after the give-up");
+        assert!(
+            !l.dropped,
+            "{name}: runtime dropped (closed) after the give-up"
+        );
+    }
+    assert_eq!(fresh_log.lock().unwrap().calls, 0);
+    assert_eq!(
+        busy_log.lock().unwrap().live,
+        1,
+        "the busy frame's surface stays"
+    );
 }
 
 #[test]
