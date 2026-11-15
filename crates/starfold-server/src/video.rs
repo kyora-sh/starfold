@@ -700,6 +700,8 @@ struct Engine {
     failed: Vec<Candidate>,
     /// Why each failed one did, for /stats.
     why: Vec<(Candidate, String)>,
+    /// Candidates not offered at this size, and why.
+    unoffered: Vec<(Candidate, String)>,
     cohorts: Vec<Cohort>,
     best: Option<Candidate>,
     open: Open,
@@ -718,6 +720,7 @@ impl Engine {
         open: Open,
     ) -> Result<Engine, String> {
         let mut offers = Vec::new();
+        let mut unoffered = Vec::new();
         let mut h264_err = String::from("no H.264 encoder");
         for &c in cands {
             match make_offer(&cfg, &open, c, w, h) {
@@ -743,6 +746,7 @@ impl Engine {
                         c.codec,
                         c.backend.name()
                     );
+                    unoffered.push((c, format!("not offered at {w}x{h}: {e}")));
                     if c.codec == Codec::H264 {
                         h264_err = e;
                     }
@@ -763,6 +767,7 @@ impl Engine {
             offers,
             failed: Vec::new(),
             why: Vec::new(),
+            unoffered,
             cohorts: Vec::new(),
             best: None,
             open,
@@ -793,6 +798,39 @@ impl Engine {
         // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
         hub.restart_clients();
         Ok(eng)
+    }
+
+    /// Fails if `--encoder` pins a hardware H.264 encoder that is not the one streaming: one
+    /// that wasn't offered at this size or failed to open, so the stream fell back to
+    /// software. Checked when the stream starts, for every hardware backend, so a pin never
+    /// starts silently on software; later fallbacks (a resize, a failing encoder) stay.
+    fn require_pin(&self, cands: &[Candidate]) -> Result<(), String> {
+        let encoder::Selection::Pinned(b) = self.cfg.selection else {
+            return Ok(());
+        };
+        let Some(pin) = cands
+            .iter()
+            .copied()
+            .find(|c| c.codec == Codec::H264 && c.backend == b && c.hardware)
+        else {
+            return Ok(());
+        };
+        if self.h264 == pin {
+            return Ok(());
+        }
+        let why = self
+            .why
+            .iter()
+            .chain(&self.unoffered)
+            .find(|(c, _)| *c == pin)
+            .map_or_else(|| "not offered".to_string(), |(_, w)| w.clone());
+        Err(format!(
+            "--encoder {}: H.264 from {} did not start at {}x{}: {why}",
+            b.name(),
+            b.name(),
+            self.w,
+            self.h
+        ))
     }
 
     /// The H.264 candidate to fall back to from the current one.
@@ -1494,6 +1532,7 @@ pub fn spawn(
     }
     let open: Open = Arc::new(|c: &EncoderConfig| encoder::open(c));
     let mut p = build(&cfg, &hub, &cands, &open)?;
+    p.engine.require_pin(&cands)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {

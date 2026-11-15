@@ -86,6 +86,19 @@ pub fn intel_device(instance: &str) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok().filter(|&d| d != 0)
 }
 
+/// The runtime to load for `a`: only the absolute path its driver's DriverStore entry gives,
+/// never a name looked up on the DLL search path (where a planted DLL would load first).
+pub fn runtime_path(found: Result<String, String>, a: &Adapter) -> Result<String, String> {
+    match found {
+        Ok(p) if ffi::windows_absolute(&p) => Ok(p),
+        Ok(p) => Err(format!(
+            "the DriverStorePathForVPL of {} is not an absolute path: {p}",
+            a.label()
+        )),
+        Err(e) => Err(format!("no DriverStorePathForVPL for {}: {e}", a.label())),
+    }
+}
+
 /// The codecs this encoder takes from the runtime's list: H.264 and HEVC, never others.
 fn codec_of(id: u32) -> Option<Codec> {
     match id {
@@ -213,29 +226,47 @@ pub fn caps(device: &str, imp: &ImplInfo) -> Vec<EncoderCapability> {
         .collect()
 }
 
-/// Why this process stopped using Quick Sync, if it did.
-static GIVEN_UP: Mutex<Option<String>> = Mutex::new(None);
+/// Whether Quick Sync is still in use, and why not. After a host-side GPU reset or a hung
+/// engine, a guest's encode sessions can keep timing out until the host is repaired: once one
+/// session sees that, every session stops calling the runtime, no new one loads it, and the
+/// streams fall back to their next encoder with the reason in the log and /stats.
+pub struct Gate(Mutex<Option<String>>);
 
-/// Stops using Quick Sync in this process: a device that hung or was lost is not asked
-/// again, so a stream that falls back to its next encoder doesn't come back to it.
-pub fn give_up(why: &str) {
-    let mut g = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
-    if g.is_none() {
-        log::error!("{why}; Quick Sync is off until starfold restarts");
-        *g = Some(why.to_string());
+impl Gate {
+    pub const fn new() -> Gate {
+        Gate(Mutex::new(None))
+    }
+
+    /// Stops using Quick Sync for good; the first reason stays.
+    pub fn give_up(&self, why: &str) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            log::error!("{why}; Quick Sync is off until starfold restarts");
+            *g = Some(why.to_string());
+        }
+    }
+
+    pub fn given_up(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
-pub fn given_up() -> Option<String> {
-    GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner()).clone()
+impl Default for Gate {
+    fn default() -> Gate {
+        Gate::new()
+    }
 }
 
-/// A session for `cfg` on `rt`.
+/// This process's gate.
+pub static GATE: Gate = Gate::new();
+
+/// A session for `cfg` on `rt`, unless `gate` has given Quick Sync up.
 pub(super) fn session(
     rt: Box<dyn driver::Runtime>,
     cfg: &EncoderConfig,
+    gate: &'static Gate,
 ) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-    Ok(Box::new(session::Session::new(rt, cfg)?))
+    Ok(Box::new(session::Session::new(rt, cfg, gate)?))
 }
 
 #[cfg(windows)]
@@ -243,7 +274,11 @@ mod windows_impl {
     use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus, PROBE_TIMEOUT};
     use super::super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
     use super::driver::MfxRuntime;
-    use super::{caps, ffi, given_up, locate, pick, read_impl, session, Adapter, ImplInfo};
+    use super::{caps, ffi, locate, pick, read_impl, session, Adapter, ImplInfo, GATE};
+
+    fn given_up() -> Option<String> {
+        GATE.given_up()
+    }
 
     /// The side of the picture a probe encodes: the smallest `open` codes.
     const SAMPLE_SIDE: u32 = 160;
@@ -298,11 +333,8 @@ mod windows_impl {
 
     /// The runtime for `a` and its implementation there.
     fn runtime(a: &Adapter) -> Result<(ffi::Runtime, ImplInfo), String> {
-        let rt = match locate::driver_store_runtime(a.device_id) {
-            Ok(path) => ffi::Runtime::load(&path)?,
-            Err(e) => ffi::Runtime::load(locate::RUNTIME)
-                .map_err(|e2| format!("{e}; nor on the search path ({e2})"))?,
-        };
+        let path = runtime_path(locate::driver_store_runtime(a.device_id), a)?;
+        let rt = ffi::Runtime::load(&path)?;
         let impls = unsafe { describe(&rt)? };
         let imp = pick(&impls, a)?;
         Ok((rt, imp))
@@ -399,7 +431,7 @@ mod windows_impl {
         }
         let drv =
             MfxRuntime::open(rt, imp.acceleration, imp.vendor_impl_id).map_err(EncodeError)?;
-        session(Box::new(drv), cfg)
+        session(Box::new(drv), cfg, &GATE)
     }
 
     fn spec_device(luid: u64) -> String {

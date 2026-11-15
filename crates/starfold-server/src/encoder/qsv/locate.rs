@@ -4,15 +4,16 @@
 //! dispatcher does (libvpl v2.17.0, `libvpl/src/windows/mfx_driver_store_loader.cpp`): the
 //! present display-class devices from CfgMgr32, the one whose instance ID names vendor 8086
 //! and the adapter's PCI device, then its software key. CfgMgr32 and the registry calls are
-//! loaded at runtime, as the dispatcher loads them.
+//! loaded at runtime from System32, as the dispatcher loads them. There is no search-path
+//! fallback: a driver that names no folder has no runtime here.
 
+use super::ffi::load_system;
 use super::{intel_device, Adapter};
-use libloading::Library;
 use std::ffi::c_void;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
 /// The runtime's file name, in its DriverStore folder.
-pub const RUNTIME: &str = "libmfx64-gen.dll";
+const RUNTIME: &str = "libmfx64-gen.dll";
 const VALUE: &str = "DriverStorePathForVPL";
 /// GUID_DEVCLASS_DISPLAY, as StringFromGUID2 writes it.
 const DISPLAY_CLASS: &str = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
@@ -86,8 +87,8 @@ pub fn driver_store_runtime(device_id: u32) -> Result<String, String> {
 }
 
 unsafe fn driver_store_dir(device_id: u32) -> Result<String, String> {
-    let cfg = Library::new("cfgmgr32.dll").map_err(|e| format!("cfgmgr32.dll: {e}"))?;
-    let reg = Library::new("advapi32.dll").map_err(|e| format!("advapi32.dll: {e}"))?;
+    let cfg = load_system("cfgmgr32.dll")?;
+    let reg = load_system("advapi32.dll")?;
     macro_rules! f {
         ($lib:expr, $name:literal) => {
             *$lib

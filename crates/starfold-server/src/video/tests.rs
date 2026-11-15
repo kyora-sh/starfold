@@ -215,6 +215,8 @@ struct Opts {
     h264_keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
     /// Hardware H.264 cohorts fail to open (the offer's sample encode still works).
     h264_hw_fails: bool,
+    /// Hardware H.264 opens nothing at this size, the offer's sample encode included.
+    h264_hw_unsized: bool,
     /// Hardware H.264 cohorts' encoders fail from their 3rd picture on, and so do
     /// reopened ones.
     h264_hw_breaks: bool,
@@ -242,6 +244,9 @@ fn fakes(o: Opts) -> Open {
     Arc::new(move |c: &EncoderConfig| {
         if c.codec == Codec::H264 && c.backend == Backend::VideoToolbox {
             let earlier = hw_opened.fetch_add(1, Ordering::Relaxed);
+            if o.h264_hw_unsized {
+                return Err(EncodeError("MFX_ERR_UNSUPPORTED at this size".into()));
+            }
             if o.h264_hw_fails && earlier > 0 {
                 return Err(EncodeError("no session".into()));
             }
@@ -1170,6 +1175,51 @@ fn a_viewer_that_cant_decode_hardware_h264_gets_openh264() {
         acked(&n, &mut rn);
     }
     assert!(!vl.is_empty());
+}
+
+#[test]
+fn a_pinned_hardware_encoder_that_cannot_start_stops_the_stream_with_the_reason() {
+    let cands = [H264_HW, H264];
+    let pinned = || VideoConfig {
+        selection: encoder::Selection::Pinned(Backend::VideoToolbox),
+        ..config()
+    };
+    let cases = [
+        (
+            Opts {
+                h264_hw_fails: true,
+                ..Default::default()
+            },
+            "failed to open: no session",
+        ),
+        (
+            Opts {
+                h264_hw_unsized: true,
+                ..Default::default()
+            },
+            "not offered at 640x480: MFX_ERR_UNSUPPORTED at this size",
+        ),
+    ];
+    for (o, said) in cases {
+        let hub = Hub::new();
+        let eng = Engine::new(pinned(), hub.clone(), W, H, &cands, fakes(o)).unwrap();
+        assert_eq!(eng.h264, H264, "the engine itself falls back");
+        let e = eng.require_pin(&cands).unwrap_err();
+        assert!(
+            e.starts_with("--encoder videotoolbox: H.264 from videotoolbox did not start")
+                && e.contains(said),
+            "{e}"
+        );
+    }
+    let hub = Hub::new();
+    let eng = Engine::new(pinned(), hub.clone(), W, H, &cands, fakes(Opts::default())).unwrap();
+    assert_eq!(eng.require_pin(&cands), Ok(()), "a pin that starts");
+    let o = Opts {
+        h264_hw_fails: true,
+        ..Default::default()
+    };
+    let eng = Engine::new(config(), Hub::new(), W, H, &cands, fakes(o)).unwrap();
+    assert_eq!(eng.require_pin(&cands), Ok(()), "auto may fall back");
 }
 
 #[test]

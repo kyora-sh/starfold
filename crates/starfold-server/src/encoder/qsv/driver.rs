@@ -30,8 +30,6 @@ pub trait Runtime: Send {
     ) -> Status;
     /// Waits at most `wait_ms` for `sync`.
     fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Status;
-    /// The device stopped answering: closing the session could block, so it is left open.
-    fn abandon(&mut self) {}
 }
 
 #[cfg(windows)]
@@ -44,12 +42,12 @@ mod real {
     use crate::encoder::hw::write_nv12;
     use ffi::{InitializationParam, Session};
 
-    /// An encode session on Intel's runtime, closed on drop unless abandoned.
+    /// An encode session on Intel's runtime, closed on drop. A session that stopped with the
+    /// device is never dropped (see `session.rs`), so neither its handle nor the library goes.
     pub struct MfxRuntime {
         rt: ffi::Runtime,
         session: Session,
         encoder: bool,
-        abandoned: bool,
     }
 
     unsafe impl Send for MfxRuntime {}
@@ -81,16 +79,12 @@ mod real {
                 rt,
                 session,
                 encoder: false,
-                abandoned: false,
             })
         }
     }
 
     impl Drop for MfxRuntime {
         fn drop(&mut self) {
-            if self.abandoned {
-                return;
-            }
             unsafe {
                 if self.encoder {
                     (self.rt.encode_close)(self.session);
@@ -183,10 +177,6 @@ mod real {
 
         fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Status {
             unsafe { (self.rt.sync_operation)(self.session, sync, wait_ms) }
-        }
-
-        fn abandon(&mut self) {
-            self.abandoned = true;
         }
     }
 

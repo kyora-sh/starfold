@@ -1,15 +1,26 @@
 //! One Quick Sync session: IDR then P frames off the last frame only (one reference, no B
 //! frames, one frame in flight), an IDR on request, parameter sets with every IDR, input
-//! through the runtime's own system-memory NV12 surfaces. A device that hangs or is lost
-//! ends the session for good, and with it the backend (see [`super::give_up`]).
+//! through the runtime's own system-memory NV12 surfaces.
+//!
+//! A device that hangs or is lost ends Quick Sync for the process ([`Gate`]): every open
+//! session stops calling the runtime, and none opens again until starfold restarts. A frame
+//! the GPU never finished may still be written to, so nothing it can reach is freed: each
+//! session open at that moment keeps its runtime (library and session handle), its output
+//! buffer and descriptor, and the surface of its one frame in flight, for the life of the
+//! process. That is at most one frame's worth per open session (one per Quick Sync stream
+//! stripe), and the runtime library stays loaded once.
 
 use super::driver::{Fault, Runtime};
-use super::ffi::{self, Bitstream, EncodeCtrl, ExtBuffer, ExtVideoSignalInfo, VideoParam};
+use super::ffi::{
+    self, Bitstream, EncodeCtrl, ExtBuffer, ExtVideoSignalInfo, FrameSurface1, VideoParam,
+};
+use super::Gate;
 use crate::encoder::hw::{self, Rc};
 use crate::encoder::{
     AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
     VideoEncoder,
 };
+use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 
 /// How long one frame may take on the GPU before the device counts as hung. The hardware
@@ -111,8 +122,20 @@ fn signal(c: ColorInfo) -> ExtVideoSignalInfo {
     }
 }
 
-pub struct Session {
+/// What a frame on the GPU can reach. Dropped with a live session; kept for good once the
+/// session stops with the device.
+struct InFlight {
     rt: Box<dyn Runtime>,
+    buf: Vec<u8>,
+    bs: Bitstream,
+    ctrl: EncodeCtrl,
+    /// The surface of the frame on the GPU, released once it is done.
+    surface: Option<*mut FrameSurface1>,
+}
+
+pub struct Session {
+    res: ManuallyDrop<Box<InFlight>>,
+    gate: &'static Gate,
     codec: Codec,
     size: (u32, u32),
     color: ColorInfo,
@@ -128,17 +151,37 @@ pub struct Session {
     /// The next picture must be an IDR: first frame, a raised rate, or the last encode
     /// failed.
     need_idr: bool,
-    buf: Vec<u8>,
     stream: hw::Stream,
-    /// Why the device is not asked again.
+    /// Why the runtime is not called again.
     dead: Option<String>,
 }
 
-// The raw pointers point into the session's own boxes.
+// The raw pointers point into the session's own boxes, or at the runtime's surface.
 unsafe impl Send for Session {}
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.dead.is_none() {
+            if let Some(s) = self.res.surface.take() {
+                self.res.rt.release(s);
+            }
+            unsafe { ManuallyDrop::drop(&mut self.res) };
+        }
+    }
+}
+
 impl Session {
-    pub fn new(rt: Box<dyn Runtime>, cfg: &EncoderConfig) -> Result<Session, EncodeError> {
+    /// A session on `rt`, unless `gate` has given Quick Sync up: then `rt` is never called,
+    /// not even to close it.
+    pub fn new(
+        rt: Box<dyn Runtime>,
+        cfg: &EncoderConfig,
+        gate: &'static Gate,
+    ) -> Result<Session, EncodeError> {
+        if let Some(why) = gate.given_up() {
+            std::mem::forget(rt);
+            return Err(EncodeError(why));
+        }
         if !matches!(cfg.codec, Codec::H264 | Codec::Hevc) {
             return Err(EncodeError(format!(
                 "Quick Sync here encodes H.264 and HEVC, not {:?}",
@@ -149,7 +192,14 @@ impl Session {
         let rc = Rc::new(cfg.codec, &cfg.rate, None);
         let size = (cfg.width, cfg.height);
         let mut s = Session {
-            rt,
+            res: ManuallyDrop::new(Box::new(InFlight {
+                rt,
+                buf: Vec::new(),
+                bs: Bitstream::over(&mut []),
+                ctrl: EncodeCtrl::default(),
+                surface: None,
+            })),
+            gate,
             codec: cfg.codec,
             size,
             color,
@@ -160,19 +210,22 @@ impl Session {
             rc,
             peak_bps: rc.bps,
             need_idr: true,
-            buf: Vec::new(),
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
             dead: None,
         };
         let mut refused = Vec::new();
         for low_power in [true, false] {
+            s.alive()?;
             let mode = if low_power {
                 "LowPower on"
             } else {
                 "LowPower off"
             };
             let mut q = s.with_ext(params(cfg.codec, size, &rc, low_power));
-            let r = s.rt.query(&mut q);
+            let r = s.res.rt.query(&mut q);
+            if fatal(r) {
+                return Err(s.failed("MFXVideoENCODE_Query", r));
+            }
             if r < ffi::ERR_NONE {
                 refused.push(format!(
                     "{mode}: MFXVideoENCODE_Query: {}",
@@ -180,8 +233,9 @@ impl Session {
                 ));
                 continue;
             }
+            s.alive()?;
             let mut p = s.with_ext(params(cfg.codec, size, &rc, low_power));
-            let r = s.rt.init(&mut p);
+            let r = s.res.rt.init(&mut p);
             if r == ffi::WRN_PARTIAL_ACCELERATION {
                 return Err(EncodeError(
                     "the runtime would encode partly in software (MFX_WRN_PARTIAL_ACCELERATION)"
@@ -223,8 +277,9 @@ impl Session {
 
     /// Reads back what the encoder runs with: refuses B frames, sizes the output buffer.
     fn refit(&mut self) -> Result<(), EncodeError> {
+        self.alive()?;
         let mut got = VideoParam::default();
-        let r = self.rt.video_param(&mut got);
+        let r = self.res.rt.video_param(&mut got);
         if r < ffi::ERR_NONE {
             return Err(self.failed("MFXVideoENCODE_GetVideoParam", r));
         }
@@ -239,8 +294,8 @@ impl Session {
         let mult = got.mfx.brc_param_multiplier.max(1) as usize;
         let buffer = got.mfx.buffer_size_in_kb as usize * mult * 1000;
         let need = picture.max(buffer).max(1 << 16);
-        if self.buf.len() < need {
-            self.buf.resize(need, 0);
+        if self.res.buf.len() < need {
+            self.res.buf.resize(need, 0);
         }
         Ok(())
     }
@@ -262,19 +317,31 @@ impl Session {
         }
     }
 
-    /// Stops using the device for good, and the backend with it.
+    /// Stops using the device for good, and Quick Sync with it, keeping what a frame still on
+    /// the GPU can reach.
     fn die(&mut self, why: String) -> EncodeError {
         let msg = format!("Quick Sync stopped: {why}");
-        self.rt.abandon();
-        super::give_up(&msg);
+        self.gate.give_up(&msg);
         self.dead = Some(msg.clone());
         EncodeError(msg)
     }
 
-    fn alive(&self) -> Result<(), EncodeError> {
+    /// Fails once this session or any other has stopped Quick Sync; checked before every
+    /// runtime call.
+    fn alive(&mut self) -> Result<(), EncodeError> {
+        if self.dead.is_none() {
+            self.dead = self.gate.given_up();
+        }
         match &self.dead {
             Some(why) => Err(EncodeError(why.clone())),
             None => Ok(()),
+        }
+    }
+
+    /// Gives the surface of a finished (or never started) frame back.
+    fn release(&mut self) {
+        if let Some(s) = self.res.surface.take() {
+            self.res.rt.release(s);
         }
     }
 }
@@ -289,7 +356,7 @@ impl VideoEncoder for Session {
         let raise = rc.bps > self.peak_bps;
         let mut p = self.par;
         apply(&rc, &mut p.mfx);
-        let r = self.rt.reset(&mut p);
+        let r = self.res.rt.reset(&mut p);
         if r < ffi::ERR_NONE {
             return Err(self.failed("MFXVideoENCODE_Reset", r));
         }
@@ -317,26 +384,36 @@ impl VideoEncoder for Session {
         let idr = opts.force_keyframe || self.need_idr;
         self.need_idr = true;
         let ts = opts.pts_ms.max(0) as u64 * 90;
-        let surface = match self.rt.surface(f, ts) {
+        let surface = match self.res.rt.surface(f, ts) {
             Ok(s) => s,
             Err(e) => return Err(self.fault(e)),
         };
-        let mut ctrl = EncodeCtrl {
-            frame_type: ffi::FRAMETYPE_I | ffi::FRAMETYPE_REF | ffi::FRAMETYPE_IDR,
-            ..Default::default()
-        };
-        let mut bs = Bitstream::over(&mut self.buf);
+        self.res.surface = Some(surface);
         let mut sync: ffi::SyncPoint = std::ptr::null_mut();
         let start = Instant::now();
         let r = loop {
-            let c = if idr { Some(&mut ctrl) } else { None };
-            let r = self.rt.encode(c, surface, &mut bs, &mut sync);
+            if let Err(e) = self.alive() {
+                self.release();
+                return Err(e);
+            }
+            let InFlight {
+                rt, buf, bs, ctrl, ..
+            } = &mut **self.res;
+            *ctrl = EncodeCtrl {
+                frame_type: ffi::FRAMETYPE_I | ffi::FRAMETYPE_REF | ffi::FRAMETYPE_IDR,
+                ..Default::default()
+            };
+            *bs = Bitstream::over(buf);
+            let c = if idr { Some(ctrl) } else { None };
+            let r = rt.encode(c, surface, bs, &mut sync);
             if r != ffi::WRN_DEVICE_BUSY || start.elapsed() >= BUSY_WAIT {
                 break r;
             }
             std::thread::sleep(BUSY_POLL);
         };
-        self.rt.release(surface);
+        if r < ffi::ERR_NONE && !fatal(r) {
+            self.release();
+        }
         match r {
             ffi::ERR_MORE_DATA => {
                 return Err(EncodeError(
@@ -354,27 +431,36 @@ impl VideoEncoder for Session {
             _ => {}
         }
         if sync.is_null() {
+            self.release();
             return Err(EncodeError(
                 "MFXVideoENCODE_EncodeFrameAsync gave no sync point".into(),
             ));
         }
-        let r = self.rt.sync(sync, SYNC_WAIT_MS);
+        // A frame is on the GPU: from here a stop keeps its surface and buffers.
+        self.alive()?;
+        let r = self.res.rt.sync(sync, SYNC_WAIT_MS);
         if r == ffi::WRN_IN_EXECUTION {
             return Err(self.die(format!(
                 "the GPU did not finish a frame in {SYNC_WAIT_MS} ms"
             )));
         }
         if r < ffi::ERR_NONE {
-            return Err(self.failed("MFXVideoCORE_SyncOperation", r));
+            let e = self.failed("MFXVideoCORE_SyncOperation", r);
+            if self.dead.is_none() {
+                self.release();
+            }
+            return Err(e);
         }
-        let (off, len) = (bs.data_offset as usize, bs.data_length as usize);
-        if off.checked_add(len).is_none_or(|end| end > self.buf.len()) {
+        self.release();
+        let res = &**self.res;
+        let (off, len) = (res.bs.data_offset as usize, res.bs.data_length as usize);
+        if off.checked_add(len).is_none_or(|end| end > res.buf.len()) {
             return Err(EncodeError(format!(
                 "Quick Sync wrote {len} bytes at {off} into a {}-byte buffer",
-                self.buf.len()
+                res.buf.len()
             )));
         }
-        let data = self.buf[off..off + len].to_vec();
+        let data = res.buf[off..off + len].to_vec();
         let au = self.stream.unit(data, opts.pts_ms, idr)?;
         self.need_idr = false;
         Ok(au.into_iter().collect())

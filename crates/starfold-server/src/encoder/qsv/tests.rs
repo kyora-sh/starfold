@@ -220,7 +220,10 @@ struct Log {
     waits: Vec<u32>,
     surfaces: Vec<u64>,
     live: i32,
-    abandoned: bool,
+    /// Every call into the runtime.
+    calls: usize,
+    /// The runtime was dropped: in a real one, the session closed and the library released.
+    dropped: bool,
 }
 
 // The logged parameters' extension list pointers are only compared, never followed.
@@ -268,14 +271,23 @@ impl Fake {
     }
 }
 
+impl Fake {
+    /// The log, counting one call into the runtime.
+    fn call(&self) -> std::sync::MutexGuard<'_, Log> {
+        let mut log = self.log.lock().unwrap();
+        log.calls += 1;
+        log
+    }
+}
+
 impl Runtime for Fake {
     fn query(&mut self, par: &mut VideoParam) -> Status {
-        self.log.lock().unwrap().queried.push(*par);
+        self.call().queried.push(*par);
         self.query.pop_front().unwrap_or(0)
     }
 
     fn init(&mut self, par: &mut VideoParam) -> Status {
-        let mut log = self.log.lock().unwrap();
+        let mut log = self.call();
         log.inited.push(*par);
         if par.num_ext_param == 1 {
             let s = unsafe { *(*par.ext_param as *const ExtVideoSignalInfo) };
@@ -285,12 +297,12 @@ impl Runtime for Fake {
     }
 
     fn reset(&mut self, par: &mut VideoParam) -> Status {
-        self.log.lock().unwrap().reset.push(*par);
+        self.call().reset.push(*par);
         self.reset.pop_front().unwrap_or(0)
     }
 
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
-        let last = self.log.lock().unwrap().inited.last().copied();
+        let last = self.call().inited.last().copied();
         *par = self.got.or(last).unwrap_or_default();
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;
@@ -298,6 +310,7 @@ impl Runtime for Fake {
     }
 
     fn surface(&mut self, f: &FrameView<'_>, ts: u64) -> Result<*mut FrameSurface1, Fault> {
+        self.call();
         if let Some(Some(fault)) = self.surface.pop_front() {
             return Err(fault);
         }
@@ -310,7 +323,7 @@ impl Runtime for Fake {
     }
 
     fn release(&mut self, s: *mut FrameSurface1) {
-        self.log.lock().unwrap().live -= 1;
+        self.call().live -= 1;
         drop(unsafe { Box::from_raw(s) });
     }
 
@@ -322,7 +335,7 @@ impl Runtime for Fake {
         sync: &mut SyncPoint,
     ) -> Status {
         let ft = ctrl.map(|c| c.frame_type);
-        self.log.lock().unwrap().frame_types.push(ft);
+        self.call().frame_types.push(ft);
         let r = self.encode.pop_front().unwrap_or(0);
         if r < 0 || r == ffi::WRN_DEVICE_BUSY {
             return r;
@@ -342,13 +355,28 @@ impl Runtime for Fake {
     }
 
     fn sync(&mut self, _sync: SyncPoint, wait_ms: u32) -> Status {
-        self.log.lock().unwrap().waits.push(wait_ms);
+        self.call().waits.push(wait_ms);
         self.sync.pop_front().unwrap_or(0)
     }
+}
 
-    fn abandon(&mut self) {
-        self.log.lock().unwrap().abandoned = true;
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().dropped = true;
     }
+}
+
+/// A gate of its own, so one test's give-up doesn't reach another's sessions.
+fn gate() -> &'static Gate {
+    Box::leak(Box::new(Gate::new()))
+}
+
+/// A session on `rt` behind a gate of its own.
+fn session(
+    rt: Box<dyn Runtime>,
+    cfg: &EncoderConfig,
+) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    super::session(rt, cfg, gate())
 }
 
 fn cfg(codec: Codec, w: u32, h: u32, kbps: u32) -> EncoderConfig {
@@ -591,11 +619,14 @@ fn more_data_and_plain_errors_fail_the_frame_only() {
     let l = log.lock().unwrap();
     assert_eq!(l.frame_types, vec![IDR, None, IDR, IDR]);
     assert_eq!(l.live, 0);
-    assert!(!l.abandoned);
+    drop(l);
+    drop(enc);
+    let l = log.lock().unwrap();
+    assert!(l.dropped, "a live session closes its runtime");
 }
 
 #[test]
-fn a_hung_or_lost_device_ends_the_session_for_good() {
+fn a_hung_or_lost_device_ends_quick_sync_and_keeps_what_the_gpu_can_reach() {
     let hung = "did not finish a frame in 3000 ms";
     for (encode_status, sync_status, said) in [
         (0, ffi::WRN_IN_EXECUTION, hung),
@@ -603,25 +634,114 @@ fn a_hung_or_lost_device_ends_the_session_for_good() {
         (ffi::ERR_DEVICE_LOST, 0, "MFX_ERR_DEVICE_LOST"),
         (ffi::ERR_DEVICE_FAILED, 0, "MFX_ERR_DEVICE_FAILED"),
     ] {
+        let g = gate();
         let (mut fake, log) = Fake::new(Codec::H264);
         fake.encode = VecDeque::from([0, encode_status]);
         fake.sync = VecDeque::from([0, sync_status]);
-        let mut enc = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000)).unwrap();
+        let c = cfg(Codec::H264, 640, 480, 2000);
+        let mut enc = super::session(Box::new(fake), &c, g).unwrap();
         encode(enc.as_mut(), 640, 480, false);
         let e = fails(enc.as_mut(), false);
         let stopped = e.0.starts_with("Quick Sync stopped: ");
         assert!(stopped && e.0.contains(said), "{e}");
-        let calls = log.lock().unwrap().frame_types.len();
+        assert_eq!(g.given_up(), Some(e.0.clone()), "off for the process");
+        let calls = log.lock().unwrap().calls;
         let again = fails(enc.as_mut(), true);
         assert_eq!(again, e, "the device is not asked again");
         assert!(enc.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
+        drop(enc);
         let l = log.lock().unwrap();
-        assert_eq!(l.frame_types.len(), calls);
-        assert!(l.reset.is_empty());
-        assert!(l.abandoned, "a hung session is left, not closed");
-        assert_eq!(l.live, 0);
+        assert_eq!(
+            l.calls, calls,
+            "no runtime call after the stop, not even a close"
+        );
+        assert!(!l.dropped, "the runtime (library, session) is kept");
+        assert_eq!(l.live, 1, "the frame's surface is kept, never released");
         assert!(l.waits.iter().all(|&w| w == SYNC_WAIT_MS));
-        assert!(given_up().is_some(), "Quick Sync is off for the process");
+        drop(l);
+
+        let (fresh, log) = Fake::new(Codec::H264);
+        let refused = super::session(Box::new(fresh), &c, g).err().unwrap();
+        assert_eq!(refused, e, "a new session is refused with the reason");
+        let l = log.lock().unwrap();
+        assert_eq!(l.calls, 0, "without calling the runtime");
+        assert!(!l.dropped, "or closing it");
+    }
+}
+
+#[test]
+fn every_open_session_stops_with_the_first() {
+    let g = gate();
+    let (h264, h264_log) = Fake::new(Codec::H264);
+    let (mut hevc, hevc_log) = Fake::new(Codec::Hevc);
+    hevc.sync = VecDeque::from([ffi::WRN_IN_EXECUTION]);
+    let mut a = super::session(Box::new(h264), &cfg(Codec::H264, 640, 480, 2000), g).unwrap();
+    let mut b = super::session(Box::new(hevc), &cfg(Codec::Hevc, 640, 480, 0), g).unwrap();
+    encode(a.as_mut(), 640, 480, false);
+    let e = fails(b.as_mut(), false);
+    assert!(e.0.contains("did not finish a frame"), "{e}");
+    let calls = h264_log.lock().unwrap().calls;
+    assert_eq!(fails(a.as_mut(), false), e, "the H.264 session stops too");
+    assert!(a.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
+    drop(a);
+    drop(b);
+    let l = h264_log.lock().unwrap();
+    assert_eq!(l.calls, calls, "and calls its runtime no more");
+    assert!(!l.dropped && !hevc_log.lock().unwrap().dropped);
+    assert_eq!(l.live, 0, "it had no frame on the GPU");
+}
+
+#[test]
+fn a_fatal_query_stops_quick_sync_instead_of_trying_without_low_power() {
+    for status in [
+        ffi::ERR_DEVICE_LOST,
+        ffi::ERR_DEVICE_FAILED,
+        ffi::ERR_GPU_HANG,
+    ] {
+        let g = gate();
+        let (mut fake, log) = Fake::new(Codec::H264);
+        fake.query = VecDeque::from([status]);
+        let e = super::session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000), g)
+            .err()
+            .unwrap();
+        let name = ffi::status_name(status);
+        assert!(
+            e.0.contains(&format!("MFXVideoENCODE_Query failed: {name}")),
+            "{e}"
+        );
+        assert!(g.given_up().is_some());
+        let l = log.lock().unwrap();
+        assert_eq!(l.queried.len(), 1, "no second Query with LowPower off");
+        assert!(l.inited.is_empty() && !l.dropped);
+    }
+}
+
+#[test]
+fn the_runtime_loads_only_from_its_driver_store_path() {
+    let a = Adapter {
+        luid: 0x1234,
+        device_id: 0x46d1,
+        name: "Intel(R) UHD Graphics".into(),
+    };
+    let dir = r"C:\Windows\System32\DriverStore\FileRepository\iigd_dch.inf_amd64_0123\";
+    let path = format!("{dir}libmfx64-gen.dll");
+    assert_eq!(runtime_path(Ok(path.clone()), &a), Ok(path));
+    let unc = r"\\host\share\libmfx64-gen.dll".to_string();
+    assert_eq!(runtime_path(Ok(unc.clone()), &a), Ok(unc));
+    let e = runtime_path(Err("the VEN_8086&DEV_46D1 driver names none".into()), &a).unwrap_err();
+    assert!(
+        e.starts_with("no DriverStorePathForVPL for luid:0000000000001234 Intel(R) UHD Graphics"),
+        "{e}"
+    );
+    for relative in [
+        "libmfx64-gen.dll",
+        r"drivers\libmfx64-gen.dll",
+        r"C:libmfx64-gen.dll",
+    ] {
+        let e = runtime_path(Ok(relative.into()), &a).unwrap_err();
+        assert!(e.contains("not an absolute path"), "{e}");
+        let refused = unsafe { ffi::load_restricted(relative) }.err().unwrap();
+        assert!(refused.contains("refusing to search"), "{refused}");
     }
 }
 
