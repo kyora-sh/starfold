@@ -300,19 +300,47 @@ fn render_nodes() -> Result<Vec<PathBuf>, String> {
     Ok(nodes)
 }
 
-/// The side of the picture a probe encodes: the smallest `open` codes.
+/// The side of the picture a probe encodes, unless the driver needs a larger one.
 const SAMPLE_SIDE: u32 = 128;
+
+/// The size of the picture a probe of `codec` encodes on `drv`: [`SAMPLE_SIDE`] square,
+/// grown to the driver's minimum for the profile and entrypoint a session picks, in
+/// whole macroblocks.
+fn sample_size(drv: &mut dyn Driver, codec: Codec) -> (u32, u32) {
+    let side = (SAMPLE_SIDE, SAMPLE_SIDE);
+    let (profiles, extra) = match codec {
+        Codec::H264 => (h264::PROFILES, &[][..]),
+        Codec::Hevc => (hevc::PROFILES, hevc::EXTRA),
+        Codec::Av1 => (av1::PROFILES, av1::EXTRA),
+        #[allow(unreachable_patterns)]
+        _ => return side,
+    };
+    let Some((w, h)) = choose(drv, profiles, side, extra)
+        .ok()
+        .and_then(|c| drv.min_size(c.profile, c.entrypoint))
+    else {
+        return side;
+    };
+    (
+        w.max(SAMPLE_SIDE).next_multiple_of(16),
+        h.max(SAMPLE_SIDE).next_multiple_of(16),
+    )
+}
+
+/// Encodes a sample of `codec` on `drv`, at a size the driver takes.
+fn sample_on(mut drv: Box<dyn Driver>, codec: Codec) -> Result<(), EncodeError> {
+    let (w, h) = sample_size(drv.as_mut(), codec);
+    let cfg = hw::sample_config(Backend::Vaapi, codec, w, h, 30);
+    let mut enc = session(drv, &cfg)?;
+    hw::sample(enc.as_mut(), w, h)
+}
 
 /// Marks `c` verified if a session on `node` encodes a sample, unavailable if not.
 fn verify(c: &mut EncoderCapability, node: &Path) {
     if !Backend::Vaapi.implements(c.codec) {
         return;
     }
-    let cfg = hw::sample_config(Backend::Vaapi, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
-    let r = VaDriver::open(node).and_then(|d| {
-        let mut enc = session(Box::new(d), &cfg)?;
-        hw::sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE)
-    });
+    let r = VaDriver::open(node).and_then(|d| sample_on(Box::new(d), c.codec));
     match r {
         Ok(()) => {
             c.status = ProbeStatus::Verified;
@@ -332,7 +360,8 @@ pub(super) fn session(
     Ok(match cfg.codec {
         Codec::H264 => {
             let mut c = choose(drv.as_mut(), h264::PROFILES, size, &[])?;
-            c.packed = h264::H264::packed(c.packed);
+            let slices = h264::H264::wants_slice_headers(&drv.vendor());
+            c.packed = h264::H264::packed(c.packed, slices);
             Box::new(Session::new(drv, &c, cfg, |c, rc| {
                 h264::H264::new(c, cfg, rc)
             })?)
