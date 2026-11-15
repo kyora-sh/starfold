@@ -609,6 +609,10 @@ pub struct Va {
 }
 
 impl Va {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Linux sonames resolve through the system linker path, not a DLL search order"
+    )]
     pub fn load() -> Result<Va, String> {
         unsafe {
             let va = Library::new("libva.so.2").map_err(|e| format!("libva.so.2: {e}"))?;
