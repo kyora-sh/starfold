@@ -36,6 +36,7 @@ mod kvazaar;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
+#[cfg(feature = "openh264")]
 pub(crate) mod openh264;
 #[cfg(feature = "svt-av1")]
 mod svt;
@@ -219,6 +220,20 @@ pub trait VideoEncoder: Send {
     }
 }
 
+#[cfg(not(any(feature = "x264", feature = "openh264")))]
+compile_error!(
+    "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
+);
+
+/// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
+const MAX_MBS: usize = 36864;
+
+/// The software H.264 encoder: x264, or OpenH264 in a build without it.
+#[cfg(feature = "x264")]
+pub const SOFTWARE_H264: Backend = Backend::X264;
+#[cfg(not(feature = "x264"))]
+pub const SOFTWARE_H264: Backend = Backend::OpenH264;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
@@ -244,7 +259,12 @@ pub enum Backend {
 impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
+            #[cfg(feature = "openh264")]
             "openh264" => Ok(Backend::OpenH264),
+            #[cfg(not(feature = "openh264"))]
+            "openh264" => {
+                Err("this build has no OpenH264 (build with `--features openh264`)".into())
+            }
             #[cfg(feature = "x264")]
             "x264" => Ok(Backend::X264),
             #[cfg(not(feature = "x264"))]
@@ -266,8 +286,8 @@ impl Backend {
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
             _ => Err(format!(
-                "unknown encoder {s:?} (auto, openh264{}{})",
-                if cfg!(feature = "x264") { ", x264" } else { "" },
+                "unknown encoder {s:?} (auto, {}{})",
+                crate::build_facts::encoder_names().join(", "),
                 if cfg!(target_os = "macos") {
                     ", videotoolbox"
                 } else if cfg!(target_os = "linux") {
@@ -306,7 +326,7 @@ impl Backend {
     /// Whether this build has an encoder for `codec` on this backend.
     pub fn implements(self, codec: Codec) -> bool {
         match self {
-            Backend::OpenH264 => codec == Codec::H264,
+            Backend::OpenH264 => cfg!(feature = "openh264") && codec == Codec::H264,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
             #[cfg(feature = "libvpx")]
@@ -338,7 +358,7 @@ impl Backend {
     /// The most 16x16 macroblocks one encoder takes, if it has a limit.
     pub fn max_mbs(self) -> Option<usize> {
         match self {
-            Backend::OpenH264 => Some(openh264::MAX_MBS),
+            Backend::OpenH264 => Some(MAX_MBS),
             #[cfg(feature = "x264")]
             Backend::X264 => None,
             #[cfg(feature = "libvpx")]
@@ -352,7 +372,7 @@ impl Backend {
             #[cfg(feature = "x265")]
             Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
-            Backend::VideoToolbox => Some(openh264::MAX_MBS),
+            Backend::VideoToolbox => Some(MAX_MBS),
             Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
         }
     }
@@ -401,12 +421,12 @@ impl Backend {
 }
 
 /// `--encoder`: `auto` streams each codec from its eligible hardware encoder (H.264
-/// from OpenH264 where there is none); a backend name pins the H.264 one.
+/// from [`SOFTWARE_H264`] where there is none); a backend name pins the H.264 one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     Auto,
     Pinned(Backend),
-    /// A bench arm: this encoder, with the OpenH264 cohort beside it.
+    /// A bench arm: this encoder, with the [`SOFTWARE_H264`] cohort beside it.
     #[cfg(feature = "sw-arm")]
     Arm(&'static str, Backend, Codec),
 }
@@ -468,7 +488,22 @@ impl Selection {
             Selection::Arm(name, ..) => name,
         }
     }
+
+    /// The encoder `--preset` is given for: the pinned one or the bench arm, and under
+    /// `auto` [`SOFTWARE_H264`]. Every other encoder opens with [`DEFAULT_PRESET`].
+    pub fn preset_backend(self) -> Backend {
+        match self {
+            Selection::Auto => SOFTWARE_H264,
+            Selection::Pinned(b) => b,
+            #[cfg(feature = "sw-arm")]
+            Selection::Arm(_, b, _) => b,
+        }
+    }
 }
+
+/// The preset every encoder takes as its own default: x264's name for its fastest preset,
+/// which the bench arms read as "no preset given".
+pub const DEFAULT_PRESET: &str = "ultrafast";
 
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
@@ -518,6 +553,7 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         ..cfg.clone()
     };
     let inner: Box<dyn VideoEncoder> = match cfg.backend {
+        #[cfg(feature = "openh264")]
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),

@@ -2,7 +2,7 @@
   lib,
   rustPlatform,
   pkg-config,
-  nasm,
+  x264,
   libyuv,
   libopus,
   libpulseaudio,
@@ -28,7 +28,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
-    nasm
+    rustPlatform.bindgenHook
     esbuild
     typescript
   ];
@@ -41,6 +41,7 @@ rustPlatform.buildRustPackage {
   '';
 
   buildInputs = [
+    x264
     libyuv
     libopus
     libpulseaudio
@@ -49,7 +50,8 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Low-latency X11 desktop streaming server (H.264 over WebSocket) for the Computer preview";
-    license = lib.licenses.mit;
+    # MIT source; the binary links x264, so it is GPL-2.0-or-later as a combined work.
+    license = with lib.licenses; [mit gpl2Plus];
     mainProgram = "starfold";
     platforms = ["x86_64-linux"];
   };

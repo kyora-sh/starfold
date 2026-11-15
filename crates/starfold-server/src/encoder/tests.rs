@@ -7,6 +7,7 @@ mod av1;
 
 fn backends() -> Vec<Backend> {
     vec![
+        #[cfg(feature = "openh264")]
         Backend::OpenH264,
         #[cfg(feature = "x264")]
         Backend::X264,
@@ -284,6 +285,7 @@ fn idr_on_request_with_parameter_sets() {
     }
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn openh264_signals_constrained_baseline_and_srgb() {
     let mut enc = open(&config(Backend::OpenH264, 640, 480, 4000)).unwrap();
@@ -368,6 +370,7 @@ fn rate_change_without_reopen() {
     }
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn oversized_picture_fails_cleanly() {
     let e = open(&config(Backend::OpenH264, 8192, 4608, 20_000))
@@ -379,6 +382,7 @@ fn oversized_picture_fails_cleanly() {
     assert!(!Backend::OpenH264.fits(4096, 2320));
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn largest_picture_encodes() {
     for (w, h) in [(3840, 2160), (4096, 2304)] {
@@ -389,6 +393,7 @@ fn largest_picture_encodes() {
     }
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn threads_slice_the_picture() {
     let mut cfg = config(Backend::OpenH264, 1280, 720, 8000);
@@ -456,7 +461,12 @@ fn idr_missing_parameter_sets_gets_cached_ones() {
 
 #[test]
 fn unknown_encoder_names() {
+    #[cfg(feature = "openh264")]
     assert_eq!(Backend::parse("openh264"), Ok(Backend::OpenH264));
+    #[cfg(not(feature = "openh264"))]
+    assert!(Backend::parse("openh264")
+        .unwrap_err()
+        .contains("--features openh264"));
     assert!(Backend::parse("x265").is_err());
     #[cfg(not(feature = "x264"))]
     assert!(Backend::parse("x264")
@@ -487,7 +497,7 @@ fn unknown_encoder_names() {
 
 #[test]
 fn backends_without_the_codec_refuse_to_open() {
-    let mut cfg = config(Backend::OpenH264, 64, 64, 1000);
+    let mut cfg = config(SOFTWARE_H264, 64, 64, 1000);
     cfg.codec = Codec::Hevc;
     assert!(open(&cfg).is_err());
     #[cfg(not(windows))]
@@ -740,7 +750,7 @@ fn dump_streams() {
     let dir = std::path::PathBuf::from(std::env::var("STREAM_DIR").expect("STREAM_DIR"));
     let (w, h) = (1280usize, 720usize);
     for workload in ["typing", "scrolling", "video"] {
-        let mut cfg = config(Backend::OpenH264, w as u32, h as u32, 30_000);
+        let mut cfg = config(SOFTWARE_H264, w as u32, h as u32, 30_000);
         cfg.best_quality = cfg.rate.quality;
         let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
@@ -765,13 +775,14 @@ fn dump_streams() {
 }
 
 /// CPU per stream at 1080p30 for typing, scrolling and video-like content:
-/// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND=x264 with the
-/// x264 feature; FRAMES, THREADS). One line per workload, `bench` first.
+/// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND=openh264 with the
+/// openh264 feature; FRAMES, THREADS). One line per workload, `bench` first.
 #[cfg(unix)]
 #[test]
 #[ignore]
 fn cpu_per_stream() {
-    let backend = Backend::parse(&std::env::var("BACKEND").unwrap_or("openh264".into())).unwrap();
+    let backend =
+        Backend::parse(&std::env::var("BACKEND").unwrap_or(SOFTWARE_H264.name().into())).unwrap();
     let env = |k: &str, d: usize| {
         std::env::var(k)
             .ok()
@@ -857,6 +868,7 @@ fn cpu_per_stream() {
     }
 }
 
+#[cfg(feature = "openh264")]
 fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
     let se: u64 = (0..p.h)
         .flat_map(|r| (0..p.w).map(move |c| (r, c)))
@@ -869,6 +881,7 @@ fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
 }
 
 /// An OpenH264 stream decoded as it goes: scrolled text, then whatever the test does.
+#[cfg(feature = "openh264")]
 struct Refining {
     enc: Box<dyn VideoEncoder>,
     dec: ::openh264::decoder::Decoder,
@@ -878,6 +891,7 @@ struct Refining {
     last_psnr: f64,
 }
 
+#[cfg(feature = "openh264")]
 impl Refining {
     fn config(threads: u32, fps: u32) -> EncoderConfig {
         let mut cfg = config(Backend::OpenH264, 640, 480, 8000);
@@ -952,6 +966,7 @@ impl Refining {
 
 /// An odd size opens OpenH264 padded; the refinement worker must still hear when a pass
 /// would sharpen, down to the finest rung.
+#[cfg(feature = "openh264")]
 #[test]
 fn a_padded_encoder_refines_to_the_last_rung() {
     for (w, h) in [(1920u32, 1080u32), (1921, 1080)] {
@@ -991,6 +1006,7 @@ fn a_padded_encoder_refines_to_the_last_rung() {
     }
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
     for (threads, fps) in [(1, 30), (4, 30), (1, 120), (4, 120)] {
@@ -1018,6 +1034,7 @@ fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
 }
 
 /// The keyframe budget and a stripe's share both go past what the encoder opened with.
+#[cfg(feature = "openh264")]
 #[test]
 fn refining_works_above_the_rate_the_encoder_opened_with() {
     let mut s = Refining::new(1, 30);
@@ -1040,6 +1057,7 @@ fn refining_works_above_the_rate_the_encoder_opened_with() {
 
 /// The library really refuses the switch: nothing goes out, nothing fails, motion carries
 /// on under rate control exactly as if no pass had been asked for, and no later pass tries.
+#[cfg(feature = "openh264")]
 #[test]
 fn a_refused_switch_costs_nothing() {
     let mut enc = openh264::OpenH264::new(&Refining::config(1, 30)).unwrap();
@@ -1059,6 +1077,7 @@ fn a_refused_switch_costs_nothing() {
     );
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn refining_leaves_rate_control_where_it_was() {
     let mut plain = Refining::new(1, 30);
@@ -1078,6 +1097,7 @@ fn refining_leaves_rate_control_where_it_was() {
     assert!((b / a - 1.0).abs() < 0.03, "motion after: {a} vs {b} bytes");
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn a_refining_pass_with_nothing_to_gain_sends_nothing() {
     let mut s = Refining::new(1, 30);
@@ -1089,6 +1109,7 @@ fn a_refining_pass_with_nothing_to_gain_sends_nothing() {
     assert_eq!(s.last_psnr, before);
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn a_keyframe_stays_under_rate_control() {
     let mut s = Refining::new(1, 30);
@@ -1105,6 +1126,7 @@ fn a_keyframe_stays_under_rate_control() {
 }
 
 /// A reopened encoder's next picture is an IDR even though nobody asked for one.
+#[cfg(feature = "openh264")]
 #[test]
 fn a_new_encoders_first_frame_stays_under_rate_control() {
     let p = Picture::new(640, 480);
@@ -1125,6 +1147,7 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn a_tight_budget_takes_a_smaller_step() {
     let refine = |qp, max_bytes| Refine {
@@ -1145,6 +1168,7 @@ fn a_tight_budget_takes_a_smaller_step() {
     assert_eq!(s.pick(refine(20, 200_000)), None);
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn the_estimate_learns_from_what_frames_cost() {
     let budget = |max_bytes| Refine {
@@ -1179,6 +1203,7 @@ fn the_estimate_learns_from_what_frames_cost() {
     assert_eq!(s.pick(budget(4_999)), None);
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn the_estimate_counts_every_block_still_coarse() {
     let budget = |max_bytes| Refine {
@@ -1216,6 +1241,7 @@ fn the_estimate_counts_every_block_still_coarse() {
 
 /// Thousands of rate-control switches against the same motion without them, in a long mix
 /// of scrolling, typing and video: `SOAK_FRAMES` frames at each cap, decoded throughout.
+#[cfg(feature = "openh264")]
 #[test]
 #[ignore]
 fn refine_soak() {
@@ -1279,6 +1305,7 @@ fn refine_soak() {
 
 /// A stream opened for more frames a second than OpenH264 budgets over, once told frames come
 /// at 30, gives each the bytes a stream opened at 30 does.
+#[cfg(feature = "openh264")]
 #[test]
 fn a_stream_opened_past_the_frame_cap_budgets_like_one_opened_at_its_new_rate() {
     let (w, h) = (640usize, 480usize);
@@ -1314,6 +1341,7 @@ fn a_stream_opened_past_the_frame_cap_budgets_like_one_opened_at_its_new_rate() 
 
 /// Told frames now come at a third of the rate, rate control gives each about three times the
 /// bytes, and the stream carries on without an IDR.
+#[cfg(feature = "openh264")]
 #[test]
 fn a_lower_frame_rate_budgets_more_per_frame_without_an_idr() {
     let (w, h) = (640usize, 480usize);

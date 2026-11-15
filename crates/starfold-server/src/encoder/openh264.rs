@@ -10,8 +10,6 @@ use openh264_sys2 as sys;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 
-/// Level 5.2's frame size, OpenH264's limit for one picture.
-pub const MAX_MBS: usize = 36864;
 /// OpenH264 clamps the frame rate it plans rate control for to this, so above it the
 /// bitrate is scaled down to keep the per-second budget.
 const MAX_FPS: u32 = 60;

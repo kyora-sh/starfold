@@ -122,20 +122,20 @@ fn picks(p: &Plan) -> Vec<Option<Codec>> {
 #[test]
 fn candidates_rank_codecs_then_hardware() {
     let r = reg(vec![
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, SOFTWARE_H264, false),
         cap(Codec::Hevc, Backend::Vaapi, false),
         cap(Codec::Hevc, Backend::VideoToolbox, true),
         cap(Codec::Av1, Backend::Nvenc, true),
         cap(Codec::H264, Backend::VideoToolbox, true),
     ]);
-    let c = candidates(&r, Backend::OpenH264);
+    let c = candidates(&r, SOFTWARE_H264);
     let got: Vec<(Codec, Backend)> = c.iter().map(|c| (c.codec, c.backend)).collect();
     assert_eq!(
         got,
         vec![
             (Codec::Hevc, Backend::VideoToolbox),
             // H.264 is the configured backend alone, whatever else is eligible.
-            (Codec::H264, Backend::OpenH264),
+            (Codec::H264, SOFTWARE_H264),
         ]
     );
     let vt: Vec<(Backend, bool)> = candidates(&r, Backend::VideoToolbox)
@@ -145,14 +145,14 @@ fn candidates_rank_codecs_then_hardware() {
         .collect();
     assert_eq!(
         vt,
-        vec![(Backend::VideoToolbox, true), (Backend::OpenH264, false)],
-        "a hardware H.264 encoder falls back to OpenH264"
+        vec![(Backend::VideoToolbox, true), (SOFTWARE_H264, false)],
+        "a hardware H.264 encoder falls back to the software one"
     );
 }
 
 #[test]
 fn auto_selection() {
-    let sw = || cap(Codec::H264, Backend::OpenH264, false);
+    let sw = || cap(Codec::H264, SOFTWARE_H264, false);
     let vt = || cap(Codec::H264, Backend::VideoToolbox, true);
     let auto = |caps: Vec<EncoderCapability>| h264_backend(&reg(caps), Selection::Auto);
     assert_eq!(auto(vec![sw(), vt()]), Ok(Backend::VideoToolbox));
@@ -167,15 +167,12 @@ fn auto_selection() {
     no_idr.keyframe_control = None;
     assert_eq!(
         auto(vec![discovered, disabled, experimental, no_idr, sw()]),
-        Ok(Backend::OpenH264)
+        Ok(SOFTWARE_H264)
     );
-    assert_eq!(auto(vec![sw()]), Ok(Backend::OpenH264));
-    assert!(auto(vec![]).is_err(), "no OpenH264 either");
+    assert_eq!(auto(vec![sw()]), Ok(SOFTWARE_H264));
+    assert!(auto(vec![]).is_err(), "no software encoder either");
     let pinned = |b, caps| h264_backend(&reg(caps), Selection::Pinned(b));
-    assert_eq!(
-        pinned(Backend::OpenH264, vec![sw(), vt()]),
-        Ok(Backend::OpenH264)
-    );
+    assert_eq!(pinned(SOFTWARE_H264, vec![sw(), vt()]), Ok(SOFTWARE_H264));
     assert_eq!(
         pinned(Backend::VideoToolbox, vec![sw(), vt()]),
         Ok(Backend::VideoToolbox)
@@ -190,11 +187,15 @@ fn auto_selection() {
     let e = pinned(Backend::VideoToolbox, vec![sw()]).unwrap_err();
     assert!(e.contains("no videotoolbox H264 encoder"), "{e}");
     let r = reg(vec![sw(), vt()]);
-    let h: Vec<Backend> = candidates(&r, Backend::OpenH264)
+    let h: Vec<Backend> = candidates(&r, SOFTWARE_H264)
         .iter()
         .map(|c| c.backend)
         .collect();
-    assert_eq!(h, vec![Backend::OpenH264], "pinned OpenH264 stays software");
+    assert_eq!(
+        h,
+        vec![SOFTWARE_H264],
+        "the pinned software encoder stays software"
+    );
 }
 
 #[test]
@@ -204,10 +205,10 @@ fn experimental_backends_only_when_pinned() {
         cap(Codec::Hevc, Backend::Vaapi, true),
         cap(Codec::Av1, Backend::Vaapi, true),
         cap(Codec::Hevc, Backend::VideoToolbox, true),
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, SOFTWARE_H264, false),
     ]);
     let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, Backend::OpenH264, "auto never picks VA-API");
+    assert_eq!(h264, SOFTWARE_H264, "auto never picks VA-API");
     assert!(candidates(&r, h264)
         .iter()
         .all(|c| c.backend != Backend::Vaapi));
@@ -224,7 +225,7 @@ fn experimental_backends_only_when_pinned() {
             (Codec::Hevc, Backend::Vaapi),
             (Codec::Hevc, Backend::VideoToolbox),
             (Codec::H264, Backend::Vaapi),
-            (Codec::H264, Backend::OpenH264),
+            (Codec::H264, SOFTWARE_H264),
         ]
     );
     let mut off = r.encoders.clone();
@@ -241,10 +242,10 @@ fn nvenc_only_when_pinned() {
         cap(Codec::H264, Backend::Nvenc, true),
         cap(Codec::Hevc, Backend::Nvenc, true),
         cap(Codec::Av1, Backend::Nvenc, true),
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, SOFTWARE_H264, false),
     ]);
     let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, Backend::OpenH264, "auto never picks NVENC");
+    assert_eq!(h264, SOFTWARE_H264, "auto never picks NVENC");
     assert!(candidates(&r, h264)
         .iter()
         .all(|c| c.backend != Backend::Nvenc));
@@ -260,7 +261,7 @@ fn nvenc_only_when_pinned() {
             (Codec::Av1, Backend::Nvenc),
             (Codec::Hevc, Backend::Nvenc),
             (Codec::H264, Backend::Nvenc),
-            (Codec::H264, Backend::OpenH264),
+            (Codec::H264, SOFTWARE_H264),
         ]
     );
     let mut off = r.encoders.clone();
@@ -277,10 +278,10 @@ fn mediafoundation_only_when_pinned() {
         cap(Codec::H264, Backend::MediaFoundation, true),
         cap(Codec::Hevc, Backend::MediaFoundation, true),
         cap(Codec::Av1, Backend::MediaFoundation, true),
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, SOFTWARE_H264, false),
     ]);
     let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, Backend::OpenH264, "auto never picks Media Foundation");
+    assert_eq!(h264, SOFTWARE_H264, "auto never picks Media Foundation");
     assert!(candidates(&r, h264)
         .iter()
         .all(|c| c.backend != Backend::MediaFoundation));
@@ -296,7 +297,7 @@ fn mediafoundation_only_when_pinned() {
             (Codec::Av1, Backend::MediaFoundation),
             (Codec::Hevc, Backend::MediaFoundation),
             (Codec::H264, Backend::MediaFoundation),
-            (Codec::H264, Backend::OpenH264),
+            (Codec::H264, SOFTWARE_H264),
         ]
     );
     let mut off = r.encoders.clone();
@@ -334,6 +335,7 @@ fn chosen_is_each_codecs_first_candidate() {
 #[test]
 fn selection_parse() {
     assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
+    #[cfg(feature = "openh264")]
     assert_eq!(
         Selection::parse("openh264"),
         Ok(Selection::Pinned(Backend::OpenH264))
@@ -695,7 +697,7 @@ fn video_v2_layout() {
 }
 
 /// What `--encoder auto` picks on this host: VideoToolbox H.264 and HEVC on the
-/// kyora-macos runner, OpenH264 alone where no hardware encoder is default-safe yet.
+/// kyora-macos runner, the software one alone where no hardware encoder is default-safe yet.
 #[test]
 fn auto_on_this_host() {
     use crate::encoder::caps::{host_providers, PROBE_TIMEOUT};
@@ -717,7 +719,7 @@ fn auto_on_this_host() {
             );
         }
     } else {
-        assert_eq!(got, vec![(Codec::H264, Backend::OpenH264, false)]);
+        assert_eq!(got, vec![(Codec::H264, SOFTWARE_H264, false)]);
     }
 }
 

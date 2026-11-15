@@ -8,6 +8,7 @@ mod access;
 mod actions;
 #[cfg(target_os = "linux")]
 mod audio;
+mod build_facts;
 #[cfg(target_os = "linux")]
 mod capture;
 mod compat;
@@ -179,20 +180,17 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    if encoder.name() != "x264" && !selection.is_arm() {
-        for flag in ["preset", "paintover-crf"]
-            .iter()
-            .filter(|f| a.contains_key(**f))
+    if !selection.is_arm() {
+        for flag in build_facts::FLAGS
+            .into_iter()
+            .filter(|f| a.contains_key(*f))
         {
-            log::warn!("--{flag} is an x264 setting; {} ignores it", encoder.name());
-        }
-        if a.contains_key("crf") {
-            if encoder == encoder::Backend::OpenH264 {
+            if flag == "crf" && encoder == encoder::Backend::OpenH264 {
                 log::warn!(
                     "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
                 );
-            } else {
-                log::warn!("--crf is an x264 setting; {} ignores it", encoder.name());
+            } else if !build_facts::reads(encoder.name(), flag) {
+                log::warn!("{}", build_facts::flag_ignored(flag, encoder.name()));
             }
         }
     }
@@ -203,7 +201,7 @@ async fn serve(a: HashMap<String, String>) {
         preset: a
             .get("preset")
             .cloned()
-            .unwrap_or_else(|| "ultrafast".into()),
+            .unwrap_or_else(|| encoder::DEFAULT_PRESET.into()),
         // Four sliced threads: lower latency than one, and the encoders' slicing overhead
         // grows with thread count, so more threads only add CPU (x264, 2560x1600).
         threads: a
@@ -280,10 +278,10 @@ async fn serve(a: HashMap<String, String>) {
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let mut candidates = negotiate::candidates(&encoders, encoder);
     // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::Backend::OpenH264 {
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE_H264 {
         let fallback = negotiate::Candidate {
             codec: encoder::Codec::H264,
-            backend: encoder::Backend::OpenH264,
+            backend: encoder::SOFTWARE_H264,
             hardware: false,
         };
         if !candidates.contains(&fallback) {

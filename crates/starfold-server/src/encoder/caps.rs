@@ -362,9 +362,11 @@ fn describe(c: &EncoderCapability) -> String {
 /// with `experimental`. Hardware probes run in a child process when this executable
 /// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself.
 pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
-    let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(Backend::OpenH264))];
+    let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
     #[cfg(feature = "x264")]
     v.push(Box::new(Software(Backend::X264)));
+    #[cfg(feature = "openh264")]
+    v.push(Box::new(Software(Backend::OpenH264)));
     if !hardware {
         return v;
     }

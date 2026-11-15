@@ -5,7 +5,7 @@
 set -euo pipefail
 rounds=${1:-5}
 bin=$(cargo test --release --locked --lib --no-run --color never 2>&1 | tee /dev/stderr | grep -oE 'target/release/deps/starfold-[0-9a-f]+' | head -1)
-arms=("videotoolbox h264" "videotoolbox hevc" "openh264 h264")
+arms=("videotoolbox h264" "videotoolbox hevc" "x264 h264")
 for ((i = 0; i < rounds; i++)); do
 	for ((k = 0; k < ${#arms[@]}; k++)); do
 		read -r backend codec <<< "${arms[$(((k + i) % ${#arms[@]}))]}"

@@ -1,4 +1,5 @@
 use super::*;
+use crate::encoder::SOFTWARE_H264;
 
 /// A provider that reports what it was given, after `delay`.
 struct Fake {
@@ -54,7 +55,7 @@ fn good(codec: Codec, backend: Backend) -> EncoderCapability {
 }
 
 fn registry(fakes: Vec<Fake>) -> Registry {
-    let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(Backend::OpenH264))];
+    let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(SOFTWARE_H264))];
     v.extend(
         fakes
             .into_iter()
@@ -63,16 +64,16 @@ fn registry(fakes: Vec<Fake>) -> Registry {
     Registry::probe(v, Duration::from_secs(5))
 }
 
-fn openh264_left(r: &Registry) {
-    let c = r.check(Backend::OpenH264, Codec::H264).expect("OpenH264");
+fn software_h264_left(r: &Registry) {
+    let c = r.check(SOFTWARE_H264, Codec::H264).expect("software H.264");
     assert_eq!(c.acceleration, Acceleration::Software);
     assert!(c.eligible());
 }
 
 #[test]
-fn openh264_is_verified_by_a_real_encode() {
+fn software_h264_is_verified_by_a_real_encode() {
     let r = registry(Vec::new());
-    openh264_left(&r);
+    software_h264_left(&r);
     assert_eq!(r.eligible(Codec::H264).count(), 1);
     assert_eq!(r.eligible(Codec::Hevc).count(), 0);
     assert!(r.diagnostics.is_empty());
@@ -83,7 +84,7 @@ fn missing_library_is_a_diagnostic() {
     let mut f = Fake::new(Backend::Vaapi);
     f.diagnostics = vec![(None, "libva.so.2: cannot open shared object file")];
     let r = registry(vec![f]);
-    openh264_left(&r);
+    software_h264_left(&r);
     assert!(r.encoders.iter().all(|c| c.backend != Backend::Vaapi));
     let e = r.check(Backend::Vaapi, Codec::H264).unwrap_err();
     assert!(e.contains("libva.so.2"), "{e}");
@@ -97,7 +98,7 @@ fn denied_device_skips_only_that_device() {
     c.device_id = "/dev/dri/renderD129".into();
     f.caps = vec![c];
     let r = registry(vec![f]);
-    openh264_left(&r);
+    software_h264_left(&r);
     assert_eq!(r.diagnostics.len(), 1);
     assert_eq!(
         r.diagnostics[0].device.as_deref(),
@@ -183,7 +184,7 @@ fn session_failure_keeps_the_diagnosis() {
     let mut f = Fake::new(Backend::VideoToolbox);
     f.caps = vec![c];
     let r = registry(vec![f]);
-    openh264_left(&r);
+    software_h264_left(&r);
     let e = r.check(Backend::VideoToolbox, Codec::Hevc).unwrap_err();
     assert!(e.contains("-12902"), "{e}");
 }
@@ -235,12 +236,11 @@ fn size_limits_are_not_independent() {
 fn hung_probes_become_diagnostics() {
     let mut slow = Fake::new(Backend::Nvenc);
     slow.delay = Duration::from_secs(3);
-    let v: Vec<Box<dyn ProbeProvider>> =
-        vec![Box::new(Software(Backend::OpenH264)), Box::new(slow)];
+    let v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(SOFTWARE_H264)), Box::new(slow)];
     let t = Instant::now();
     let r = Registry::probe(v, Duration::from_millis(500));
     assert!(t.elapsed() < Duration::from_secs(2));
-    openh264_left(&r);
+    software_h264_left(&r);
     assert_eq!(r.diagnostics.len(), 1);
     assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);
     assert!(
@@ -275,7 +275,7 @@ fn experimental_probes_are_off_by_default() {
             .collect(),
         PROBE_TIMEOUT,
     );
-    openh264_left(&r);
+    software_h264_left(&r);
     let experimental = [Backend::Vaapi, Backend::Nvenc, Backend::MediaFoundation];
     let off: Vec<_> = r
         .encoders
@@ -308,7 +308,7 @@ fn stats_json_shape() {
     let v = serde_json::to_value(&r).unwrap();
     let e = &v["encoders"][0];
     assert_eq!(e["codec"], "h264");
-    assert_eq!(e["backend"], "openh264");
+    assert_eq!(e["backend"], SOFTWARE_H264.name());
     assert_eq!(e["acceleration"], "software");
     assert_eq!(e["status"]["state"], "verified");
     assert_eq!(e["implemented"], true);
@@ -486,14 +486,14 @@ fn bounded_providers_are_waited_for() {
     let mut hung = Fake::new(Backend::Nvenc);
     hung.delay = Duration::from_secs(5);
     let v: Vec<Box<dyn ProbeProvider>> = vec![
-        Box::new(Software(Backend::OpenH264)),
+        Box::new(Software(SOFTWARE_H264)),
         Box::new(child),
         Box::new(hung),
     ];
     let t = Instant::now();
     let r = Registry::probe(v, Duration::from_millis(200));
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
-    openh264_left(&r);
+    software_h264_left(&r);
     assert!(r.encoders.iter().any(|c| c.backend == Backend::Vaapi));
     assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
     assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);
