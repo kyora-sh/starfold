@@ -70,6 +70,24 @@ let proto = 0;
 /** `v,` waits for the capability hello, so the server doesn't take this for an old client. */
 let videoSent = false;
 let helloSeq = 0;
+
+// Firefox throws if getContext('2d') is called twice on one canvas; reuse it.
+// Fall back to default attrs if the ones below are rejected.
+function get2dContext(
+	c: OffscreenCanvas
+): OffscreenCanvasRenderingContext2D | null {
+	if (ctx) return ctx;
+	try {
+		return c.getContext('2d', { alpha: false, desynchronized: true });
+	} catch {
+		try {
+			return c.getContext('2d');
+		} catch {
+			post({ t: 'log', s: 'no video: the canvas has no 2d context' });
+			return null;
+		}
+	}
+}
 /** One per socket: async work started on an earlier connection is dropped. */
 let conn = 0;
 /** Protocol 2: the epoch announced last, and whether the decoders are set up for it. */
@@ -208,7 +226,7 @@ function setLayout(w: number, h: number, list: Stripe[]) {
 		canvas.width = w;
 		canvas.height = h;
 	}
-	ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+	ctx = get2dContext(canvas);
 	layout = list;
 	width = w;
 }
@@ -456,7 +474,7 @@ function present(id: number, parts: Part<Picture>[], t0: number) {
 			if (ctx && !noDraw) g.pic.draw(ctx, g.y, width || Infinity, h);
 			g.pic.close();
 		}
-		if (!painted) {
+		if (!painted && (ctx || noDraw)) {
 			painted = true;
 			post({ t: 'painted' });
 		}
@@ -639,7 +657,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			canvas = m.canvas;
 			url = m.url;
 			presentToMain = m.presentToMain;
-			ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+			ctx = get2dContext(canvas);
 			connect();
 			break;
 		case 'send':

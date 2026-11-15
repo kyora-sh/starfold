@@ -3,18 +3,32 @@
 #
 # Rebuilds sync/upstream from origin/main: each upstream main commit after the one in
 # .github/upstream-sha (first parent), moved into this repo's layout by map_tree, is
-# cherry-picked in order. Stops at the first one that doesn't apply, bumps the marker to
-# the last one that did and force-pushes sync/upstream, unless the branch already has
-# that content or carries commits the bot didn't make. Writes the pull request body to
-# <body-file>, and status=<up-to-date|human-edits|blocked|unchanged|pushed> plus, for
-# the last two, head=<sync/upstream sha> to $GITHUB_OUTPUT.
+# cherry-picked in order; one listed in .github/upstream-skip ("<full sha> <reason>" per
+# line) is left out and counts as synced, while one listed as "<full sha> held: <follow-up>"
+# is never left out: the sync stops before it. Stops at the first one that is held or
+# doesn't apply, or once $SYNC_MAX_COMMITS (1 to 999; 1 when unset or empty) have been
+# applied, bumps the marker to the last one before it and force-pushes
+# sync/upstream (never main), unless the branch already has that content or carries
+# commits the bot didn't make. Writes the pull request body to <body-file>, and
+# status=<up-to-date|human-edits|held|blocked|unchanged|pushed> plus, for the last two,
+# head=<sync/upstream sha> to $GITHUB_OUTPUT. When the first commit to sync is held or
+# doesn't apply, the body also goes to $GITHUB_STEP_SUMMARY with one warning naming
+# that commit, and the run still succeeds; any other failure, including any git command
+# failing, exits non-zero.
 set -euo pipefail
+shopt -s inherit_errexit lastpipe
 
 upstream_url=$1
 body=$2
 branch=sync/upstream
 marker_file=.github/upstream-sha
+skip_file=.github/upstream-skip
 bot_email=${SYNC_BOT_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}
+max_commits=${SYNC_MAX_COMMITS:-1}
+if ! [[ $max_commits =~ ^[123456789][0123456789]{0,2}$ ]]; then
+	echo "SYNC_MAX_COMMITS must be a whole number from 1 to 999, not: $max_commits" >&2
+	exit 1
+fi
 
 output() {
 	echo "$1"
@@ -24,79 +38,222 @@ output() {
 # A commit's tree with upstream paths moved to where they live here. Upstream's .github
 # (its CI) and package-lock.json (bun.lock here) are left out.
 map_tree() {
-	local index
+	local index tree
 	index=$(mktemp -u)
-	git ls-tree -r -z --full-tree "$1" | perl -0 -ne '
+	if ! git ls-tree -r -z --full-tree "$1" | perl -0 -ne '
 		chomp;
 		my ($meta, $path) = split /\t/, $_, 2;
 		next if $path =~ m{^\.github/} || $path eq "package-lock.json";
 		$path = "crates/starfold-server/$path" if $path =~ m{^src/} || $path eq "build.rs" || $path eq "Cargo.toml";
 		$path = "packages/$path" if $path =~ m{^web/};
 		print "$meta\t$path\0";
-	' | GIT_INDEX_FILE=$index git update-index -z --index-info
-	GIT_INDEX_FILE=$index git write-tree
+	' | GIT_INDEX_FILE=$index git update-index -z --index-info; then
+		echo "mapping the tree of $1 failed" >&2
+		rm -f "$index"
+		return 1
+	fi
+	tree=$(GIT_INDEX_FILE=$index git write-tree)
 	rm -f "$index"
+	echo "$tree"
 }
 
-line() { git log -1 --format='%h %s' "$1"; }
+# 0 when $1 is an ancestor of $2, 1 when it isn't; any other git failure exits.
+is_ancestor() {
+	local rc=0
+	git merge-base --is-ancestor "$1" "$2" || rc=$?
+	case $rc in 0 | 1) return "$rc" ;; esac
+	echo "git merge-base --is-ancestor $1 $2 failed (exit $rc)" >&2
+	exit 1
+}
+
+# Bare (#NN) references are upstream's; here they would link to this repo's own.
+qualify() { sed -E 's|\(#([0123456789]+)\)|(tembo/voxl#\1)|g'; }
+line() { git log -1 --format='%h %s' "$1" | qualify; }
+# Upstream's message for this repo: its first non-blank line as the subject, then the
+# plain text after it up to the first line that starts with optional whitespace and '<'
+# (badges, images, links), without trailing blank lines. Reads to the end either way.
+clean_message() {
+	git log -1 --format=%B "$1" | awk '
+		cut { next }
+		!subject && /^[[:space:]]*$/ { next }
+		!subject { print; subject = 1; next }
+		/^[[:space:]]*</ { cut = 1; next }
+		/^[[:space:]]*$/ { blank = blank $0 "\n"; next }
+		{ printf "%s%s\n", blank, $0; blank = "" }
+	' | qualify
+}
 list() { paste -sd, - | sed 's/,/, /g'; }
+
+# The commits among "$@" that the skip list marks, as lists of held, ported and skipped.
+print_marked() {
+	local c held=() ported=() skipped=()
+	for c in "$@"; do
+		case ${skip_reasons[$c]:-} in
+		'') ;;
+		held:*) held+=("$c") ;;
+		'ported in '*) ported+=("$c") ;;
+		*) skipped+=("$c") ;;
+		esac
+	done
+	print_kind Held "${held[@]}"
+	print_kind Ported "${ported[@]}"
+	print_kind Skipped "${skipped[@]}"
+}
+print_kind() {
+	local kind=$1 c l reason
+	shift
+	if [ $# -eq 0 ]; then return 0; fi
+	echo "$kind ($#):"
+	for c in "$@"; do
+		l=$(line "$c")
+		reason=${skip_reasons[$c]}
+		echo "- $l: ${reason#held: }"
+	done
+	echo
+}
+
+# The non-empty lines of $1 in the array `lines`, with no temporary file.
+split_lines() {
+	local IFS=$'\n'
+	set -f
+	# shellcheck disable=SC2206
+	lines=($1)
+	set +f
+}
 
 git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
 git fetch --quiet --no-tags "$upstream_url" "+refs/heads/main:refs/remotes/upstream/main"
 remote_branch=
-if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+listed=0
+git ls-remote --exit-code --heads origin "$branch" >/dev/null || listed=$?
+case $listed in
+0)
 	git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
 	remote_branch=$(git rev-parse "refs/remotes/origin/$branch")
-fi
+	;;
+2) ;;
+*)
+	echo "listing $branch on origin failed (git ls-remote exit $listed)" >&2
+	exit 1
+	;;
+esac
 upstream=$(git rev-parse refs/remotes/upstream/main)
 marker=$(git show "refs/remotes/origin/main:$marker_file")
-if ! git merge-base --is-ancestor "$marker" "$upstream"; then
+if ! is_ancestor "$marker" "$upstream"; then
 	echo "$marker_file ($marker) is not on upstream main ($upstream)" >&2
 	exit 1
 fi
+skip_list=
+skip_present=$(git ls-tree --full-tree --name-only refs/remotes/origin/main -- "$skip_file")
+if [ -n "$skip_present" ]; then
+	nul=$(git show "refs/remotes/origin/main:$skip_file" | tr -cd '\000' | wc -c)
+	if [ $((nul)) -ne 0 ]; then
+		echo "$skip_file contains a NUL byte" >&2
+		exit 1
+	fi
+	skip_list=$(git show "refs/remotes/origin/main:$skip_file")
+fi
+declare -A skip_reasons=()
+# Each line is "<full sha> <reason>" or "<full sha> held: <follow-up>", printable ASCII only.
+parse_skip_list() {
+	local LC_ALL=C l sha
+	split_lines "$1"
+	for l in "${lines[@]}"; do
+		if [[ $l == *[!\ -~]* ]] || ! [[ $l =~ ^([0123456789abcdef]{40})\ (held:\ )?([[:graph:]].*)$ ]] ||
+			[[ -z ${BASH_REMATCH[2]} && ${BASH_REMATCH[3]} == held:* ]]; then
+			echo "$skip_file: each line is '<full sha> <reason>' or '<full sha> held: <follow-up>', single spaces, printable ASCII only; not: ${l@Q}" >&2
+			exit 1
+		fi
+		sha=${BASH_REMATCH[1]}
+		if [ -n "${skip_reasons[$sha]+x}" ]; then
+			echo "$skip_file: $sha is listed more than once" >&2
+			exit 1
+		fi
+		skip_reasons[$sha]=${BASH_REMATCH[2]}${BASH_REMATCH[3]}
+	done
+}
+parse_skip_list "$skip_list"
 
-commits=()
-while IFS= read -r c; do commits+=("$c"); done < <(git rev-list --reverse --first-parent "$marker..$upstream")
+revs=$(git rev-list --reverse --first-parent "$marker..$upstream")
+split_lines "$revs"
+commits=("${lines[@]}")
 if [ ${#commits[@]} -eq 0 ]; then
 	output status=up-to-date
 	exit 0
 fi
 if [ -n "$remote_branch" ]; then
-	committers=$(git log --format=%ce "refs/remotes/origin/main..$remote_branch")
-	if [ -n "$committers" ] && grep -qvxF "$bot_email" <<<"$committers"; then
-		output status=human-edits
-		exit 0
-	fi
+	committers=$(git log --format=x%ce "refs/remotes/origin/main..$remote_branch")
+	split_lines "$committers"
+	for e in "${lines[@]}"; do
+		if [ "$e" != "x$bot_email" ]; then
+			output status=human-edits
+			exit 0
+		fi
+	done
 fi
 
 git checkout --quiet -B "$branch" refs/remotes/origin/main
 picked=()
+skipped_listed=()
 left_out=()
+last=
+handled=0
+held_for=
 stop=
+stop_label=
 stop_reason=
 for c in "${commits[@]}"; do
-	base=$(git commit-tree "$(map_tree "$c^1")" -m base)
-	mapped=$(
-		GIT_AUTHOR_NAME=$(git log -1 --format=%an "$c") \
-			GIT_AUTHOR_EMAIL=$(git log -1 --format=%ae "$c") \
-			GIT_AUTHOR_DATE=$(git log -1 --format=%ad --date=raw "$c") \
-			git commit-tree "$(map_tree "$c")" -p "$base" \
-			-m "$(git log -1 --format=%B "$c")" -m "Upstream: tembo/voxl@$c"
-	)
-	if git cherry-pick --keep-redundant-commits "$mapped" >/dev/null 2>&1; then
-		picked+=("$c")
-	else
+	label=$(line "$c")
+	reason=${skip_reasons[$c]:-}
+	if [[ $reason == held:* ]]; then
 		stop=$c
-		stop_reason="conflicts in $(git diff --name-only --diff-filter=U | list)"
+		stop_label=$label
+		held_for=${reason#held:}
+		held_for=${held_for# }
+		stop_reason="held in \`$skip_file\`: $held_for"
+		break
+	fi
+	if [ -n "$reason" ]; then
+		skipped_listed+=("$c")
+		last=$c
+		handled=$((handled + 1))
+		continue
+	fi
+	parent_tree=$(map_tree "$c^1")
+	base=$(git commit-tree "$parent_tree" -m base)
+	tree=$(map_tree "$c")
+	author_name=$(git log -1 --format=%an "$c")
+	author_email=$(git log -1 --format=%ae "$c")
+	author_date=$(git log -1 --format=%ad --date=raw "$c")
+	message=$(clean_message "$c")
+	mapped=$(GIT_AUTHOR_NAME=$author_name GIT_AUTHOR_EMAIL=$author_email GIT_AUTHOR_DATE=$author_date \
+		git commit-tree "$tree" -p "$base" -m "$message" -m "Upstream: tembo/voxl@$c")
+	if pick_log=$(git cherry-pick --keep-redundant-commits "$mapped" 2>&1); then
+		picked+=("$c")
+		last=$c
+		handled=$((handled + 1))
+	else
+		conflicts=$(git ls-files -u | cut -f2 | sort -u | list)
+		if [ -z "$conflicts" ]; then
+			echo "cherry-picking $label failed without a conflict:" >&2
+			echo "$pick_log" >&2
+			exit 1
+		fi
+		stop=$c
+		stop_label=$label
+		stop_reason="conflicts in $conflicts"
 		git cherry-pick --abort
 		break
 	fi
-	skipped=$(git diff --name-only "$c^1" "$c" | grep -E '^(\.github/|package-lock\.json$)' || true)
-	if [ -n "$skipped" ]; then left_out+=("$(line "$c"): $(echo "$skipped" | list)"); fi
+	files=
+	git diff -z --name-only "$c^1" "$c" | while IFS= read -r -d '' f; do
+		if [[ $f == .github/* || $f == package-lock.json ]]; then files+=${files:+, }$f; fi
+	done
+	if [ -n "$files" ]; then left_out+=("$label: $files"); fi
+	if [ ${#picked[@]} -eq "$max_commits" ]; then break; fi
 done
 
-if [ ${#picked[@]} -gt 0 ]; then
-	last=${picked[${#picked[@]} - 1]}
+if [ -n "$last" ]; then
 	echo "$last" >"$marker_file"
 	git add "$marker_file"
 	git commit --quiet -m "chore: upstream sync through tembo/voxl@${last:0:7}"
@@ -107,16 +264,47 @@ fi
 	echo
 	if [ ${#picked[@]} -gt 0 ]; then
 		echo "Applied (${#picked[@]}), with upstream paths moved into this repo's layout:"
-		for c in "${picked[@]}"; do echo "- $(line "$c")"; done
+		for c in "${picked[@]}"; do
+			l=$(line "$c")
+			echo "- $l"
+		done
 		echo
 	fi
+	if [ ${#skipped_listed[@]} -gt 0 ]; then
+		echo "Passed over in this run, as \`$skip_file\` lists them:"
+		echo
+		print_marked "${skipped_listed[@]}"
+	fi
+	rest=("${commits[@]:$handled}")
+	pending=()
+	for c in "${rest[@]}"; do
+		if [ -z "${skip_reasons[$c]:-}" ]; then pending+=("$c"); fi
+	done
 	if [ -n "$stop" ]; then
-		rest=("${commits[@]:${#picked[@]}}")
-		echo "**Stopped at $(line "$stop")**: $stop_reason. Still to sync (${#rest[@]}), oldest first:"
-		for c in "${rest[@]}"; do echo "- $(line "$c")"; done
+		echo "**Stopped at $stop_label**: $stop_reason."
 		echo
-		echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
+		if [ -n "$held_for" ]; then
+			echo "It and everything after it wait until its line is removed from \`$skip_file\`."
+		else
+			echo "To go on by hand, on \`$branch\` (branched from main if it doesn't exist): apply \`$stop\` with \`src/\`, \`build.rs\` and \`Cargo.toml\` under \`crates/starfold-server/\` and \`web/\` under \`packages/web/\`, resolve, write its sha to \`$marker_file\`, commit and push. The bot leaves the branch alone while it has commits the bot didn't make."
+		fi
 		echo
+	elif [ ${#rest[@]} -gt 0 ]; then
+		echo "At most $max_commits applied per run."
+		echo
+	fi
+	if [ ${#pending[@]} -gt 0 ]; then
+		echo "Still to sync (${#pending[@]}), oldest first:"
+		for c in "${pending[@]}"; do
+			l=$(line "$c")
+			echo "- $l"
+		done
+		echo
+	fi
+	if [ ${#rest[@]} -gt ${#pending[@]} ]; then
+		echo "Further on, as \`$skip_file\` lists them:"
+		echo
+		print_marked "${rest[@]}"
 	fi
 	if [ ${#left_out[@]} -gt 0 ]; then
 		echo "Left out of the applied commits (upstream's CI and npm lockfile; port by hand if wanted):"
@@ -125,16 +313,31 @@ fi
 	fi
 } >"$body"
 
-if [ ${#picked[@]} -eq 0 ]; then
-	output status=blocked
+if [ -z "$last" ]; then
+	if [ -n "$held_for" ]; then
+		status=held
+		warning="upstream sync is held at $stop_label: $held_for"
+	else
+		status=blocked
+		warning="upstream sync is blocked at $stop_label, which doesn't apply here; see the job summary"
+	fi
+	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$body" >>"$GITHUB_STEP_SUMMARY"; fi
+	warning=${warning//%/%25}
+	warning=${warning//$'\r'/%0D}
+	echo "::warning::${warning//$'\n'/%0A}"
+	output "status=$status"
 	exit 0
 fi
-if [ -n "$remote_branch" ] && git merge-base --is-ancestor refs/remotes/origin/main "$remote_branch" &&
-	[ "$(git rev-parse "$remote_branch^{tree}")" = "$(git rev-parse "HEAD^{tree}")" ]; then
-	output "head=$remote_branch"
-	output status=unchanged
-	exit 0
+if [ -n "$remote_branch" ] && is_ancestor refs/remotes/origin/main "$remote_branch"; then
+	remote_tree=$(git rev-parse "$remote_branch^{tree}")
+	head_tree=$(git rev-parse "HEAD^{tree}")
+	if [ "$remote_tree" = "$head_tree" ]; then
+		output "head=$remote_branch"
+		output status=unchanged
+		exit 0
+	fi
 fi
 git push --quiet --force-with-lease="refs/heads/$branch:$remote_branch" origin "HEAD:refs/heads/$branch"
-output "head=$(git rev-parse HEAD)"
+head=$(git rev-parse HEAD)
+output "head=$head"
 output status=pushed
