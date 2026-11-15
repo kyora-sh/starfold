@@ -223,6 +223,9 @@ struct Log {
     abandoned: bool,
 }
 
+// The logged parameters' extension list pointers are only compared, never followed.
+unsafe impl Send for Log {}
+
 /// A runtime that answers from scripts (status 0 once a script runs out).
 struct Fake {
     codec: Codec,
