@@ -181,6 +181,7 @@ async fn serve(a: HashMap<String, String>) {
         }
     };
     if !selection.is_arm() {
+        let uncapped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 == 0;
         for flag in build_facts::FLAGS
             .into_iter()
             .filter(|f| a.contains_key(*f))
@@ -189,7 +190,7 @@ async fn serve(a: HashMap<String, String>) {
                 log::warn!(
                     "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
                 );
-            } else if !build_facts::reads(encoder.name(), flag) {
+            } else if !build_facts::reads(encoder.name(), flag, uncapped) {
                 log::warn!("{}", build_facts::flag_ignored(flag, encoder.name()));
             }
         }
@@ -216,6 +217,11 @@ async fn serve(a: HashMap<String, String>) {
         // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
         max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
+        paintover_qp: a.contains_key("paintover-crf").then(|| {
+            range_max(a.get("paintover-crf"), 16.0)
+                .round()
+                .clamp(0.0, 51.0) as u8
+        }),
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
         min_kbps: range_max(a.get("min-kbps"), 2000.0) as u32,

@@ -22,6 +22,11 @@ pub struct Encoder {
     pub preset: Option<&'static str>,
     /// Whether it takes the quality again on the fly, so `--paintover-crf` reaches it.
     pub paintover_crf: bool,
+    /// Whether a given `--paintover-crf` is also the finest QP it refines a still picture to.
+    pub refines_to_paintover_crf: bool,
+    /// Reads `--crf` and `--paintover-crf` only with an uncapped bitrate (`--max-kbps 0`), as
+    /// its constant QP; a capped one runs CBR and ignores them.
+    pub uncapped_only: bool,
     /// GPL: a binary that links it is GPL-2.0-or-later as a combined work.
     pub gpl: bool,
 }
@@ -35,6 +40,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("base quality"),
         preset: Some("a preset name, ultrafast by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: true,
+        uncapped_only: false,
         gpl: true,
     },
     Encoder {
@@ -45,6 +52,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP in motion"),
         preset: None,
         paintover_crf: false,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: false,
     },
     Encoder {
@@ -55,6 +64,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 8 by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: false,
     },
     Encoder {
@@ -65,6 +76,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 10 by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: false,
     },
     Encoder {
@@ -75,6 +88,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP"),
         preset: Some("a preset number, 12 by default"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: false,
     },
     Encoder {
@@ -85,6 +100,8 @@ pub const ENCODERS: &[Encoder] = &[
         crf: None,
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: false,
     },
     Encoder {
@@ -95,26 +112,35 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP"),
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
+        uncapped_only: false,
         gpl: true,
     },
-    hardware("videotoolbox", cfg!(target_os = "macos")),
-    hardware("vaapi", cfg!(target_os = "linux")),
-    hardware("nvenc", cfg!(any(target_os = "linux", windows))),
-    hardware("mediafoundation", cfg!(windows)),
-    hardware("qsv", cfg!(windows)),
+    hardware("videotoolbox", cfg!(target_os = "macos"), false),
+    hardware("vaapi", cfg!(target_os = "linux"), true),
+    hardware("nvenc", cfg!(any(target_os = "linux", windows)), true),
+    hardware("mediafoundation", cfg!(windows), true),
+    hardware("qsv", cfg!(windows), true),
 ];
 
-/// A hardware H.264 encoder built on this platform when `built`; it reads none of the shared
-/// flags and links nothing.
-const fn hardware(name: &'static str, built: bool) -> Encoder {
+/// A hardware H.264 encoder built on this platform when `built`. None takes a preset or links
+/// anything; one with `constant_qp` codes an uncapped bitrate at a constant QP, `--crf` (and
+/// `--paintover-crf` while sharpening), and a capped one with CBR, which ignores both.
+const fn hardware(name: &'static str, built: bool, constant_qp: bool) -> Encoder {
     Encoder {
         name,
         built,
         hardware: true,
         h264: true,
-        crf: None,
+        crf: if constant_qp {
+            Some("constant QP with --max-kbps 0")
+        } else {
+            None
+        },
         preset: None,
-        paintover_crf: false,
+        paintover_crf: constant_qp,
+        refines_to_paintover_crf: false,
+        uncapped_only: constant_qp,
         gpl: false,
     }
 }
@@ -172,16 +198,36 @@ fn meaning(e: &Encoder, flag: &str) -> Option<&'static str> {
     match flag {
         "preset" => e.preset,
         "crf" => e.crf,
-        "paintover-crf" => e.paintover_crf.then_some("paint-over quality"),
+        "paintover-crf" => e.paintover_crf.then_some(if e.uncapped_only {
+            "paint-over QP with --max-kbps 0"
+        } else {
+            "paint-over quality"
+        }),
         _ => None,
     }
 }
 
-/// Whether the encoder named `encoder` reads `flag`; a hardware encoder reads none of them.
-pub fn reads(encoder: &str, flag: &str) -> bool {
+/// Whether a given `--paintover-crf` is the finest QP the encoder named `encoder` refines to.
+pub fn refines_to_paintover_crf(encoder: &str) -> bool {
     ENCODERS
         .iter()
-        .any(|e| e.name == encoder && meaning(e, flag).is_some())
+        .any(|e| e.name == encoder && e.refines_to_paintover_crf)
+}
+
+/// This build's encoders a given `--paintover-crf` sets the finest refinement QP of.
+pub fn refining_to_paintover_crf() -> Vec<&'static str> {
+    built()
+        .filter(|e| e.refines_to_paintover_crf)
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Whether the encoder named `encoder` reads `flag` with the bitrate uncapped (`--max-kbps 0`)
+/// or not.
+pub fn reads(encoder: &str, flag: &str, uncapped: bool) -> bool {
+    ENCODERS
+        .iter()
+        .any(|e| e.name == encoder && meaning(e, flag).is_some() && (uncapped || !e.uncapped_only))
 }
 
 /// This build's encoders that read `flag`, each with what the flag is to it.
@@ -204,7 +250,9 @@ pub fn licence() -> &'static str {
 /// The startup warning for `--flag` given while `encoder`, which ignores it, encodes H.264.
 pub fn flag_ignored(flag: &str, encoder: &str) -> String {
     let readers: Vec<&str> = readers(flag).into_iter().map(|r| r.0).collect();
-    if readers.is_empty() {
+    if reads(encoder, flag, true) {
+        format!("--{flag} reaches {encoder} only with --max-kbps 0; with a capped bitrate it ignores it")
+    } else if readers.is_empty() {
         format!("--{flag} has no effect in this build: {encoder} ignores it")
     } else {
         format!(
@@ -265,8 +313,20 @@ mod tests {
             let parsed = Backend::parse(e.name);
             assert_eq!(parsed.is_ok(), e.built, "{}", e.name);
             assert!(parsed.is_ok_and(|b| b.name() == e.name) || !e.built);
-            assert!(e.h264 && !e.gpl && FLAGS.iter().all(|f| !reads(e.name, f)));
+            assert!(e.h264 && !e.gpl && e.preset.is_none(), "{}", e.name);
+            for flag in FLAGS {
+                assert!(!reads(e.name, flag, false), "{} {flag} capped", e.name);
+            }
         }
+        // With an uncapped bitrate these code at a constant QP: --crf, and --paintover-crf
+        // while sharpening (set_rate takes its quality). VideoToolbox sets a bitrate only.
+        for name in ["vaapi", "nvenc", "mediafoundation", "qsv"] {
+            assert!(reads(name, "crf", true) && reads(name, "paintover-crf", true));
+            assert!(!reads(name, "preset", true));
+            let w = flag_ignored("crf", name);
+            assert!(w.contains("only with --max-kbps 0"), "{w}");
+        }
+        assert!(FLAGS.iter().all(|f| !reads("videotoolbox", f, true)));
         let hw = hardware_encoders();
         assert_eq!(hw.contains(&"videotoolbox"), cfg!(target_os = "macos"));
         assert_eq!(hw.contains(&"vaapi"), cfg!(target_os = "linux"));
