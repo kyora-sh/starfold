@@ -19,6 +19,8 @@ pub struct Encoder {
     pub preset: Option<&'static str>,
     /// Whether it takes the quality again on the fly, so `--paintover-crf` reaches it.
     pub paintover_crf: bool,
+    /// Whether a given `--paintover-crf` is also the finest QP it refines a still picture to.
+    pub refines_to_paintover_crf: bool,
     /// GPL: a binary that links it is GPL-2.0-or-later as a combined work.
     pub gpl: bool,
 }
@@ -31,6 +33,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("base quality"),
         preset: Some("a preset name, ultrafast by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: true,
         gpl: true,
     },
     Encoder {
@@ -40,6 +43,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP in motion"),
         preset: None,
         paintover_crf: false,
+        refines_to_paintover_crf: false,
         gpl: false,
     },
     Encoder {
@@ -49,6 +53,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 8 by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: false,
         gpl: false,
     },
     Encoder {
@@ -58,6 +63,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 10 by default"),
         paintover_crf: true,
+        refines_to_paintover_crf: false,
         gpl: false,
     },
     Encoder {
@@ -67,6 +73,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP"),
         preset: Some("a preset number, 12 by default"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
         gpl: false,
     },
     Encoder {
@@ -76,6 +83,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: None,
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
         gpl: false,
     },
     Encoder {
@@ -85,6 +93,7 @@ pub const ENCODERS: &[Encoder] = &[
         crf: Some("lowest QP"),
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
+        refines_to_paintover_crf: false,
         gpl: true,
     },
 ];
@@ -135,6 +144,21 @@ fn meaning(e: &Encoder, flag: &str) -> Option<&'static str> {
         "paintover-crf" => e.paintover_crf.then_some("paint-over quality"),
         _ => None,
     }
+}
+
+/// Whether a given `--paintover-crf` is the finest QP the encoder named `encoder` refines to.
+pub fn refines_to_paintover_crf(encoder: &str) -> bool {
+    ENCODERS
+        .iter()
+        .any(|e| e.name == encoder && e.refines_to_paintover_crf)
+}
+
+/// This build's encoders a given `--paintover-crf` sets the finest refinement QP of.
+pub fn refining_to_paintover_crf() -> Vec<&'static str> {
+    built()
+        .filter(|e| e.refines_to_paintover_crf)
+        .map(|e| e.name)
+        .collect()
 }
 
 /// Whether the encoder named `encoder` reads `flag`; a hardware encoder reads none of them.

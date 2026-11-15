@@ -211,8 +211,17 @@ fn encoder_entries(usage: &str) -> String {
             paintover.join(", ")
         ),
     };
+    let finest = build_facts::refining_to_paintover_crf();
+    let finest = match finest.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; given, it is also the QP {} refines a still picture down to (default {})",
+            finest.join(", "),
+            crate::video::REFINE_RUNGS[2]
+        ),
+    };
     let paintover =
-        format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}");
+        format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
     usage
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
