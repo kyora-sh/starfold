@@ -1012,6 +1012,13 @@ fn an_encoder_that_keeps_failing_falls_back() {
     assert_eq!(route_codec(&c), Some(Codec::H264));
     assert!(eng.failed.contains(&HEVC));
     assert!(eng.cohorts.iter().all(|k| k.shared.cand != HEVC));
+    let enc = hub.encoder.lock();
+    let failed = &enc["failed"];
+    assert_eq!(failed[0]["codec"], "hevc", "{failed}");
+    assert_eq!(
+        failed[0]["reason"], "keeps failing to encode: session lost",
+        "/stats says why the encoder was left: {failed}"
+    );
 }
 
 /// `c`'s messages, with every frame in them acked.
@@ -1182,6 +1189,15 @@ fn a_hardware_h264_encoder_that_fails_to_open_falls_back() {
     push(&mut eng);
     assert!(!videos(&drain(&mut rl)).is_empty());
     assert_eq!(hub.encoder.lock()["chosen"][0]["backend"], "openh264");
+    let enc = hub.encoder.lock();
+    let failed = &enc["failed"];
+    assert_eq!(failed[0]["backend"], "videotoolbox", "{failed}");
+    assert!(
+        failed[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("failed to open: ")),
+        "{failed}"
+    );
 }
 
 #[test]

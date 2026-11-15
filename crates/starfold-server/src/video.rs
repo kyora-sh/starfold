@@ -273,6 +273,8 @@ struct Shared {
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
     failures: AtomicU32,
+    /// What the last failed encode said.
+    last_error: Mutex<Option<String>>,
     /// When the capture thread last sent this cohort a keyframe job.
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
@@ -688,6 +690,8 @@ struct Engine {
     offers: Vec<Offer>,
     /// Candidates whose encoders failed to open at this size.
     failed: Vec<Candidate>,
+    /// Why each failed one did, for /stats.
+    why: Vec<(Candidate, String)>,
     cohorts: Vec<Cohort>,
     best: Option<Candidate>,
     open: Open,
@@ -750,6 +754,7 @@ impl Engine {
             h264,
             offers,
             failed: Vec::new(),
+            why: Vec::new(),
             cohorts: Vec::new(),
             best: None,
             open,
@@ -760,7 +765,7 @@ impl Engine {
                 Ok(c) => break c,
                 Err(e) => {
                     log::warn!("H264 from {} failed to open: {e}", eng.h264.backend.name());
-                    eng.failed.push(eng.h264);
+                    eng.fail(eng.h264, format!("failed to open: {e}"));
                     eng.h264 = eng.next_h264().ok_or(e)?;
                 }
             }
@@ -800,7 +805,7 @@ impl Engine {
                     Ok(c) => self.cohorts.push(c),
                     Err(e) => {
                         log::warn!("H264 from {} failed to open: {e}", n.backend.name());
-                        self.failed.push(n);
+                        self.fail(n, format!("failed to open: {e}"));
                         continue;
                     }
                 }
@@ -835,6 +840,16 @@ impl Engine {
             return;
         }
         self.failed.retain(|c| *c != old);
+        self.why.retain(|(c, _)| *c != old);
+    }
+
+    /// Takes `cand` out of use at this size; /stats says `why`.
+    fn fail(&mut self, cand: Candidate, why: String) {
+        if !self.failed.contains(&cand) {
+            self.failed.push(cand);
+        }
+        self.why.retain(|(c, _)| *c != cand);
+        self.why.push((cand, why));
     }
 
     fn open_cohort(&self, cand: Candidate) -> Result<Cohort, String> {
@@ -874,6 +889,7 @@ impl Engine {
             idr_inflight: AtomicBool::new(false),
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
+            last_error: Mutex::new(None),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             keyframes: AtomicU64::new(0),
             paintover_bytes: AtomicU64::new(0),
@@ -934,22 +950,30 @@ impl Engine {
         // A cohort whose encoder keeps failing: its candidate is off until the next size.
         // The last H.264 encoder is the last resort and stays.
         let h264_fallback = self.next_h264().is_some();
-        for c in &self.cohorts {
-            let sh = &c.shared;
-            if (sh.cand != self.h264 || h264_fallback)
-                && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
-                && !self.failed.contains(&sh.cand)
-            {
-                log::warn!(
-                    "{:?} from {} keeps failing to encode; trying the next encoder",
-                    sh.cand.codec,
-                    sh.cand.backend.name()
-                );
-                self.failed.push(sh.cand);
-            }
+        let failing: Vec<(Candidate, String)> = self
+            .cohorts
+            .iter()
+            .map(|c| &c.shared)
+            .filter(|sh| {
+                (sh.cand != self.h264 || h264_fallback)
+                    && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
+                    && !self.failed.contains(&sh.cand)
+            })
+            .map(|sh| {
+                let last = sh.last_error.lock().clone().unwrap_or_default();
+                (sh.cand, format!("keeps failing to encode: {last}"))
+            })
+            .collect();
+        for (cand, why) in failing {
+            log::warn!(
+                "{:?} from {} {why}; trying the next encoder",
+                cand.codec,
+                cand.backend.name()
+            );
+            self.fail(cand, why);
         }
         if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
-            self.failed.push(self.h264);
+            self.fail(self.h264, "failed by /debug/fail-h264".into());
         }
         if self.failed.contains(&self.h264) {
             self.replace_h264();
@@ -1008,7 +1032,7 @@ impl Engine {
                                 b.codec,
                                 b.backend.name()
                             );
-                            self.failed.push(b);
+                            self.fail(b, format!("failed to open: {e}"));
                             continue;
                         }
                     }
@@ -1124,9 +1148,18 @@ impl Engine {
             .map(|o| o.cand)
             .filter(|c| !self.failed.contains(c))
             .collect();
+        let failed: Vec<serde_json::Value> = self
+            .why
+            .iter()
+            .filter(|(c, _)| self.failed.contains(c))
+            .map(|(c, why)| {
+                serde_json::json!({"codec": c.codec, "backend": c.backend, "reason": why})
+            })
+            .collect();
         *self.hub.encoder.lock() = serde_json::json!({
             "mode": self.cfg.selection.name(),
             "chosen": negotiate::chosen(&live),
+            "failed": failed,
         });
     }
 
@@ -2369,6 +2402,8 @@ struct StripeResult {
     out: Option<(bool, Vec<u8>)>,
     config: Option<StreamConfig>,
     failed: bool,
+    /// What the failed encode said.
+    error: Option<String>,
     /// A refining pass left something a tail pass could still sharpen, at the tail's budget and
     /// at the ladder's.
     refinable: bool,
@@ -2596,6 +2631,7 @@ fn stripe_worker(
             }
         }
         let failed = out.is_err();
+        let error = out.as_ref().err().map(|e| e.0.clone());
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
             Ok(_) => None,
@@ -2637,6 +2673,7 @@ fn stripe_worker(
             refinable,
             refinable_small,
             failed,
+            error,
         };
         if done.send(r).is_err() {
             return;
@@ -2766,6 +2803,9 @@ fn encode_loop(
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
+                if let Some(e) = r.error {
+                    *sh.last_error.lock() = Some(e);
+                }
                 refinable[r.i] = r.refinable;
                 refinable_small |= r.refinable_small;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };

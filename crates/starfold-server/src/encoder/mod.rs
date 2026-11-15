@@ -38,6 +38,9 @@ mod mf;
 mod nvenc;
 #[cfg(feature = "openh264")]
 pub(crate) mod openh264;
+#[cfg(any(windows, all(test, target_os = "linux")))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod qsv;
 #[cfg(feature = "svt-av1")]
 mod svt;
 #[cfg(test)]
@@ -254,6 +257,7 @@ pub enum Backend {
     Vaapi,
     Nvenc,
     MediaFoundation,
+    Qsv,
 }
 
 impl Backend {
@@ -285,6 +289,10 @@ impl Backend {
             "mediafoundation" => Ok(Backend::MediaFoundation),
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
+            #[cfg(windows)]
+            "qsv" => Ok(Backend::Qsv),
+            #[cfg(not(windows))]
+            "qsv" => Err("qsv is Windows-only".into()),
             _ => Err(format!(
                 "unknown encoder {s:?} (auto, {}{})",
                 crate::build_facts::software_encoders().join(", "),
@@ -293,7 +301,7 @@ impl Backend {
                 } else if cfg!(target_os = "linux") {
                     ", vaapi, nvenc"
                 } else if cfg!(windows) {
-                    ", nvenc, mediafoundation"
+                    ", nvenc, mediafoundation, qsv"
                 } else {
                     ""
                 }
@@ -320,6 +328,7 @@ impl Backend {
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
             Backend::MediaFoundation => "mediafoundation",
+            Backend::Qsv => "qsv",
         }
     }
 
@@ -352,6 +361,7 @@ impl Backend {
             Backend::MediaFoundation => {
                 cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
+            Backend::Qsv => cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc),
         }
     }
 
@@ -373,7 +383,7 @@ impl Backend {
             Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(MAX_MBS),
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv => None,
         }
     }
 
@@ -397,6 +407,7 @@ impl Backend {
             Backend::Vaapi => 128,
             Backend::Nvenc => 160,
             Backend::MediaFoundation => 128,
+            Backend::Qsv => 128,
         }
     }
 
@@ -405,7 +416,7 @@ impl Backend {
     pub fn experimental(self) -> bool {
         matches!(
             self,
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv
         )
     }
 
@@ -560,6 +571,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Nvenc => nvenc::open(&coded)?,
         #[cfg(windows)]
         Backend::MediaFoundation => mf::open(&coded)?,
+        #[cfg(windows)]
+        Backend::Qsv => qsv::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {

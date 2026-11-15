@@ -1,4 +1,4 @@
-//! What the VA-API, NVENC and Media Foundation encoders share: NV12 upload, checking
+//! What the VA-API, NVENC, Media Foundation and Quick Sync encoders share: NV12 upload, checking
 //! their output, the sample encode that verifies a session, and opening each new session
 //! in a child process first.
 

@@ -122,8 +122,10 @@ fn session_main(backend: Option<&str>, spec: Option<&String>) -> i32 {
         Some("nvenc") => super::nvenc::child_session,
         #[cfg(windows)]
         Some("mediafoundation") => super::mf::child_session,
+        #[cfg(windows)]
+        Some("qsv") => super::qsv::child_session,
         _ => {
-            eprintln!("{FLAG}: {SESSION} takes vaapi, nvenc or mediafoundation and a session");
+            eprintln!("{FLAG}: {SESSION} takes vaapi, nvenc, mediafoundation or qsv and a session");
             return 2;
         }
     };

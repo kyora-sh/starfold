@@ -82,9 +82,9 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--basic-auth-user`                                            | any                                                                   | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                                  | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                               | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
-| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`, or the experimental `vaapi`, `nvenc`, `mediafoundation` |
+| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`; experimental `vaapi`, `nvenc`, `mediafoundation`, `qsv` |
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
-| `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC and Media Foundation, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                                     |
+| `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC, Media Foundation and Quick Sync, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                         |
 | `--preset`                                                     | `ultrafast`                                                           | x264 preset (builds with x264)                                                                                                                                                                            |
 | `--encoder-threads`                                            | `ncpu/4`, from 1 to 4                                                 | sliced encoder threads                                                                                                                                                                                    |
 | `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion (each if built in); other encoders ignore it                                                                                                          |
@@ -315,9 +315,9 @@ Phones and tablets get touch input and an on-screen keyboard.
 **Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
 (OpenH264 in a build without x264).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
-macOS). The VA-API, NVENC and Media Foundation encoders are experimental: start with
-`--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc` or `mediafoundation`;
-`/stats` shows what the probe found.
+macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, Windows) encoders are
+experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,
+`mediafoundation` or `qsv`; `/stats` shows what the probe found.
 
 **What's the license?** The code is MIT; a default build links x264 and is
 GPL-2.0-or-later. See [Licensing](#licensing).

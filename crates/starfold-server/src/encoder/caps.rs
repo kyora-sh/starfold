@@ -358,8 +358,8 @@ fn describe(c: &EncoderCapability) -> String {
 }
 
 /// The providers for this platform and build. `hardware` false keeps to the software
-/// encoders; the VA-API, NVENC and Media Foundation probes are experimental and run only
-/// with `experimental`. Hardware probes run in a child process when this executable
+/// encoders; the VA-API, NVENC, Media Foundation and Quick Sync probes are experimental and
+/// run only with `experimental`. Hardware probes run in a child process when this executable
 /// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself.
 pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
@@ -404,6 +404,8 @@ pub fn hardware_providers(experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     v.push(Box::new(super::nvenc::Probe));
     #[cfg(windows)]
     v.push(Box::new(super::mf::Probe));
+    #[cfg(windows)]
+    v.push(Box::new(super::qsv::Probe));
     v
 }
 

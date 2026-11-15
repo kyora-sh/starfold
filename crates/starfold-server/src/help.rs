@@ -39,9 +39,9 @@ CRF_ENTRY
 ENCODER_ENTRY
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
-  --experimental-hw-probes      experimental: also probe VA-API, NVENC and
-                                Media Foundation, each in a child process
-                                (default false)
+  --experimental-hw-probes      experimental: also probe VA-API, NVENC, Media
+                                Foundation and Quick Sync, each in a child
+                                process (default false)
 PRESET_ENTRY
   --encoder-threads             sliced threads (default cores/4, from 1 to 4)
   --adaptive-threads            encode on one thread, fanning out only under
@@ -176,8 +176,9 @@ fn encoder_entries(usage: &str) -> String {
     let encoder = format!(
         "auto: each codec from its hardware encoder, H.264 from {} where there is none \
          (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows) or mediafoundation (Windows); vaapi, nvenc and mediafoundation \
-         are experimental, need --experimental-hw-probes and auto never picks them; /stats \
+         nvenc (Linux, Windows), mediafoundation or qsv (Windows, Intel Quick Sync); vaapi, \
+         nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes and \
+         auto never picks them; /stats \
          shows what the probe found",
         build_facts::software_h264(),
         build_facts::software_encoders().join(", ")
