@@ -21,7 +21,10 @@ pub unsafe fn system(name: &str) -> Result<Library, String> {
 /// A driver runtime at an absolute path (e.g. in the DriverStore). Its own imports
 /// resolve from its directory and System32.
 #[cfg(windows)]
-#[allow(dead_code, reason = "for driver runtimes outside System32, none loaded yet")]
+#[allow(
+    dead_code,
+    reason = "for driver runtimes outside System32, none loaded yet"
+)]
 pub unsafe fn absolute(path: &str) -> Result<Library, String> {
     check_absolute(path)?;
     WinLibrary::load_with_flags(
@@ -33,10 +36,8 @@ pub unsafe fn absolute(path: &str) -> Result<Library, String> {
 }
 
 fn check_bare_name(name: &str) -> Result<(), String> {
-    let bare = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\', ':', '\0']);
+    let bare =
+        !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0']);
     if bare {
         Ok(())
     } else {
