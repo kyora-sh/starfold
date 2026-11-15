@@ -57,15 +57,6 @@ pub trait Driver: Send {
     fn destroy(&mut self, config: VaId, ctx: VaId, surfaces: &[VaId]);
 }
 
-/// One segment of a coded buffer.
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct Segment {
-    pub size: u32,
-    pub bit_offset: u32,
-    pub status: u32,
-    pub data: Vec<u8>,
-}
-
 /// A render node's VA display.
 pub struct VaDriver {
     va: Va,
@@ -115,33 +106,6 @@ impl VaDriver {
         } else {
             Err(EncodeError(format!("{what}: {}", self.va.describe(r))))
         }
-    }
-
-    /// A coded buffer's segments, as the driver chains them.
-    pub fn segments(&mut self, buf: VaId) -> Result<Vec<Segment>, EncodeError> {
-        let mut p: *mut c_void = std::ptr::null_mut();
-        self.check("vaMapBuffer (coded)", unsafe {
-            (self.va.map_buffer)(self.dpy, buf, &mut p)
-        })?;
-        let mut out = Vec::new();
-        let mut seg = p as *const ffi::VACodedBufferSegment;
-        while !seg.is_null() && out.len() < 1024 {
-            let s = unsafe { &*seg };
-            let data = if !s.buf.is_null() && s.size > 0 {
-                unsafe { std::slice::from_raw_parts(s.buf as *const u8, s.size as usize) }.to_vec()
-            } else {
-                Vec::new()
-            };
-            out.push(Segment {
-                size: s.size,
-                bit_offset: s.bit_offset,
-                status: s.status,
-                data,
-            });
-            seg = s.next as *const ffi::VACodedBufferSegment;
-        }
-        unsafe { (self.va.unmap_buffer)(self.dpy, buf) };
-        Ok(out)
     }
 
     /// The surface attributes of `config`, empty if the driver doesn't list them.
@@ -451,16 +415,32 @@ impl Driver for VaDriver {
     }
 
     fn coded(&mut self, buf: VaId) -> Result<Vec<u8>, EncodeError> {
-        let segs = self.segments(buf)?;
-        if segs
-            .iter()
-            .any(|s| s.status & ffi::CODED_BAD_BITSTREAM != 0)
-        {
+        let mut p: *mut c_void = std::ptr::null_mut();
+        self.check("vaMapBuffer (coded)", unsafe {
+            (self.va.map_buffer)(self.dpy, buf, &mut p)
+        })?;
+        let mut out = Vec::new();
+        let mut bad = false;
+        let mut seg = p as *const ffi::VACodedBufferSegment;
+        let mut n = 0;
+        while !seg.is_null() && n < 1024 {
+            let s = unsafe { &*seg };
+            bad |= s.status & ffi::CODED_BAD_BITSTREAM != 0;
+            if !s.buf.is_null() && s.size > 0 {
+                out.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(s.buf as *const u8, s.size as usize)
+                });
+            }
+            seg = s.next as *const ffi::VACodedBufferSegment;
+            n += 1;
+        }
+        unsafe { (self.va.unmap_buffer)(self.dpy, buf) };
+        if bad {
             return Err(EncodeError(
                 "the driver marked its output a bad bitstream".into(),
             ));
         }
-        Ok(segs.into_iter().flat_map(|s| s.data).collect())
+        Ok(out)
     }
 
     fn destroy_buffer(&mut self, buf: VaId) {

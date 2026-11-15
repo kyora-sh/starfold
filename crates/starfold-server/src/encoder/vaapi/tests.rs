@@ -1178,17 +1178,57 @@ fn hardware_smoke() {
     }
 }
 
+/// Whether `a` is shaped as asked: an IDR with its parameter sets, or a P frame, and the
+/// stream announced on its first unit.
+fn au_shape(codec: Codec, a: &AccessUnit, key: bool, first: bool) -> Result<(), String> {
+    let units: Vec<&[u8]> = h264_nal::nal_units(&a.data).collect();
+    let (types, slice, irap, params): (Vec<u8>, bool, bool, bool) = match codec {
+        Codec::H264 => {
+            let t: Vec<u8> = units.iter().map(|n| h264_nal::nal_type(n)).collect();
+            let slice = t.iter().any(|&t| t == 1 || t == 5);
+            let idr = t.contains(&5);
+            let ps = t.contains(&7) && t.contains(&8);
+            (t, slice, idr, ps)
+        }
+        _ => {
+            use crate::encoder::hevc;
+            let t: Vec<u8> = units.iter().map(|n| hevc::nal_type(n)).collect();
+            let slice = t.iter().any(|&t| hevc::is_slice(t));
+            let irap = t.iter().any(|&t| hevc::is_random_access(t));
+            let ps = [hevc::NAL_VPS, hevc::NAL_SPS, hevc::NAL_PPS]
+                .iter()
+                .all(|p| t.contains(p));
+            (t, slice, irap, ps)
+        }
+    };
+    let ok = slice
+        && irap == key
+        && a.keyframe == key
+        && (!key || params)
+        && (!first || a.config.is_some());
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "keyframe {} (asked {key}), NAL types {types:?}, config {}",
+            a.keyframe,
+            a.config.is_some()
+        ))
+    }
+}
+
 /// Real hardware, a minute per codec: 1280x720 at 30 fps of moving content, paced to the
 /// clock, in the session `--encoder vaapi` opens, with a keyframe asked for every 10 s.
+/// Fails if either codec can't open, any frame fails, or a unit isn't shaped as asked.
 /// Each stream goes to `$STARFOLD_VAAPI_OUT/minute.{h264,hevc}` when that is set.
 #[test]
 #[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
 fn hardware_minute() {
     use std::time::{Duration, Instant};
-    let Some(node) = render_nodes().ok().and_then(|n| n.into_iter().next()) else {
-        eprintln!("skipped: no render node");
-        return;
-    };
+    let node = render_nodes()
+        .ok()
+        .and_then(|n| n.into_iter().next())
+        .expect("no render node in /dev/dri");
     let (w, h, fps) = (1280u32, 720u32, 30u64);
     let out = std::env::var_os("STARFOLD_VAAPI_OUT").map(std::path::PathBuf::from);
     let mut failed = Vec::new();
@@ -1235,9 +1275,7 @@ fn hardware_minute() {
                 let [a] = aus.as_slice() else {
                     return Err(format!("frame {i}: {} access units", aus.len()));
                 };
-                if a.keyframe != (i == 0 || key) {
-                    return Err(format!("frame {i}: keyframe {}", a.keyframe));
-                }
+                au_shape(codec, a, i == 0 || key, i == 0).map_err(|e| format!("frame {i}: {e}"))?;
                 keys += a.keyframe as u32;
                 stream.extend_from_slice(&a.data);
                 let next = start + Duration::from_millis((i + 1) * 1000 / fps);
@@ -1261,300 +1299,4 @@ fn hardware_minute() {
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
-}
-
-/// The real driver, with what goes in and comes out written down.
-struct Recorder {
-    inner: driver::VaDriver,
-    dir: std::path::PathBuf,
-    notes: Arc<Mutex<Vec<String>>>,
-    /// Report no packed headers, so none are packed.
-    hide_packed: bool,
-    /// Offer only this profile.
-    only: Option<i32>,
-    buffers: HashMap<VaId, (i32, Vec<u8>)>,
-    frame: usize,
-}
-
-impl Recorder {
-    fn note(&self, s: String) {
-        self.notes.lock().unwrap().push(s);
-    }
-}
-
-fn types_of(data: &[u8]) -> Vec<u8> {
-    h264_nal::nal_units(data).map(h264_nal::nal_type).collect()
-}
-
-impl Driver for Recorder {
-    fn vendor(&mut self) -> String {
-        let v = self.inner.vendor();
-        self.note(format!("vendor = {v:?}"));
-        v
-    }
-
-    fn entrypoints(&mut self, profile: i32) -> Result<Vec<i32>, EncodeError> {
-        if self.only.is_some_and(|p| p != profile) {
-            return Ok(Vec::new());
-        }
-        let r = self.inner.entrypoints(profile);
-        self.note(format!("entrypoints({profile}) = {r:?}"));
-        r
-    }
-
-    fn attribs(&mut self, p: i32, e: i32, kinds: &[i32]) -> Result<Vec<Option<u32>>, EncodeError> {
-        let mut r = self.inner.attribs(p, e, kinds)?;
-        let shown: Vec<String> = kinds
-            .iter()
-            .zip(&r)
-            .map(|(k, v)| format!("{k}={}", v.map_or("none".into(), |v| format!("{v:#x}"))))
-            .collect();
-        self.note(format!("attribs({p}, {e}): {}", shown.join(" ")));
-        if self.hide_packed {
-            for (k, v) in kinds.iter().zip(r.iter_mut()) {
-                if *k == ffi::ATTRIB_PACKED_HEADERS {
-                    *v = None;
-                }
-            }
-        }
-        Ok(r)
-    }
-
-    fn create_config(&mut self, p: i32, e: i32, a: &[(i32, u32)]) -> Result<VaId, EncodeError> {
-        let r = self.inner.create_config(p, e, a);
-        self.note(format!("create_config({p}, {e}, {a:x?}) = {r:?}"));
-        r
-    }
-
-    fn min_size(&mut self, p: i32, e: i32) -> Option<(u32, u32)> {
-        let r = self.inner.min_size(p, e);
-        self.note(format!("min_size({p}, {e}) = {r:?}"));
-        r
-    }
-
-    fn create_surfaces(&mut self, w: u32, h: u32, n: usize) -> Result<Vec<VaId>, EncodeError> {
-        let r = self.inner.create_surfaces(w, h, n);
-        self.note(format!("create_surfaces({w}x{h}, {n}) = {r:?}"));
-        r
-    }
-
-    fn create_context(&mut self, c: VaId, w: u32, h: u32, t: &[VaId]) -> Result<VaId, EncodeError> {
-        let r = self.inner.create_context(c, w, h, t);
-        self.note(format!("create_context({w}x{h}) = {r:?}"));
-        r
-    }
-
-    fn create_buffer(&mut self, ctx: VaId, kind: i32, data: &[u8]) -> Result<VaId, EncodeError> {
-        let id = self.inner.create_buffer(ctx, kind, data)?;
-        self.buffers.insert(id, (kind, data.to_vec()));
-        Ok(id)
-    }
-
-    fn create_coded(&mut self, ctx: VaId, size: usize) -> Result<VaId, EncodeError> {
-        let r = self.inner.create_coded(ctx, size);
-        self.note(format!("create_coded({size}) = {r:?}"));
-        r
-    }
-
-    fn upload(&mut self, s: VaId, size: (u32, u32), f: &FrameView<'_>) -> Result<(), EncodeError> {
-        let r = self.inner.upload(s, size, f);
-        if r.is_err() {
-            self.note(format!("upload: {r:?}"));
-        }
-        r
-    }
-
-    fn encode(&mut self, ctx: VaId, surface: VaId, ids: &[VaId]) -> Result<(), EncodeError> {
-        let n = self.frame;
-        self.note(format!("frame {n}: render {} buffers", ids.len()));
-        for (i, id) in ids.iter().enumerate() {
-            let (kind, data) = &self.buffers[id];
-            let what = match *kind {
-                ffi::BUF_PACKED_PARAM => {
-                    let p: ffi::VAEncPackedHeaderParameterBuffer = ffi::read(data);
-                    format!(
-                        "packed param type {} bits {} emulation {}",
-                        p.kind, p.bit_length, p.has_emulation_bytes
-                    )
-                }
-                ffi::BUF_PACKED_DATA => format!("packed data, NAL types {:?}", types_of(data)),
-                _ => String::new(),
-            };
-            self.note(format!("  [{i}] kind {kind} {} bytes {what}", data.len()));
-            let _ = std::fs::write(
-                self.dir.join(format!("frame{n}-buf{i}-kind{kind}.bin")),
-                data,
-            );
-        }
-        let r = self.inner.encode(ctx, surface, ids);
-        self.note(format!("frame {n}: encode = {r:?}"));
-        r
-    }
-
-    fn coded(&mut self, buf: VaId) -> Result<Vec<u8>, EncodeError> {
-        let n = self.frame;
-        self.frame += 1;
-        let segs = match self.inner.segments(buf) {
-            Ok(s) => s,
-            Err(e) => {
-                self.note(format!("frame {n}: segments: {e}"));
-                return Err(e);
-            }
-        };
-        let mut all = Vec::new();
-        for (i, s) in segs.iter().enumerate() {
-            let head: Vec<String> = s.data.iter().take(16).map(|b| format!("{b:02x}")).collect();
-            self.note(format!(
-                "frame {n}: segment {i}: size {} bit_offset {} status {:#x}, NAL types {:?}, first bytes {}",
-                s.size,
-                s.bit_offset,
-                s.status,
-                types_of(&s.data),
-                head.join(" ")
-            ));
-            let _ = std::fs::write(self.dir.join(format!("frame{n}-seg{i}.bin")), &s.data);
-            all.extend_from_slice(&s.data);
-        }
-        self.note(format!(
-            "frame {n}: {} segments, {} bytes, NAL types {:?}",
-            segs.len(),
-            all.len(),
-            types_of(&all)
-        ));
-        if segs
-            .iter()
-            .any(|s| s.status & ffi::CODED_BAD_BITSTREAM != 0)
-        {
-            return Err(err("the driver marked its output a bad bitstream"));
-        }
-        Ok(all)
-    }
-
-    fn destroy_buffer(&mut self, buf: VaId) {
-        self.buffers.remove(&buf);
-        self.inner.destroy_buffer(buf);
-    }
-
-    fn destroy(&mut self, config: VaId, ctx: VaId, surfaces: &[VaId]) {
-        self.inner.destroy(config, ctx, surfaces);
-    }
-}
-
-struct Setup {
-    name: &'static str,
-    w: u32,
-    h: u32,
-    cqp: bool,
-    hide_packed: bool,
-    only: Option<i32>,
-}
-
-impl Setup {
-    fn new(name: &'static str, w: u32, h: u32) -> Setup {
-        Setup {
-            name,
-            w,
-            h,
-            cqp: false,
-            hide_packed: false,
-            only: None,
-        }
-    }
-}
-
-fn dump_setup(
-    node: &std::path::Path,
-    dir: &std::path::Path,
-    notes: &Arc<Mutex<Vec<String>>>,
-    s: &Setup,
-) -> Result<Vec<String>, EncodeError> {
-    let rec = Recorder {
-        inner: driver::VaDriver::open(node)?,
-        dir: dir.to_path_buf(),
-        notes: notes.clone(),
-        hide_packed: s.hide_packed,
-        only: s.only,
-        buffers: HashMap::new(),
-        frame: 0,
-    };
-    let mut c = cfg(Codec::H264, s.w, s.h);
-    if s.cqp {
-        c.rate.max_kbps = 0;
-    }
-    let mut enc = session(Box::new(rec), &c)?;
-    let mut got = Vec::new();
-    for (i, key) in [false, false, false, true].into_iter().enumerate() {
-        match encode(enc.as_mut(), s.w, s.h, key) {
-            Ok(aus) => {
-                for a in &aus {
-                    got.push(format!(
-                        "frame {i}: unit keyframe {} {} bytes NAL types {:?} config {:?}",
-                        a.keyframe,
-                        a.data.len(),
-                        nal_types(a),
-                        a.config.as_ref().map(|c| c.codec_string.clone())
-                    ));
-                }
-                if aus.is_empty() {
-                    got.push(format!("frame {i}: no unit"));
-                }
-            }
-            Err(e) => got.push(format!("frame {i}: error {e}")),
-        }
-    }
-    Ok(got)
-}
-
-/// Real hardware, H.264 only: encodes IDR, P, P, IDR in several setups and writes, per
-/// setup under `$STARFOLD_VAAPI_DUMP/<setup>/`, every buffer rendered, every coded
-/// segment (size, status, bit offset, bytes) and the NAL types found, to `notes.txt`.
-#[test]
-#[ignore = "needs a VA-API GPU (/dev/dri/renderD*) and $STARFOLD_VAAPI_DUMP"]
-fn hardware_h264_dump() {
-    let Some(root) = std::env::var_os("STARFOLD_VAAPI_DUMP").map(std::path::PathBuf::from) else {
-        eprintln!("skipped: STARFOLD_VAAPI_DUMP unset");
-        return;
-    };
-    let Some(node) = render_nodes().ok().and_then(|n| n.into_iter().next()) else {
-        eprintln!("skipped: no render node");
-        return;
-    };
-    let setups = [
-        Setup::new("high-cbr-128", 128, 128),
-        Setup::new("high-cbr-1280x720", 1280, 720),
-        Setup {
-            cqp: true,
-            ..Setup::new("high-cqp-128", 128, 128)
-        },
-        Setup {
-            hide_packed: true,
-            ..Setup::new("high-unpacked-128", 128, 128)
-        },
-        Setup {
-            only: Some(ffi::PROFILE_H264_MAIN),
-            ..Setup::new("main-cbr-128", 128, 128)
-        },
-        Setup {
-            only: Some(ffi::PROFILE_H264_CB),
-            ..Setup::new("cb-cbr-128", 128, 128)
-        },
-    ];
-    let mut summary = Vec::new();
-    for s in setups {
-        let dir = root.join(s.name);
-        std::fs::create_dir_all(&dir).unwrap();
-        let notes = Arc::new(Mutex::new(Vec::new()));
-        let outcome = dump_setup(&node, &dir, &notes, &s);
-        let name = s.name;
-        let mut text = notes.lock().unwrap().join("\n");
-        match &outcome {
-            Ok(got) => text.push_str(&format!("\n{}\n", got.join("\n"))),
-            Err(e) => text.push_str(&format!("\nsession: {e}\n")),
-        }
-        std::fs::write(dir.join("notes.txt"), &text).unwrap();
-        summary.push(format!("== {name}\n{text}"));
-    }
-    let all = summary.join("\n");
-    std::fs::write(root.join("summary.txt"), &all).unwrap();
-    eprintln!("{all}");
 }
