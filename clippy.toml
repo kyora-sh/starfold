@@ -1,0 +1,4 @@
+disallowed-methods = [
+	{ path = "libloading::Library::new", reason = "on Windows this searches the executable's and current directory; load DLLs through crate::winlib::system or crate::winlib::absolute", allow-invalid = true },
+	{ path = "libloading::os::windows::Library::new", reason = "this searches the executable's and current directory; load DLLs through crate::winlib::system or crate::winlib::absolute", allow-invalid = true },
+]

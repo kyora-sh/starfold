@@ -89,7 +89,7 @@ unsafe fn owned<T: Interface>(p: *mut c_void, what: &str) -> Result<T, EncodeErr
 
 impl Mf {
     unsafe fn load() -> Result<Mf, String> {
-        let lib = Library::new("mfplat.dll").map_err(|e| format!("mfplat.dll: {e}"))?;
+        let lib = crate::winlib::system("mfplat.dll")?;
         let get = |e: libloading::Error| format!("mfplat.dll: {e}");
         let startup: MfStartup = *lib.get(b"MFStartup\0").map_err(get)?;
         let mf = Mf {
