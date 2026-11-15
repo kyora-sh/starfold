@@ -1177,6 +1177,27 @@ fn a_viewer_that_cant_decode_hardware_h264_gets_openh264() {
     assert!(!vl.is_empty());
 }
 
+/// A backend that gave up for good is not offered at the next size (a rebuild after a
+/// resize); /stats still says why it's gone.
+#[test]
+fn stats_keep_the_reason_of_an_encoder_not_offered() {
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_unsized: true,
+        ..Default::default()
+    };
+    let eng = Engine::new(config(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
+    assert_eq!(eng.h264, H264);
+    let enc = hub.encoder.lock();
+    let failed = enc["failed"].as_array().cloned().unwrap_or_default();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["backend"], "videotoolbox");
+    assert_eq!(
+        failed[0]["reason"],
+        "not offered at 640x480: MFX_ERR_UNSUPPORTED at this size"
+    );
+}
+
 #[test]
 fn a_pinned_hardware_encoder_that_cannot_start_stops_the_stream_with_the_reason() {
     let cands = [H264_HW, H264];

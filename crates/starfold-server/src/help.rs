@@ -202,9 +202,9 @@ fn encoder_entries(usage: &str) -> String {
     };
     let paintover: Vec<String> = build_facts::readers("paintover-crf")
         .into_iter()
-        .map(|(name, what)| match what.contains("--max-kbps 0") {
-            true => format!("{name} (with --max-kbps 0)"),
-            false => name.to_string(),
+        .map(|(name, what)| match what {
+            "paint-over quality" => name.to_string(),
+            _ => format!("{name} (as its {what})"),
         })
         .collect();
     let paintover = match paintover.is_empty() {

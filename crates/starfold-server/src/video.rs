@@ -1202,10 +1202,13 @@ impl Engine {
             .map(|o| o.cand)
             .filter(|c| !self.failed.contains(c))
             .collect();
+        // Encoders left at this size, and those never offered at it: after a rebuild (a
+        // resize) a backend that gave up for good shows up as the latter, with its reason.
         let failed: Vec<serde_json::Value> = self
             .why
             .iter()
             .filter(|(c, _)| self.failed.contains(c))
+            .chain(&self.unoffered)
             .map(|(c, why)| {
                 serde_json::json!({"codec": c.codec, "backend": c.backend, "reason": why})
             })

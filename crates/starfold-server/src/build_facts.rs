@@ -116,31 +116,50 @@ pub const ENCODERS: &[Encoder] = &[
         uncapped_only: false,
         gpl: true,
     },
-    hardware("videotoolbox", cfg!(target_os = "macos"), false),
-    hardware("vaapi", cfg!(target_os = "linux"), true),
-    hardware("nvenc", cfg!(any(target_os = "linux", windows)), true),
-    hardware("mediafoundation", cfg!(windows), true),
-    hardware("qsv", cfg!(windows), true),
+    hardware("videotoolbox", cfg!(target_os = "macos"), Qp::Never),
+    hardware("vaapi", cfg!(target_os = "linux"), Qp::Negotiated),
+    hardware(
+        "nvenc",
+        cfg!(any(target_os = "linux", windows)),
+        Qp::Uncapped,
+    ),
+    hardware("mediafoundation", cfg!(windows), Qp::Uncapped),
+    hardware("qsv", cfg!(windows), Qp::Uncapped),
 ];
 
+/// When a hardware encoder codes at a constant QP: then `--crf` is that QP, and
+/// `--paintover-crf` while it sharpens; under a bitrate (CBR, VBR) it ignores both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Qp {
+    /// It sets a bitrate only.
+    Never,
+    /// With an uncapped bitrate (`--max-kbps 0`), and only then: a cap is always CBR.
+    Uncapped,
+    /// When the driver's rate control comes out at constant QP: the first choice with
+    /// `--max-kbps 0`, and also with a cap on a driver that has no CBR or VBR (VA-API).
+    Negotiated,
+}
+
 /// A hardware H.264 encoder built on this platform when `built`. None takes a preset or links
-/// anything; one with `constant_qp` codes an uncapped bitrate at a constant QP, `--crf` (and
-/// `--paintover-crf` while sharpening), and a capped one with CBR, which ignores both.
-const fn hardware(name: &'static str, built: bool, constant_qp: bool) -> Encoder {
+/// anything; what `--crf` and `--paintover-crf` are to it follows `qp`.
+const fn hardware(name: &'static str, built: bool, qp: Qp) -> Encoder {
     Encoder {
         name,
         built,
         hardware: true,
         h264: true,
-        crf: if constant_qp {
-            Some("constant QP with --max-kbps 0")
-        } else {
-            None
+        crf: match qp {
+            Qp::Never => None,
+            Qp::Uncapped => Some("constant QP with --max-kbps 0"),
+            Qp::Negotiated => Some(
+                "constant QP whenever the driver codes at one (with --max-kbps 0, or a cap on \
+                 a driver without CBR or VBR)",
+            ),
         },
         preset: None,
-        paintover_crf: constant_qp,
+        paintover_crf: !matches!(qp, Qp::Never),
         refines_to_paintover_crf: false,
-        uncapped_only: constant_qp,
+        uncapped_only: matches!(qp, Qp::Uncapped),
         gpl: false,
     }
 }
@@ -198,11 +217,13 @@ fn meaning(e: &Encoder, flag: &str) -> Option<&'static str> {
     match flag {
         "preset" => e.preset,
         "crf" => e.crf,
-        "paintover-crf" => e.paintover_crf.then_some(if e.uncapped_only {
-            "paint-over QP with --max-kbps 0"
-        } else {
-            "paint-over quality"
-        }),
+        "paintover-crf" => e
+            .paintover_crf
+            .then_some(match (e.hardware, e.uncapped_only) {
+                (true, true) => "paint-over QP with --max-kbps 0",
+                (true, false) => "paint-over QP whenever the driver codes at a constant QP",
+                (false, _) => "paint-over quality",
+            }),
         _ => None,
     }
 }
@@ -314,17 +335,28 @@ mod tests {
             assert_eq!(parsed.is_ok(), e.built, "{}", e.name);
             assert!(parsed.is_ok_and(|b| b.name() == e.name) || !e.built);
             assert!(e.h264 && !e.gpl && e.preset.is_none(), "{}", e.name);
-            for flag in FLAGS {
-                assert!(!reads(e.name, flag, false), "{} {flag} capped", e.name);
-            }
         }
-        // With an uncapped bitrate these code at a constant QP: --crf, and --paintover-crf
-        // while sharpening (set_rate takes its quality). VideoToolbox sets a bitrate only.
-        for name in ["vaapi", "nvenc", "mediafoundation", "qsv"] {
-            assert!(reads(name, "crf", true) && reads(name, "paintover-crf", true));
-            assert!(!reads(name, "preset", true));
+        // NVENC, Media Foundation and Quick Sync run CQP exactly when uncapped (a cap is
+        // always CBR): --crf, and --paintover-crf while sharpening (set_rate takes its
+        // quality), only then.
+        for name in ["nvenc", "mediafoundation", "qsv"] {
+            for flag in ["crf", "paintover-crf"] {
+                assert!(reads(name, flag, true), "{name} {flag} uncapped");
+                assert!(!reads(name, flag, false), "{name} {flag} capped");
+            }
             let w = flag_ignored("crf", name);
             assert!(w.contains("only with --max-kbps 0"), "{w}");
+        }
+        // VA-API takes the driver's first mode of CQP, VBR, CBR uncapped and of CBR, VBR,
+        // CQP capped, so a capped stream can still run CQP: no cap rules the flags out.
+        let vaapi = ENCODERS.iter().find(|e| e.name == "vaapi").unwrap();
+        for flag in ["crf", "paintover-crf"] {
+            assert!(reads("vaapi", flag, true) && reads("vaapi", flag, false));
+            let what = meaning(vaapi, flag).unwrap();
+            assert!(what.contains("whenever the driver codes at"), "{what}");
+        }
+        for name in ["vaapi", "nvenc", "mediafoundation", "qsv", "videotoolbox"] {
+            assert!(!reads(name, "preset", true) && !reads(name, "preset", false));
         }
         assert!(FLAGS.iter().all(|f| !reads("videotoolbox", f, true)));
         let hw = hardware_encoders();
