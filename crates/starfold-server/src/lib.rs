@@ -8,6 +8,7 @@ mod access;
 mod actions;
 #[cfg(target_os = "linux")]
 mod audio;
+mod build_facts;
 #[cfg(target_os = "linux")]
 mod capture;
 mod compat;
@@ -184,7 +185,7 @@ async fn serve(a: HashMap<String, String>) {
             .iter()
             .filter(|f| a.contains_key(**f))
         {
-            log::warn!("--{flag} is an x264 setting; {} ignores it", encoder.name());
+            log::warn!("{}", build_facts::x264_flag_ignored(flag, encoder.name()));
         }
         if a.contains_key("crf") {
             if encoder == encoder::Backend::OpenH264 {
@@ -192,7 +193,7 @@ async fn serve(a: HashMap<String, String>) {
                     "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
                 );
             } else {
-                log::warn!("--crf is an x264 setting; {} ignores it", encoder.name());
+                log::warn!("{}", build_facts::x264_flag_ignored("crf", encoder.name()));
             }
         }
     }

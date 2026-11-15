@@ -82,12 +82,12 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--basic-auth-user`                                            | any                                                                   | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                                  | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                               | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
-| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else x264; or the H.264 one: `x264`, `videotoolbox`, `openh264` (openh264 builds), or the experimental `vaapi`, `nvenc`, `mediafoundation` |
+| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`, or the experimental `vaapi`, `nvenc`, `mediafoundation` |
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
 | `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC and Media Foundation, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                                     |
-| `--preset`                                                     | `ultrafast`                                                           | x264 preset                                                                                                                                                                                               |
+| `--preset`                                                     | `ultrafast`                                                           | x264 preset (builds with x264)                                                                                                                                                                            |
 | `--encoder-threads`                                            | `ncpu/4`, from 1 to 4                                                 | sliced encoder threads                                                                                                                                                                                    |
-| `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion; other encoders ignore it                                                                                                                             |
+| `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion (each if built in); other encoders ignore it                                                                                                          |
 | `--max-kbps` / `--video-bitrate`                               | `30000`                                                               | adaptive bitrate ceiling                                                                                                                                                                                  |
 | `--min-kbps`                                                   | `2000`                                                                | adaptive bitrate floor                                                                                                                                                                                    |
 | `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                                                      | sharpening when the screen goes still (`--paintover-crf` is x264's; other encoders ignore it)                                                                                                             |
@@ -180,8 +180,8 @@ own. It needs `--stripes=1` (otherwise 409), and a resize ends it. It doesn't in
 cursor, which viewers draw, except on macOS when the cursor is in the video: with
 `--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
 
-If another encoder takes over mid-recording (a hardware encoder failing over to x264,
-say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
+If another encoder takes over mid-recording (a hardware encoder failing over to the
+software one, say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
@@ -312,7 +312,8 @@ Phones and tablets get touch input and an on-screen keyboard.
 
 **Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
-**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264.
+**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
+(OpenH264 in a build without x264).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
 macOS). The VA-API, NVENC and Media Foundation encoders are experimental: start with
 `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc` or `mediafoundation`;

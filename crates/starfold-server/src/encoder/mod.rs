@@ -286,13 +286,8 @@ impl Backend {
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
             _ => Err(format!(
-                "unknown encoder {s:?} (auto{}{}{})",
-                if cfg!(feature = "x264") { ", x264" } else { "" },
-                if cfg!(feature = "openh264") {
-                    ", openh264"
-                } else {
-                    ""
-                },
+                "unknown encoder {s:?} (auto, {}{})",
+                crate::build_facts::software_encoders().join(", "),
                 if cfg!(target_os = "macos") {
                     ", videotoolbox"
                 } else if cfg!(target_os = "linux") {
