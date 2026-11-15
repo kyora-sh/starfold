@@ -294,17 +294,13 @@ impl Backend {
             #[cfg(not(windows))]
             "qsv" => Err("qsv is Windows-only".into()),
             _ => Err(format!(
-                "unknown encoder {s:?} (auto, {}{})",
-                crate::build_facts::software_encoders().join(", "),
-                if cfg!(target_os = "macos") {
-                    ", videotoolbox"
-                } else if cfg!(target_os = "linux") {
-                    ", vaapi, nvenc"
-                } else if cfg!(windows) {
-                    ", nvenc, mediafoundation, qsv"
-                } else {
-                    ""
-                }
+                "unknown encoder {s:?} (auto, {})",
+                [
+                    crate::build_facts::encoder_names(),
+                    crate::build_facts::hardware_encoders()
+                ]
+                .concat()
+                .join(", ")
             )),
         }
     }
@@ -499,7 +495,22 @@ impl Selection {
             Selection::Arm(name, ..) => name,
         }
     }
+
+    /// The encoder `--preset` is given for: the pinned one or the bench arm, and under
+    /// `auto` [`SOFTWARE_H264`]. Every other encoder opens with [`DEFAULT_PRESET`].
+    pub fn preset_backend(self) -> Backend {
+        match self {
+            Selection::Auto => SOFTWARE_H264,
+            Selection::Pinned(b) => b,
+            #[cfg(feature = "sw-arm")]
+            Selection::Arm(_, b, _) => b,
+        }
+    }
 }
+
+/// The preset every encoder takes as its own default: x264's name for its fastest preset,
+/// which the bench arms read as "no preset given".
+pub const DEFAULT_PRESET: &str = "ultrafast";
 
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {

@@ -540,7 +540,11 @@ fn encoder_config(
         },
         rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,
-        preset: cfg.preset.clone(),
+        preset: if cand.backend == cfg.selection.preset_backend() {
+            cfg.preset.clone()
+        } else {
+            encoder::DEFAULT_PRESET.into()
+        },
     }
 }
 

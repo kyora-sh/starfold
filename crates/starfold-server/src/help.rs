@@ -166,41 +166,59 @@ fn entry(flag: &str, text: &str) -> String {
 
 /// The entries that name software encoders, from what this build includes.
 fn encoder_entries(usage: &str) -> String {
-    let mut crf = Vec::new();
-    if build_facts::has_x264() {
-        crf.push("x264's base quality;");
-    }
-    if build_facts::has_openh264() {
-        crf.push("OpenH264's lowest QP in motion;");
-    }
-    let encoder = format!(
-        "auto: each codec from its hardware encoder, H.264 from {} where there is none \
-         (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows), mediafoundation or qsv (Windows, Intel Quick Sync); vaapi, \
-         nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes and \
-         auto never picks them; /stats \
-         shows what the probe found",
-        build_facts::software_h264(),
-        build_facts::software_encoders().join(", ")
-    );
-    let crf = format!("{} other encoders ignore it (default 24)", crf.join(" "));
-    let (preset, paintover) = if build_facts::has_x264() {
-        (
-            "x264 preset (default ultrafast)",
-            "sharpening once the screen goes still (default 16, 3, 150); --paintover-crf is x264's, other encoders ignore it",
-        )
-    } else {
-        (
-            "ignored: this build's encoders take no preset (default ultrafast)",
-            "sharpening once the screen goes still (default 16, 3, 150); this build's encoders ignore --paintover-crf",
-        )
+    let sw = build_facts::software_h264();
+    let arms = build_facts::bench_arms();
+    let arms = match arms.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; or a bench arm, streamed beside {sw}: {}",
+            arms.join(", ")
+        ),
     };
+    let encoder = format!(
+        "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
+         (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
+         nvenc (Linux, Windows), mediafoundation or qsv (Windows, Intel Quick Sync){arms}; \
+         vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
+         and auto never picks them; /stats shows what the probe found",
+        build_facts::h264_encoders().join(", ")
+    );
+    let crf: Vec<String> = build_facts::readers("crf")
+        .into_iter()
+        .map(|(name, what)| format!("{name}'s {what};"))
+        .collect();
+    let crf = format!("{} other encoders ignore it (default 24)", crf.join(" "));
+    let presets: Vec<String> = build_facts::readers("preset")
+        .into_iter()
+        .map(|(name, what)| format!("{name}: {what}"))
+        .collect();
+    let preset = match presets.is_empty() {
+        true => "ignored: this build's encoders take no preset".to_string(),
+        false => format!(
+            "for the encoder --encoder names (under auto, {sw}); the others keep their own \
+             default. {}",
+            presets.join("; ")
+        ),
+    };
+    let paintover: Vec<&str> = build_facts::readers("paintover-crf")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let paintover = match paintover.is_empty() {
+        true => "this build's encoders ignore --paintover-crf".to_string(),
+        false => format!(
+            "--paintover-crf reaches {}, other encoders ignore it",
+            paintover.join(", ")
+        ),
+    };
+    let paintover =
+        format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
     usage
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
-        .replace("PRESET_ENTRY\n", &entry("--preset", preset))
-        .replace("PAINTOVER_ENTRY\n", &entry(paintover_flags, paintover))
+        .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
+        .replace("PAINTOVER_ENTRY\n", &entry(paintover_flags, &paintover))
 }
 
 /// `--help`'s text, with `addr` as the default listen address.
@@ -291,12 +309,11 @@ mod tests {
         );
         let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let lower = words.to_lowercase();
+        for e in build_facts::ENCODERS {
+            assert_eq!(lower.contains(e.name), e.built, "{}:\n{text}", e.name);
+        }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
-        assert_eq!(
-            lower.contains("openh264"),
-            cfg!(feature = "openh264"),
-            "{text}"
-        );
+        assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
         assert!(
             words.contains(&format!(
                 "H.264 from {} where there is none",
