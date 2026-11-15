@@ -4,7 +4,7 @@
 use super::ffi::{self, VAConfigAttrib, VADisplay, VAImage, Va, VaId};
 use crate::encoder::hw::write_nv12;
 use crate::encoder::{EncodeError, FrameView};
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 use std::os::fd::AsRawFd;
 
 pub trait Driver: Send {
@@ -22,6 +22,11 @@ pub trait Driver: Send {
         entrypoint: c_int,
         attribs: &[(c_int, u32)],
     ) -> Result<VaId, EncodeError>;
+    /// The smallest picture a context for this profile and entrypoint takes, where the
+    /// driver says (as surface attributes: libva has no config attribute for it).
+    fn min_size(&mut self, _profile: c_int, _entrypoint: c_int) -> Option<(u32, u32)> {
+        None
+    }
     fn create_surfaces(&mut self, w: u32, h: u32, n: usize) -> Result<Vec<VaId>, EncodeError>;
     fn create_context(
         &mut self,
@@ -97,6 +102,27 @@ impl VaDriver {
         } else {
             Err(EncodeError(format!("{what}: {}", self.va.describe(r))))
         }
+    }
+
+    /// The surface attributes of `config`, empty if the driver doesn't list them.
+    fn surface_attribs(&self, config: VaId) -> Vec<ffi::VASurfaceAttrib> {
+        let mut n: c_uint = 0;
+        let r = unsafe {
+            (self.va.query_surface_attributes)(self.dpy, config, std::ptr::null_mut(), &mut n)
+        };
+        if r != 0 || n == 0 || n > 256 {
+            return Vec::new();
+        }
+        let mut v = vec![ffi::zeroed::<ffi::VASurfaceAttrib>(); n as usize];
+        let mut got = n;
+        let r = unsafe {
+            (self.va.query_surface_attributes)(self.dpy, config, v.as_mut_ptr(), &mut got)
+        };
+        if r != 0 {
+            return Vec::new();
+        }
+        v.truncate(got.min(n) as usize);
+        v
     }
 
     /// Maps `image`, writes the picture into it and unmaps it.
@@ -203,6 +229,29 @@ impl Driver for VaDriver {
             )
         })?;
         Ok(id)
+    }
+
+    fn min_size(&mut self, profile: c_int, entrypoint: c_int) -> Option<(u32, u32)> {
+        let config = self
+            .create_config(
+                profile,
+                entrypoint,
+                &[(ffi::ATTRIB_RT_FORMAT, ffi::RT_FORMAT_YUV420)],
+            )
+            .ok()?;
+        let attrs = self.surface_attribs(config);
+        unsafe { (self.va.destroy_config)(self.dpy, config) };
+        let get = |kind| {
+            attrs
+                .iter()
+                .find(|a| a.kind == kind && a.value.kind == ffi::GENERIC_VALUE_INTEGER)
+                .map(|a| a.value.value as usize as u32)
+                .filter(|&v| v > 0 && v < 1 << 16)
+        };
+        Some((
+            get(ffi::SURFACE_ATTRIB_MIN_WIDTH)?,
+            get(ffi::SURFACE_ATTRIB_MIN_HEIGHT)?,
+        ))
     }
 
     fn create_surfaces(&mut self, w: u32, h: u32, n: usize) -> Result<Vec<VaId>, EncodeError> {

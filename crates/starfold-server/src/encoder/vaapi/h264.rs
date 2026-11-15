@@ -1,10 +1,13 @@
 //! H.264: SPS and PPS packed before every IDR (when the driver takes packed headers),
 //! slice headers from the driver. POC type 2, so no reordering and no POC in the slice.
+//! A driver may code the IDR from the packed SPS and PPS yet leave them out of its
+//! output (Mesa's radeonsi writes packed headers only next to a packed slice header);
+//! the IDR then gets the ones it was given.
 
 use super::bits::{nal, Bits};
 use super::ffi::{self, VaId};
 use super::session::{Buffer, Choice, Params, Picture, Rc, RcMode};
-use crate::encoder::h264::ParamSets;
+use crate::encoder::h264::{nal_type, nal_units, ParamSets, NAL_PPS, NAL_SPS};
 use crate::encoder::{AccessUnit, ColorInfo, EncodeError, EncoderConfig};
 
 pub const PROFILES: &[i32] = &[
@@ -56,6 +59,8 @@ pub struct H264 {
     packed: bool,
     pps_qp: u8,
     units: ParamSets,
+    /// The SPS and PPS packed for the picture in flight.
+    sent: Vec<u8>,
 }
 
 impl H264 {
@@ -71,6 +76,7 @@ impl H264 {
             packed: choice.packed == Some(BOTH),
             pps_qp: rc.qp,
             units: ParamSets::default(),
+            sent: Vec::new(),
         };
         let (level, _) = h.level_for(rc.bps).ok_or_else(|| {
             EncodeError(format!(
@@ -271,9 +277,12 @@ impl Params for H264 {
                 | 1 << 9;
         });
         out.push(Buffer::new(ffi::BUF_PICTURE, pic));
+        self.sent.clear();
         if p.idr && self.packed {
-            out.extend(Buffer::packed(ffi::PACKED_TYPE_SEQUENCE, self.sps()));
-            out.extend(Buffer::packed(ffi::PACKED_TYPE_PICTURE, self.pps()));
+            let (sps, pps) = (self.sps(), self.pps());
+            self.sent = [sps.as_slice(), pps.as_slice()].concat();
+            out.extend(Buffer::packed(ffi::PACKED_TYPE_SEQUENCE, sps));
+            out.extend(Buffer::packed(ffi::PACKED_TYPE_PICTURE, pps));
         }
         let sl = ffi::param(|sl: &mut ffi::VAEncSliceParameterBufferH264| {
             sl.num_macroblocks = self.mbs.0 * self.mbs.1;
@@ -315,6 +324,15 @@ impl Params for H264 {
         pts_ms: i64,
         idr: bool,
     ) -> Result<Option<AccessUnit>, EncodeError> {
+        let sent = std::mem::take(&mut self.sent);
+        let data = if idr
+            && !sent.is_empty()
+            && !nal_units(&data).any(|n| matches!(nal_type(n), NAL_SPS | NAL_PPS))
+        {
+            [sent, data].concat()
+        } else {
+            data
+        };
         let au = self.units.unit(data, pts_ms, self.size, self.color);
         match &au {
             None if idr => Err(EncodeError(

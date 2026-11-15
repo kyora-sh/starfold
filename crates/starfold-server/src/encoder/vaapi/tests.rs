@@ -93,6 +93,7 @@ struct Log {
     surfaces: Vec<VaId>,
     encoded: Vec<VaId>,
     config: Vec<Config>,
+    context: Option<(u32, u32)>,
     destroyed: bool,
 }
 
@@ -106,6 +107,11 @@ struct Fake {
     extra: Vec<Option<u32>>,
     slice: fn(bool) -> Vec<u8>,
     fail_encode: Option<usize>,
+    /// The smallest context it takes, reported as surface attributes.
+    min: Option<(u32, u32)>,
+    /// Like Mesa's radeonsi: packed headers come out only when the picture also has a
+    /// packed slice header (whose bits it writes itself).
+    headers_need_a_slice: bool,
     next: VaId,
     out: Vec<u8>,
 }
@@ -121,6 +127,8 @@ impl Fake {
             extra: Vec::new(),
             slice,
             fail_encode: None,
+            min: None,
+            headers_need_a_slice: false,
             next: 100,
             out: Vec::new(),
         };
@@ -173,7 +181,15 @@ impl Driver for Fake {
         Ok(s)
     }
 
-    fn create_context(&mut self, _: VaId, _: u32, _: u32, _: &[VaId]) -> Result<VaId, EncodeError> {
+    fn min_size(&mut self, _: i32, _: i32) -> Option<(u32, u32)> {
+        self.min
+    }
+
+    fn create_context(&mut self, _: VaId, w: u32, h: u32, _: &[VaId]) -> Result<VaId, EncodeError> {
+        if self.min.is_some_and(|m| w < m.0 || h < m.1) {
+            return Err(err("vaCreateContext: resolution not supported (19)"));
+        }
+        self.log.lock().unwrap().context = Some((w, h));
         Ok(self.id())
     }
 
@@ -206,9 +222,15 @@ impl Driver for Fake {
         }
         let bufs: Vec<(i32, Vec<u8>)> = ids.iter().map(|i| log.buffers[i].clone()).collect();
         let idr = bufs.iter().any(|b| b.0 == ffi::BUF_SEQUENCE);
+        let slice_packed = bufs.iter().any(|b| {
+            b.0 == ffi::BUF_PACKED_PARAM
+                && ffi::read::<ffi::VAEncPackedHeaderParameterBuffer>(&b.1).kind
+                    == ffi::PACKED_TYPE_SLICE
+        });
         self.out = bufs
             .iter()
             .filter(|b| b.0 == ffi::BUF_PACKED_DATA)
+            .filter(|_| slice_packed || !self.headers_need_a_slice)
             .flat_map(|b| b.1.clone())
             .collect();
         self.out.extend((self.slice)(idr));
@@ -744,6 +766,103 @@ fn h264_packs_both_parameter_sets_or_neither() {
     assert!(log.config[0].2.contains(&(ffi::ATTRIB_PACKED_HEADERS, 0)));
 }
 
+fn nal_types(a: &AccessUnit) -> Vec<u8> {
+    h264_nal::nal_units(&a.data)
+        .map(h264_nal::nal_type)
+        .collect()
+}
+
+#[test]
+fn h264_idrs_get_the_parameter_sets_a_driver_leaves_out() {
+    let (mut fake, log) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.headers_need_a_slice = true;
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    let mut aus = Vec::new();
+    for key in [false, false, true] {
+        aus.extend(encode(enc.as_mut(), 320, 240, key).unwrap());
+    }
+    assert_eq!(
+        aus.iter().map(nal_types).collect::<Vec<_>>(),
+        vec![vec![7, 8, 5], vec![1], vec![7, 8, 5]]
+    );
+    assert!(aus[0].keyframe && !aus[1].keyframe && aus[2].keyframe);
+    assert!(aus[0].config.is_some());
+    let log = log.lock().unwrap();
+    for (au, frame) in [(&aus[0], &log.frames[0]), (&aus[2], &log.frames[2])] {
+        let packed = find(frame, ffi::BUF_PACKED_DATA).concat();
+        assert!(au.data.starts_with(&packed), "the SPS and PPS it was given");
+    }
+}
+
+#[test]
+fn h264_output_with_its_own_parameter_sets_is_kept_and_without_a_slice_refused() {
+    let (fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    let au = encode(enc.as_mut(), 320, 240, false).unwrap();
+    assert_eq!(nal_types(&au[0]), vec![7, 8, 5], "not doubled");
+    for need_slice in [false, true] {
+        let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, |_| Vec::new());
+        fake.headers_need_a_slice = need_slice;
+        let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+        let e = encode(enc.as_mut(), 320, 240, false).err().unwrap();
+        assert!(e.0.contains("without a picture"), "{e}");
+    }
+}
+
+/// Mesa 26.0's radeonsi on VCN 1.0: 128x128 at the least, 130 wide for HEVC, and packed
+/// headers only beside a packed slice header.
+#[test]
+fn a_radeonsi_shaped_driver_passes_the_probe_sample() {
+    type Slice = fn(bool) -> Vec<u8>;
+    let h264: Slice = h264_slice;
+    for (profile, codec, slice, min, want) in [
+        (
+            ffi::PROFILE_H264_HIGH,
+            Codec::H264,
+            h264,
+            (128, 128),
+            (128, 128),
+        ),
+        (
+            ffi::PROFILE_HEVC_MAIN,
+            Codec::Hevc,
+            hevc_slice,
+            (130, 128),
+            (144, 128),
+        ),
+    ] {
+        let (mut fake, log) = Fake::new(profile, slice);
+        fake.min = Some(min);
+        fake.headers_need_a_slice = true;
+        sample_on(Box::new(fake), codec).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(log.lock().unwrap().context, Some(want), "{codec:?}");
+    }
+}
+
+#[test]
+fn the_probe_sample_stays_128_unless_the_driver_needs_more() {
+    for min in [None, Some((32, 32)), Some((128, 128))] {
+        for (profile, codec, slice) in [
+            (
+                ffi::PROFILE_H264_HIGH,
+                Codec::H264,
+                h264_slice as fn(bool) -> Vec<u8>,
+            ),
+            (ffi::PROFILE_HEVC_MAIN, Codec::Hevc, hevc_slice),
+        ] {
+            let (mut fake, log) = Fake::new(profile, slice);
+            fake.min = min;
+            sample_on(Box::new(fake), codec).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+            assert_eq!(log.lock().unwrap().context, Some((128, 128)), "{min:?}");
+        }
+    }
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.min = Some((130, 200));
+    assert_eq!(sample_size(&mut fake, Codec::H264), (144, 208));
+    fake.profiles.clear();
+    assert_eq!(sample_size(&mut fake, Codec::H264), (128, 128));
+}
+
 #[test]
 fn child_sessions_need_an_absolute_node() {
     assert!(child_session("h264:64x64@30,0,0,30,24,dev")
@@ -854,6 +973,14 @@ fn layouts_match_libva() {
         "VAEncMiscParameterBuffer_header",
         offset_of!(ffi::Misc<u32>, data),
     ));
+    want.push((
+        "VASurfaceAttribMinWidth",
+        ffi::SURFACE_ATTRIB_MIN_WIDTH as usize,
+    ));
+    want.push((
+        "VASurfaceAttribMinHeight",
+        ffi::SURFACE_ATTRIB_MIN_HEIGHT as usize,
+    ));
     let dir = std::env::temp_dir().join(format!("va-layout-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut c = String::from(
@@ -862,6 +989,8 @@ fn layouts_match_libva() {
     for (t, _) in &want {
         if *t == "VAEncMiscParameterBuffer_header" {
             c.push_str("printf(\"%zu\\n\", offsetof(VAEncMiscParameterBuffer, data));\n");
+        } else if t.starts_with("VASurfaceAttribMin") {
+            c.push_str(&format!("printf(\"%zu\\n\", (size_t){t});\n"));
         } else {
             c.push_str(&format!("printf(\"%zu\\n\", sizeof({t}));\n"));
         }
@@ -925,4 +1054,89 @@ fn hardware_smoke() {
             Err(e) => eprintln!("{codec:?}: {e}"),
         }
     }
+}
+
+/// Real hardware, a minute per codec: 1280x720 at 30 fps of moving content, paced to the
+/// clock, in the session `--encoder vaapi` opens, with a keyframe asked for every 10 s.
+/// Each stream goes to `$STARFOLD_VAAPI_OUT/minute.{h264,hevc}` when that is set.
+#[test]
+#[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
+fn hardware_minute() {
+    use std::time::{Duration, Instant};
+    let Some(node) = render_nodes().ok().and_then(|n| n.into_iter().next()) else {
+        eprintln!("skipped: no render node");
+        return;
+    };
+    let (w, h, fps) = (1280u32, 720u32, 30u64);
+    let out = std::env::var_os("STARFOLD_VAAPI_OUT").map(std::path::PathBuf::from);
+    let mut failed = Vec::new();
+    for (codec, ext) in [(Codec::H264, "h264"), (Codec::Hevc, "hevc")] {
+        let mut enc = match open_on(&node, &cfg(codec, w, h)) {
+            Ok(e) => e,
+            Err(e) => {
+                failed.push(format!("{codec:?}: open: {e}"));
+                continue;
+            }
+        };
+        let (mut y, uv) = grey(w, h);
+        let (mut stream, mut keys, mut slowest) = (Vec::new(), 0, Duration::ZERO);
+        let start = Instant::now();
+        let mut run = || -> Result<(), String> {
+            for i in 0..fps * 60 {
+                for (row, line) in y.chunks_mut(w as usize).enumerate() {
+                    for (col, p) in line.iter_mut().enumerate() {
+                        *p = ((col + row + 8 * i as usize) % 220 + 16) as u8;
+                    }
+                }
+                let f = FrameView {
+                    width: w,
+                    height: h,
+                    y: &y,
+                    u: &uv,
+                    v: &uv,
+                    stride_y: w as usize,
+                    stride_uv: w.div_ceil(2) as usize,
+                };
+                let key = i > 0 && i % (fps * 10) == 0;
+                let t = Instant::now();
+                let aus = enc
+                    .encode(
+                        &f,
+                        EncodeOptions {
+                            pts_ms: (i * 1000 / fps) as i64,
+                            force_keyframe: key,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| format!("frame {i}: {e}"))?;
+                slowest = slowest.max(t.elapsed());
+                let [a] = aus.as_slice() else {
+                    return Err(format!("frame {i}: {} access units", aus.len()));
+                };
+                if a.keyframe != (i == 0 || key) {
+                    return Err(format!("frame {i}: keyframe {}", a.keyframe));
+                }
+                keys += a.keyframe as u32;
+                stream.extend_from_slice(&a.data);
+                let next = start + Duration::from_millis((i + 1) * 1000 / fps);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+            Ok(())
+        };
+        let r = run();
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{codec:?}: {:.1} s, {keys} keyframes, {} bytes ({:.0} kbit/s), slowest frame {slowest:?}",
+            secs,
+            stream.len(),
+            stream.len() as f64 * 8.0 / secs / 1000.0
+        );
+        if let Some(dir) = &out {
+            std::fs::write(dir.join(format!("minute.{ext}")), &stream).unwrap();
+        }
+        if let Err(e) = r {
+            failed.push(format!("{codec:?}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
 }

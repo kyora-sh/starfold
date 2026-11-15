@@ -60,6 +60,8 @@ pub const PACKED_TYPE_SLICE: u32 = 3;
 
 pub const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
 pub const SURFACE_ATTRIB_PIXEL_FORMAT: c_int = 1;
+pub const SURFACE_ATTRIB_MIN_WIDTH: c_int = 2;
+pub const SURFACE_ATTRIB_MIN_HEIGHT: c_int = 4;
 pub const SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 pub const GENERIC_VALUE_INTEGER: c_int = 1;
 pub const PROGRESSIVE: c_int = 0x1;
@@ -551,6 +553,8 @@ pub struct Va {
         *mut VaId,
     ) -> VAStatus,
     pub destroy_config: unsafe extern "C" fn(VADisplay, VaId) -> VAStatus,
+    pub query_surface_attributes:
+        unsafe extern "C" fn(VADisplay, VaId, *mut VASurfaceAttrib, *mut c_uint) -> VAStatus,
     pub create_surfaces: unsafe extern "C" fn(
         VADisplay,
         c_uint,
@@ -637,6 +641,7 @@ impl Va {
                 vendor: sym!(va, "vaQueryVendorString"),
                 create_config: sym!(va, "vaCreateConfig"),
                 destroy_config: sym!(va, "vaDestroyConfig"),
+                query_surface_attributes: sym!(va, "vaQuerySurfaceAttributes"),
                 create_surfaces: sym!(va, "vaCreateSurfaces"),
                 destroy_surfaces: sym!(va, "vaDestroySurfaces"),
                 create_context: sym!(va, "vaCreateContext"),
