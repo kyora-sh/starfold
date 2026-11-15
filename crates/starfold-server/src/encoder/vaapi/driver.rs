@@ -8,6 +8,10 @@ use std::ffi::{c_int, c_uint, c_void};
 use std::os::fd::AsRawFd;
 
 pub trait Driver: Send {
+    /// The driver's vendor string, empty if it gives none.
+    fn vendor(&mut self) -> String {
+        String::new()
+    }
     fn entrypoints(&mut self, profile: c_int) -> Result<Vec<c_int>, EncodeError>;
     /// Each attribute's value, `None` where the driver doesn't support it.
     fn attribs(
@@ -205,6 +209,10 @@ impl Drop for VaDriver {
 }
 
 impl Driver for VaDriver {
+    fn vendor(&mut self) -> String {
+        unsafe { super::vendor_string(&self.va, self.dpy) }
+    }
+
     fn entrypoints(&mut self, profile: c_int) -> Result<Vec<c_int>, EncodeError> {
         let max = unsafe { (self.va.max_num_entrypoints)(self.dpy) };
         if !(0..=256).contains(&max) {

@@ -360,7 +360,8 @@ pub(super) fn session(
     Ok(match cfg.codec {
         Codec::H264 => {
             let mut c = choose(drv.as_mut(), h264::PROFILES, size, &[])?;
-            c.packed = h264::H264::packed(c.packed);
+            let slices = h264::H264::wants_slice_headers(&drv.vendor());
+            c.packed = h264::H264::packed(c.packed, slices);
             Box::new(Session::new(drv, &c, cfg, |c, rc| {
                 h264::H264::new(c, cfg, rc)
             })?)
