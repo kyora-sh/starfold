@@ -1,9 +1,8 @@
 //! A helper process and what the server shares with it: its stdin and stdout, read and
 //! written without ever blocking, the shared section frames go through, and the means to
-//! kill it. On Windows the helper starts suspended, inside a job object that kills it when
-//! the server's handle closes (so it never outlives the server), inherits only its three
-//! standard handles, and runs only once it is in the job. On Unix (the tests' fakes) it
-//! leads its own process group.
+//! kill it. On Windows the helper is created inside a job object that kills it when the
+//! server's handle closes, so it never outlives the server, and it inherits only its three
+//! standard handles. On Unix (the tests' fakes) it leads its own process group.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -297,12 +296,34 @@ mod unix {
     }
 }
 
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: the only handles the child inherits.
+pub const HANDLE_LIST: usize = 0x0002_0002;
+/// `PROC_THREAD_ATTRIBUTE_JOB_LIST`: the jobs the child is created in (Windows 10 1607 /
+/// Server 2016 and later).
+pub const JOB_LIST: usize = 0x0002_000D;
+/// What a helper needs of Windows, said where it isn't there.
+pub const NEEDS: &str = "needs Windows 10 1607 / Server 2016 or later";
+
+/// The attributes a helper is created with, as (attribute, value, size) for
+/// UpdateProcThreadAttribute: its three standard handles as the only ones it inherits, and
+/// its job, which it is a member of from creation on: there is no moment it exists outside
+/// it, and no separate step that could put it there or fail to.
+pub fn attributes<H>(inherit: &[H; 3], job: &[H; 1]) -> [(usize, *const H, usize); 2] {
+    [
+        (
+            HANDLE_LIST,
+            inherit.as_ptr(),
+            std::mem::size_of_val(inherit),
+        ),
+        (JOB_LIST, job.as_ptr(), std::mem::size_of_val(job)),
+    ]
+}
+
 #[cfg(windows)]
 struct Inner {
     process: std::os::windows::io::OwnedHandle,
+    /// The job it was created in: ending the job ends it and whatever it started.
     job: std::os::windows::io::OwnedHandle,
-    /// It is in `job`: ending the job ends it and whatever it started.
-    assigned: bool,
     reaped: bool,
 }
 
@@ -312,9 +333,7 @@ impl Inner {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         let job = HANDLE(self.job.as_raw_handle());
-        let ended = self.assigned
-            && unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) }.is_ok();
-        if !ended {
+        if unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) }.is_err() {
             unsafe { win::TerminateProcess(self.process.as_raw_handle(), 1) };
         }
     }
@@ -327,7 +346,7 @@ impl Inner {
 
 #[cfg(windows)]
 mod win {
-    //! CreateProcessW with an explicit handle list and a suspended start, which
+    //! CreateProcessW with an explicit handle list and job list, which
     //! `std::process::Command` doesn't offer, and the section calls. Prototypes as the
     //! Win32 documentation gives them.
     use super::*;
@@ -390,10 +409,8 @@ mod win {
     const HANDLE_FLAG_INHERIT: u32 = 1;
     const PIPE_NOWAIT: u32 = 1;
     const STARTF_USESTDHANDLES: u32 = 0x100;
-    const CREATE_SUSPENDED: u32 = 0x4;
     const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
     const PAGE_READWRITE: u32 = 0x04;
     const FILE_MAP_WRITE: u32 = 0x02;
     pub const FILE_MAP_READ: u32 = 0x04;
@@ -451,7 +468,6 @@ mod win {
             si: *const StartupInfoExW,
             pi: *mut ProcessInformation,
         ) -> Bool;
-        fn ResumeThread(thread: Handle) -> u32;
         pub fn TerminateProcess(process: Handle, code: u32) -> Bool;
         pub fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
         fn CreateFileMappingW(
@@ -606,10 +622,10 @@ mod win {
             });
     }
 
-    /// Starts this executable as a Quick Sync helper with `args` after the helper flag:
-    /// suspended, with only its three pipe ends inherited, put in a kill-on-close job, then
-    /// resumed. Between CreateProcessW and the job it is suspended and has run nothing; only
-    /// the server dying in that window leaves it (suspended, never running) behind.
+    /// Starts this executable as a Quick Sync helper with `args` after the helper flag,
+    /// created inside a kill-on-close job (see [`super::attributes`]) and inheriting only
+    /// its three pipe ends. Where Windows can't create a process in a job, there is no
+    /// helper: it [`super::NEEDS`] a newer Windows.
     pub fn spawn_helper(args: &[&str]) -> Result<(Proc, Pipes), NotStarted> {
         let exe =
             std::env::current_exe().map_err(|e| format!("no path to this executable: {e}"))?;
@@ -647,28 +663,38 @@ mod win {
             out_w.as_raw_handle(),
             err_w.as_raw_handle(),
         ];
+        let jobs: [Handle; 1] = [job.as_raw_handle()];
+        let wanted = super::attributes(&inherit, &jobs);
         let mut size = 0usize;
-        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        let n = wanted.len() as u32;
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), n, 0, &mut size) };
         let mut list = vec![0u64; size.div_ceil(8).max(1)];
         let attrs: *mut c_void = list.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(attrs, n, 0, &mut size) } == 0 {
             return Err(last("InitializeProcThreadAttributeList").into());
         }
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                attrs,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                inherit.as_ptr().cast(),
-                std::mem::size_of_val(&inherit),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if updated == 0 {
-            let e = last("UpdateProcThreadAttribute");
-            unsafe { DeleteProcThreadAttributeList(attrs) };
-            return Err(e.into());
+        for (attribute, value, len) in wanted {
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    attrs,
+                    0,
+                    attribute,
+                    value.cast(),
+                    len,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if updated == 0 {
+                let e = last("UpdateProcThreadAttribute");
+                unsafe { DeleteProcThreadAttributeList(attrs) };
+                return Err(if attribute == super::JOB_LIST {
+                    format!("{} ({e})", super::NEEDS)
+                } else {
+                    e
+                }
+                .into());
+            }
         }
         let si = StartupInfoExW {
             info: StartupInfoW {
@@ -713,14 +739,20 @@ mod win {
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
                 std::ptr::null(),
                 std::ptr::null(),
                 &si,
                 &mut pi,
             )
         };
-        let created_err = (created == 0).then(|| last("CreateProcessW"));
+        let created_err = (created == 0).then(|| {
+            format!(
+                "{} (a helper {}: it is created inside its job)",
+                last("CreateProcessW"),
+                super::NEEDS
+            )
+        });
         unsafe { DeleteProcThreadAttributeList(attrs) };
         drop(list);
         drop((in_r, out_w, err_w));
@@ -728,45 +760,15 @@ mod win {
             return Err(e.into());
         }
         let process = owned(pi.process);
-        let thread = owned(pi.thread);
-        let proc = Arc::new(Proc {
+        drop(owned(pi.thread));
+        let proc = Proc {
             inner: Mutex::new(Inner {
                 process,
                 job,
-                assigned: false,
                 reaped: false,
             }),
             pid: pi.process_id,
-        });
-        let failed = |why: String| NotStarted {
-            why,
-            left: end_all(std::slice::from_ref(&proc), Duration::from_secs(2)),
         };
-        let assigned = {
-            use windows::Win32::Foundation::HANDLE;
-            use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-            let mut i = proc.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let r = unsafe {
-                AssignProcessToJobObject(
-                    HANDLE(i.job.as_raw_handle()),
-                    HANDLE(i.process.as_raw_handle()),
-                )
-            };
-            i.assigned = r.is_ok();
-            r
-        };
-        if let Err(e) = assigned {
-            return Err(failed(format!(
-                "couldn't put the helper in a job object: {e}"
-            )));
-        }
-        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-            return Err(failed(last("ResumeThread")));
-        }
-        let Ok(proc) = Arc::try_unwrap(proc) else {
-            return Err("the helper's process is shared".to_string().into());
-        };
-        drop(thread);
         forward(std::fs::File::from(err_r), pi.process_id);
         let pipes = Pipes {
             tx: Box::new(Tx(std::fs::File::from(in_w))),

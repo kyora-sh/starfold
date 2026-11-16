@@ -159,10 +159,17 @@ impl Policy {
         self.timing
     }
 
-    /// Holds on to helpers that did not exit after being killed.
+    /// Holds on to helpers that did not exit after being killed, each once however many
+    /// paths end it.
     pub fn keep(&self, left: Vec<Arc<Proc>>) {
-        if !left.is_empty() {
-            self.lock().stuck.extend(left);
+        if left.is_empty() {
+            return;
+        }
+        let mut s = self.lock();
+        for p in left {
+            if !s.stuck.iter().any(|q| Arc::ptr_eq(q, &p)) {
+                s.stuck.push(p);
+            }
         }
     }
 

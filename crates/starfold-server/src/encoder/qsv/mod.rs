@@ -44,6 +44,12 @@ pub use windows_impl::{open, provider};
 #[cfg(windows)]
 use windows_impl::{open_session, probe_here};
 
+/// Why Quick Sync is off in this process, as it stands now.
+#[cfg(windows)]
+pub fn off() -> Option<String> {
+    remote::POLICY.off()
+}
+
 /// More than any runtime lists; bounds what is read from its descriptions.
 const MAX_LIST: usize = 64;
 
@@ -376,22 +382,22 @@ mod windows_impl {
                     format!("{} lists no H.264 or HEVC encoder", imp.name),
                 );
             }
-            let mut stopped = false;
+            let mut stopped = None;
             for c in cs
                 .iter_mut()
                 .filter(|c| c.status == ProbeStatus::Discovered)
             {
-                if verify(c, a.luid) {
-                    stopped = true;
+                stopped = verify(c, a.luid);
+                if stopped.is_some() {
                     break;
                 }
             }
             found.caps.append(&mut cs);
-            if stopped {
+            if let Some(why) = stopped {
                 found.note(
                     Backend::Qsv,
                     Some(&a.label()),
-                    "the device stopped answering; no further adapter is probed",
+                    format!("{why}; no further adapter is probed"),
                 );
                 break;
             }
@@ -399,11 +405,12 @@ mod windows_impl {
         found
     }
 
-    /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not; true
-    /// if the device stopped answering (hung, failed or was lost).
-    fn verify(c: &mut super::EncoderCapability, luid: u64) -> bool {
+    /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not; the
+    /// reason (starting with [`STOPPED`]) if the device stopped answering (hung, failed or
+    /// was lost).
+    fn verify(c: &mut super::EncoderCapability, luid: u64) -> Option<String> {
         if !Backend::Qsv.implements(c.codec) {
-            return false;
+            return None;
         }
         let cfg = hw::sample_config(Backend::Qsv, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
         let r = open_session(&cfg, luid)
@@ -413,12 +420,11 @@ mod windows_impl {
                 c.status = ProbeStatus::Verified;
                 c.low_latency = Some(true);
                 c.keyframe_control = Some(true);
-                false
+                None
             }
             Err(e) => {
-                let stopped = e.0.starts_with(STOPPED);
                 c.status = ProbeStatus::Unavailable(format!("sample encode: {e}"));
-                stopped
+                e.0.starts_with(STOPPED).then_some(e.0)
             }
         }
     }

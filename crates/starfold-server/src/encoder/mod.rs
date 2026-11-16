@@ -539,6 +539,43 @@ pub struct EncoderConfig {
     pub preset: String,
 }
 
+/// The backends turned off for this process, and why, as they stand now: Quick Sync after
+/// a give-up, with the helpers that haven't exited yet.
+pub fn turned_off() -> Vec<(Backend, String)> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(why) = qsv::off() {
+        return vec![(Backend::Qsv, why)];
+    }
+    Vec::new()
+}
+
+/// `/stats`' `encoder` object with `off`'s reasons as they stand now: each backend in it is
+/// listed under `off`, and its `failed` entries give that reason rather than the one
+/// recorded when the stream fell back.
+pub fn with_live(encoder: &serde_json::Value, off: &[(Backend, String)]) -> serde_json::Value {
+    let mut e = encoder.clone();
+    let Some(obj) = e.as_object_mut() else {
+        return e;
+    };
+    if let Some(failed) = obj.get_mut("failed").and_then(|f| f.as_array_mut()) {
+        for f in failed {
+            let backend = f.get("backend").and_then(|b| b.as_str()).map(str::to_owned);
+            if let Some((_, why)) = off
+                .iter()
+                .find(|(b, _)| Some(b.name()) == backend.as_deref())
+            {
+                f["reason"] = serde_json::Value::from(why.as_str());
+            }
+        }
+    }
+    let list: Vec<serde_json::Value> = off
+        .iter()
+        .map(|(b, why)| serde_json::json!({"backend": b, "reason": why}))
+        .collect();
+    obj.insert("off".into(), serde_json::Value::Array(list));
+    e
+}
+
 /// Opens `cfg.backend`. Sizes it can't code (odd, or below its minimum) are coded
 /// larger, the last column and row repeated, and report the real size as `display`.
 pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {

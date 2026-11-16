@@ -1,18 +1,22 @@
-//! Termination, delivery and rate-buffer cases, against fake helpers (shell scripts that
-//! print what a helper would) and the fake runtime.
+//! Termination, delivery, probing and rate-buffer cases, against fake helpers (shell
+//! scripts that print what a helper would) and the fake runtime.
 
+use super::probe::{Probe as Prober, Verified};
 use super::proc;
 use super::proto::{Reply, Unit};
 use super::remote::{Policy, Remote, Timing};
 use super::session::Session;
 use super::tests::{bitstream, Fake};
+use crate::encoder::caps::{Acceleration, EncoderCapability, ProbeProvider, ProbeStatus};
 use crate::encoder::hw::sample_config;
+use crate::encoder::isolate::{Report, VERSION};
 use crate::encoder::{
     AccessUnit, Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
     VideoEncoder,
 };
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const QUICK: Timing = Timing {
@@ -285,5 +289,135 @@ fn rate_changes_stay_within_the_initial_buffer() {
     assert_eq!(resets.len(), 2);
     for r in resets {
         assert!(r <= init, "Reset asks for {r} KB, Init sized {init} KB");
+    }
+}
+
+/// A probe report, printed as a probe helper prints it.
+fn report(caps: Vec<EncoderCapability>, notes: &[&str]) -> String {
+    let mut found = crate::encoder::caps::Probe {
+        caps,
+        ..Default::default()
+    };
+    for n in notes {
+        found.note(Backend::Qsv, Some("luid:0000000000000001 Intel"), *n);
+    }
+    let r = Report {
+        probe: VERSION,
+        backend: Backend::Qsv,
+        caps: found.caps,
+        diagnostics: found.diagnostics,
+    };
+    let mut line = serde_json::to_string(&r).unwrap();
+    line.push('\n');
+    let octal: String = line.bytes().map(|b| format!("\\{b:03o}")).collect();
+    format!("printf '{octal}'")
+}
+
+fn cap(luid: u64, codec: Codec, status: ProbeStatus) -> EncoderCapability {
+    let device = format!("luid:{luid:016x} Intel(R) Graphics (mfx-gen, oneVPL API 2.9)");
+    let mut c = EncoderCapability::new(codec, Backend::Qsv, Acceleration::Hardware, device);
+    c.status = status;
+    c
+}
+
+const HANG: &str = "Quick Sync stopped: MFXVideoCORE_SyncOperation failed: MFX_ERR_GPU_HANG (-21)";
+
+/// The probe of one adapter: H.264 verified, then HEVC hangs the device.
+pub(super) fn hung_probe(
+    p: &'static Policy,
+    verified: &'static Verified,
+) -> crate::encoder::caps::Probe {
+    let script = report(
+        vec![
+            cap(1, Codec::H264, ProbeStatus::Verified),
+            cap(
+                1,
+                Codec::Hevc,
+                ProbeStatus::Unavailable(format!("sample encode: {HANG}")),
+            ),
+        ],
+        &[&format!("{HANG}; no further adapter is probed")],
+    );
+    Prober {
+        helpers: true,
+        spawn: Box::new(move || {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script.clone());
+            proc::spawn(c)
+        }),
+        policy: p,
+        verified,
+        timeout: Duration::from_secs(2),
+    }
+    .probe()
+}
+
+/// A device that stops answering during the probe ends Quick Sync for the process, as
+/// a hang while streaming does: what passed before it is not used.
+#[test]
+fn a_fatal_probe_status_ends_quick_sync_whatever_passed_before() {
+    let p = policy();
+    let verified: &'static Verified = Box::leak(Box::default());
+    let found = hung_probe(p, verified);
+    let off = p.off();
+    assert!(
+        off.as_deref()
+            .is_some_and(|o| o.contains("MFX_ERR_GPU_HANG")),
+        "{off:?}"
+    );
+    assert_eq!(verified.adapter(Codec::H264), None, "H.264 not offered");
+    assert!(
+        found
+            .caps
+            .iter()
+            .all(|c| matches!(&c.status, ProbeStatus::Unavailable(r) if r.contains("GPU_HANG"))),
+        "{:?}",
+        found.caps
+    );
+    let started = Arc::new(AtomicBool::new(false));
+    let seen = started.clone();
+    let spawn = move || {
+        seen.store(true, Ordering::SeqCst);
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(opened());
+        proc::spawn(c)
+    };
+    assert!(Remote::open(p, spawn, &cfg(), 1).is_err());
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "no helper starts afterwards"
+    );
+}
+
+/// One helper that won't exit counts once, however many paths end it: the give-up, then
+/// its encoder dropped.
+#[test]
+fn a_stuck_helper_counts_once() {
+    let p = policy();
+    let held = unwaitable(p);
+    let mut b = start!(p, format!("{}; sleep 30", opened())).unwrap();
+    let _ = frame(&mut b, 1);
+    until(Duration::from_secs(4), || {
+        p.off().is_some_and(|o| o.contains("did not exit"))
+    });
+    drop(held);
+    drop(b);
+    let off = p.off().expect("Quick Sync off");
+    assert!(off.contains("; 1 helper(s) did not exit"), "{off}");
+}
+
+/// No Quick Sync child is ever moved into its job after it exists: there is no call that
+/// could, so no moment it runs outside one.
+#[test]
+fn no_helper_is_put_in_a_job_after_it_is_created() {
+    let needle = concat!("Assign", "ProcessToJobObject");
+    for (name, src) in [
+        ("proc.rs", include_str!("proc.rs")),
+        ("remote.rs", include_str!("remote.rs")),
+        ("probe.rs", include_str!("probe.rs")),
+        ("helper.rs", include_str!("helper.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ] {
+        assert!(!src.contains(needle), "{name} calls {needle}");
     }
 }

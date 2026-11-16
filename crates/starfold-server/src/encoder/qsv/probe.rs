@@ -4,8 +4,10 @@
 //! gets no Quick Sync rather than a probe of its own.
 //!
 //! What it verified is kept: sessions open on the adapter that passed, not merely the
-//! first one listed.
+//! first one listed. A device that stops answering during the probe ends Quick Sync for
+//! the process, as one that stops while streaming does, whatever passed before it.
 
+use super::driver::STOPPED;
 use super::proc::{NotStarted, Pipes, Proc};
 use super::remote::Policy;
 use crate::encoder::caps::{Probe as Found, ProbeProvider, ProbeStatus};
@@ -54,6 +56,19 @@ impl Default for Verified {
 /// This process's verified adapters.
 pub static VERIFIED: Verified = Verified::new();
 
+/// Why the device stopped answering during the probe, if it did: whatever was verified
+/// before that is not to be used, on this adapter or another.
+fn stopped(found: &Found) -> Option<String> {
+    let caps = found.caps.iter().filter_map(|c| match &c.status {
+        ProbeStatus::Unavailable(r) => Some(r.as_str()),
+        _ => None,
+    });
+    let notes = found.diagnostics.iter().map(|d| d.reason.as_str());
+    notes
+        .chain(caps)
+        .find_map(|r| r.find(STOPPED).map(|i| r[i..].to_string()))
+}
+
 /// The LUID a probed device names: `luid:<16 hex digits> ...` (see `Adapter::label`).
 pub fn luid_of(device: &str) -> Option<u64> {
     let hex = device.strip_prefix("luid:")?.get(..16)?;
@@ -82,7 +97,15 @@ impl ProbeProvider for Probe {
                 "needs the helper process: this program doesn't run starfold's helpers",
             );
         }
-        let found = self.run();
+        let mut found = self.run();
+        if let Some(why) = stopped(&found) {
+            for c in &mut found.caps {
+                if c.status != ProbeStatus::Disabled {
+                    c.status = ProbeStatus::Unavailable(format!("probe: {why}"));
+                }
+            }
+            self.policy.give_up(&format!("the probe: {why}"));
+        }
         self.verified.set(&found);
         found
     }

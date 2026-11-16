@@ -277,7 +277,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
         "cohorts": &*s.hub.cohorts.lock(),
-        "encoder": &*s.hub.encoder.lock(),
+        "encoder": crate::encoder::with_live(&s.hub.encoder.lock(), &crate::encoder::turned_off()),
         "encoders": &*s.encoders,
     });
     (

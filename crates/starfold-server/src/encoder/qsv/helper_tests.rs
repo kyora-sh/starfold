@@ -316,6 +316,45 @@ fn the_helper_refuses_what_it_can_not_serve() {
     );
 }
 
+#[test]
+fn a_helper_is_created_in_its_job_inheriting_only_its_three_handles() {
+    use super::proc::{attributes, HANDLE_LIST, JOB_LIST};
+    assert_eq!((HANDLE_LIST, JOB_LIST), (0x0002_0002, 0x0002_000D));
+    let (inherit, job) = ([1usize, 2, 3], [9usize]);
+    let a = attributes(&inherit, &job);
+    let ids: Vec<usize> = a.iter().map(|x| x.0).collect();
+    assert_eq!(ids, vec![HANDLE_LIST, JOB_LIST], "both, in one list");
+    let w = std::mem::size_of::<usize>();
+    assert_eq!((a[0].1, a[0].2), (inherit.as_ptr(), 3 * w));
+    assert_eq!((a[1].1, a[1].2), (job.as_ptr(), w));
+}
+
+#[test]
+fn stats_say_why_quick_sync_is_off_as_it_stands_now() {
+    use crate::encoder::{turned_off, with_live, Backend};
+    let snapshot = serde_json::json!({
+        "mode": "qsv",
+        "chosen": [],
+        "failed": [
+            {"codec": "h264", "backend": "qsv", "reason": "qsv given up: helper 7 missed its deadline (a frame)"},
+            {"codec": "h264", "backend": "x264", "reason": "keeps failing"},
+        ],
+    });
+    let now = "qsv given up: helper 7 missed its deadline (a frame); 1 helper(s) did not exit";
+    let e = with_live(&snapshot, &[(Backend::Qsv, now.into())]);
+    assert_eq!(e["failed"][0]["reason"], now);
+    assert_eq!(e["failed"][1]["reason"], "keeps failing");
+    assert_eq!(
+        e["off"],
+        serde_json::json!([{"backend": "qsv", "reason": now}])
+    );
+    assert_eq!(e["chosen"], snapshot["chosen"]);
+    let quiet = with_live(&snapshot, &[]);
+    assert_eq!(quiet["failed"], snapshot["failed"]);
+    assert_eq!(quiet["off"], serde_json::json!([]));
+    assert!(turned_off().is_empty(), "no Quick Sync on this platform");
+}
+
 #[cfg(unix)]
 mod remote {
     use super::super::probe::{self, luid_of, Verified};
@@ -738,5 +777,20 @@ mod remote {
             found.diagnostics
         );
         assert!(p.off().is_none(), "reaped: nothing kept");
+    }
+
+    #[test]
+    fn stats_say_why_after_a_fatal_probe() {
+        let verified: &'static Verified = Box::leak(Box::default());
+        let p = policy(QUICK);
+        super::super::r1_tests::hung_probe(p, verified);
+        let off = p.off().expect("Quick Sync off");
+        let snapshot = serde_json::json!({"mode": "qsv", "chosen": [], "failed": []});
+        let e = crate::encoder::with_live(&snapshot, &[(Backend::Qsv, off)]);
+        let why = e["off"][0]["reason"].as_str().unwrap_or_default();
+        assert!(
+            why.starts_with("qsv given up: the probe: ") && why.contains("MFX_ERR_GPU_HANG"),
+            "{e}"
+        );
     }
 }

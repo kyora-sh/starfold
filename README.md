@@ -283,6 +283,10 @@ The other flags work as on Linux; `--microphone-fifo` and the rounded-corner fla
 apply. Dynamic resolution picks the largest display mode that fits the viewer's window,
 and Windows restores the original mode when starfold exits.
 
+The experimental Intel Quick Sync encoder (`--encoder qsv`, 64-bit only) runs in helper
+processes that are created inside a job object, which needs Windows 10 1607 / Server 2016
+or later; on an older system Quick Sync is unavailable.
+
 ## FAQ
 
 **Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through reverse
