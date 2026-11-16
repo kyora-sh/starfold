@@ -16,8 +16,11 @@ mod helper;
 mod helper_tests;
 #[cfg(windows)]
 mod locate;
+mod probe;
 mod proc;
 mod proto;
+#[cfg(all(test, unix))]
+mod r1_tests;
 mod remote;
 mod session;
 #[cfg(test)]
@@ -37,9 +40,9 @@ pub const HELPER_FLAG: &str = "--encoder-helper";
 #[cfg(windows)]
 pub use helper::main as helper_main;
 #[cfg(windows)]
-use windows_impl::open_session;
+pub use windows_impl::{open, provider};
 #[cfg(windows)]
-pub use windows_impl::{open, Probe};
+use windows_impl::{open_session, probe_here};
 
 /// More than any runtime lists; bounds what is read from its descriptions.
 const MAX_LIST: usize = 64;
@@ -257,11 +260,13 @@ fn session(
 #[cfg(windows)]
 mod windows_impl {
     use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus};
-    use super::super::{hw, Backend, EncodeError, EncoderConfig, VideoEncoder};
+    use super::super::{hw, isolate, Backend, EncodeError, EncoderConfig, VideoEncoder};
     use super::driver::{MfxRuntime, STOPPED};
+    use super::probe::{self, VERIFIED};
     use super::remote::{Remote, POLICY};
     use super::session::Session;
     use super::{caps, ffi, locate, pick, proc, read_impl, runtime_path, Adapter, ImplInfo};
+    use std::time::Duration;
 
     /// The side of the picture a probe encodes: the smallest `open` codes.
     const SAMPLE_SIDE: u32 = 160;
@@ -333,61 +338,65 @@ mod windows_impl {
         )
     }
 
-    pub struct Probe;
+    /// The server's Quick Sync probe: run in a helper, or not at all.
+    pub fn provider(timeout: Duration) -> Box<dyn ProbeProvider> {
+        Box::new(probe::Probe {
+            helpers: isolate::self_exec(),
+            spawn: Box::new(|| proc::spawn_helper(&["--probe"])),
+            policy: &POLICY,
+            verified: &VERIFIED,
+            timeout,
+        })
+    }
 
-    impl ProbeProvider for Probe {
-        fn backend(&self) -> Backend {
-            Backend::Qsv
+    /// The probe itself, in this process: only a helper runs it.
+    pub fn probe_here() -> Found {
+        let adapters = match locate::intel_adapters() {
+            Ok(a) => a,
+            Err(e) => return Found::failed(Backend::Qsv, e),
+        };
+        let mut found = Found::default();
+        if adapters.is_empty() {
+            found.note(Backend::Qsv, None, "no Intel graphics adapter");
         }
-
-        fn probe(&self) -> Found {
-            let adapters = match locate::intel_adapters() {
-                Ok(a) => a,
-                Err(e) => return Found::failed(Backend::Qsv, e),
+        for a in &adapters {
+            let (rt, imp) = match runtime(a) {
+                Ok(r) => r,
+                Err(e) => {
+                    found.note(Backend::Qsv, Some(&a.label()), e);
+                    continue;
+                }
             };
-            let mut found = Found::default();
-            if adapters.is_empty() {
-                found.note(Backend::Qsv, None, "no Intel graphics adapter");
+            drop(rt);
+            let mut cs = caps(&device(a, &imp), &imp);
+            if cs.is_empty() {
+                found.note(
+                    Backend::Qsv,
+                    Some(&a.label()),
+                    format!("{} lists no H.264 or HEVC encoder", imp.name),
+                );
             }
-            for a in &adapters {
-                let (rt, imp) = match runtime(a) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        found.note(Backend::Qsv, Some(&a.label()), e);
-                        continue;
-                    }
-                };
-                drop(rt);
-                let mut cs = caps(&device(a, &imp), &imp);
-                if cs.is_empty() {
-                    found.note(
-                        Backend::Qsv,
-                        Some(&a.label()),
-                        format!("{} lists no H.264 or HEVC encoder", imp.name),
-                    );
-                }
-                let mut stopped = false;
-                for c in cs
-                    .iter_mut()
-                    .filter(|c| c.status == ProbeStatus::Discovered)
-                {
-                    if verify(c, a.luid) {
-                        stopped = true;
-                        break;
-                    }
-                }
-                found.caps.append(&mut cs);
-                if stopped {
-                    found.note(
-                        Backend::Qsv,
-                        Some(&a.label()),
-                        "the device stopped answering; no further adapter is probed",
-                    );
+            let mut stopped = false;
+            for c in cs
+                .iter_mut()
+                .filter(|c| c.status == ProbeStatus::Discovered)
+            {
+                if verify(c, a.luid) {
+                    stopped = true;
                     break;
                 }
             }
-            found
+            found.caps.append(&mut cs);
+            if stopped {
+                found.note(
+                    Backend::Qsv,
+                    Some(&a.label()),
+                    "the device stopped answering; no further adapter is probed",
+                );
+                break;
+            }
         }
+        found
     }
 
     /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not; true
@@ -434,21 +443,24 @@ mod windows_impl {
         Ok((Session::new(Box::new(drv), cfg)?, imp.name))
     }
 
-    /// Opens a Quick Sync encoder for `cfg` in a helper process, on the first Intel adapter
-    /// DXGI lists. The server itself never loads or calls Intel's runtime: which adapter
-    /// encodes what comes from the probe child, and a helper that can't open says so.
+    /// Opens a Quick Sync encoder for `cfg` in a helper process, on the adapter the probe
+    /// verified `cfg`'s codec on. The server itself never loads or calls Intel's runtime.
     pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-        if let Some(off) = POLICY.off() {
-            return Err(EncodeError(off));
+        if !isolate::self_exec() {
+            return Err(EncodeError(
+                "Quick Sync needs the helper process: this program doesn't run starfold's helpers"
+                    .into(),
+            ));
         }
-        let luid = locate::intel_adapters()
-            .map_err(EncodeError)?
-            .first()
-            .map(|a| a.luid)
-            .ok_or_else(|| EncodeError("no Intel graphics adapter".into()))?;
+        let luid = VERIFIED.adapter(cfg.codec).ok_or_else(|| {
+            EncodeError(format!(
+                "no Intel adapter passed the Quick Sync probe for {:?}",
+                cfg.codec
+            ))
+        })?;
         Ok(Box::new(Remote::open(
             &POLICY,
-            proc::spawn_helper,
+            || proc::spawn_helper(&[]),
             cfg,
             luid,
         )?))

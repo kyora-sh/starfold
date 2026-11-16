@@ -207,13 +207,20 @@ pub fn serve(
     }
 }
 
-/// `--encoder-helper qsv`: serves the server on stdin and stdout.
+/// `--encoder-helper qsv`: serves the server on stdin and stdout. With `--probe` after it,
+/// runs the Quick Sync probe here instead and prints its report, as a probe child does.
 #[cfg(windows)]
 pub fn main(args: &[String]) -> i32 {
     use super::proc::Mapped;
-    if args.first().map(String::as_str) != Some("qsv") || args.len() != 1 {
-        eprintln!("{} takes qsv", super::HELPER_FLAG);
-        return BAD_REQUEST;
+    match args {
+        [qsv] if qsv == "qsv" => {}
+        [qsv, probe] if qsv == "qsv" && probe == "--probe" => {
+            return crate::encoder::isolate::report_main(Backend::Qsv, super::probe_here);
+        }
+        _ => {
+            eprintln!("{} takes qsv [--probe]", super::HELPER_FLAG);
+            return BAD_REQUEST;
+        }
     }
     struct Shared(Mapped);
     impl Frames for Shared {

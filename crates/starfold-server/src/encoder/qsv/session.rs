@@ -127,6 +127,9 @@ pub struct Session {
     /// The session runs on VDEnc (fixed-function, LowPower on).
     pub low_power: bool,
     rc: Rc,
+    /// The rate buffer Init sized the session for: Reset can't ask for more, so no rate
+    /// change does.
+    max_buffer_bits: u32,
     /// The highest bitrate the session has been set up for: a higher one goes out at an IDR.
     peak_bps: u32,
     /// The next picture must be an IDR: first frame, a raised rate, or the last encode
@@ -158,6 +161,12 @@ impl Session {
         }
         let color = ColorInfo::SRGB_BT601_LIMITED;
         let rc = Rc::new(cfg.codec, &cfg.rate, None);
+        let r = &cfg.rate;
+        let boosted = crate::video::keyframe_rate(r.quality, r.max_kbps, r.fps);
+        let mut init = rc;
+        init.buffer_bits = rc
+            .buffer_bits
+            .max(Rc::new(cfg.codec, &boosted, None).buffer_bits);
         let size = (cfg.width, cfg.height);
         let mut s = Session {
             rt: ManuallyDrop::new(rt),
@@ -172,6 +181,7 @@ impl Session {
             ctrl: Box::default(),
             low_power: true,
             rc,
+            max_buffer_bits: init.buffer_bits,
             peak_bps: rc.bps,
             need_idr: true,
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
@@ -184,7 +194,7 @@ impl Session {
             } else {
                 "LowPower off"
             };
-            let mut q = s.with_ext(params(cfg.codec, size, &rc, low_power));
+            let mut q = s.with_ext(params(cfg.codec, size, &init, low_power));
             let r = s.rt.query(&mut q);
             if fatal(r) {
                 return Err(s.failed("MFXVideoENCODE_Query", r));
@@ -196,7 +206,7 @@ impl Session {
                 ));
                 continue;
             }
-            let mut p = s.with_ext(params(cfg.codec, size, &rc, low_power));
+            let mut p = s.with_ext(params(cfg.codec, size, &init, low_power));
             let r = s.rt.init(&mut p);
             if r == ffi::WRN_PARTIAL_ACCELERATION {
                 return Err(EncodeError(
@@ -306,8 +316,10 @@ impl VideoEncoder for Session {
             return Ok(());
         }
         let raise = rc.bps > self.peak_bps;
+        let mut asked = rc;
+        asked.buffer_bits = asked.buffer_bits.min(self.max_buffer_bits);
         let mut p = self.par;
-        apply(&rc, &mut p.mfx);
+        apply(&asked, &mut p.mfx);
         let r = self.rt.reset(&mut p);
         if r < ffi::ERR_NONE {
             return Err(self.failed("MFXVideoENCODE_Reset", r));

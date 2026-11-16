@@ -178,7 +178,8 @@ fn encoder_entries(usage: &str) -> String {
     let encoder = format!(
         "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
          (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows), mediafoundation or qsv (Windows, Intel Quick Sync){arms}; \
+         nvenc (Linux, Windows), mediafoundation (Windows) or qsv (64-bit Windows, Intel Quick \
+         Sync){arms}; \
          vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
          and auto never picks them; /stats shows what the probe found",
         build_facts::h264_encoders().join(", ")

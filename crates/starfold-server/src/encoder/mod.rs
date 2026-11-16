@@ -38,10 +38,10 @@ mod mf;
 mod nvenc;
 #[cfg(feature = "openh264")]
 pub(crate) mod openh264;
-#[cfg(any(windows, all(test, target_os = "linux")))]
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod qsv;
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub use qsv::{helper_main, HELPER_FLAG};
 #[cfg(any(feature = "openh264", feature = "x264"))]
 pub(crate) mod sharpness;
@@ -293,10 +293,10 @@ impl Backend {
             "mediafoundation" => Ok(Backend::MediaFoundation),
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
-            #[cfg(windows)]
+            #[cfg(all(windows, target_arch = "x86_64"))]
             "qsv" => Ok(Backend::Qsv),
-            #[cfg(not(windows))]
-            "qsv" => Err("qsv is Windows-only".into()),
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            "qsv" => Err("qsv is Windows-only (64-bit)".into()),
             _ => Err(format!(
                 "unknown encoder {s:?} (auto, {})",
                 [
@@ -361,7 +361,10 @@ impl Backend {
             Backend::MediaFoundation => {
                 cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
-            Backend::Qsv => cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc),
+            Backend::Qsv => {
+                cfg!(all(windows, target_arch = "x86_64"))
+                    && matches!(codec, Codec::H264 | Codec::Hevc)
+            }
         }
     }
 
@@ -591,7 +594,7 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Nvenc => nvenc::open(&coded)?,
         #[cfg(windows)]
         Backend::MediaFoundation => mf::open(&coded)?,
-        #[cfg(windows)]
+        #[cfg(all(windows, target_arch = "x86_64"))]
         Backend::Qsv => qsv::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };

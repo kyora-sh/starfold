@@ -318,15 +318,20 @@ fn the_helper_refuses_what_it_can_not_serve() {
 
 #[cfg(unix)]
 mod remote {
-    use super::super::proc::{self, write_by, Pipes, Proc, Unwritten};
+    use super::super::probe::{self, luid_of, Verified};
+    use super::super::proc::{self, end_all, write_by, NotStarted, Pipes, Proc, Unwritten};
     use super::super::proto::{Reply, Unit};
     use super::super::remote::{Policy, Remote, Timing, TIMING};
     use super::super::tests::bitstream;
+    use crate::encoder::caps::{Acceleration, EncoderCapability, ProbeProvider, ProbeStatus};
     use crate::encoder::hw::sample_config;
+    use crate::encoder::isolate::{Report, VERSION};
     use crate::encoder::{
         Backend, Codec, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder,
     };
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     const QUICK: Timing = Timing {
@@ -362,7 +367,7 @@ mod remote {
         })
     }
 
-    fn helper(script: String) -> impl FnOnce() -> Result<(Proc, Pipes), String> {
+    fn helper(script: String) -> impl FnOnce() -> Result<(Proc, Pipes), NotStarted> {
         move || {
             let mut c = Command::new("sh");
             c.arg("-c").arg(script);
@@ -421,14 +426,18 @@ mod remote {
         }
     }
 
-    /// Quick Sync is off in `p` with a reason containing `said`, `pid` is gone, and no new
-    /// helper starts.
+    /// Quick Sync is off in `p` with a reason containing `said`, `pid` is gone (reaped
+    /// within the grace, by whichever thread gave up), and no new helper starts.
     fn given_up(p: &'static Policy, pid: u32, said: &str) {
         let off = p.off().expect("Quick Sync off");
         assert!(
             off.starts_with("qsv given up: ") && off.contains(said),
             "{off}"
         );
+        let t = Instant::now();
+        while alive(pid) && t.elapsed() < QUICK.grace {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!alive(pid), "helper {pid} killed and reaped");
         let spawned = p.spawned();
         let again = Remote::open(p, helper(opened()), &cfg(), 0x1234);
@@ -443,10 +452,8 @@ mod remote {
         assert_eq!(enc.name, "fake-gen");
         let pid = enc.pid();
         let t = Instant::now();
-        assert!(frame(&mut enc, 1).unwrap().is_empty(), "still in flight");
-        while (p.off().is_none() || alive(pid)) && t.elapsed() < QUICK.frame + QUICK.grace * 2 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let e = frame(&mut enc, 1).err().unwrap();
+        assert!(e.0.contains("missed its deadline (a frame)"), "{e}");
         assert!(
             t.elapsed() < QUICK.frame + QUICK.grace + Duration::from_millis(500),
             "killed and reaped after {:?}",
@@ -526,44 +533,210 @@ mod remote {
     fn a_helper_that_stops_reading_can_not_block_a_write() {
         let mut c = Command::new("sh");
         c.arg("-c").arg("sleep 30");
-        let (p, mut pipes) = proc::spawn(c).unwrap();
+        let (p, mut pipes) = proc::spawn(c).ok().unwrap();
+        let pid = p.id();
         let t = Instant::now();
         let big = vec![0u8; 4 << 20];
         let e = write_by(&mut *pipes.tx, &big, t + Duration::from_millis(300));
         assert_eq!(e, Err(Unwritten::Late));
         assert!(t.elapsed() < Duration::from_secs(2));
-        assert!(p.end(Duration::from_secs(1)));
-        assert!(!alive(p.id()));
+        assert!(end_all(&[Arc::new(p)], Duration::from_secs(1)).is_empty());
+        assert!(!alive(pid));
     }
 
     #[test]
-    fn two_frames_in_flight_then_only_the_newest_waits() {
+    fn each_frame_comes_back_from_its_own_call() {
         let p = policy(TIMING);
         let script = format!(
-            "{}; sleep 0.4; {}; sleep 0.05; {}; sleep 0.05; {}; sleep 30",
+            "{}; {}; sleep 0.05; {}; {}; sleep 30",
             opened(),
             done(0, true),
-            done(1, false),
-            done(0, false)
+            done(0, false),
+            done(0, true)
         );
         let mut enc = start(p, script);
-        for pts in 1..=4 {
-            assert!(frame(&mut enc, pts).unwrap().is_empty(), "frame {pts}");
+        let mut got = Vec::new();
+        for (pts, key) in [(1, false), (2, false), (3, true)] {
+            let (y, uv) = (vec![16u8; 64 * 48], vec![128u8; 32 * 24]);
+            let f = FrameView {
+                width: 64,
+                height: 48,
+                y: &y,
+                u: &uv,
+                v: &uv,
+                stride_y: 64,
+                stride_uv: 32,
+            };
+            let opts = EncodeOptions {
+                pts_ms: pts,
+                force_keyframe: key,
+                ..Default::default()
+            };
+            let aus = enc.encode(&f, opts).unwrap();
+            assert_eq!(aus.len(), 1, "frame {pts}");
+            assert!(
+                pts != 1 || aus[0].config.is_some(),
+                "the first carries the config"
+            );
+            got.push((aus[0].pts_ms, aus[0].keyframe));
         }
-        std::thread::sleep(Duration::from_millis(500));
-        let aus = enc.drain().unwrap();
-        let got: Vec<(i64, bool)> = aus.iter().map(|a| (a.pts_ms, a.keyframe)).collect();
-        assert_eq!(
-            got,
-            vec![(1, true), (2, false), (4, false)],
-            "frame 3 skipped"
-        );
-        assert_eq!(
-            enc.sent,
-            vec![(0, 1, false), (1, 2, false), (0, 4, false)],
-            "no IDR asked for the frame after the skip"
-        );
-        assert!(aus[0].config.is_some());
+        assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
+        assert_eq!(enc.sent, vec![(1, false), (2, false), (3, true)]);
+        assert!(enc.drain().unwrap().is_empty(), "nothing left in flight");
         assert!(p.off().is_none());
+    }
+
+    fn no_threads(_: &'static Policy) -> std::io::Result<()> {
+        Err(std::io::Error::other("no threads left"))
+    }
+
+    #[test]
+    fn a_watchdog_that_does_not_start_lets_no_helper_run() {
+        let p: &'static Policy = Box::leak(Box::new(Policy::with_watchdog(QUICK, no_threads)));
+        for _ in 0..2 {
+            let pid = Arc::new(AtomicU32::new(0));
+            let seen = pid.clone();
+            let spawn = move || {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(format!("{}; sleep 30", opened()));
+                let (proc, pipes) = proc::spawn(c)?;
+                seen.store(proc.id(), Ordering::SeqCst);
+                Ok((proc, pipes))
+            };
+            let e = Remote::open(p, spawn, &cfg(), 0x1234).err().unwrap();
+            assert!(e.0.contains("watchdog didn't start"), "{e}");
+            let pid = pid.load(Ordering::SeqCst);
+            assert!(pid != 0 && !alive(pid), "helper {pid} ended");
+        }
+        assert!(
+            p.off().is_none(),
+            "not a give-up: the next try starts it again"
+        );
+    }
+
+    #[test]
+    fn a_process_left_by_a_failed_start_is_kept_and_counted() {
+        let p = policy(QUICK);
+        let spawn = || {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("exit 0");
+            let (proc, _pipes) = proc::spawn(c)?;
+            let mut status = 0;
+            unsafe { libc::waitpid(proc.id() as libc::pid_t, &mut status, 0) };
+            Err(NotStarted {
+                why: "couldn't put the helper in a job object".into(),
+                left: end_all(&[Arc::new(proc)], Duration::from_millis(100)),
+            })
+        };
+        let e = Remote::open(p, spawn, &cfg(), 0x1234).err().unwrap();
+        assert!(e.0.contains("job object"), "{e}");
+        let off = p.off().expect("Quick Sync off");
+        assert!(off.contains("1 helper(s) did not exit"), "{off}");
+    }
+
+    fn report(caps: Vec<EncoderCapability>) -> String {
+        let r = Report {
+            probe: VERSION,
+            backend: Backend::Qsv,
+            caps,
+            diagnostics: Vec::new(),
+        };
+        let mut line = serde_json::to_string(&r).unwrap();
+        line.push('\n');
+        let octal: String = line.bytes().map(|b| format!("\\{b:03o}")).collect();
+        format!("printf '{octal}'")
+    }
+
+    fn cap(luid: u64, codec: Codec, status: ProbeStatus) -> EncoderCapability {
+        let device = format!("luid:{luid:016x} Intel(R) Graphics (mfx-gen, oneVPL API 2.9)");
+        let mut c = EncoderCapability::new(codec, Backend::Qsv, Acceleration::Hardware, device);
+        c.status = status;
+        c
+    }
+
+    fn prober(
+        p: &'static Policy,
+        verified: &'static Verified,
+        helpers: bool,
+        script: String,
+        started: Arc<AtomicBool>,
+    ) -> probe::Probe {
+        probe::Probe {
+            helpers,
+            spawn: Box::new(move || {
+                started.store(true, Ordering::SeqCst);
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(script.clone());
+                proc::spawn(c)
+            }),
+            policy: p,
+            verified,
+            timeout: Duration::from_millis(600),
+        }
+    }
+
+    #[test]
+    fn without_helpers_quick_sync_is_unavailable_and_nothing_probes_it() {
+        let verified: &'static Verified = Box::leak(Box::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let ok = report(vec![cap(1, Codec::H264, ProbeStatus::Verified)]);
+        let found = prober(policy(QUICK), verified, false, ok, started.clone()).probe();
+        assert!(!started.load(Ordering::SeqCst), "no helper, no probe");
+        assert!(found.caps.is_empty());
+        assert!(
+            found.diagnostics[0]
+                .reason
+                .contains("needs the helper process"),
+            "{:?}",
+            found.diagnostics
+        );
+        assert_eq!(verified.adapter(Codec::H264), None);
+        let in_process: Vec<Backend> = crate::encoder::caps::hardware_providers(true)
+            .iter()
+            .map(|p| p.backend())
+            .collect();
+        assert!(!in_process.contains(&Backend::Qsv), "{in_process:?}");
+    }
+
+    #[test]
+    fn sessions_open_on_the_adapter_the_probe_verified() {
+        let verified: &'static Verified = Box::leak(Box::default());
+        let script = report(vec![
+            cap(
+                0xa,
+                Codec::H264,
+                ProbeStatus::Unavailable("sample encode: no".into()),
+            ),
+            cap(0xa, Codec::Hevc, ProbeStatus::Verified),
+            cap(0xb, Codec::H264, ProbeStatus::Verified),
+        ]);
+        let started = Arc::new(AtomicBool::new(false));
+        let found = prober(policy(QUICK), verified, true, script, started).probe();
+        assert_eq!(found.caps.len(), 3, "{:?}", found.diagnostics);
+        assert_eq!(
+            verified.adapter(Codec::H264),
+            Some(0xb),
+            "not the first listed"
+        );
+        assert_eq!(verified.adapter(Codec::Hevc), Some(0xa));
+        assert_eq!(verified.adapter(Codec::Av1), None);
+        assert_eq!(luid_of("luid:00000000000000ff x"), Some(0xff));
+        assert_eq!(luid_of("luid:xyz"), None);
+    }
+
+    #[test]
+    fn a_probe_helper_that_hangs_is_killed_at_its_deadline() {
+        let verified: &'static Verified = Box::leak(Box::default());
+        let p = policy(QUICK);
+        let started = Arc::new(AtomicBool::new(false));
+        let t = Instant::now();
+        let found = prober(p, verified, true, "sleep 30".into(), started).probe();
+        assert!(t.elapsed() < Duration::from_millis(600) + QUICK.grace);
+        assert!(
+            found.diagnostics[0].reason.contains("did not finish"),
+            "{:?}",
+            found.diagnostics
+        );
+        assert!(p.off().is_none(), "reaped: nothing kept");
     }
 }

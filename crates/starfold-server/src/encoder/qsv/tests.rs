@@ -212,9 +212,9 @@ pub(super) fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
 #[derive(Default)]
 pub(super) struct Log {
     queried: Vec<VideoParam>,
-    inited: Vec<VideoParam>,
+    pub(super) inited: Vec<VideoParam>,
     signal: Vec<ExtVideoSignalInfo>,
-    reset: Vec<VideoParam>,
+    pub(super) reset: Vec<VideoParam>,
     /// The frame type asked of each encode call, if it asked for one.
     frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
@@ -434,7 +434,11 @@ fn h264_low_power_cbr_with_an_idr_on_request() {
         assert_eq!((m.gop_pic_size, m.idr_interval), (u16::MAX, 0));
         assert_eq!(m.rate_control_method, ffi::RATECONTROL_CBR);
         let rate = (m.target_kbps, m.max_kbps, m.buffer_size_in_kb);
-        assert_eq!(rate, (6000, 6000, 31));
+        assert_eq!(
+            rate,
+            (6000, 6000, 800),
+            "the buffer an IDR at 4x the cap needs"
+        );
         assert_eq!(m.brc_param_multiplier, 1);
         let fi = m.frame_info;
         assert_eq!((fi.width, fi.height), (1920, 1088), "16-aligned");

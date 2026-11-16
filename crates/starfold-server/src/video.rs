@@ -564,7 +564,7 @@ fn stripe_share(target: u32, n: usize) -> u32 {
 /// A keyframe is what a new viewer sees first; don't starve it to the steady-state
 /// frame budget (up to ~8 frames' worth at 4x the cap). An uncapped stream (cap 0)
 /// stays uncapped.
-fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
+pub(crate) fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
     let boost = if cap == 0 {
         0
     } else {

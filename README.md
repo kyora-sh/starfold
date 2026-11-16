@@ -315,7 +315,7 @@ Phones and tablets get touch input and an on-screen keyboard.
 **Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
 (OpenH264 in a build without x264).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
-macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, Windows) encoders are
+macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, 64-bit Windows) encoders are
 experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,
 `mediafoundation` or `qsv`; `/stats` shows what the probe found.
 

@@ -124,7 +124,11 @@ pub const ENCODERS: &[Encoder] = &[
         Qp::Uncapped,
     ),
     hardware("mediafoundation", cfg!(windows), Qp::Uncapped),
-    hardware("qsv", cfg!(windows), Qp::Uncapped),
+    hardware(
+        "qsv",
+        cfg!(all(windows, target_arch = "x86_64")),
+        Qp::Uncapped,
+    ),
 ];
 
 /// When a hardware encoder codes at a constant QP: then `--crf` is that QP, and
@@ -367,7 +371,10 @@ mod tests {
             cfg!(any(target_os = "linux", windows))
         );
         assert_eq!(hw.contains(&"mediafoundation"), cfg!(windows));
-        assert_eq!(hw.contains(&"qsv"), cfg!(windows));
+        assert_eq!(
+            hw.contains(&"qsv"),
+            cfg!(all(windows, target_arch = "x86_64"))
+        );
         let e = Backend::parse("bogus").unwrap_err();
         for name in hw {
             assert!(e.contains(name), "{e}");

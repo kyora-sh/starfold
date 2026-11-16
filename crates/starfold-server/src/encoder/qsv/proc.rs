@@ -6,7 +6,7 @@
 //! leads its own process group.
 
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A pipe end that never waits: `None` when nothing can be read or written right now.
@@ -42,7 +42,7 @@ pub fn write_by(p: &mut dyn Ready, mut buf: &[u8], until: Instant) -> Result<(),
     Ok(())
 }
 
-/// The helper, killed and reaped at most once.
+/// The helper, reaped at most once.
 pub struct Proc {
     inner: Mutex<Inner>,
     pid: u32,
@@ -53,39 +53,56 @@ impl Proc {
         self.pid
     }
 
-    /// Kills the helper and whatever it started, and reaps it within `grace`; true once it
-    /// is gone. One that the kernel keeps (a call stuck in a driver) is left and logged.
-    pub fn end(&self, grace: Duration) -> bool {
+    /// Kills the helper and whatever it started. Never waits.
+    pub fn kill(&self) {
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if i.reaped {
-            return true;
-        }
-        i.kill();
-        let end = Instant::now() + grace;
-        loop {
-            if i.exited() {
-                i.reaped = true;
-                return true;
-            }
-            if Instant::now() >= end {
-                log::error!(
-                    "Quick Sync helper {} did not exit within {} ms of being killed",
-                    self.pid,
-                    grace.as_millis()
-                );
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        if !i.reaped {
+            i.kill();
         }
     }
 
-    /// Whether it exited on its own, reaping it if so.
+    /// Whether it has exited, reaping it if so. One that can't be waited for counts as
+    /// still there.
     pub fn exited(&self) -> bool {
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !i.reaped && i.exited() {
             i.reaped = true;
         }
         i.reaped
+    }
+}
+
+/// Kills every one of `procs` first, then reaps them all against one deadline, `grace`
+/// away. Returns those still there after it: killed, but held in the kernel (a call stuck
+/// in a driver); the caller keeps them.
+pub fn end_all(procs: &[Arc<Proc>], grace: Duration) -> Vec<Arc<Proc>> {
+    for p in procs {
+        p.kill();
+    }
+    let end = Instant::now() + grace;
+    let mut left: Vec<Arc<Proc>> = procs.to_vec();
+    loop {
+        left.retain(|p| !p.exited());
+        if left.is_empty() || Instant::now() >= end {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Why a helper didn't start, with any process that was started for it and is still
+/// there after being killed: the caller keeps those, as it keeps any other.
+pub struct NotStarted {
+    pub why: String,
+    pub left: Vec<Arc<Proc>>,
+}
+
+impl From<String> for NotStarted {
+    fn from(why: String) -> NotStarted {
+        NotStarted {
+            why,
+            left: Vec::new(),
+        }
     }
 }
 
@@ -194,7 +211,7 @@ mod unix {
     }
 
     /// Starts `cmd` as a helper in a process group of its own.
-    pub fn spawn(mut cmd: Command) -> Result<(Proc, Pipes), String> {
+    pub fn spawn(mut cmd: Command) -> Result<(Proc, Pipes), NotStarted> {
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -204,7 +221,8 @@ mod unix {
             .map_err(|e| format!("the helper didn't start: {e}"))?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
-            return Err("the helper has no pipes".into());
+            let _ = child.wait();
+            return Err("the helper has no pipes".to_string().into());
         };
         let pid = child.id();
         let proc = Proc {
@@ -216,8 +234,10 @@ mod unix {
         };
         if let Err(e) = nonblocking(stdin.as_raw_fd()).and_then(|_| nonblocking(stdout.as_raw_fd()))
         {
-            proc.end(Duration::from_secs(2));
-            return Err(format!("the helper's pipes: {e}"));
+            return Err(NotStarted {
+                why: format!("the helper's pipes: {e}"),
+                left: end_all(&[Arc::new(proc)], Duration::from_secs(2)),
+            });
         }
         let pipes = Pipes {
             tx: Box::new(Fd(WriteOnly(stdin))),
@@ -281,6 +301,8 @@ mod unix {
 struct Inner {
     process: std::os::windows::io::OwnedHandle,
     job: std::os::windows::io::OwnedHandle,
+    /// It is in `job`: ending the job ends it and whatever it started.
+    assigned: bool,
     reaped: bool,
 }
 
@@ -290,7 +312,9 @@ impl Inner {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         let job = HANDLE(self.job.as_raw_handle());
-        if unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) }.is_err() {
+        let ended = self.assigned
+            && unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) }.is_ok();
+        if !ended {
             unsafe { win::TerminateProcess(self.process.as_raw_handle(), 1) };
         }
     }
@@ -582,14 +606,22 @@ mod win {
             });
     }
 
-    /// Starts this executable as a Quick Sync helper: suspended, with only its three pipe
-    /// ends inherited, put in a kill-on-close job, then resumed.
-    pub fn spawn_helper() -> Result<(Proc, Pipes), String> {
+    /// Starts this executable as a Quick Sync helper with `args` after the helper flag:
+    /// suspended, with only its three pipe ends inherited, put in a kill-on-close job, then
+    /// resumed. Between CreateProcessW and the job it is suspended and has run nothing; only
+    /// the server dying in that window leaves it (suspended, never running) behind.
+    pub fn spawn_helper(args: &[&str]) -> Result<(Proc, Pipes), NotStarted> {
         let exe =
             std::env::current_exe().map_err(|e| format!("no path to this executable: {e}"))?;
         let exe = exe.to_string_lossy().into_owned();
         if exe.contains('"') {
-            return Err(format!("{exe}: a path with a quote"));
+            return Err(format!("{exe}: a path with a quote").into());
+        }
+        if args
+            .iter()
+            .any(|a| a.is_empty() || a.contains(['"', ' ', '\t']))
+        {
+            return Err(format!("helper arguments that need quoting: {args:?}").into());
         }
         let job = job()?;
         let (in_r, in_w) = pipe()?;
@@ -608,7 +640,7 @@ mod win {
             )
         } == 0
         {
-            return Err(last("SetNamedPipeHandleState"));
+            return Err(last("SetNamedPipeHandleState").into());
         }
         let inherit: [Handle; 3] = [
             in_r.as_raw_handle(),
@@ -620,7 +652,7 @@ mod win {
         let mut list = vec![0u64; size.div_ceil(8).max(1)];
         let attrs: *mut c_void = list.as_mut_ptr().cast();
         if unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) } == 0 {
-            return Err(last("InitializeProcThreadAttributeList"));
+            return Err(last("InitializeProcThreadAttributeList").into());
         }
         let updated = unsafe {
             UpdateProcThreadAttribute(
@@ -636,7 +668,7 @@ mod win {
         if updated == 0 {
             let e = last("UpdateProcThreadAttribute");
             unsafe { DeleteProcThreadAttributeList(attrs) };
-            return Err(e);
+            return Err(e.into());
         }
         let si = StartupInfoExW {
             info: StartupInfoW {
@@ -662,10 +694,12 @@ mod win {
             attribute_list: attrs,
         };
         let app: Vec<u16> = exe.encode_utf16().chain([0]).collect();
-        let mut cmdline: Vec<u16> = format!("\"{exe}\" {} qsv", super::super::HELPER_FLAG)
-            .encode_utf16()
-            .chain([0])
-            .collect();
+        let mut line = format!("\"{exe}\" {} qsv", super::super::HELPER_FLAG);
+        for a in args {
+            line.push(' ');
+            line.push_str(a);
+        }
+        let mut cmdline: Vec<u16> = line.encode_utf16().chain([0]).collect();
         let mut pi = ProcessInformation {
             process: std::ptr::null_mut(),
             thread: std::ptr::null_mut(),
@@ -691,38 +725,47 @@ mod win {
         drop(list);
         drop((in_r, out_w, err_w));
         if let Some(e) = created_err {
-            return Err(e);
+            return Err(e.into());
         }
         let process = owned(pi.process);
         let thread = owned(pi.thread);
-        let proc = Proc {
+        let proc = Arc::new(Proc {
             inner: Mutex::new(Inner {
                 process,
                 job,
+                assigned: false,
                 reaped: false,
             }),
             pid: pi.process_id,
+        });
+        let failed = |why: String| NotStarted {
+            why,
+            left: end_all(std::slice::from_ref(&proc), Duration::from_secs(2)),
         };
         let assigned = {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-            let i = proc.inner.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe {
+            let mut i = proc.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let r = unsafe {
                 AssignProcessToJobObject(
                     HANDLE(i.job.as_raw_handle()),
                     HANDLE(i.process.as_raw_handle()),
                 )
-            }
+            };
+            i.assigned = r.is_ok();
+            r
         };
         if let Err(e) = assigned {
-            proc.end(Duration::from_secs(2));
-            return Err(format!("couldn't put the helper in a job object: {e}"));
+            return Err(failed(format!(
+                "couldn't put the helper in a job object: {e}"
+            )));
         }
         if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-            let e = last("ResumeThread");
-            proc.end(Duration::from_secs(2));
-            return Err(e);
+            return Err(failed(last("ResumeThread")));
         }
+        let Ok(proc) = Arc::try_unwrap(proc) else {
+            return Err("the helper's process is shared".to_string().into());
+        };
         drop(thread);
         forward(std::fs::File::from(err_r), pi.process_id);
         let pipes = Pipes {
