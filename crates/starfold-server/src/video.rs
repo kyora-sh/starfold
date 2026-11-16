@@ -275,6 +275,8 @@ struct Shared {
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
     failures: AtomicU32,
+    /// What the last failed encode said.
+    last_error: Mutex<Option<String>>,
     /// When the capture thread last sent this cohort a keyframe job.
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
@@ -562,7 +564,7 @@ fn stripe_share(target: u32, n: usize) -> u32 {
 /// A keyframe is what a new viewer sees first; don't starve it to the steady-state
 /// frame budget (up to ~8 frames' worth at 4x the cap). An uncapped stream (cap 0)
 /// stays uncapped.
-fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
+pub(crate) fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
     let boost = if cap == 0 {
         0
     } else {
@@ -696,6 +698,10 @@ struct Engine {
     offers: Vec<Offer>,
     /// Candidates whose encoders failed to open at this size.
     failed: Vec<Candidate>,
+    /// Why each failed one did, for /stats.
+    why: Vec<(Candidate, String)>,
+    /// Candidates not offered at this size, and why.
+    unoffered: Vec<(Candidate, String)>,
     cohorts: Vec<Cohort>,
     best: Option<Candidate>,
     open: Open,
@@ -714,6 +720,7 @@ impl Engine {
         open: Open,
     ) -> Result<Engine, String> {
         let mut offers = Vec::new();
+        let mut unoffered = Vec::new();
         let mut h264_err = String::from("no H.264 encoder");
         for &c in cands {
             match make_offer(&cfg, &open, c, w, h) {
@@ -739,6 +746,7 @@ impl Engine {
                         c.codec,
                         c.backend.name()
                     );
+                    unoffered.push((c, format!("not offered at {w}x{h}: {e}")));
                     if c.codec == Codec::H264 {
                         h264_err = e;
                     }
@@ -758,6 +766,8 @@ impl Engine {
             h264,
             offers,
             failed: Vec::new(),
+            why: Vec::new(),
+            unoffered,
             cohorts: Vec::new(),
             best: None,
             open,
@@ -768,7 +778,7 @@ impl Engine {
                 Ok(c) => break c,
                 Err(e) => {
                     log::warn!("H264 from {} failed to open: {e}", eng.h264.backend.name());
-                    eng.failed.push(eng.h264);
+                    eng.fail(eng.h264, format!("failed to open: {e}"));
                     eng.h264 = eng.next_h264().ok_or(e)?;
                 }
             }
@@ -790,6 +800,39 @@ impl Engine {
         Ok(eng)
     }
 
+    /// Fails if `--encoder` pins a hardware H.264 encoder that is not the one streaming: one
+    /// that wasn't offered at this size or failed to open, so the stream fell back to
+    /// software. Checked when the stream starts, for every hardware backend, so a pin never
+    /// starts silently on software; later fallbacks (a resize, a failing encoder) stay.
+    fn require_pin(&self, cands: &[Candidate]) -> Result<(), String> {
+        let encoder::Selection::Pinned(b) = self.cfg.selection else {
+            return Ok(());
+        };
+        let Some(pin) = cands
+            .iter()
+            .copied()
+            .find(|c| c.codec == Codec::H264 && c.backend == b && c.hardware)
+        else {
+            return Ok(());
+        };
+        if self.h264 == pin {
+            return Ok(());
+        }
+        let why = self
+            .why
+            .iter()
+            .chain(&self.unoffered)
+            .find(|(c, _)| *c == pin)
+            .map_or_else(|| "not offered".to_string(), |(_, w)| w.clone());
+        Err(format!(
+            "--encoder {}: H.264 from {} did not start at {}x{}: {why}",
+            b.name(),
+            b.name(),
+            self.w,
+            self.h
+        ))
+    }
+
     /// The H.264 candidate to fall back to from the current one.
     fn next_h264(&self) -> Option<Candidate> {
         self.offers
@@ -808,7 +851,7 @@ impl Engine {
                     Ok(c) => self.cohorts.push(c),
                     Err(e) => {
                         log::warn!("H264 from {} failed to open: {e}", n.backend.name());
-                        self.failed.push(n);
+                        self.fail(n, format!("failed to open: {e}"));
                         continue;
                     }
                 }
@@ -843,6 +886,16 @@ impl Engine {
             return;
         }
         self.failed.retain(|c| *c != old);
+        self.why.retain(|(c, _)| *c != old);
+    }
+
+    /// Takes `cand` out of use at this size; /stats says `why`.
+    fn fail(&mut self, cand: Candidate, why: String) {
+        if !self.failed.contains(&cand) {
+            self.failed.push(cand);
+        }
+        self.why.retain(|(c, _)| *c != cand);
+        self.why.push((cand, why));
     }
 
     fn open_cohort(&self, cand: Candidate) -> Result<Cohort, String> {
@@ -882,6 +935,7 @@ impl Engine {
             idr_inflight: AtomicBool::new(false),
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
+            last_error: Mutex::new(None),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             keyframes: AtomicU64::new(0),
             paintover_bytes: AtomicU64::new(0),
@@ -950,22 +1004,30 @@ impl Engine {
         // A cohort whose encoder keeps failing: its candidate is off until the next size.
         // The last H.264 encoder is the last resort and stays.
         let h264_fallback = self.next_h264().is_some();
-        for c in &self.cohorts {
-            let sh = &c.shared;
-            if (sh.cand != self.h264 || h264_fallback)
-                && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
-                && !self.failed.contains(&sh.cand)
-            {
-                log::warn!(
-                    "{:?} from {} keeps failing to encode; trying the next encoder",
-                    sh.cand.codec,
-                    sh.cand.backend.name()
-                );
-                self.failed.push(sh.cand);
-            }
+        let failing: Vec<(Candidate, String)> = self
+            .cohorts
+            .iter()
+            .map(|c| &c.shared)
+            .filter(|sh| {
+                (sh.cand != self.h264 || h264_fallback)
+                    && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
+                    && !self.failed.contains(&sh.cand)
+            })
+            .map(|sh| {
+                let last = sh.last_error.lock().clone().unwrap_or_default();
+                (sh.cand, format!("keeps failing to encode: {last}"))
+            })
+            .collect();
+        for (cand, why) in failing {
+            log::warn!(
+                "{:?} from {} {why}; trying the next encoder",
+                cand.codec,
+                cand.backend.name()
+            );
+            self.fail(cand, why);
         }
         if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
-            self.failed.push(self.h264);
+            self.fail(self.h264, "failed by /debug/fail-h264".into());
         }
         if self.failed.contains(&self.h264) {
             self.replace_h264();
@@ -1024,7 +1086,7 @@ impl Engine {
                                 b.codec,
                                 b.backend.name()
                             );
-                            self.failed.push(b);
+                            self.fail(b, format!("failed to open: {e}"));
                             continue;
                         }
                     }
@@ -1140,9 +1202,21 @@ impl Engine {
             .map(|o| o.cand)
             .filter(|c| !self.failed.contains(c))
             .collect();
+        // Encoders left at this size, and those never offered at it: after a rebuild (a
+        // resize) a backend that gave up for good shows up as the latter, with its reason.
+        let failed: Vec<serde_json::Value> = self
+            .why
+            .iter()
+            .filter(|(c, _)| self.failed.contains(c))
+            .chain(&self.unoffered)
+            .map(|(c, why)| {
+                serde_json::json!({"codec": c.codec, "backend": c.backend, "reason": why})
+            })
+            .collect();
         *self.hub.encoder.lock() = serde_json::json!({
             "mode": self.cfg.selection.name(),
             "chosen": negotiate::chosen(&live),
+            "failed": failed,
         });
     }
 
@@ -1461,6 +1535,7 @@ pub fn spawn(
     }
     let open: Open = Arc::new(|c: &EncoderConfig| encoder::open(c));
     let mut p = build(&cfg, &hub, &cands, &open)?;
+    p.engine.require_pin(&cands)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
@@ -2411,6 +2486,8 @@ struct StripeResult {
     out: Option<(bool, Vec<u8>)>,
     config: Option<StreamConfig>,
     failed: bool,
+    /// What the failed encode said.
+    error: Option<String>,
     /// A refining pass left something a tail pass could still sharpen, at the tail's budget and
     /// at the ladder's.
     refinable: bool,
@@ -2638,6 +2715,7 @@ fn stripe_worker(
             }
         }
         let failed = out.is_err();
+        let error = out.as_ref().err().map(|e| e.0.clone());
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
             Ok(_) => None,
@@ -2679,6 +2757,7 @@ fn stripe_worker(
             refinable,
             refinable_small,
             failed,
+            error,
         };
         if done.send(r).is_err() {
             return;
@@ -2809,6 +2888,9 @@ fn encode_loop(
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
+                if let Some(e) = r.error {
+                    *sh.last_error.lock() = Some(e);
+                }
                 refinable[r.i] = r.refinable;
                 refinable_small |= r.refinable_small;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };

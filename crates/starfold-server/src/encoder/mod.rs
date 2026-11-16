@@ -38,6 +38,11 @@ mod mf;
 mod nvenc;
 #[cfg(feature = "openh264")]
 pub(crate) mod openh264;
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod qsv;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use qsv::{helper_main, HELPER_FLAG};
 #[cfg(any(feature = "openh264", feature = "x264"))]
 pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]
@@ -256,6 +261,7 @@ pub enum Backend {
     Vaapi,
     Nvenc,
     MediaFoundation,
+    Qsv,
 }
 
 impl Backend {
@@ -287,18 +293,18 @@ impl Backend {
             "mediafoundation" => Ok(Backend::MediaFoundation),
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            "qsv" => Ok(Backend::Qsv),
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            "qsv" => Err("qsv is Windows-only (64-bit)".into()),
             _ => Err(format!(
-                "unknown encoder {s:?} (auto, {}{})",
-                crate::build_facts::encoder_names().join(", "),
-                if cfg!(target_os = "macos") {
-                    ", videotoolbox"
-                } else if cfg!(target_os = "linux") {
-                    ", vaapi, nvenc"
-                } else if cfg!(windows) {
-                    ", nvenc, mediafoundation"
-                } else {
-                    ""
-                }
+                "unknown encoder {s:?} (auto, {})",
+                [
+                    crate::build_facts::encoder_names(),
+                    crate::build_facts::hardware_encoders()
+                ]
+                .concat()
+                .join(", ")
             )),
         }
     }
@@ -322,6 +328,7 @@ impl Backend {
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
             Backend::MediaFoundation => "mediafoundation",
+            Backend::Qsv => "qsv",
         }
     }
 
@@ -354,6 +361,10 @@ impl Backend {
             Backend::MediaFoundation => {
                 cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
+            Backend::Qsv => {
+                cfg!(all(windows, target_arch = "x86_64"))
+                    && matches!(codec, Codec::H264 | Codec::Hevc)
+            }
         }
     }
 
@@ -375,7 +386,7 @@ impl Backend {
             Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
             Backend::VideoToolbox => Some(MAX_MBS),
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv => None,
         }
     }
 
@@ -399,6 +410,7 @@ impl Backend {
             Backend::Vaapi => 128,
             Backend::Nvenc => 160,
             Backend::MediaFoundation => 128,
+            Backend::Qsv => 128,
         }
     }
 
@@ -407,7 +419,7 @@ impl Backend {
     pub fn experimental(self) -> bool {
         matches!(
             self,
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv
         )
     }
 
@@ -527,6 +539,43 @@ pub struct EncoderConfig {
     pub preset: String,
 }
 
+/// The backends turned off for this process, and why, as they stand now: Quick Sync after
+/// a give-up, with the helpers that haven't exited yet.
+pub fn turned_off() -> Vec<(Backend, String)> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(why) = qsv::off() {
+        return vec![(Backend::Qsv, why)];
+    }
+    Vec::new()
+}
+
+/// `/stats`' `encoder` object with `off`'s reasons as they stand now: each backend in it is
+/// listed under `off`, and its `failed` entries give that reason rather than the one
+/// recorded when the stream fell back.
+pub fn with_live(encoder: &serde_json::Value, off: &[(Backend, String)]) -> serde_json::Value {
+    let mut e = encoder.clone();
+    let Some(obj) = e.as_object_mut() else {
+        return e;
+    };
+    if let Some(failed) = obj.get_mut("failed").and_then(|f| f.as_array_mut()) {
+        for f in failed {
+            let backend = f.get("backend").and_then(|b| b.as_str()).map(str::to_owned);
+            if let Some((_, why)) = off
+                .iter()
+                .find(|(b, _)| Some(b.name()) == backend.as_deref())
+            {
+                f["reason"] = serde_json::Value::from(why.as_str());
+            }
+        }
+    }
+    let list: Vec<serde_json::Value> = off
+        .iter()
+        .map(|(b, why)| serde_json::json!({"backend": b, "reason": why}))
+        .collect();
+    obj.insert("off".into(), serde_json::Value::Array(list));
+    e
+}
+
 /// Opens `cfg.backend`. Sizes it can't code (odd, or below its minimum) are coded
 /// larger, the last column and row repeated, and report the real size as `display`.
 pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
@@ -582,6 +631,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Nvenc => nvenc::open(&coded)?,
         #[cfg(windows)]
         Backend::MediaFoundation => mf::open(&coded)?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        Backend::Qsv => qsv::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {

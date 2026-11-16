@@ -358,9 +358,10 @@ fn describe(c: &EncoderCapability) -> String {
 }
 
 /// The providers for this platform and build. `hardware` false keeps to the software
-/// encoders; the VA-API, NVENC and Media Foundation probes are experimental and run only
-/// with `experimental`. Hardware probes run in a child process when this executable
-/// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself.
+/// encoders; the VA-API, NVENC, Media Foundation and Quick Sync probes are experimental and
+/// run only with `experimental`. Hardware probes run in a child process when this executable
+/// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself; Quick Sync's
+/// only ever in a helper process, so without one it is unavailable.
 pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
     #[cfg(feature = "x264")]
@@ -380,6 +381,12 @@ pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbePr
             v.push(p);
         }
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    v.push(if experimental {
+        super::qsv::provider(PROBE_TIMEOUT)
+    } else {
+        Box::new(Disabled(Backend::Qsv))
+    });
     v
 }
 
@@ -389,7 +396,7 @@ pub fn host_probe(hardware: bool, experimental: bool) -> Registry {
 }
 
 /// This platform's hardware probes, run in-process: the experimental ones only with
-/// `experimental`.
+/// `experimental`. Quick Sync's is not one: it has no in-process form.
 #[cfg_attr(target_os = "macos", allow(clippy::vec_init_then_push))]
 pub fn hardware_providers(experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();

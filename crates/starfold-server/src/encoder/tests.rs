@@ -493,6 +493,10 @@ fn unknown_encoder_names() {
     assert!(Backend::parse("mediafoundation")
         .unwrap_err()
         .contains("Windows-only"));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    assert_eq!(Backend::parse("qsv"), Ok(Backend::Qsv));
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    assert!(Backend::parse("qsv").unwrap_err().contains("Windows-only"));
 }
 
 #[test]

@@ -91,6 +91,10 @@ pub fn main() {
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if args.first().map(String::as_str) == Some(encoder::HELPER_FLAG) {
+        std::process::exit(encoder::helper_main(&args[1..]));
+    }
     encoder::isolate::enable();
     run(args);
 }
@@ -183,6 +187,7 @@ async fn serve(a: HashMap<String, String>) {
         }
     };
     if !selection.is_arm() {
+        let uncapped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 == 0;
         for flag in build_facts::FLAGS
             .into_iter()
             .filter(|f| a.contains_key(*f))
@@ -191,7 +196,7 @@ async fn serve(a: HashMap<String, String>) {
                 log::warn!(
                     "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
                 );
-            } else if !build_facts::reads(encoder.name(), flag) {
+            } else if !build_facts::reads(encoder.name(), flag, uncapped) {
                 log::warn!("{}", build_facts::flag_ignored(flag, encoder.name()));
             }
         }

@@ -39,9 +39,9 @@ CRF_ENTRY
 ENCODER_ENTRY
   --encoder-probe               probe the hardware encoders at startup
                                 (default true)
-  --experimental-hw-probes      experimental: also probe VA-API, NVENC and
-                                Media Foundation, each in a child process
-                                (default false)
+  --experimental-hw-probes      experimental: also probe VA-API, NVENC, Media
+                                Foundation and Quick Sync, each in a child
+                                process (default false)
 PRESET_ENTRY
   --encoder-threads             sliced threads (default cores/4, from 1 to 4)
   --adaptive-threads            encode on one thread, fanning out only under
@@ -178,9 +178,10 @@ fn encoder_entries(usage: &str) -> String {
     let encoder = format!(
         "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
          (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows) or mediafoundation (Windows){arms}; vaapi, nvenc and \
-         mediafoundation are experimental, need --experimental-hw-probes and auto never picks \
-         them; /stats shows what the probe found",
+         nvenc (Linux, Windows), mediafoundation (Windows) or qsv (64-bit Windows, Intel Quick \
+         Sync){arms}; \
+         vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
+         and auto never picks them; /stats shows what the probe found",
         build_facts::h264_encoders().join(", ")
     );
     let crf: Vec<String> = build_facts::readers("crf")
@@ -200,9 +201,12 @@ fn encoder_entries(usage: &str) -> String {
             presets.join("; ")
         ),
     };
-    let paintover: Vec<&str> = build_facts::readers("paintover-crf")
+    let paintover: Vec<String> = build_facts::readers("paintover-crf")
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(name, what)| match what {
+            "paint-over quality" => name.to_string(),
+            _ => format!("{name} (as its {what})"),
+        })
         .collect();
     let paintover = match paintover.is_empty() {
         true => "this build's encoders ignore --paintover-crf".to_string(),
@@ -318,7 +322,7 @@ mod tests {
         );
         let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let lower = words.to_lowercase();
-        for e in build_facts::ENCODERS {
+        for e in build_facts::ENCODERS.iter().filter(|e| !e.hardware) {
             assert_eq!(lower.contains(e.name), e.built, "{}:\n{text}", e.name);
         }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");

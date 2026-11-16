@@ -82,15 +82,15 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--basic-auth-user`                                            | any                                                                   | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                                  | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                               | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
-| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`, or the experimental `vaapi`, `nvenc`, `mediafoundation` |
+| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`; experimental `vaapi`, `nvenc`, `mediafoundation`, `qsv` |
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
-| `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC and Media Foundation, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                                     |
+| `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC, Media Foundation and Quick Sync, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                         |
 | `--preset`                                                     | `ultrafast`                                                           | the preset or speed of the encoder `--encoder` names (under `auto`, of the software H.264 one); others keep their default; `--help` lists what each built-in encoder takes                                |
 | `--encoder-threads`                                            | `ncpu/4`, from 1 to 4                                                 | sliced encoder threads                                                                                                                                                                                    |
-| `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion; most bench arms' lowest quantizer or QP (each if built in, see `--help`); other encoders ignore it                                                   |
+| `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion; most bench arms' lowest quantizer or QP; a hardware encoder's constant QP when it runs one (`--max-kbps 0`, or as VA-API's driver allows)            |
 | `--max-kbps` / `--video-bitrate`                               | `30000`                                                               | adaptive bitrate ceiling                                                                                                                                                                                  |
 | `--min-kbps`                                                   | `2000`                                                                | adaptive bitrate floor                                                                                                                                                                                    |
-| `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                                                      | sharpening when the screen goes still (`--paintover-crf` reaches x264 and the libvpx and libaom arms, if built in; other encoders ignore it; given, it is also the finest QP x264 refines to, default 12) |
+| `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                                                      | sharpening when the screen goes still (`--paintover-crf` reaches x264, the libvpx and libaom arms if built in, and a hardware encoder at constant QP; also the finest QP x264 refines to, default 12)     |
 | `--enable-clipboard`                                           | `true`                                                                | `true`, `in`, `out` or `false`                                                                                                                                                                            |
 | `--audio-enabled`, `--audio-device-name`, `--audio-bitrate`    | `true`, `output.monitor`, `128000`                                    | desktop audio                                                                                                                                                                                             |
 | `--enable-resize`, `--resize-scale`                            | `false`, `1.5`                                                        | desktop follows the viewer's window; desktop pixels per CSS pixel                                                                                                                                         |
@@ -283,6 +283,10 @@ The other flags work as on Linux; `--microphone-fifo` and the rounded-corner fla
 apply. Dynamic resolution picks the largest display mode that fits the viewer's window,
 and Windows restores the original mode when starfold exits.
 
+The experimental Intel Quick Sync encoder (`--encoder qsv`, 64-bit only) runs in helper
+processes that are created inside a job object, which needs Windows 10 1607 / Server 2016
+or later; on an older system Quick Sync is unavailable.
+
 ## FAQ
 
 **Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through reverse
@@ -315,9 +319,9 @@ Phones and tablets get touch input and an on-screen keyboard.
 **Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
 (OpenH264 in a build without x264).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
-macOS). The VA-API, NVENC and Media Foundation encoders are experimental: start with
-`--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc` or `mediafoundation`;
-`/stats` shows what the probe found.
+macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, 64-bit Windows) encoders are
+experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,
+`mediafoundation` or `qsv`; `/stats` shows what the probe found.
 
 **What's the license?** The code is MIT; a default build links x264 and is
 GPL-2.0-or-later. See [Licensing](#licensing).

@@ -15,5 +15,11 @@
 - **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
   feature. `--no-default-features --features openh264` builds without x264, and that binary stays
   under starfold's MIT licence.
+- **Intel libvpl API headers** (MIT, Copyright Intel Corporation,
+  [intel/libvpl](https://github.com/intel/libvpl) v2.17.0, commit
+  d77f9195cf495b937631607333288fd917ae8939): the Windows Quick Sync encoder's struct layouts and
+  constants are transcribed from them. Nothing of libvpl is vendored or linked; the oneVPL runtime
+  it calls ships with the user's Intel graphics driver. Licence:
+  [third_party/libvpl/LICENSE](third_party/libvpl/LICENSE).
 
 `starfold --version` lists the encoders a binary includes and its licence.
