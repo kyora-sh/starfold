@@ -91,6 +91,10 @@ pub fn main() {
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some(encoder::HELPER_FLAG) {
+        std::process::exit(encoder::helper_main(&args[1..]));
+    }
     encoder::isolate::enable();
     run(args);
 }

@@ -41,6 +41,8 @@ pub(crate) mod openh264;
 #[cfg(any(windows, all(test, target_os = "linux")))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod qsv;
+#[cfg(windows)]
+pub use qsv::{helper_main, HELPER_FLAG};
 #[cfg(any(feature = "openh264", feature = "x264"))]
 pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]

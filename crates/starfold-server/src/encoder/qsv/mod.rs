@@ -4,11 +4,21 @@
 //! (`MFXQueryImplsDescription`) and nothing else; an EXPERIMENTAL H.264 and HEVC encoder
 //! runs on it (8-bit 4:2:0, IDR + P, one reference, LowPower where the runtime takes it).
 //! Windows only. `--encoder auto` never picks it, only `--encoder qsv` does.
+//!
+//! The runtime is only ever loaded and called in another process: the probe's child, and
+//! for streaming one helper per encoder ([`remote`], [`helper`]), which the server kills
+//! when it stops answering.
 
 mod driver;
 mod ffi;
+mod helper;
+#[cfg(test)]
+mod helper_tests;
 #[cfg(windows)]
 mod locate;
+mod proc;
+mod proto;
+mod remote;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -17,11 +27,19 @@ use super::caps::{
     Acceleration, Chroma, EncoderCapability, EncoderLimits, PixelFormat, ProbeStatus,
     ProfileCapability,
 };
-use super::{Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
-use std::sync::Mutex;
+use super::{Backend, Codec};
+#[cfg(test)]
+use super::{EncodeError, EncoderConfig, VideoEncoder};
+
+/// The hidden flag that makes this executable a Quick Sync helper.
+pub const HELPER_FLAG: &str = "--encoder-helper";
 
 #[cfg(windows)]
-pub use windows_impl::{child_session, open, Probe};
+pub use helper::main as helper_main;
+#[cfg(windows)]
+use windows_impl::open_session;
+#[cfg(windows)]
+pub use windows_impl::{open, Probe};
 
 /// More than any runtime lists; bounds what is read from its descriptions.
 const MAX_LIST: usize = 64;
@@ -227,61 +245,23 @@ pub fn caps(device: &str, imp: &ImplInfo) -> Vec<EncoderCapability> {
         .collect()
 }
 
-/// Whether Quick Sync is still in use, and why not. After a host-side GPU reset or a hung
-/// engine, a guest's encode sessions can keep timing out until the host is repaired: once one
-/// session sees that, every session stops calling the runtime, no new one loads it, and the
-/// streams fall back to their next encoder with the reason in the log and /stats.
-pub struct Gate(Mutex<Option<String>>);
-
-impl Gate {
-    pub const fn new() -> Gate {
-        Gate(Mutex::new(None))
-    }
-
-    /// Stops using Quick Sync for good; the first reason stays.
-    pub fn give_up(&self, why: &str) {
-        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none() {
-            log::error!("{why}; Quick Sync is off until starfold restarts");
-            *g = Some(why.to_string());
-        }
-    }
-
-    pub fn given_up(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-}
-
-impl Default for Gate {
-    fn default() -> Gate {
-        Gate::new()
-    }
-}
-
-/// This process's gate.
-pub static GATE: Gate = Gate::new();
-
-/// A session for `cfg` on `rt`, unless `gate` has given Quick Sync up.
-pub(super) fn session(
+/// A session for `cfg` on `rt`.
+#[cfg(test)]
+fn session(
     rt: Box<dyn driver::Runtime>,
     cfg: &EncoderConfig,
-    gate: &'static Gate,
 ) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-    Ok(Box::new(session::Session::new(rt, cfg, gate)?))
+    Ok(Box::new(session::Session::new(rt, cfg)?))
 }
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus, PROBE_TIMEOUT};
-    use super::super::{hw, Backend, Codec, EncodeError, EncoderConfig, VideoEncoder};
-    use super::driver::MfxRuntime;
-    use super::{
-        caps, ffi, locate, pick, read_impl, runtime_path, session, Adapter, ImplInfo, GATE,
-    };
-
-    fn given_up() -> Option<String> {
-        GATE.given_up()
-    }
+    use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus};
+    use super::super::{hw, Backend, EncodeError, EncoderConfig, VideoEncoder};
+    use super::driver::{MfxRuntime, STOPPED};
+    use super::remote::{Remote, POLICY};
+    use super::session::Session;
+    use super::{caps, ffi, locate, pick, proc, read_impl, runtime_path, Adapter, ImplInfo};
 
     /// The side of the picture a probe encodes: the smallest `open` codes.
     const SAMPLE_SIDE: u32 = 160;
@@ -386,40 +366,57 @@ mod windows_impl {
                         format!("{} lists no H.264 or HEVC encoder", imp.name),
                     );
                 }
+                let mut stopped = false;
                 for c in cs
                     .iter_mut()
                     .filter(|c| c.status == ProbeStatus::Discovered)
                 {
-                    verify(c, a.luid);
+                    if verify(c, a.luid) {
+                        stopped = true;
+                        break;
+                    }
                 }
                 found.caps.append(&mut cs);
+                if stopped {
+                    found.note(
+                        Backend::Qsv,
+                        Some(&a.label()),
+                        "the device stopped answering; no further adapter is probed",
+                    );
+                    break;
+                }
             }
             found
         }
     }
 
-    /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not.
-    fn verify(c: &mut super::EncoderCapability, luid: u64) {
+    /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not; true
+    /// if the device stopped answering (hung, failed or was lost).
+    fn verify(c: &mut super::EncoderCapability, luid: u64) -> bool {
         if !Backend::Qsv.implements(c.codec) {
-            return;
+            return false;
         }
         let cfg = hw::sample_config(Backend::Qsv, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
-        let r = open_on(luid, &cfg)
-            .and_then(|mut enc| hw::sample(enc.as_mut(), SAMPLE_SIDE, SAMPLE_SIDE));
+        let r = open_session(&cfg, luid)
+            .and_then(|(mut s, _)| hw::sample(&mut s, SAMPLE_SIDE, SAMPLE_SIDE));
         match r {
             Ok(()) => {
                 c.status = ProbeStatus::Verified;
                 c.low_latency = Some(true);
                 c.keyframe_control = Some(true);
+                false
             }
-            Err(e) => c.status = ProbeStatus::Unavailable(format!("sample encode: {e}")),
+            Err(e) => {
+                let stopped = e.0.starts_with(STOPPED);
+                c.status = ProbeStatus::Unavailable(format!("sample encode: {e}"));
+                stopped
+            }
         }
     }
 
-    fn open_on(luid: u64, cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-        if let Some(why) = given_up() {
-            return Err(EncodeError(why));
-        }
+    /// A session on adapter `luid`, in this process: the helper's, or a probe child's. Its
+    /// name is the runtime implementation's.
+    pub fn open_session(cfg: &EncoderConfig, luid: u64) -> Result<(Session, String), EncodeError> {
         let a = locate::intel_adapters()
             .map_err(EncodeError)?
             .into_iter()
@@ -434,68 +431,26 @@ mod windows_impl {
         }
         let drv =
             MfxRuntime::open(rt, imp.acceleration, imp.vendor_impl_id).map_err(EncodeError)?;
-        session(Box::new(drv), cfg, &GATE)
+        Ok((Session::new(Box::new(drv), cfg)?, imp.name))
     }
 
-    fn spec_device(luid: u64) -> String {
-        format!("{luid:016x}")
-    }
-
-    /// Opens a Quick Sync encoder for `cfg` on the first Intel adapter whose runtime encodes
-    /// its codec. Each new session is first opened and run in a child process (when this
-    /// executable takes `--probe-encoders`); one that crashes, hangs or fails there is
-    /// never opened here, and the caller falls back to its next encoder.
+    /// Opens a Quick Sync encoder for `cfg` in a helper process, on the first Intel adapter
+    /// DXGI lists. The server itself never loads or calls Intel's runtime: which adapter
+    /// encodes what comes from the probe child, and a helper that can't open says so.
     pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-        if let Some(why) = given_up() {
-            return Err(EncodeError(why));
+        if let Some(off) = POLICY.off() {
+            return Err(EncodeError(off));
         }
-        let adapters = locate::intel_adapters().map_err(EncodeError)?;
-        let mut why = Vec::new();
-        let luid = adapters
-            .iter()
-            .find(|a| match runtime(a) {
-                Ok((_, imp)) if imp.encodes(cfg.codec) => true,
-                Ok((_, imp)) => {
-                    why.push(format!(
-                        "{}: {} lists no {:?} encoder",
-                        a.label(),
-                        imp.name,
-                        cfg.codec
-                    ));
-                    false
-                }
-                Err(e) => {
-                    why.push(format!("{}: {e}", a.label()));
-                    false
-                }
-            })
+        let luid = locate::intel_adapters()
+            .map_err(EncodeError)?
+            .first()
             .map(|a| a.luid)
-            .ok_or_else(|| {
-                EncodeError(if why.is_empty() {
-                    "no Intel graphics adapter".into()
-                } else {
-                    why.join("; ")
-                })
-            })?;
-        hw::preflight(cfg, &spec_device(luid), |spec| {
-            super::super::isolate::session(Backend::Qsv, spec, PROBE_TIMEOUT)
-        })?;
-        open_on(luid, cfg)
-    }
-
-    /// The child's side of [`open`]: opens the session `spec` names on its adapter and
-    /// encodes a sample, in-process.
-    pub fn child_session(spec: &str) -> Result<(), String> {
-        let (cfg, luid) = hw::parse_spec(Backend::Qsv, spec)
-            .and_then(|(c, d)| Some((c, u64::from_str_radix(&d, 16).ok()?)))
-            .ok_or_else(|| format!("bad session {spec:?}"))?;
-        if !matches!(cfg.codec, Codec::H264 | Codec::Hevc) {
-            return Err(format!(
-                "Quick Sync here encodes H.264 and HEVC, not {:?}",
-                cfg.codec
-            ));
-        }
-        let mut enc = open_on(luid, &cfg)?;
-        hw::sample(enc.as_mut(), cfg.width, cfg.height).map_err(String::from)
+            .ok_or_else(|| EncodeError("no Intel graphics adapter".into()))?;
+        Ok(Box::new(Remote::open(
+            &POLICY,
+            proc::spawn_helper,
+            cfg,
+            luid,
+        )?))
     }
 }

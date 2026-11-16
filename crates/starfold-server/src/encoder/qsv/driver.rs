@@ -1,10 +1,20 @@
 //! The oneVPL calls an encode session makes, behind a trait so the session logic runs
-//! against a fake on hosts without an Intel GPU.
+//! against a fake on hosts without an Intel GPU. This runs in the helper process only.
 
-use super::ffi::{Bitstream, EncodeCtrl, FrameSurface1, Status, SyncPoint, VideoParam};
-use super::Gate;
+use super::ffi::{self, Bitstream, EncodeCtrl, FrameSurface1, Status, SyncPoint, VideoParam};
 use crate::encoder::FrameView;
-use std::mem::ManuallyDrop;
+
+/// What a stopped Quick Sync error starts with: the device hung, failed or was lost, and
+/// the helper is not to be used again.
+pub const STOPPED: &str = "Quick Sync stopped: ";
+
+/// Statuses after which the device is not asked again.
+pub fn fatal(s: Status) -> bool {
+    matches!(
+        s,
+        ffi::ERR_GPU_HANG | ffi::ERR_DEVICE_FAILED | ffi::ERR_DEVICE_LOST
+    )
+}
 
 /// What went wrong outside a plain status: the call and its status, or a description.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,111 +44,17 @@ pub trait Runtime: Send {
     fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Status;
 }
 
-/// What the runtime answers once Quick Sync is given up: the reason, and no call made.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stopped(pub String);
-
-/// The runtime as a session sees it, and the only way a session reaches it. Every call,
-/// dropping included, first asks the process's [`Gate`]; once Quick Sync is given up it calls
-/// nothing, answers [`Stopped`], and never drops (closes, unloads) the runtime.
-pub struct Gated {
-    inner: ManuallyDrop<Box<dyn Runtime>>,
-    gate: &'static Gate,
-}
-
-impl Gated {
-    /// `rt` behind `gate`; refused, without a call or a close, if Quick Sync is given up.
-    pub fn new(rt: Box<dyn Runtime>, gate: &'static Gate) -> Result<Gated, Stopped> {
-        if let Some(why) = gate.given_up() {
-            std::mem::forget(rt);
-            return Err(Stopped(why));
-        }
-        Ok(Gated {
-            inner: ManuallyDrop::new(rt),
-            gate,
-        })
-    }
-
-    fn open(&mut self) -> Result<&mut dyn Runtime, Stopped> {
-        match self.gate.given_up() {
-            Some(why) => Err(Stopped(why)),
-            None => Ok(&mut **self.inner),
-        }
-    }
-
-    /// Gives Quick Sync up for the process; the first reason stays.
-    pub fn give_up(&self, why: &str) {
-        self.gate.give_up(why);
-    }
-
-    pub fn stopped(&self) -> Option<Stopped> {
-        self.gate.given_up().map(Stopped)
-    }
-
-    pub fn query(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
-        Ok(self.open()?.query(par))
-    }
-
-    pub fn init(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
-        Ok(self.open()?.init(par))
-    }
-
-    pub fn reset(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
-        Ok(self.open()?.reset(par))
-    }
-
-    pub fn video_param(&mut self, par: &mut VideoParam) -> Result<Status, Stopped> {
-        Ok(self.open()?.video_param(par))
-    }
-
-    pub fn surface(
-        &mut self,
-        f: &FrameView<'_>,
-        ts: u64,
-    ) -> Result<Result<*mut FrameSurface1, Fault>, Stopped> {
-        Ok(self.open()?.surface(f, ts))
-    }
-
-    pub fn release(&mut self, s: *mut FrameSurface1) -> Result<(), Stopped> {
-        self.open()?.release(s);
-        Ok(())
-    }
-
-    pub fn encode(
-        &mut self,
-        ctrl: Option<&mut EncodeCtrl>,
-        s: *mut FrameSurface1,
-        bs: &mut Bitstream,
-        sync: &mut SyncPoint,
-    ) -> Result<Status, Stopped> {
-        Ok(self.open()?.encode(ctrl, s, bs, sync))
-    }
-
-    pub fn sync(&mut self, sync: SyncPoint, wait_ms: u32) -> Result<Status, Stopped> {
-        Ok(self.open()?.sync(sync, wait_ms))
-    }
-}
-
-impl Drop for Gated {
-    fn drop(&mut self) {
-        if self.gate.given_up().is_none() {
-            unsafe { ManuallyDrop::drop(&mut self.inner) };
-        }
-    }
-}
-
 #[cfg(windows)]
 pub use real::MfxRuntime;
 
 #[cfg(windows)]
 mod real {
-    use super::super::ffi;
     use super::*;
     use crate::encoder::hw::write_nv12;
     use ffi::{InitializationParam, Session};
 
     /// An encode session on Intel's runtime, closed on drop. A session that stopped with the
-    /// device is never dropped (see `session.rs`), so neither its handle nor the library goes.
+    /// device is never dropped (see `session.rs`): its helper process is ended instead.
     pub struct MfxRuntime {
         rt: ffi::Runtime,
         session: Session,
@@ -149,6 +65,7 @@ mod real {
 
     impl MfxRuntime {
         /// A session on the implementation `vendor_impl_id` of `rt` through `acceleration`.
+        /// A hung, failed or lost device here stops Quick Sync like one met later.
         pub fn open(
             rt: ffi::Runtime,
             acceleration: u32,
@@ -165,8 +82,9 @@ mod real {
             let mut session: Session = std::ptr::null_mut();
             let r = unsafe { (rt.initialize)(par, &mut session) };
             if r != ffi::ERR_NONE || session.is_null() {
+                let stopped = if fatal(r) { STOPPED } else { "" };
                 return Err(format!(
-                    "MFXInitialize failed: {} ({r})",
+                    "{stopped}MFXInitialize failed: {} ({r})",
                     ffi::status_name(r)
                 ));
             }

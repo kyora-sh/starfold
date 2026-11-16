@@ -198,7 +198,7 @@ fn annexb(nals: &[&[u8]]) -> Vec<u8> {
 }
 
 /// What the runtime would code: parameter sets and an IDR when asked, else a P frame.
-fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
+pub(super) fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
     match (codec, idr, sets) {
         (Codec::Hevc, true, true) => annexb(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, &[0x26, 0x01, 0xaf]]),
         (Codec::Hevc, true, false) => annexb(&[&[0x26, 0x01, 0xaf]]),
@@ -210,7 +210,7 @@ fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
 }
 
 #[derive(Default)]
-struct Log {
+pub(super) struct Log {
     queried: Vec<VideoParam>,
     inited: Vec<VideoParam>,
     signal: Vec<ExtVideoSignalInfo>,
@@ -219,46 +219,38 @@ struct Log {
     frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
     surfaces: Vec<u64>,
-    live: i32,
+    pub(super) live: i32,
     /// Every call into the runtime.
     calls: usize,
     /// The runtime was dropped: in a real one, the session closed and the library released.
-    dropped: bool,
-    /// Calls (a drop included) made after the watched gate gave Quick Sync up.
-    after: usize,
+    pub(super) dropped: bool,
 }
 
 // The logged parameters' extension list pointers are only compared, never followed.
 unsafe impl Send for Log {}
 
 /// A runtime that answers from scripts (status 0 once a script runs out).
-struct Fake {
+pub(super) struct Fake {
     codec: Codec,
     log: Arc<Mutex<Log>>,
     query: VecDeque<Status>,
     init: VecDeque<Status>,
     reset: VecDeque<Status>,
     encode: VecDeque<Status>,
-    sync: VecDeque<Status>,
+    pub(super) sync: VecDeque<Status>,
     surface: VecDeque<Option<Fault>>,
     /// What GetVideoParam says; else what Init was given.
     got: Option<VideoParam>,
     /// IDRs after the first come without parameter sets.
     sets_once: bool,
     idrs: usize,
-    /// The gate whose give-up the log watches: every call after it counts in `after`.
-    gate: Option<&'static Gate>,
-    /// Gives `gate` up when this many encode calls have answered busy: another session
-    /// stopping Quick Sync while this one waits on the device.
-    give_up_at_busy: Option<usize>,
-    busy: usize,
 }
 
 // `got` holds a null extension list pointer and nothing else.
 unsafe impl Send for Fake {}
 
 impl Fake {
-    fn new(codec: Codec) -> (Fake, Arc<Mutex<Log>>) {
+    pub(super) fn new(codec: Codec) -> (Fake, Arc<Mutex<Log>>) {
         let log = Arc::new(Mutex::new(Log::default()));
         (
             Fake {
@@ -273,26 +265,15 @@ impl Fake {
                 got: None,
                 sets_once: false,
                 idrs: 0,
-                gate: None,
-                give_up_at_busy: None,
-                busy: 0,
             },
             log,
         )
     }
 
-    fn given_up(&self) -> bool {
-        self.gate.is_some_and(|g| g.given_up().is_some())
-    }
-}
-
-impl Fake {
     /// The log, counting one call into the runtime.
     fn call(&self) -> std::sync::MutexGuard<'_, Log> {
-        let after = self.given_up();
         let mut log = self.log.lock().unwrap();
         log.calls += 1;
-        log.after += after as usize;
         log
     }
 }
@@ -355,14 +336,6 @@ impl Runtime for Fake {
         let ft = ctrl.map(|c| c.frame_type);
         self.call().frame_types.push(ft);
         let r = self.encode.pop_front().unwrap_or(0);
-        if r == ffi::WRN_DEVICE_BUSY {
-            self.busy += 1;
-            if let (Some(g), Some(n)) = (self.gate, self.give_up_at_busy) {
-                if self.busy == n {
-                    g.give_up("Quick Sync stopped: another session's GPU did not finish a frame");
-                }
-            }
-        }
         if r < 0 || r == ffi::WRN_DEVICE_BUSY {
             return r;
         }
@@ -388,24 +361,8 @@ impl Runtime for Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
-        let after = self.given_up();
-        let mut log = self.log.lock().unwrap();
-        log.dropped = true;
-        log.after += after as usize;
+        self.log.lock().unwrap().dropped = true;
     }
-}
-
-/// A gate of its own, so one test's give-up doesn't reach another's sessions.
-fn gate() -> &'static Gate {
-    Box::leak(Box::new(Gate::new()))
-}
-
-/// A session on `rt` behind a gate of its own.
-fn session(
-    rt: Box<dyn Runtime>,
-    cfg: &EncoderConfig,
-) -> Result<Box<dyn VideoEncoder>, EncodeError> {
-    super::session(rt, cfg, gate())
 }
 
 fn cfg(codec: Codec, w: u32, h: u32, kbps: u32) -> EncoderConfig {
@@ -517,7 +474,11 @@ fn h264_low_power_cbr_with_an_idr_on_request() {
     assert!(k[0].keyframe);
     let l = log.lock().unwrap();
     assert_eq!(l.frame_types, vec![IDR, None, IDR]);
-    assert_eq!(l.waits, vec![3000; 3], "bounded, never MFX_INFINITE");
+    assert_eq!(
+        l.waits,
+        vec![SYNC_WAIT_MS; 3],
+        "bounded, never MFX_INFINITE"
+    );
     assert_eq!(l.surfaces, vec![900; 3], "pts in 90 kHz");
     assert_eq!(l.live, 0, "every surface goes back");
     drop(l);
@@ -655,145 +616,49 @@ fn more_data_and_plain_errors_fail_the_frame_only() {
 }
 
 #[test]
-fn a_hung_or_lost_device_ends_quick_sync_and_keeps_what_the_gpu_can_reach() {
-    let hung = "did not finish a frame in 3000 ms";
+fn a_hung_or_lost_device_stops_the_session_without_another_call() {
+    let hung = "did not finish a frame in 1000 ms";
     for (encode_status, sync_status, said) in [
         (0, ffi::WRN_IN_EXECUTION, hung),
         (0, ffi::ERR_GPU_HANG, "MFX_ERR_GPU_HANG"),
         (ffi::ERR_DEVICE_LOST, 0, "MFX_ERR_DEVICE_LOST"),
         (ffi::ERR_DEVICE_FAILED, 0, "MFX_ERR_DEVICE_FAILED"),
     ] {
-        let g = gate();
         let (mut fake, log) = Fake::new(Codec::H264);
         fake.encode = VecDeque::from([0, encode_status]);
         fake.sync = VecDeque::from([0, sync_status]);
         let c = cfg(Codec::H264, 640, 480, 2000);
-        let mut enc = super::session(Box::new(fake), &c, g).unwrap();
-        encode(enc.as_mut(), 640, 480, false);
-        let e = fails(enc.as_mut(), false);
-        let stopped = e.0.starts_with("Quick Sync stopped: ");
+        let mut s = super::session::Session::new(Box::new(fake), &c).unwrap();
+        encode(&mut s, 640, 480, false);
+        let e = fails(&mut s, false);
+        let stopped = e.0.starts_with(super::driver::STOPPED);
         assert!(stopped && e.0.contains(said), "{e}");
-        assert_eq!(g.given_up(), Some(e.0.clone()), "off for the process");
+        assert_eq!(s.stopped(), Some(e.0.as_str()));
         let calls = log.lock().unwrap().calls;
-        let again = fails(enc.as_mut(), true);
-        assert_eq!(again, e, "the device is not asked again");
-        assert!(enc.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
-        drop(enc);
+        assert_eq!(fails(&mut s, true), e, "the device is not asked again");
+        assert!(s.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
+        drop(s);
         let l = log.lock().unwrap();
         assert_eq!(
             l.calls, calls,
             "no runtime call after the stop, not even a close"
         );
-        assert!(!l.dropped, "the runtime (library, session) is kept");
-        assert_eq!(l.live, 1, "the frame's surface is kept, never released");
+        assert!(!l.dropped, "the runtime is left for the process to end");
+        assert_eq!(l.live, 1, "the frame's surface is never released");
         assert!(l.waits.iter().all(|&w| w == SYNC_WAIT_MS));
-        drop(l);
-
-        let (fresh, log) = Fake::new(Codec::H264);
-        let refused = super::session(Box::new(fresh), &c, g).err().unwrap();
-        assert_eq!(refused, e, "a new session is refused with the reason");
-        let l = log.lock().unwrap();
-        assert_eq!(l.calls, 0, "without calling the runtime");
-        assert!(!l.dropped, "or closing it");
     }
 }
 
-/// Once Quick Sync is given up, no path of any open session reaches the runtime: not an
-/// encode, a keyframe, a rate change, the busy-retry loop's exit, a drop of a session never
-/// called again, nor a new session.
 #[test]
-fn after_a_give_up_no_session_calls_the_runtime_on_any_path() {
-    let g = gate();
-    let watched = |codec| {
-        let (mut f, log) = Fake::new(codec);
-        f.gate = Some(g);
-        (f, log)
-    };
-    let c264 = cfg(Codec::H264, 640, 480, 2000);
-    let (idle, idle_log) = watched(Codec::H264);
-    let (used, used_log) = watched(Codec::H264);
-    let (mut hevc, hevc_log) = watched(Codec::Hevc);
-    hevc.sync = VecDeque::from([0, ffi::WRN_IN_EXECUTION]);
-    let (mut busy, busy_log) = watched(Codec::H264);
-    busy.encode = VecDeque::from([0, ffi::WRN_DEVICE_BUSY, ffi::WRN_DEVICE_BUSY]);
-    busy.give_up_at_busy = Some(2);
-    let mut idle = super::session(Box::new(idle), &c264, g).unwrap();
-    let mut used = super::session(Box::new(used), &c264, g).unwrap();
-    let mut hevc = super::session(Box::new(hevc), &cfg(Codec::Hevc, 640, 480, 0), g).unwrap();
-    let mut busy = super::session(Box::new(busy), &c264, g).unwrap();
-    for s in [&mut idle, &mut used, &mut hevc, &mut busy] {
-        encode(s.as_mut(), 640, 480, false);
-    }
-
-    let e = fails(busy.as_mut(), false);
-    assert_eq!(Some(e.0.clone()), g.given_up(), "given up while busy: {e}");
-    assert_eq!(fails(hevc.as_mut(), false), e);
-    assert_eq!(fails(used.as_mut(), true), e, "a keyframe");
-    assert_eq!(fails(used.as_mut(), false), e);
-    assert!(used.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
-    assert!(used.set_rate(RateConfig::new(24.0, 500, 30)).is_err());
-    drop(idle);
-    drop(used);
-    drop(hevc);
-    drop(busy);
-    let (fresh, fresh_log) = watched(Codec::H264);
-    assert_eq!(super::session(Box::new(fresh), &c264, g).err(), Some(e));
-
-    for (name, log) in [
-        ("idle", &idle_log),
-        ("used", &used_log),
-        ("hevc", &hevc_log),
-        ("busy", &busy_log),
-        ("fresh", &fresh_log),
-    ] {
-        let l = log.lock().unwrap();
-        assert_eq!(l.after, 0, "{name}: runtime calls after the give-up");
-        assert!(
-            !l.dropped,
-            "{name}: runtime dropped (closed) after the give-up"
-        );
-    }
-    assert_eq!(fresh_log.lock().unwrap().calls, 0);
-    assert_eq!(
-        busy_log.lock().unwrap().live,
-        1,
-        "the busy frame's surface stays"
-    );
-}
-
-#[test]
-fn every_open_session_stops_with_the_first() {
-    let g = gate();
-    let (h264, h264_log) = Fake::new(Codec::H264);
-    let (mut hevc, hevc_log) = Fake::new(Codec::Hevc);
-    hevc.sync = VecDeque::from([ffi::WRN_IN_EXECUTION]);
-    let mut a = super::session(Box::new(h264), &cfg(Codec::H264, 640, 480, 2000), g).unwrap();
-    let mut b = super::session(Box::new(hevc), &cfg(Codec::Hevc, 640, 480, 0), g).unwrap();
-    encode(a.as_mut(), 640, 480, false);
-    let e = fails(b.as_mut(), false);
-    assert!(e.0.contains("did not finish a frame"), "{e}");
-    let calls = h264_log.lock().unwrap().calls;
-    assert_eq!(fails(a.as_mut(), false), e, "the H.264 session stops too");
-    assert!(a.set_rate(RateConfig::new(24.0, 9000, 30)).is_err());
-    drop(a);
-    drop(b);
-    let l = h264_log.lock().unwrap();
-    assert_eq!(l.calls, calls, "and calls its runtime no more");
-    assert!(!l.dropped && !hevc_log.lock().unwrap().dropped);
-    assert_eq!(l.live, 0, "it had no frame on the GPU");
-}
-
-#[test]
-fn a_fatal_query_stops_quick_sync_instead_of_trying_without_low_power() {
+fn a_fatal_query_stops_instead_of_trying_without_low_power() {
     for status in [
         ffi::ERR_DEVICE_LOST,
         ffi::ERR_DEVICE_FAILED,
         ffi::ERR_GPU_HANG,
     ] {
-        let g = gate();
         let (mut fake, log) = Fake::new(Codec::H264);
         fake.query = VecDeque::from([status]);
-        let e = super::session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000), g)
+        let e = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000))
             .err()
             .unwrap();
         let name = ffi::status_name(status);
@@ -801,7 +666,7 @@ fn a_fatal_query_stops_quick_sync_instead_of_trying_without_low_power() {
             e.0.contains(&format!("MFXVideoENCODE_Query failed: {name}")),
             "{e}"
         );
-        assert!(g.given_up().is_some());
+        assert!(e.0.starts_with(super::driver::STOPPED), "{e}");
         let l = log.lock().unwrap();
         assert_eq!(l.queried.len(), 1, "no second Query with LowPower off");
         assert!(l.inited.is_empty() && !l.dropped);
