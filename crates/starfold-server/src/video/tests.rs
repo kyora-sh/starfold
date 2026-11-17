@@ -4081,7 +4081,8 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
     p.eng.cfg.source_fps = 120;
     for c in &mut p.eng.cohorts {
         let fps = c.fps();
-        c.take.took(later - Duration::from_millis(5), frame_interval(fps));
+        c.take
+            .took(later - Duration::from_millis(5), frame_interval(fps));
     }
     let turn = p.eng.turn(&views, 33.0, later);
     assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
@@ -4299,8 +4300,11 @@ fn an_early_capture_borrows_from_the_next() {
         "not another early capture right after the first"
     );
     assert!(
-        s.wait(t + interval.mul_f64(2.0 - EARLY_SHARE) + Duration::from_micros(1), interval)
-            .is_zero(),
+        s.wait(
+            t + interval.mul_f64(2.0 - EARLY_SHARE) + Duration::from_micros(1),
+            interval
+        )
+        .is_zero(),
         "the next is due a whole interval after the one the early capture was due for"
     );
 }
@@ -4326,7 +4330,15 @@ fn a_slower_source_is_not_held_back() {
 #[test]
 fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     let hub = Hub::new();
-    let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264], fakes(Opts::default())).unwrap();
+    let mut eng = Engine::new(
+        high_fps(),
+        hub.clone(),
+        W,
+        H,
+        &[H264],
+        fakes(Opts::default()),
+    )
+    .unwrap();
     eng.cfg.source_fps = 120;
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
