@@ -556,13 +556,21 @@ pub fn turned_off() -> Vec<(Backend, String)> {
 }
 
 /// `/stats`' `encoder` object with `off`'s reasons as they stand now: each backend in it is
-/// listed under `off`, and its `failed` entries give that reason rather than the one
-/// recorded when the stream fell back.
+/// listed under `off` and no longer under `chosen` (a codec no stream used keeps its offer
+/// there otherwise), and its `failed` entries give that reason rather than the one recorded
+/// when the stream fell back.
 pub fn with_live(encoder: &serde_json::Value, off: &[(Backend, String)]) -> serde_json::Value {
     let mut e = encoder.clone();
     let Some(obj) = e.as_object_mut() else {
         return e;
     };
+    let is_off = |v: &serde_json::Value| {
+        off.iter()
+            .any(|(b, _)| v.get("backend") == Some(&serde_json::json!(b)))
+    };
+    if let Some(chosen) = obj.get_mut("chosen").and_then(|c| c.as_array_mut()) {
+        chosen.retain(|c| !is_off(c));
+    }
     if let Some(failed) = obj.get_mut("failed").and_then(|f| f.as_array_mut()) {
         for f in failed {
             let backend = f.get("backend").and_then(|b| b.as_str()).map(str::to_owned);
