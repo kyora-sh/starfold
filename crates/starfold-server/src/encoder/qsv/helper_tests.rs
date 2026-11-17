@@ -356,22 +356,23 @@ fn stats_say_why_quick_sync_is_off_as_it_stands_now() {
 }
 
 /// After a give-up, a codec whose Quick Sync offer no stream used is not listed as using
-/// it: only the H.264 stream failed over to x264, so HEVC's offer stayed in the snapshot.
+/// it: only the H.264 stream failed over to software, so HEVC's offer stayed in the
+/// snapshot.
 #[test]
 fn stats_list_no_backend_that_is_off_as_chosen() {
-    use crate::encoder::{with_live, Backend, Codec};
+    use crate::encoder::{with_live, Backend, Codec, SOFTWARE_H264};
     use crate::negotiate::{chosen, Candidate};
     let qsv = |codec| Candidate {
         codec,
         backend: Backend::Qsv,
         hardware: true,
     };
-    let x264 = Candidate {
+    let sw = Candidate {
         codec: Codec::H264,
-        backend: Backend::X264,
+        backend: SOFTWARE_H264,
         hardware: false,
     };
-    let live = [qsv(Codec::Hevc), x264];
+    let live = [qsv(Codec::Hevc), sw];
     let snapshot = serde_json::json!({
         "mode": "qsv",
         "chosen": chosen(&live),
@@ -380,12 +381,13 @@ fn stats_list_no_backend_that_is_off_as_chosen() {
     let why = "qsv given up: a second helper failed (helper 7 closed its stdout)";
     let off = [(Backend::Qsv, why.to_string())];
     let e = with_live(&snapshot, &off);
-    assert_eq!(e["chosen"], serde_json::json!(chosen(&[x264])), "{e}");
+    assert_eq!(e["chosen"], serde_json::json!(chosen(&[sw])), "{e}");
     assert_eq!(e["failed"][0]["reason"], why);
     assert_eq!(e["off"][0]["backend"], serde_json::json!(Backend::Qsv));
     assert_eq!(with_live(&snapshot, &[])["chosen"], snapshot["chosen"]);
 
-    let only = serde_json::json!({"mode": "qsv", "chosen": chosen(&[qsv(Codec::Hevc)]), "failed": []});
+    let only =
+        serde_json::json!({"mode": "qsv", "chosen": chosen(&[qsv(Codec::Hevc)]), "failed": []});
     assert_eq!(
         with_live(&only, &off)["chosen"],
         serde_json::json!([]),
