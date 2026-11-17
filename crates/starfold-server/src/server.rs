@@ -618,7 +618,10 @@ mod tests {
         let now = hub.offer_gen.load(Ordering::SeqCst);
         assert_eq!(gens.last(), Some(&now));
         assert!(Hub::answers(gens.last().copied(), now));
-        assert!(!Hub::answers(Some(0), now), "an answer to the stale hello is refused");
+        assert!(
+            !Hub::answers(Some(0), now),
+            "an answer to the stale hello is refused"
+        );
     }
 
     /// Two new sizes between a check and the next enqueue: the loop checks again after
@@ -652,7 +655,11 @@ mod tests {
         assert_eq!(steps, vec![HelloStep::Built(0), HelloStep::Sent(0)]);
         assert_eq!(hello_gens(&mut rx), vec![0]);
         hub.send_first_hello(&c);
-        assert_eq!(hello_gens(&mut rx), vec![0], "the plain entry point: one hello");
+        assert_eq!(
+            hello_gens(&mut rx),
+            vec![0],
+            "the plain entry point: one hello"
+        );
     }
 
     #[tokio::test]
