@@ -745,23 +745,79 @@ fn av1_tiles_and_driver_requirements() {
 }
 
 #[test]
-fn choose_prefers_low_power_and_the_best_profile() {
+fn choose_prefers_the_full_entrypoint_and_the_best_profile() {
     let (mut fake, _) = Fake::new(ffi::PROFILE_H264_MAIN, h264_slice);
     fake.profiles = vec![
         (
             ffi::PROFILE_H264_MAIN,
-            vec![ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP],
+            vec![ffi::ENTRYPOINT_ENC_SLICE_LP, ffi::ENTRYPOINT_ENC_SLICE],
         ),
         (ffi::PROFILE_H264_CB, vec![ffi::ENTRYPOINT_ENC_SLICE]),
     ];
     let c = choose(&mut fake, h264::PROFILES, (640, 480), &[]).unwrap();
     assert_eq!(
         (c.profile, c.entrypoint),
-        (ffi::PROFILE_H264_MAIN, ffi::ENTRYPOINT_ENC_SLICE_LP)
+        (ffi::PROFILE_H264_MAIN, ffi::ENTRYPOINT_ENC_SLICE)
     );
     assert!(choose(&mut fake, h264::PROFILES, (8192, 480), &[]).is_err());
     fake.profiles.clear();
     assert!(session(Box::new(fake), &cfg(Codec::H264, 640, 480)).is_err());
+}
+
+/// Low-power encoding with constant bitrate has faulted a GPU's video engine, so a
+/// session takes the full entrypoint wherever the driver offers it, and low-power only
+/// where that is all there is.
+#[test]
+fn sessions_take_low_power_only_when_it_is_all_there_is() {
+    let (slice, lp) = (ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP);
+    for (codec, profile, data, extra) in [
+        (
+            Codec::H264,
+            ffi::PROFILE_H264_HIGH,
+            h264_slice as fn(bool) -> Vec<u8>,
+            vec![],
+        ),
+        (
+            Codec::Hevc,
+            ffi::PROFILE_HEVC_MAIN,
+            hevc_slice,
+            vec![None, None],
+        ),
+        (
+            Codec::Av1,
+            ffi::PROFILE_AV1_0,
+            av1_tile_group,
+            vec![Some(0x1f), Some(3 << 2 | 4 << 4)],
+        ),
+    ] {
+        for (offered, want) in [
+            (vec![lp, slice], Some(slice)),
+            (vec![slice, lp], Some(slice)),
+            (vec![lp], Some(lp)),
+            (vec![slice], Some(slice)),
+            (vec![1], None),
+        ] {
+            let (mut fake, log) = Fake::new(profile, data);
+            fake.profiles = vec![(profile, offered.clone())];
+            fake.extra = extra.clone();
+            let r = sample_on(Box::new(fake), codec);
+            let got = log.lock().unwrap().config.last().map(|c| c.1);
+            match want {
+                Some(e) => {
+                    assert!(r.is_ok(), "{codec:?} {offered:?}: {r:?}");
+                    assert_eq!(got, Some(e), "{codec:?} {offered:?}");
+                }
+                None => {
+                    let e = r.err().unwrap();
+                    assert!(
+                        e.0.contains("no encode entrypoint"),
+                        "{codec:?} {offered:?}: {e}"
+                    );
+                    assert_eq!(got, None, "{codec:?} {offered:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

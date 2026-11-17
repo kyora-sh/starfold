@@ -151,7 +151,8 @@ impl Choice {
 }
 
 /// The first of `profiles` (best first) the driver encodes 8-bit 4:2:0 at `size` with
-/// one reference, low-power entrypoint first.
+/// one reference. The full entrypoint goes first; low-power only where the driver offers
+/// nothing else for the profile.
 pub fn choose(
     drv: &mut dyn Driver,
     profiles: &[c_int],
@@ -167,7 +168,7 @@ pub fn choose(
                 continue;
             }
         };
-        for entrypoint in [ffi::ENTRYPOINT_ENC_SLICE_LP, ffi::ENTRYPOINT_ENC_SLICE] {
+        for entrypoint in [ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP] {
             if !eps.contains(&entrypoint) {
                 continue;
             }
