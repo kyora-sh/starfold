@@ -21,8 +21,6 @@ mod helper_tests;
 mod locate;
 #[cfg(test)]
 mod low_power_tests;
-#[cfg(all(test, unix))]
-mod mode_tests;
 mod probe;
 mod proc;
 mod proto;
@@ -55,11 +53,6 @@ use windows_impl::{open_session, probe_here};
 #[cfg(windows)]
 pub fn off() -> Option<String> {
     remote::POLICY.off()
-}
-
-/// The codec and LowPower mode of each Quick Sync session open in a live helper now.
-pub fn modes() -> Vec<(Codec, bool)> {
-    remote::POLICY.modes()
 }
 
 /// More than any runtime lists; bounds what is read from its descriptions.
