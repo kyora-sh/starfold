@@ -4243,7 +4243,7 @@ fn continuous(fps: u32, secs: u64, overhead: Duration) -> Vec<Duration> {
     while now < start + Duration::from_secs(secs) {
         let rem = s.wait(now, interval);
         if !rem.is_zero() {
-            now += Duration::from_millis(rem.as_micros().div_ceil(1000) as u64);
+            now += Duration::from_millis(rem.as_nanos().div_ceil(1_000_000) as u64);
             continue;
         }
         s.took(now, interval);
