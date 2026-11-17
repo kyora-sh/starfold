@@ -346,6 +346,9 @@ pub struct Remote {
     /// Every frame request sent: pts, IDR asked.
     #[cfg(test)]
     pub sent: Vec<(i64, bool)>,
+    /// The line logged when the session opened.
+    #[cfg(test)]
+    pub opened: String,
 }
 
 fn rate_of(r: &RateConfig) -> Rate {
@@ -418,6 +421,8 @@ impl Remote {
             low_power: false,
             #[cfg(test)]
             sent: Vec::new(),
+            #[cfg(test)]
+            opened: String::new(),
         };
         let shared = r.section.share(&r.proc).map_err(EncodeError)?;
         let open = Request::Open(Open {
@@ -433,6 +438,21 @@ impl Remote {
         });
         match r.request(&open, "opening", policy.timing.open)? {
             Reply::Opened { low_power, name } => {
+                let codec = if cfg.codec == Codec::Hevc {
+                    "HEVC"
+                } else {
+                    "H.264"
+                };
+                let mode = if low_power { "on" } else { "off" };
+                let line = format!(
+                    "qsv helper {}: opened {name} for {codec}, LowPower {mode}",
+                    r.proc.id()
+                );
+                log::info!("{line}");
+                #[cfg(test)]
+                {
+                    r.opened = line;
+                }
                 r.name = name;
                 r.low_power = low_power;
                 Ok(r)

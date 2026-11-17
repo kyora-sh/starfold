@@ -484,6 +484,34 @@ mod remote {
         assert_eq!(p.spawned(), spawned, "nothing starts after the give-up");
     }
 
+    /// The line logged when a helper with `low_power` opens its session.
+    fn open_line(low_power: bool) -> (u32, String) {
+        let opened = says(&Reply::Opened {
+            low_power,
+            name: "fake-gen".into(),
+        });
+        let enc = start(policy(QUICK), format!("{opened}; sleep 30"));
+        (enc.pid(), enc.opened.clone())
+    }
+
+    #[test]
+    fn the_open_line_says_low_power_off() {
+        let (pid, line) = open_line(false);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower off")
+        );
+    }
+
+    #[test]
+    fn the_open_line_says_low_power_on() {
+        let (pid, line) = open_line(true);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on")
+        );
+    }
+
     #[test]
     fn a_helper_that_hangs_on_a_frame_is_killed_at_the_deadline() {
         let p = policy(QUICK);
