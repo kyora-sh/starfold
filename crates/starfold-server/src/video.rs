@@ -440,8 +440,10 @@ fn frame_interval(fps: u32) -> Duration {
 }
 
 /// When the next capture at a rate is due. An early capture moves the due time on from
-/// the one it came early for, so the next gives the time back: at most one capture more
-/// than the rate allows in any window, never more on average. A late one starts afresh.
+/// the one it came early for, so the next gives the time back. A late one keeps up to the
+/// rest of an interval of its lateness, so captures offered on a grid that doesn't divide
+/// the interval still come at the rate on average: never more, and in any window at most
+/// two more than the rate allows (the second right after a late one).
 #[derive(Clone, Copy, Debug, Default)]
 struct Schedule {
     due: Option<Instant>,
@@ -458,7 +460,10 @@ impl Schedule {
 
     /// A capture at `interval` came at `at`.
     fn took(&mut self, at: Instant, interval: Duration) {
-        self.due = Some(self.due.map_or(at, |d| d.max(at)) + interval);
+        let from = at
+            .checked_sub(interval.mul_f64(1.0 - EARLY_SHARE))
+            .unwrap_or(at);
+        self.due = Some(self.due.map_or(from, |d| d.max(from)) + interval);
     }
 }
 

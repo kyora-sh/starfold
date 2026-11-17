@@ -4080,9 +4080,8 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         .contains(&true));
     p.eng.cfg.source_fps = 120;
     for c in &mut p.eng.cohorts {
-        let fps = c.fps();
-        c.take
-            .took(later - Duration::from_millis(5), frame_interval(fps));
+        let due = later - Duration::from_millis(5) + frame_interval(c.fps());
+        c.take = Schedule { due: Some(due) };
     }
     let turn = p.eng.turn(&views, 33.0, later);
     assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
@@ -4266,31 +4265,80 @@ fn continuous_damage_is_captured_at_the_framerate_on_average() {
     }
 }
 
-#[test]
-fn an_early_capture_borrows_from_the_next() {
-    let fps = 30;
+/// Captures taken whenever the schedule allows one of those offered every `grid`, over `secs`
+/// seconds at `fps`: when each came.
+fn on_a_grid(fps: u32, grid: Duration, secs: u64) -> Vec<Duration> {
     let interval = frame_interval(fps);
-    let at = continuous(fps, 10, Duration::from_micros(300));
-    let bound = (1.0 / interval.as_secs_f64() + EARLY_SHARE).floor() as usize + 1;
-    assert_eq!(bound, 31, "at most one capture over the rate in any second");
-    for (i, &a) in at.iter().enumerate() {
-        let n = at[i..]
-            .iter()
-            .take_while(|&&b| b < a + Duration::from_secs(1))
-            .count();
-        assert!(n <= bound, "{n} captures in the second from {a:?}");
+    let mut s = Schedule::default();
+    let start = Instant::now();
+    let mut at = Vec::new();
+    let mut now = start;
+    while now < start + Duration::from_secs(secs) {
+        if s.wait(now, interval).is_zero() {
+            s.took(now, interval);
+            at.push(now - start);
+        }
+        now += grid;
     }
-    for w in at.windows(2) {
+    at
+}
+
+#[test]
+fn captures_offered_on_any_grid_up_to_the_interval_come_at_the_rate() {
+    for (fps, grid_us) in [(60, 15_000), (100, 8_333), (60, 8_333), (30, 30_000), (30, 20_000)] {
+        let n = on_a_grid(fps, Duration::from_micros(grid_us), 10).len() as f64 / 10.0;
         assert!(
-            w[1] - w[0] >= interval.mul_f64(1.0 - EARLY_SHARE) - Duration::from_micros(1),
-            "{:?} -> {:?}",
-            w[0],
-            w[1]
+            (n - fps as f64).abs() <= 0.2,
+            "{n}/s at {fps} fps offered every {grid_us} us"
         );
     }
-    let mut s = Schedule::default();
+}
+
+/// The cost of keeping a late capture's lateness: at most two captures over the rate in any
+/// second, and a capture right after a late one; never three within an interval.
+#[test]
+fn no_more_than_two_captures_over_the_rate_in_any_second() {
+    let fps = 30;
+    let interval = frame_interval(fps);
+    let bound = fps as usize + 2;
+    let runs = [
+        continuous(fps, 10, Duration::from_micros(300)),
+        continuous(fps, 10, Duration::ZERO),
+        on_a_grid(fps, interval.mul_f64(0.9), 10),
+        on_a_grid(fps, interval.mul_f64(0.7), 10),
+        on_a_grid(fps, interval.mul_f64(0.5), 10),
+    ];
+    for at in &runs {
+        for (i, &a) in at.iter().enumerate() {
+            let n = at[i..]
+                .iter()
+                .take_while(|&&b| b < a + Duration::from_secs(1))
+                .count();
+            assert!(n <= bound, "{n} captures in the second from {a:?}");
+            let close = at[i..].iter().take_while(|&&b| b < a + interval).count();
+            assert!(close <= 2, "{close} captures within an interval from {a:?}");
+        }
+    }
+    let mut s = Schedule {
+        due: Some(Instant::now()),
+    };
+    let late = s.due.unwrap() + interval.mul_f64(1.0 - EARLY_SHARE);
+    s.took(late, interval);
+    assert!(
+        s.wait(late, interval) <= Duration::from_micros(1),
+        "a late capture can be followed at once"
+    );
+    s.took(late, interval);
+    assert!(!s.wait(late, interval).is_zero(), "but not by a third");
+}
+
+#[test]
+fn an_early_capture_borrows_from_the_next() {
+    let interval = frame_interval(30);
     let t = Instant::now();
-    s.took(t, interval);
+    let mut s = Schedule {
+        due: Some(t + interval),
+    };
     let early = t + interval.mul_f64(1.0 - EARLY_SHARE);
     assert!(s.wait(early, interval).is_zero(), "early by the allowance");
     s.took(early, interval);
@@ -4327,6 +4375,37 @@ fn a_slower_source_is_not_held_back() {
     }
 }
 
+/// Offers the engine's one cohort a capture every `grid` for 2 s, its viewer acking each
+/// frame; the frames it got. The capture comes at `arrival` fps, the cohort is capped at `cap`.
+fn frames_on_a_grid(
+    eng: &mut Engine,
+    c: &Client,
+    rx: &mut UnboundedReceiver<Out>,
+    grid: Duration,
+    (arrival, cap): (u32, u32),
+) -> usize {
+    let mut t = Instant::now();
+    let mut got = 0;
+    for _ in 0..(2_000_000_000 / grid.as_nanos()) {
+        eng.replan();
+        let views = eng.views();
+        eng.update_rates(&views);
+        assert_eq!((eng.arrival_fps(&views), eng.cohorts[0].fps()), (arrival, cap));
+        let turn = eng.turn(&views, 1000.0 / arrival as f64, t);
+        eng.mark(&views, None);
+        eng.dispatch(&whole(W, H), &views, &turn, t);
+        settle(eng);
+        let epoch = c.route.lock().epoch;
+        let legacy = c.route.lock().proto == Proto::Legacy;
+        for v in videos(&drain(rx)) {
+            got += 1;
+            assert!(c.ack((!legacy).then_some(epoch), v.2));
+        }
+        t += grid;
+    }
+    got
+}
+
 #[test]
 fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     let hub = Hub::new();
@@ -4342,25 +4421,40 @@ fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     eng.cfg.source_fps = 120;
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
-    let mut t = Instant::now();
-    let mut got = 0;
-    for _ in 0..(2000 / 15) {
-        eng.replan();
-        let views = eng.views();
-        eng.update_rates(&views);
-        assert_eq!((eng.arrival_fps(&views), eng.cohorts[0].fps()), (120, 60));
-        let turn = eng.turn(&views, 1000.0 / 120.0, t);
-        eng.mark(&views, None);
-        eng.dispatch(&whole(W, H), &views, &turn, t);
-        settle(&eng);
-        for v in videos(&drain(&mut rx)) {
-            got += 1;
-            assert!(c.ack(None, v.2));
-        }
-        t += Duration::from_millis(15);
-    }
+    let got = frames_on_a_grid(&mut eng, &c, &mut rx, Duration::from_millis(15), (120, 60));
     assert!(
-        (got as f64 - 120.0).abs() <= 120.0 * 0.03,
+        got.abs_diff(120) <= 1,
         "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms"
+    );
+}
+
+#[test]
+fn a_100_fps_cohort_on_a_120_fps_capture_takes_100_frames_a_second() {
+    let hub = Hub::new();
+    let mut eng = Engine::new(
+        high_fps(),
+        hub.clone(),
+        W,
+        H,
+        &[HEVC],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    eng.cfg.source_fps = 120;
+    let (c, mut rx) = client(&hub);
+    c.hz.store(100, Ordering::Relaxed);
+    join_v2(&hub, &c, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&c, &drain(&mut rx));
+    let got = frames_on_a_grid(
+        &mut eng,
+        &c,
+        &mut rx,
+        Duration::from_nanos(1_000_000_000 / 120),
+        (120, 100),
+    );
+    assert!(
+        got.abs_diff(200) <= 1,
+        "{got} frames in 2 s at a 100 fps cap from a 120 fps capture"
     );
 }
