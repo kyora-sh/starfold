@@ -427,13 +427,21 @@ impl Runtime for Fake {
         if self.normalize && par.mfx.rate_control_method == ffi::RATECONTROL_CBR {
             let m = &mut par.mfx;
             let k = m.brc_param_multiplier.max(1) as u32;
-            let [t, x, b, d] =
-                [m.target_kbps, m.max_kbps, m.buffer_size_in_kb, m.initial_delay_in_kb]
-                    .map(|v| v as u32 * k);
+            let [t, x, b, d] = [
+                m.target_kbps,
+                m.max_kbps,
+                m.buffer_size_in_kb,
+                m.initial_delay_in_kb,
+            ]
+            .map(|v| v as u32 * k);
             let n = t.max(x).max(b).max(d).div_ceil(u16::MAX as u32).max(1);
             m.brc_param_multiplier = n as u16;
-            [m.target_kbps, m.max_kbps, m.buffer_size_in_kb, m.initial_delay_in_kb] =
-                [t, x, b, d].map(|v| (v / n) as u16);
+            [
+                m.target_kbps,
+                m.max_kbps,
+                m.buffer_size_in_kb,
+                m.initial_delay_in_kb,
+            ] = [t, x, b, d].map(|v| (v / n) as u16);
         }
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;

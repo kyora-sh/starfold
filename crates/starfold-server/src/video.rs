@@ -1310,7 +1310,10 @@ impl Engine {
             }
         }
         if shown == Some(0) {
-            shown = self.cohorts.first().map_or(Some(0), |c| c.shared.shown_kbps());
+            shown = self
+                .cohorts
+                .first()
+                .map_or(Some(0), |c| c.shared.shown_kbps());
         }
         self.hub
             .target_kbps
@@ -2940,7 +2943,8 @@ fn encode_loop(
                 configs[r.i] = r.config;
             }
         }
-        sh.in_force.store(cohort_in_force(&in_force), Ordering::Relaxed);
+        sh.in_force
+            .store(cohort_in_force(&in_force), Ordering::Relaxed);
         if job.refine_qp.is_some() {
             sh.refinable
                 .store(refinable.contains(&true), Ordering::Release);

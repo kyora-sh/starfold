@@ -252,8 +252,12 @@ impl InForce {
     /// TargetKbps for `kbps` asked at `fps` pictures a second: the same budget per picture
     /// at this encoder's own frame rate. None if the runtime reports no frame rate.
     fn target_for(&self, kbps: u64, fps: u32) -> Option<u64> {
-        (self.fps_n > 0)
-            .then(|| div_round(kbps * self.fps_n as u64, self.fps_d as u64 * fps.max(1) as u64))
+        (self.fps_n > 0).then(|| {
+            div_round(
+                kbps * self.fps_n as u64,
+                self.fps_d as u64 * fps.max(1) as u64,
+            )
+        })
     }
 
     /// What this TargetKbps comes to per second at `fps` pictures a second.

@@ -530,7 +530,11 @@ mod remote {
             reason: "MFXVideoENCODE_Reset failed".into(),
         });
         let mut enc = start(p, format!("{}; {set}; {refused}; sleep 30", opened()));
-        assert_eq!(enc.rate_in_force(), RateInForce::NotRead, "nothing read yet");
+        assert_eq!(
+            enc.rate_in_force(),
+            RateInForce::NotRead,
+            "nothing read yet"
+        );
         enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
         assert_eq!(enc.rate_in_force(), RateInForce::Known(5_000));
         assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
