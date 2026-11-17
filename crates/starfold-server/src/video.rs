@@ -715,6 +715,13 @@ struct Engine {
     best: Option<Candidate>,
     open: Open,
     last_tick: Instant,
+    /// The backends turned off when the engine last looked ([`Hub::off`]).
+    off_seen: Vec<encoder::Backend>,
+}
+
+/// Whether `a` and `b` name the same backends.
+fn same_backends(a: &[encoder::Backend], b: &[encoder::Backend]) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x))
 }
 
 impl Engine {
@@ -731,7 +738,20 @@ impl Engine {
         let mut offers = Vec::new();
         let mut unoffered = Vec::new();
         let mut h264_err = String::from("no H.264 encoder");
+        let off = hub.off();
         for &c in cands {
+            if let Some((_, why)) = off.iter().find(|(b, _)| *b == c.backend) {
+                log::warn!(
+                    "{:?} from {} is not offered at {w}x{h}: {why}",
+                    c.codec,
+                    c.backend.name()
+                );
+                unoffered.push((c, format!("not offered at {w}x{h}: {why}")));
+                if c.codec == Codec::H264 {
+                    h264_err = why.clone();
+                }
+                continue;
+            }
             match make_offer(&cfg, &open, c, w, h) {
                 Ok(o) => {
                     log::info!(
@@ -781,6 +801,7 @@ impl Engine {
             best: None,
             open,
             last_tick: Instant::now(),
+            off_seen: off.into_iter().map(|(b, _)| b).collect(),
         };
         let c = loop {
             match eng.open_cohort(eng.h264) {
@@ -801,7 +822,7 @@ impl Engine {
             .map(|s| (s.y, s.h))
             .collect();
         eng.cohorts.push(c);
-        *hub.offers.lock() = eng.offers.clone();
+        eng.publish_offers();
         hub.offer_gen.fetch_add(1, Ordering::Relaxed);
         eng.publish();
         // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
@@ -871,6 +892,7 @@ impl Engine {
                 n.backend.name()
             );
             self.h264 = n;
+            self.publish_offers();
             if self.best == Some(n) {
                 self.best = None;
             }
@@ -896,6 +918,7 @@ impl Engine {
         }
         self.failed.retain(|c| *c != old);
         self.why.retain(|(c, _)| *c != old);
+        self.publish_offers();
     }
 
     /// Takes `cand` out of use at this size; /stats says `why`.
@@ -905,6 +928,53 @@ impl Engine {
         }
         self.why.retain(|(c, _)| *c != cand);
         self.why.push((cand, why));
+        self.publish_offers();
+    }
+
+    /// What a hello offers: this size's offers but those out of use (failed here, or whose
+    /// backend is turned off), as the plan would never give them. The H.264 stream's own
+    /// offer always stays: it is the last resort every viewer can fall back to.
+    fn offered(&self) -> Vec<Offer> {
+        self.offers
+            .iter()
+            .filter(|o| {
+                o.cand == self.h264
+                    || (!self.failed.contains(&o.cand)
+                        && !self.off_seen.contains(&o.cand.backend))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Sets what later hellos offer. Connected viewers keep what they were sent.
+    fn publish_offers(&self) {
+        *self.hub.offers.lock() = self.offered();
+    }
+
+    /// Takes the offers of a backend turned off since the last look out of use and sends
+    /// every connected viewer the offers left (a new hello), so none is planned on it.
+    fn follow_off(&mut self) {
+        let off = self.hub.off();
+        let now: Vec<encoder::Backend> = off.iter().map(|(b, _)| *b).collect();
+        if same_backends(&now, &self.off_seen) {
+            return;
+        }
+        for (b, why) in &off {
+            let cands: Vec<Candidate> = self
+                .offers
+                .iter()
+                .map(|o| o.cand)
+                .filter(|c| c.backend == *b && !self.failed.contains(c))
+                .collect();
+            for c in cands {
+                log::warn!("{:?} from {} is off: {why}; no longer offered", c.codec, b.name());
+                self.fail(c, why.clone());
+            }
+        }
+        self.off_seen = now;
+        self.publish_offers();
+        self.hub.offer_gen.fetch_add(1, Ordering::Relaxed);
+        self.hub.restart_clients();
     }
 
     fn open_cohort(&self, cand: Candidate) -> Result<Cohort, String> {
@@ -1010,6 +1080,7 @@ impl Engine {
             self.last_tick = Instant::now();
             self.expire();
         }
+        self.follow_off();
         // A cohort whose encoder keeps failing: its candidate is off until the next size.
         // The last H.264 encoder is the last resort and stays.
         let h264_fallback = self.next_h264().is_some();

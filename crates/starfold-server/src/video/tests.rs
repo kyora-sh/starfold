@@ -788,6 +788,138 @@ fn an_encoder_that_fails_to_open_falls_back() {
     assert_eq!(route_codec(&d), Some(Codec::H264));
 }
 
+fn offered_codecs(hub: &Hub) -> Vec<Codec> {
+    hub.offers.lock().iter().map(|o| o.codec).collect()
+}
+
+fn hellos(m: &[Msg]) -> Vec<&serde_json::Value> {
+    m.iter()
+        .filter_map(|m| match m {
+            Msg::Json(j) if j["t"] == "hello" => Some(j),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Makes `hub` read the turned-off backends from the returned list.
+fn fake_off(hub: &Hub) -> Arc<StdMutex<Vec<(Backend, String)>>> {
+    let off = Arc::new(StdMutex::new(Vec::new()));
+    let read = off.clone();
+    *hub.off.lock() = Arc::new(move || read.lock().unwrap().clone());
+    off
+}
+
+const GIVEN_UP: &str = "videotoolbox given up: a second helper failed";
+
+/// A candidate whose encoder failed to open at this size is out of use there, so a later
+/// hello does not offer it.
+#[test]
+fn a_later_hello_does_not_offer_a_failed_candidate() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_fails: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(offered_codecs(&hub), vec![Codec::Hevc, Codec::H264]);
+    let (c, _rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert_eq!(offered_codecs(&hub), vec![Codec::H264]);
+}
+
+/// A failed cohort changes only what later hellos offer: the viewers already connected
+/// keep their stream and are sent no new hello.
+#[test]
+fn a_cohort_that_fails_sends_connected_viewers_no_new_hello() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_fails: true,
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    let (d, mut rd) = client(&hub);
+    join_v2(&hub, &d, &[Codec::H264]);
+    push(&mut eng);
+    drain(&mut rd);
+    let gen = hub.offer_gen.load(Ordering::Relaxed);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert!(hellos(&drain(&mut rx)).is_empty());
+    assert!(hellos(&drain(&mut rd)).is_empty());
+    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen);
+    assert_eq!(route_codec(&d), Some(Codec::H264));
+}
+
+/// A backend turned off before the engine starts is not offered, and /stats says why.
+#[test]
+fn a_backend_that_is_off_is_not_offered() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    let _eng = engine(&hub, &[HEVC, H264], Opts::default());
+    assert_eq!(offered_codecs(&hub), vec![Codec::H264]);
+    let enc = hub.encoder.lock();
+    let failed = enc["failed"].as_array().cloned().unwrap_or_default();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["backend"], "videotoolbox");
+    assert_eq!(
+        failed[0]["reason"],
+        format!("not offered at {W}x{H}: {GIVEN_UP}")
+    );
+}
+
+/// A backend turned off while a viewer streams from it: every connected viewer gets a new
+/// hello without it, and the viewer moves to the next codec.
+#[test]
+fn a_backend_turned_off_is_taken_out_of_every_viewers_offers() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(route_codec(&c), Some(Codec::Hevc));
+    drain(&mut rx);
+    let gen = hub.offer_gen.load(Ordering::Relaxed);
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    hub.replan();
+    push(&mut eng);
+    let m = drain(&mut rx);
+    let h = hellos(&m);
+    assert_eq!(h.len(), 1, "one new hello");
+    let codecs: Vec<&str> = h[0]["videoOffers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["codec"].as_str())
+        .collect();
+    assert_eq!(codecs, vec!["h264"]);
+    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen + 1);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert!(eng.why.contains(&(HEVC, GIVEN_UP.to_string())));
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(route_codec(&c), Some(Codec::H264));
+    // Nothing changed since: no further hello.
+    hub.replan();
+    push(&mut eng);
+    assert!(hellos(&drain(&mut rx)).is_empty());
+}
+
 #[test]
 fn errors_and_timeouts_walk_down_to_no_codec() {
     let hub = Hub::new();

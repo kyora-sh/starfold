@@ -448,7 +448,13 @@ pub struct Hub {
     pub cohorts: Mutex<serde_json::Value>,
     /// `--encoder` and the encoder each codec streams from, for /stats.
     pub encoder: Mutex<serde_json::Value>,
+    /// The backends turned off for this process and why ([`crate::encoder::turned_off`]; a
+    /// fake in tests). The video thread reads it each time it routes viewers.
+    pub off: Mutex<Off>,
 }
+
+/// Where the video thread reads which backends are turned off.
+pub type Off = Arc<dyn Fn() -> Vec<(crate::encoder::Backend, String)> + Send + Sync>;
 
 impl Hub {
     pub fn new() -> Arc<Self> {
@@ -478,6 +484,7 @@ impl Hub {
             next_cohort: AtomicU64::new(1),
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
             encoder: Mutex::new(serde_json::Value::Null),
+            off: Mutex::new(Arc::new(crate::encoder::turned_off)),
         })
     }
 
@@ -498,6 +505,12 @@ impl Hub {
         if matches!(ev, crate::input::InputEvent::Key { .. }) {
             *self.key_at.lock() = Some(now);
         }
+    }
+
+    /// The backends turned off now, and why.
+    pub fn off(&self) -> Vec<(crate::encoder::Backend, String)> {
+        let f = self.off.lock().clone();
+        f()
     }
 
     /// Asks the video thread to route viewers again.
