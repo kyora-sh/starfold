@@ -2,7 +2,8 @@
 //! graphics driver) loaded at runtime from the DriverStore folder the adapter's driver names,
 //! as Intel's own dispatcher finds it. Discovery asks the runtime what it encodes
 //! (`MFXQueryImplsDescription`) and nothing else; an EXPERIMENTAL H.264 and HEVC encoder
-//! runs on it (8-bit 4:2:0, IDR + P, one reference, LowPower where the runtime takes it).
+//! runs on it (8-bit 4:2:0, IDR + P, one reference, LowPower only where the runtime refuses
+//! the full encoder).
 //! Windows only. `--encoder auto` never picks it, only `--encoder qsv` does.
 //!
 //! The runtime is only ever loaded and called in another process: the probe's child, and
@@ -16,6 +17,8 @@ mod helper;
 mod helper_tests;
 #[cfg(windows)]
 mod locate;
+#[cfg(test)]
+mod low_power_tests;
 mod probe;
 mod proc;
 mod proto;

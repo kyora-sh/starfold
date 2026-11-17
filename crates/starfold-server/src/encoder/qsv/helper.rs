@@ -113,6 +113,9 @@ pub fn serve(
     };
     let mut session = match open(&cfg, o.luid) {
         Ok((s, name)) => {
+            if let Some(why) = &s.low_power_why {
+                eprintln!("LowPower on: the runtime refused the full encoder ({why})");
+            }
             let opened = Reply::Opened {
                 low_power: s.low_power,
                 name,
