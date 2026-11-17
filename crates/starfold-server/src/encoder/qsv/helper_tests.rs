@@ -498,8 +498,21 @@ mod remote {
             let enc = start(p, format!("{opened}; sleep 30"));
             let line = format!("qsv helper {}: opened fake-gen, {mode}", enc.pid());
             assert_eq!(enc.opened_line(), line);
-            assert_eq!(p.low_power(), Some(low_power));
+            assert_eq!(p.modes(), vec![(Codec::H264, low_power)]);
         }
+    }
+
+    #[test]
+    fn a_session_mode_leaves_with_its_helper() {
+        let p = policy(QUICK);
+        let mut dies = start(p, format!("{}; sleep 0.1; exit 1", opened()));
+        let lives = start(p, format!("{}; sleep 30", opened()));
+        assert_eq!(p.modes(), vec![(Codec::H264, true); 2]);
+        fails_within(&mut dies, Duration::from_secs(2));
+        assert_eq!(p.modes(), vec![(Codec::H264, true)], "an ended helper's goes");
+        p.give_up("a test", None);
+        assert!(p.modes().is_empty(), "a give-up takes every one");
+        drop(lives);
     }
 
     #[test]

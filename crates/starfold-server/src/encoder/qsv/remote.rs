@@ -53,6 +53,8 @@ struct Live {
     proc: Arc<Proc>,
     /// When its request is due, and what that request is.
     due: Option<(Instant, &'static str)>,
+    /// The codec its session encodes and whether it opened with LowPower on, once open.
+    mode: Option<(Codec, bool)>,
 }
 
 struct State {
@@ -64,8 +66,6 @@ struct State {
     /// Helpers killed that did not exit: never dropped, so never mistaken for gone.
     stuck: Vec<Arc<Proc>>,
     watchdog: bool,
-    /// Whether the last helper to open a session opened it with LowPower on.
-    low_power: Option<bool>,
 }
 
 /// What [`Policy::settle`] does to a helper's entry: a new deadline, none, or off the list
@@ -109,7 +109,6 @@ impl Policy {
                 live: Vec::new(),
                 stuck: Vec::new(),
                 watchdog: false,
-                low_power: None,
             }),
             timing,
             start_watchdog,
@@ -131,9 +130,17 @@ impl Policy {
         })
     }
 
-    /// Whether the last session a helper opened runs with LowPower on; `None` before any.
-    pub fn low_power(&self) -> Option<bool> {
-        self.lock().low_power
+    /// The codec and LowPower mode of each live helper's open session: gone with the helper
+    /// when it ends or Quick Sync is given up.
+    pub fn modes(&self) -> Vec<(Codec, bool)> {
+        self.lock().live.iter().filter_map(|l| l.mode).collect()
+    }
+
+    /// Helper `id` opened a session for `codec`, with LowPower on or off.
+    fn opened(&self, id: u64, codec: Codec, low_power: bool) {
+        if let Some(l) = self.lock().live.iter_mut().find(|l| l.id == id) {
+            l.mode = Some((codec, low_power));
+        }
     }
 
     /// Helpers started so far.
@@ -251,6 +258,7 @@ impl Policy {
             id,
             proc,
             due: None,
+            mode: None,
         });
         Ok(id)
     }
@@ -443,7 +451,7 @@ impl Remote {
             Reply::Opened { low_power, name } => {
                 r.name = name;
                 r.low_power = low_power;
-                policy.lock().low_power = Some(low_power);
+                policy.opened(r.id, cfg.codec, low_power);
                 log::info!("{}", r.opened_line());
                 Ok(r)
             }

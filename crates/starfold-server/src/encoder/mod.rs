@@ -551,18 +551,30 @@ pub fn turned_off() -> Vec<(Backend, String)> {
 
 /// `/stats`' `encoder` object with `off`'s reasons as they stand now: each backend in it is
 /// listed under `off`, and its `failed` entries give that reason rather than the one
-/// recorded when the stream fell back. A `chosen` Quick Sync entry carries `low_power`, the
-/// mode its last session opened with, once one has.
+/// recorded when the stream fell back. A `chosen` Quick Sync entry carries `low_power`: the
+/// mode of the sessions of its codec open in live helpers now, `[false, true]` if they
+/// differ, and no field while none is open.
 pub fn with_live(encoder: &serde_json::Value, off: &[(Backend, String)]) -> serde_json::Value {
     let mut e = encoder.clone();
     let Some(obj) = e.as_object_mut() else {
         return e;
     };
     #[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
-    if let Some(low_power) = qsv::low_power() {
-        if let Some(chosen) = obj.get_mut("chosen").and_then(|c| c.as_array_mut()) {
-            for c in chosen.iter_mut().filter(|c| c["backend"] == "qsv") {
-                c["low_power"] = serde_json::Value::from(low_power);
+    if let Some(chosen) = obj.get_mut("chosen").and_then(|c| c.as_array_mut()) {
+        let modes = qsv::modes();
+        for c in chosen.iter_mut().filter(|c| c["backend"] == "qsv") {
+            let codec = c["codec"].clone();
+            let mut seen: Vec<bool> = modes
+                .iter()
+                .filter(|(of, _)| serde_json::to_value(of).ok() == Some(codec.clone()))
+                .map(|&(_, low_power)| low_power)
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            match seen.as_slice() {
+                [] => {}
+                [one] => c["low_power"] = serde_json::Value::from(*one),
+                all => c["low_power"] = serde_json::json!(all),
             }
         }
     }

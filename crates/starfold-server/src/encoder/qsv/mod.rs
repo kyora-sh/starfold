@@ -57,10 +57,9 @@ pub fn off() -> Option<String> {
     remote::POLICY.off()
 }
 
-/// Whether the last Quick Sync session a helper opened in this process runs with LowPower
-/// on; `None` before any.
-pub fn low_power() -> Option<bool> {
-    remote::POLICY.low_power()
+/// The codec and LowPower mode of each Quick Sync session open in a live helper now.
+pub fn modes() -> Vec<(Codec, bool)> {
+    remote::POLICY.modes()
 }
 
 /// More than any runtime lists; bounds what is read from its descriptions.
