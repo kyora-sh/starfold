@@ -15,6 +15,10 @@
 - **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
   feature. `--no-default-features --features openh264` builds without x264, and that binary stays
   under starfold's MIT licence.
+- **Cisco's OpenH264 binary** (BSD-2-Clause, with Cisco's AVC/H.264 patent licence conditions): not
+  bundled. A build with the `openh264-cisco` feature loads it at run time from a path the user gives,
+  after checking it against the pinned sha256; starfold neither contains nor downloads it. Licence,
+  verbatim from Cisco: [licenses/openh264-cisco-binary.txt](licenses/openh264-cisco-binary.txt).
 - **Intel libvpl API headers** (MIT, Copyright Intel Corporation,
   [intel/libvpl](https://github.com/intel/libvpl) v2.17.0, commit
   d77f9195cf495b937631607333288fd917ae8939): the Windows Quick Sync encoder's struct layouts and

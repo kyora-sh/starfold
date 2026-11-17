@@ -29,6 +29,19 @@ pub struct Encoder {
     pub uncapped_only: bool,
     /// GPL: a binary that links it is GPL-2.0-or-later as a combined work.
     pub gpl: bool,
+    /// Where its library comes from.
+    pub library: Library,
+}
+
+/// Where an encoder's library comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Library {
+    /// Linked into the binary (or, for the bench arms, a system library it links).
+    Linked,
+    /// The platform's driver or system runtime, found at startup.
+    Driver,
+    /// Cisco's OpenH264 binary, loaded at run time from a path; never part of the binary.
+    CiscoBinary,
 }
 
 pub const ENCODERS: &[Encoder] = &[
@@ -43,10 +56,11 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: true,
         uncapped_only: false,
         gpl: true,
+        library: Library::Linked,
     },
     Encoder {
         name: "openh264",
-        built: cfg!(feature = "openh264"),
+        built: cfg!(any(feature = "openh264", feature = "openh264-cisco")),
         hardware: false,
         h264: true,
         crf: Some("lowest QP in motion"),
@@ -55,6 +69,11 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
+        library: if cfg!(feature = "openh264-cisco") {
+            Library::CiscoBinary
+        } else {
+            Library::Linked
+        },
     },
     Encoder {
         name: "libvpx",
@@ -67,6 +86,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
+        library: Library::Linked,
     },
     Encoder {
         name: "libaom",
@@ -79,6 +99,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
+        library: Library::Linked,
     },
     Encoder {
         name: "svt-av1",
@@ -91,6 +112,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
+        library: Library::Linked,
     },
     Encoder {
         name: "kvazaar",
@@ -103,6 +125,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
+        library: Library::Linked,
     },
     Encoder {
         name: "x265",
@@ -115,6 +138,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: true,
+        library: Library::Linked,
     },
     hardware("videotoolbox", cfg!(target_os = "macos"), Qp::Never),
     hardware("vaapi", cfg!(target_os = "linux"), Qp::Negotiated),
@@ -165,6 +189,7 @@ const fn hardware(name: &'static str, built: bool, qp: Qp) -> Encoder {
         refines_to_paintover_crf: false,
         uncapped_only: matches!(qp, Qp::Uncapped),
         gpl: false,
+        library: Library::Driver,
     }
 }
 
@@ -179,9 +204,15 @@ fn software() -> impl Iterator<Item = &'static Encoder> {
     built().filter(|e| !e.hardware)
 }
 
-/// Every software encoder this binary includes, H.264 and bench arms, by feature name.
-pub fn software_encoders() -> Vec<&'static str> {
-    software().map(|e| e.name).collect()
+/// Every software encoder this binary includes, H.264 and bench arms, as `--version` names
+/// them: by feature name, and one loaded from Cisco's binary says so.
+pub fn software_encoder_labels() -> Vec<String> {
+    software()
+        .map(|e| match e.library {
+            Library::CiscoBinary => format!("{} [Cisco's binary, loaded at run time]", e.name),
+            _ => e.name.to_string(),
+        })
+        .collect()
 }
 
 /// The software H.264 encoders `--encoder` can pin.
@@ -305,8 +336,16 @@ mod tests {
 
     #[test]
     fn every_encoder_feature_in_cargo_toml_is_described() {
-        let mut features = cargo_features();
+        // `openh264-cisco` is the openh264 row too, with its library loaded at run time.
+        let mut features: Vec<String> = cargo_features()
+            .into_iter()
+            .map(|f| match f.as_str() {
+                "openh264-cisco" => "openh264".to_string(),
+                _ => f,
+            })
+            .collect();
         features.sort();
+        features.dedup();
         let mut described: Vec<String> = ENCODERS
             .iter()
             .filter(|e| !e.hardware)
@@ -324,11 +363,34 @@ mod tests {
             cfg!(any(feature = "x264", feature = "x265"))
         );
         for arm in bench_arms() {
-            assert!(
-                software_encoders().iter().any(|e| arm.starts_with(e)),
-                "{arm}"
-            );
+            assert!(software().any(|e| arm.starts_with(e.name)), "{arm}");
         }
+    }
+
+    /// Only a build with `openh264-cisco` loads Cisco's binary, and it says so in `--version`;
+    /// the binary itself stays under starfold's own licence unless x264 is in it.
+    #[test]
+    fn cisco_binary_only_with_its_feature() {
+        let cisco: Vec<&str> = ENCODERS
+            .iter()
+            .filter(|e| e.library == Library::CiscoBinary)
+            .map(|e| e.name)
+            .collect();
+        let want: &[&str] = if cfg!(feature = "openh264-cisco") {
+            &["openh264"]
+        } else {
+            &[]
+        };
+        assert_eq!(cisco, want);
+        let labels = software_encoder_labels().join(", ");
+        assert_eq!(
+            labels.contains("openh264 [Cisco's binary, loaded at run time]"),
+            cfg!(feature = "openh264-cisco"),
+            "{labels}"
+        );
+        assert!(ENCODERS
+            .iter()
+            .all(|e| e.hardware == (e.library == Library::Driver)));
     }
 
     #[test]

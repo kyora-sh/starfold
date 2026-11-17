@@ -146,6 +146,79 @@ jobs:
           cargo test --features openh264 --locked
           cargo test --no-default-features --features openh264 --locked
 
+  openh264-cisco:
+    name: Rust with Cisco's OpenH264 binary (clippy, test, startup)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # As the OpenH264 job (the tests' own OpenH264 is built from source), plus Xvfb.
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild xvfb; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-openh264-cisco-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-openh264-cisco-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      # Without x264, then beside it.
+      - name: Clippy
+        run: |
+          cargo clippy --no-default-features --features openh264-cisco --all-targets --locked -- -D warnings
+          cargo clippy --features openh264-cisco --all-targets --locked -- -D warnings
+      # No library given: the tests encode with the dev-dependency's OpenH264.
+      - name: Test
+        run: cargo test --no-default-features --features openh264-cisco --locked
+      # The two OpenH264 features refuse to build together.
+      - name: openh264 with openh264-cisco
+        run: |
+          if cargo check --no-default-features --features openh264,openh264-cisco --locked 2> "$RUNNER_TEMP/both.log"; then
+            echo "::error::openh264 and openh264-cisco built together"; exit 1
+          fi
+          grep -q "exclude each other" "$RUNNER_TEMP/both.log" || { cat "$RUNNER_TEMP/both.log"; exit 1; }
+      # The binary contains no OpenH264, and without a library it does not start.
+      - name: No OpenH264 without a library
+        run: |
+          cargo build --no-default-features --features openh264-cisco --locked
+          if nm --defined-only target/debug/starfold | grep -q WelsCreateSVCEncoder; then
+            echo "::error::the binary contains OpenH264"; exit 1
+          fi
+          target/debug/starfold --version
+          rc=0
+          timeout 60 target/debug/starfold --enable-basic-auth=false --audio-enabled=false --port=6902 > "$RUNNER_TEMP/nolib.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/nolib.log"
+          [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
+          grep -q "no OpenH264 library" "$RUNNER_TEMP/nolib.log"
+      # Cisco's own file, fetched from Cisco and checked against the pin: every library test
+      # runs on it (the_library_tests_run_on asserts 2.6), then the server starts with it.
+      - name: On Cisco's OpenH264
+        run: |
+          lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
+          STARFOLD_OPENH264_LIB="$lib" cargo test --no-default-features --features openh264-cisco --locked
+          BENCH_DISPLAY=:99 bench/env/xvfb.sh > /dev/null 2>&1 &
+          for _ in $(seq 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done
+          log=$RUNNER_TEMP/cisco.log
+          DISPLAY=:99 RUST_LOG=info target/debug/starfold --openh264-lib="$lib" --port=6901 --enable-basic-auth=false --audio-enabled=false > "$log" 2>&1 &
+          pid=$!
+          up() { grep -q 'listening on' "$log" && grep -q 'offering H264 from openh264:' "$log"; }
+          for _ in $(seq 60); do up && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+          sleep 3
+          cut -c1-240 "$log" || true
+          ok=1
+          up && grep -qF 'OpenH264 Video Codec provided by Cisco Systems, Inc.' "$log" && kill -0 $pid 2>/dev/null || ok=0
+          kill $pid 2>/dev/null || true
+          wait $pid 2>/dev/null || true
+          [ $ok = 1 ] || { echo "::error::starfold did not start on Cisco's OpenH264"; exit 1; }
+
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
     runs-on: kyora-8x16
@@ -288,8 +361,12 @@ jobs:
             target
           key: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
+      # Then the code that loads Cisco's DLL (library and binary; its tests build OpenH264
+      # from source, which this cross-compile doesn't).
       - name: Clippy
-        run: cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
+          cargo clippy --target x86_64-pc-windows-gnu --features openh264-cisco --locked -- -D warnings
 
   macos:
     name: macOS (rustfmt, clippy, test)
@@ -331,7 +408,9 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --features openh264-cisco --locked -- -D warnings
       - name: Test
         run: cargo test --locked
       # What the startup probe finds on this host's hardware encoders.

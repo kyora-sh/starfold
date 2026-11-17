@@ -366,7 +366,7 @@ pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbePr
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
     #[cfg(feature = "x264")]
     v.push(Box::new(Software(Backend::X264)));
-    #[cfg(feature = "openh264")]
+    #[cfg(openh264_any)]
     v.push(Box::new(Software(Backend::OpenH264)));
     if !hardware {
         return v;
@@ -448,7 +448,16 @@ impl ProbeProvider for Software {
     }
 
     fn probe(&self) -> Probe {
-        let mut c = EncoderCapability::new(Codec::H264, self.0, Acceleration::Software, "cpu");
+        // Cisco's OpenH264 says which file it is, and the attribution its licence asks for.
+        let device: String = match self.0 {
+            #[cfg(feature = "openh264-cisco")]
+            Backend::OpenH264 => match super::cisco::load(None) {
+                Ok(what) => format!("cpu, {what}"),
+                Err(_) => "cpu".into(),
+            },
+            _ => "cpu".into(),
+        };
+        let mut c = EncoderCapability::new(Codec::H264, self.0, Acceleration::Software, device);
         c.profiles = vec![match self.0 {
             Backend::OpenH264 => ProfileCapability::new("constrained_baseline", 8, Chroma::Yuv420),
             _ => ProfileCapability::new("high", 8, Chroma::Yuv420),

@@ -42,6 +42,8 @@ Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esb
 toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
+`--no-default-features --features openh264-cisco` builds without either and encodes H.264 with
+Cisco's OpenH264 binary, loaded at run time (see [OpenH264 from Cisco](#openh264-from-cisco)).
 
 ```sh
 nix-shell --arg withRust true
@@ -336,3 +338,43 @@ work. Each release attaches the exact x264 source its builds link
 no GPL component, so the binary stays under starfold's MIT licence; `starfold --version` lists
 the encoders a binary includes and its licence.
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.
+
+### OpenH264 from Cisco
+
+`cargo build --release --no-default-features --features openh264-cisco` builds a binary with no
+H.264 encoder of its own. It encodes H.264 with Cisco's OpenH264 2.6.0 binary, which starfold
+neither contains nor downloads. The binary stays under starfold's MIT licence.
+
+- **Loading it:** pass the file's path with `--openh264-lib PATH` or `STARFOLD_OPENH264_LIB`.
+  - Cisco publishes the file at `https://ciscobinary.openh264.org/<file>.bz2`.
+  - The pinned files are `libopenh264-2.6.0-linux64.8.so`, `libopenh264-2.6.0-linux-arm64.8.so`,
+    `libopenh264-2.6.0-mac-x64.dylib`, `libopenh264-2.6.0-mac-arm64.dylib` and
+    `openh264-2.6.0-win64.dll`.
+- **Checks:** starfold loads the file only if its sha256 is the pinned build for this platform and
+  the library reports version 2.6.
+  - It loads the bytes it checked, from a copy no other process can change:
+    - Linux: a sealed memfd.
+    - macOS: a private copy in a directory only the user can enter.
+    - Windows: the file itself, held open so that it can't be written, renamed or deleted until
+      it is loaded.
+  - Windows takes local absolute paths only, loaded without the DLL search path.
+- **Platforms:** Linux x86-64 and arm64, macOS x86-64 and arm64, Windows x64. No Cisco build is
+  pinned for Windows on Arm, so there it is refused.
+- **macOS, unverified:** a signed starfold with the hardened runtime may need the
+  `com.apple.security.cs.disable-library-validation` entitlement to load Cisco's dylib.
+- **Without the library, or with any other file:** OpenH264 is unavailable, and the log and `/stats`
+  say why.
+  - `--encoder auto` still uses a hardware encoder where there is one.
+  - Without one, startup fails with that reason. starfold never falls back to another encoder.
+- **What it shows:** when it loads the library, starfold logs
+  "OpenH264 Video Codec provided by Cisco Systems, Inc.", and `/stats` and `--help` show the same
+  text.
+- **Not with `openh264`:** `openh264` and `openh264-cisco` can't be built together. `x264` and
+  `openh264-cisco` can (`--encoder openh264` beside x264).
+
+Cisco's licence for its binary is in
+[licenses/openh264-cisco-binary.txt](licenses/openh264-cisco-binary.txt), a verbatim copy of
+`https://www.openh264.org/BINARY_LICENSE.txt`. Its "AVC/H.264 Patent Portfolio License Conditions"
+set what must hold for Cisco's patent licence to cover the binary: how it reaches the end user's
+device, the end user's control over its use, the text to display, and the licence text to show.
+Those conditions fall on whoever ships starfold to end users; read the file before doing so.

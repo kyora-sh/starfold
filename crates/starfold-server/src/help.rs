@@ -43,7 +43,8 @@ ENCODER_ENTRY
                                 Foundation and Quick Sync, each in a child
                                 process (default false)
 PRESET_ENTRY
-  --encoder-threads             sliced threads (default cores/4, from 1 to 4)
+OPENH264_ENTRY
+  --encoder-threads            sliced threads (default cores/4, from 1 to 4)
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
 PAINTOVER_ENTRY
@@ -227,7 +228,21 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
+    #[cfg(feature = "openh264-cisco")]
+    let openh264 = entry(
+        "--openh264-lib",
+        &format!(
+            "Cisco's OpenH264 binary ({}), loaded only if its sha256 is the build starfold pins \
+             (default ${}); without it there is no OpenH264. {}",
+            crate::encoder::cisco::platform_file().unwrap_or("none pinned for this platform"),
+            crate::encoder::cisco::LIB_ENV,
+            crate::encoder::cisco::ATTRIBUTION
+        ),
+    );
+    #[cfg(not(feature = "openh264-cisco"))]
+    let openh264 = String::new();
     usage
+        .replace("OPENH264_ENTRY\n", &openh264)
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
         .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
@@ -246,7 +261,7 @@ fn help_text(version: &str, addr: &str) -> String {
 fn version_line(version: &str) -> String {
     format!(
         "starfold {version} (encoders: {}; licence: {})",
-        build_facts::software_encoders().join(", "),
+        build_facts::software_encoder_labels().join(", "),
         build_facts::licence()
     )
 }
@@ -335,6 +350,29 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("_ENTRY"), "{text}");
+    }
+
+    /// A build that loads Cisco's binary shows `--openh264-lib` with Cisco's attribution
+    /// exactly; no other build mentions either.
+    #[test]
+    fn help_shows_ciscos_attribution_only_with_its_binary() {
+        let words = help_text("1.2.3", "0.0.0.0")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let attribution = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
+        assert_eq!(
+            words.contains(attribution),
+            cfg!(feature = "openh264-cisco"),
+            "{words}"
+        );
+        assert_eq!(
+            words.contains("--openh264-lib"),
+            cfg!(feature = "openh264-cisco"),
+            "{words}"
+        );
+        #[cfg(feature = "openh264-cisco")]
+        assert_eq!(crate::encoder::cisco::ATTRIBUTION, attribution);
     }
 
     #[test]

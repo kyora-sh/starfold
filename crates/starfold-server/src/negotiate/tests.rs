@@ -335,7 +335,7 @@ fn chosen_is_each_codecs_first_candidate() {
 #[test]
 fn selection_parse() {
     assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
-    #[cfg(feature = "openh264")]
+    #[cfg(openh264_any)]
     assert_eq!(
         Selection::parse("openh264"),
         Ok(Selection::Pinned(Backend::OpenH264))

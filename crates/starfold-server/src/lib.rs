@@ -174,6 +174,15 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
+    // --openh264-lib: Cisco's OpenH264 binary, loaded once before the encoders are probed.
+    #[cfg(feature = "openh264-cisco")]
+    if let Err(e) = encoder::cisco::load(a.get("openh264-lib").map(std::path::Path::new)) {
+        log::warn!("OpenH264 unavailable: {e}");
+    }
+    #[cfg(not(feature = "openh264-cisco"))]
+    if a.contains_key("openh264-lib") {
+        log::warn!("--openh264-lib has no effect: this build does not load Cisco's OpenH264");
+    }
     let encoders = std::sync::Arc::new(encoder::caps::host_probe(
         truthy(a.get("encoder-probe"), true),
         truthy(a.get("experimental-hw-probes"), false),

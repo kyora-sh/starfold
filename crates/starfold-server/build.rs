@@ -13,6 +13,11 @@ fn main() {
     if cfg!(feature = "openh264") {
         nasm_check();
     }
+    // `openh264_any`: the OpenH264 backend is built in, compiled from source or Cisco's.
+    println!("cargo::rustc-check-cfg=cfg(openh264_any)");
+    if cfg!(any(feature = "openh264", feature = "openh264-cisco")) {
+        println!("cargo::rustc-cfg=openh264_any");
+    }
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
 }

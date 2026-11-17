@@ -16,6 +16,8 @@ mod aom;
 )]
 mod av1;
 pub mod caps;
+#[cfg(feature = "openh264-cisco")]
+pub mod cisco;
 mod h264;
 #[cfg(any(
     target_os = "macos",
@@ -36,14 +38,14 @@ mod kvazaar;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
-#[cfg(feature = "openh264")]
+#[cfg(openh264_any)]
 pub(crate) mod openh264;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod qsv;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use qsv::{helper_main, HELPER_FLAG};
-#[cfg(any(feature = "openh264", feature = "x264"))]
+#[cfg(any(openh264_any, feature = "x264"))]
 pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]
 mod svt;
@@ -233,9 +235,16 @@ pub trait VideoEncoder: Send {
     }
 }
 
-#[cfg(not(any(feature = "x264", feature = "openh264")))]
+#[cfg(not(any(feature = "x264", openh264_any)))]
 compile_error!(
-    "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
+    "starfold needs a software H.264 encoder: the `x264` (default), `openh264` or \
+     `openh264-cisco` feature"
+);
+
+#[cfg(all(feature = "openh264", feature = "openh264-cisco"))]
+compile_error!(
+    "`openh264` and `openh264-cisco` exclude each other: a build that loads Cisco's binary \
+     must not contain OpenH264 compiled from source"
 );
 
 /// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
@@ -273,12 +282,14 @@ pub enum Backend {
 impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
-            #[cfg(feature = "openh264")]
+            #[cfg(openh264_any)]
             "openh264" => Ok(Backend::OpenH264),
-            #[cfg(not(feature = "openh264"))]
-            "openh264" => {
-                Err("this build has no OpenH264 (build with `--features openh264`)".into())
-            }
+            #[cfg(not(openh264_any))]
+            "openh264" => Err(
+                "this build has no OpenH264 (build with `--features openh264` or \
+                 `--features openh264-cisco`)"
+                    .into(),
+            ),
             #[cfg(feature = "x264")]
             "x264" => Ok(Backend::X264),
             #[cfg(not(feature = "x264"))]
@@ -341,7 +352,7 @@ impl Backend {
     /// Whether this build has an encoder for `codec` on this backend.
     pub fn implements(self, codec: Codec) -> bool {
         match self {
-            Backend::OpenH264 => cfg!(feature = "openh264") && codec == Codec::H264,
+            Backend::OpenH264 => cfg!(openh264_any) && codec == Codec::H264,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
             #[cfg(feature = "libvpx")]
@@ -623,7 +634,7 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         ..cfg.clone()
     };
     let inner: Box<dyn VideoEncoder> = match cfg.backend {
-        #[cfg(feature = "openh264")]
+        #[cfg(openh264_any)]
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),

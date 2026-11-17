@@ -1,5 +1,6 @@
-//! OpenH264 (BSD-2-Clause, compiled from source by openh264-sys2) through its C vtable:
-//! constrained Baseline, bitrate rate control, IDR on request only.
+//! OpenH264 (BSD-2-Clause) through its C vtable: constrained Baseline, bitrate rate control,
+//! IDR on request only. The library is compiled from source by openh264-sys2 (`openh264`), or
+//! Cisco's binary loaded at run time (`openh264-cisco`, see [`super::cisco`]).
 
 use super::h264::ParamSets;
 use super::sharpness::Sharpness;
@@ -10,6 +11,25 @@ use super::{
 use openh264_sys2 as sys;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
+use sys::API;
+
+#[cfg(feature = "openh264")]
+struct Source(sys::DynamicAPI);
+
+// The compiled-in library's entry points are plain C functions, callable from any thread.
+#[cfg(feature = "openh264")]
+unsafe impl Sync for Source {}
+
+#[cfg(feature = "openh264")]
+static SOURCE: Source = Source(sys::DynamicAPI::from_source());
+
+/// The OpenH264 this build encodes with.
+fn library() -> Result<&'static sys::DynamicAPI, EncodeError> {
+    #[cfg(feature = "openh264")]
+    return Ok(&SOURCE.0);
+    #[cfg(not(feature = "openh264"))]
+    return super::cisco::library().map_err(EncodeError);
+}
 
 /// OpenH264 clamps the frame rate it plans rate control for to this, so above it the
 /// bitrate is scaled down to keep the per-second budget.
@@ -17,6 +37,7 @@ const MAX_FPS: u32 = 60;
 /// What an uncapped rate (`max_kbps` 0) becomes: level 5.2's bitrate.
 const UNCAPPED_BPS: c_int = 240_000_000;
 pub struct OpenH264 {
+    lib: &'static sys::DynamicAPI,
     enc: *mut sys::ISVCEncoder,
     info: Box<sys::SFrameBSInfo>,
     params: ParamSets,
@@ -56,12 +77,14 @@ fn bps(max_kbps: u32, fps: u32) -> c_int {
 
 impl OpenH264 {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, EncodeError> {
+        let lib = library()?;
         let mut enc = ptr::null_mut();
-        let r = unsafe { sys::source::APILoader::WelsCreateSVCEncoder(&mut enc) };
+        let r = unsafe { lib.WelsCreateSVCEncoder(&mut enc) };
         if r != 0 || enc.is_null() {
             return Err(EncodeError(format!("WelsCreateSVCEncoder failed ({r})")));
         }
         let mut me = OpenH264 {
+            lib,
             enc,
             info: Box::default(),
             params: ParamSets::default(),
@@ -335,7 +358,7 @@ impl Drop for OpenH264 {
     fn drop(&mut self) {
         unsafe {
             self.vt().Uninitialize.unwrap()(self.enc);
-            sys::source::APILoader::WelsDestroySVCEncoder(self.enc);
+            self.lib.WelsDestroySVCEncoder(self.enc);
         }
     }
 }
