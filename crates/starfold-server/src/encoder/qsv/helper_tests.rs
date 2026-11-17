@@ -370,7 +370,8 @@ mod remote {
     use crate::encoder::hw::sample_config;
     use crate::encoder::isolate::{Report, VERSION};
     use crate::encoder::{
-        Backend, Codec, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder,
+        Backend, Codec, EncodeOptions, EncoderConfig, FrameView, RateConfig, RateInForce,
+        VideoEncoder,
     };
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -516,6 +517,25 @@ mod remote {
             line,
             format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on")
         );
+    }
+
+    /// The rate the helper read back is kept until a rate change fails; then it is unknown,
+    /// not the one before, and stays unknown while nothing is read back.
+    #[test]
+    fn a_failed_rate_change_makes_the_helpers_rate_unknown() {
+        let p = policy(QUICK);
+        let set = says(&Reply::RateSet { kbps: 5_000 });
+        let refused = says(&Reply::Error {
+            stopped: false,
+            reason: "MFXVideoENCODE_Reset failed".into(),
+        });
+        let mut enc = start(p, format!("{}; {set}; {refused}; sleep 30", opened()));
+        assert_eq!(enc.rate_in_force(), RateInForce::NotRead, "nothing read yet");
+        enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
+        assert_eq!(enc.rate_in_force(), RateInForce::Known(5_000));
+        assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
+        assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
+        assert!(p.off().is_none(), "an ordinary failure");
     }
 
     #[test]

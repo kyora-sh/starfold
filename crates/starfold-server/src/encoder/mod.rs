@@ -225,11 +225,21 @@ pub trait VideoEncoder: Send {
     fn refinable(&self, _r: Refine) -> bool {
         false
     }
-    /// The bitrate (kbit/s) the encoder says it runs at, for an encoder that reads its
-    /// rate back after a change; None for one that doesn't.
-    fn rate_in_force(&self) -> Option<u32> {
-        None
+    /// What the encoder can say about the bitrate it runs at.
+    fn rate_in_force(&self) -> RateInForce {
+        RateInForce::NotRead
     }
+}
+
+/// What an encoder can say about the bitrate it runs at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateInForce {
+    /// It doesn't read its rate back, or runs at a constant QP.
+    NotRead,
+    /// It read this back after its last rate change (kbit/s).
+    Known(u32),
+    /// A rate change failed: what it runs at isn't known until it reads it back again.
+    Unknown,
 }
 
 #[cfg(not(any(feature = "x264", feature = "openh264")))]
@@ -734,7 +744,7 @@ impl VideoEncoder for Pad {
         self.inner.refinable(r)
     }
 
-    fn rate_in_force(&self) -> Option<u32> {
+    fn rate_in_force(&self) -> RateInForce {
         self.inner.rate_in_force()
     }
 }

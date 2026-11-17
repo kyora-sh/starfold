@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo};
+use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo, RateInForce};
 use crate::input::InputEvent;
 use crate::negotiate::Implementation;
 use std::sync::{Condvar, Mutex as StdMutex};
@@ -83,7 +83,7 @@ struct Fake {
     /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
     slow_keys: Option<(usize, Duration)>,
     /// The bitrate it says it runs at, whatever it was asked for.
-    in_force: Option<u32>,
+    in_force: RateInForce,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -108,7 +108,7 @@ impl VideoEncoder for Fake {
         Ok(())
     }
 
-    fn rate_in_force(&self) -> Option<u32> {
+    fn rate_in_force(&self) -> RateInForce {
         self.in_force
     }
 
@@ -241,8 +241,8 @@ struct Opts {
     h264_hw_delay: Option<Duration>,
     /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
     h264_hw_slow_keys: Option<(usize, Duration)>,
-    /// H.264 encoders say they run at this, whatever they are asked for.
-    h264_in_force: Option<u32>,
+    /// H.264 encoders say this about their rate, whatever they are asked for.
+    h264_in_force: Option<RateInForce>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -281,7 +281,7 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
-                in_force: None,
+                in_force: RateInForce::NotRead,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -328,7 +328,10 @@ fn fakes(o: Opts) -> Open {
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
             delay: None,
             slow_keys: None,
-            in_force: o.h264_in_force.filter(|_| !hevc),
+            in_force: o
+                .h264_in_force
+                .filter(|_| !hevc)
+                .unwrap_or(RateInForce::NotRead),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -3738,13 +3741,12 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
     );
 }
 
-/// `/stats` shows the bitrate a cohort's encoders say they run at, read back from the
-/// encoder, not the target the stream asked them for.
-#[test]
-fn stats_show_the_bitrate_the_encoders_run_at() {
+/// A stream whose H.264 encoders say `rate`, after a few pictures: the hub's bitrate, and
+/// that cohort's own target and its `/stats` entry's target_kbps.
+fn stats_with(rate: RateInForce, stored: u32) -> (u32, u32, serde_json::Value) {
     let hub = Hub::new();
     let opts = Opts {
-        h264_in_force: Some(12_345),
+        h264_in_force: Some(rate),
         ..Default::default()
     };
     let mut eng = engine(&hub, &[H264], opts);
@@ -3761,11 +3763,9 @@ fn stats_show_the_bitrate_the_encoders_run_at() {
     let reporting = eng
         .cohorts
         .iter()
-        .find(|c| c.shared.in_force.load(Ordering::Relaxed) == 12_345)
-        .expect("a cohort whose encoders say what they run at");
+        .find(|c| c.shared.in_force.load(Ordering::Relaxed) == stored)
+        .expect("the cohort of the encoders that said it");
     let target = reporting.shared.target.load(Ordering::Relaxed);
-    assert_ne!(target, 12_345, "the stream's own target is another");
-    assert_eq!(hub.target_kbps.load(Ordering::Relaxed), 12_345);
     let id = reporting.shared.id;
     eng.publish();
     let cohorts = hub.cohorts.lock().clone();
@@ -3774,8 +3774,30 @@ fn stats_show_the_bitrate_the_encoders_run_at() {
         .unwrap()
         .iter()
         .find(|c| c["id"] == id)
-        .map(|c| c["target_kbps"].clone());
-    assert_eq!(shown, Some(serde_json::json!(12_345)), "{cohorts}");
+        .map(|c| c["target_kbps"].clone())
+        .expect("its /stats entry");
+    (hub.target_kbps.load(Ordering::Relaxed), target, shown)
+}
+
+/// `/stats` shows the bitrate a cohort's encoders say they run at, read back from the
+/// encoder, not the target the stream asked them for.
+#[test]
+fn stats_show_the_bitrate_the_encoders_run_at() {
+    let (hub, target, shown) = stats_with(RateInForce::Known(12_345), 12_345);
+    assert_ne!(target, 12_345, "the stream's own target is another");
+    assert_eq!(hub, 12_345);
+    assert_eq!(shown, serde_json::json!(12_345));
+}
+
+/// While an encoder's rate is unknown (a rate change failed and nothing was read back since),
+/// `/stats` shows the cohort's and the overall bitrate as null: never a number, not the
+/// target.
+#[test]
+fn stats_show_an_unknown_bitrate_as_null() {
+    let (hub, target, shown) = stats_with(RateInForce::Unknown, UNKNOWN_KBPS);
+    assert_ne!(target, 0, "the stream has a target");
+    assert_eq!(hub, UNKNOWN_KBPS, "null in /stats");
+    assert_eq!(shown, serde_json::Value::Null);
 }
 
 #[test]

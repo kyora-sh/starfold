@@ -8,8 +8,8 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{
-    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, Refine,
-    StreamConfig, VideoEncoder,
+    self, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, RateInForce,
+    Refine, StreamConfig, VideoEncoder,
 };
 use crate::hub::wait_any;
 use crate::hub::{Client, Hub, Inflight, Out, Phase, Proto, Stats};
@@ -272,8 +272,9 @@ struct Shared {
     idr_inflight: AtomicBool,
     /// Adaptive bitrate cap (kbit/s).
     target: AtomicU32,
-    /// What the cohort's encoders say they run at, all stripes together (kbit/s; 0 until
-    /// every stripe's encoder has said, or for encoders that don't read their rate back).
+    /// What the cohort's encoders say they run at, all stripes together (kbit/s): 0 until
+    /// every stripe's encoder has said, or for encoders that don't read their rate back;
+    /// UNKNOWN_KBPS while any stripe's is unknown.
     in_force: AtomicU32,
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
@@ -303,6 +304,25 @@ struct Shared {
     h: u32,
 }
 
+/// A bitrate nobody knows: an encoder's rate change failed and nothing was read back since.
+/// `/stats` shows it as null.
+pub(crate) const UNKNOWN_KBPS: u32 = u32::MAX;
+
+/// A cohort's bitrate from its stripes' encoders, for `Shared::in_force`: unknown if any
+/// stripe's is, their sum if every one read its own back, else 0 (the target stands).
+fn cohort_in_force(stripes: &[RateInForce]) -> u32 {
+    if stripes.contains(&RateInForce::Unknown) {
+        return UNKNOWN_KBPS;
+    }
+    let known = stripes.iter().map(|r| match r {
+        RateInForce::Known(k) => Some(*k as u64),
+        _ => None,
+    });
+    known
+        .sum::<Option<u64>>()
+        .map_or(0, |k| k.min(UNKNOWN_KBPS as u64 - 1) as u32)
+}
+
 /// Consecutive failed encodes after which a cohort's viewers move to their next codec.
 const FAIL_AFTER: u32 = 3;
 /// How often a cohort past FAIL_AFTER with nothing to fall back to (the last H.264
@@ -311,11 +331,12 @@ const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 impl Shared {
     /// The bitrate `/stats` shows for the cohort: what its encoders say they run at, where
-    /// they say it, else its target.
-    fn shown_kbps(&self) -> u32 {
+    /// they say it, else its target; None (null) while that is unknown, never the target.
+    fn shown_kbps(&self) -> Option<u32> {
         match self.in_force.load(Ordering::Relaxed) {
-            0 => self.target.load(Ordering::Relaxed),
-            k => k,
+            UNKNOWN_KBPS => None,
+            0 => Some(self.target.load(Ordering::Relaxed)),
+            k => Some(k),
         }
     }
 
@@ -1251,7 +1272,7 @@ impl Engine {
 
     /// Each cohort's bitrate from its own viewers; a cohort that lost them all starts over.
     fn update_rates(&mut self, views: &[View]) {
-        let mut shown = 0;
+        let mut shown = Some(0);
         for (c, v) in self.cohorts.iter_mut().zip(views) {
             // All of them gone and others come since the last look is a leave and a join.
             let replaced = c.active
@@ -1285,13 +1306,15 @@ impl Engine {
             c.shared.hz.store(hz.unwrap_or(u32::MAX), Ordering::Release);
             c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
             if c.active {
-                shown = shown.max(c.shared.shown_kbps());
+                shown = shown.zip(c.shared.shown_kbps()).map(|(a, b)| a.max(b));
             }
         }
-        if shown == 0 {
-            shown = self.cohorts.first().map_or(0, |c| c.shared.shown_kbps());
+        if shown == Some(0) {
+            shown = self.cohorts.first().map_or(Some(0), |c| c.shared.shown_kbps());
         }
-        self.hub.target_kbps.store(shown, Ordering::Relaxed);
+        self.hub
+            .target_kbps
+            .store(shown.unwrap_or(UNKNOWN_KBPS), Ordering::Relaxed);
     }
 
     /// The rate captures can come at: the capture's own, or the source's when faster.
@@ -2505,8 +2528,8 @@ struct StripeResult {
     /// at the ladder's.
     refinable: bool,
     refinable_small: bool,
-    /// The bitrate the stripe's encoder says it runs at (kbit/s), if it reads it back.
-    in_force: Option<u32>,
+    /// What the stripe's encoder says about the bitrate it runs at.
+    in_force: RateInForce,
 }
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
@@ -2801,7 +2824,7 @@ fn encode_loop(
     // Consecutive failed encodes per stripe; a stripe not asked to encode hasn't recovered.
     let mut fails = vec![0u32; n];
     // What each stripe's encoder last said it runs at.
-    let mut in_force: Vec<Option<u32>> = vec![None; n];
+    let mut in_force = vec![RateInForce::NotRead; n];
     let mut slow = SlowWatch::default();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
@@ -2917,8 +2940,7 @@ fn encode_loop(
                 configs[r.i] = r.config;
             }
         }
-        let all: Option<u32> = in_force.iter().copied().sum();
-        sh.in_force.store(all.unwrap_or(0), Ordering::Relaxed);
+        sh.in_force.store(cohort_in_force(&in_force), Ordering::Relaxed);
         if job.refine_qp.is_some() {
             sh.refinable
                 .store(refinable.contains(&true), Ordering::Release);

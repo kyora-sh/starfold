@@ -7,7 +7,9 @@ use super::driver::STOPPED;
 use super::proto::{Open, Reply, Request, Unit};
 use super::session::Session;
 use crate::encoder::hw::sample_config;
-use crate::encoder::{Backend, EncodeError, EncodeOptions, FrameView, RateConfig, VideoEncoder};
+use crate::encoder::{
+    Backend, EncodeError, EncodeOptions, FrameView, RateConfig, RateInForce, VideoEncoder,
+};
 use std::io::{Read, Write};
 
 /// The most a request may be: they carry fields, never pictures.
@@ -195,7 +197,10 @@ pub fn serve(
                 };
                 match session.set_rate(rate) {
                     Ok(()) => Reply::RateSet {
-                        kbps: session.rate_in_force().unwrap_or(0),
+                        kbps: match session.rate_in_force() {
+                            RateInForce::Known(k) => k,
+                            _ => 0,
+                        },
                     },
                     Err(e) => error(&e, session.stopped().is_some()),
                 }

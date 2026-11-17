@@ -271,7 +271,10 @@ async fn stats(State(s): State<AppState>) -> Response {
         "refines": st.refines.load(Ordering::Relaxed),
         "paintover_frames": st.paintover_frames.load(Ordering::Relaxed),
         "paintover_bytes": st.paintover_bytes.load(Ordering::Relaxed),
-        "target_kbps": s.hub.target_kbps.load(Ordering::Relaxed),
+        "target_kbps": match s.hub.target_kbps.load(Ordering::Relaxed) {
+            crate::video::UNKNOWN_KBPS => None,
+            k => Some(k),
+        },
         "damage_events": crate::capture::DAMAGE_EVENTS.load(Ordering::Relaxed),
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),

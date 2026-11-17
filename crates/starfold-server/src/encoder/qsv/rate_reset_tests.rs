@@ -10,7 +10,7 @@ use super::tests::{Fake, INCOMPATIBLE_VIDEO_PARAM};
 use crate::encoder::hw::{sample_config, Rc};
 use crate::encoder::{
     AccessUnit, Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    RateInForce, VideoEncoder,
 };
 use crate::video::keyframe_rate;
 use std::collections::VecDeque;
@@ -80,7 +80,7 @@ fn the_first_rate_change_after_open_goes_through() {
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(keyframe_rate(24.0, 16_000, 30)).unwrap();
     assert!(frame(&mut s, false).unwrap()[0].keyframe);
-    assert_eq!(s.rate_in_force(), Some(at(64_000)));
+    assert_eq!(s.rate_in_force(), RateInForce::Known(at(64_000)));
     let l = log.lock().unwrap();
     assert_eq!(
         l.hrd,
@@ -110,11 +110,11 @@ fn steady_state_rate_changes_go_through() {
     let mut ran = Vec::new();
     for r in rates {
         s.set_rate(r).unwrap();
-        ran.push(s.rate_in_force().unwrap());
+        ran.push(s.rate_in_force());
         frame(&mut s, false).unwrap();
     }
     let want = [12_000, 6_000, 24_000, 20_000, 8_000].map(at);
-    assert_eq!(ran, want);
+    assert_eq!(ran, want.map(RateInForce::Known));
     let l = log.lock().unwrap();
     let asked: Vec<u32> = l.reset.iter().map(kbps).collect();
     assert_eq!(asked[0], at(64_000));
@@ -135,7 +135,7 @@ fn a_reset_changes_the_bitrate_only() {
     let per_picture = at(12_000 * 30 / 10);
     assert_eq!(
         s.rate_in_force(),
-        Some(per_picture * 10 / 30),
+        RateInForce::Known(per_picture * 10 / 30),
         "per second at 10 fps"
     );
     let l = log.lock().unwrap();
@@ -179,9 +179,9 @@ fn a_corrected_rate_is_reported_as_the_one_in_force() {
     fake.correct = Some(25_000);
     let mut s = Session::new(Box::new(fake), &cfg(2_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
-    assert_eq!(s.rate_in_force(), Some(25_000));
-    assert_eq!(s.in_force().target_kbps, 25_000);
-    assert_eq!(s.in_force().max_kbps, 25_000);
+    assert_eq!(s.rate_in_force(), RateInForce::Known(25_000));
+    let ran = s.in_force().unwrap();
+    assert_eq!((ran.target_kbps, ran.max_kbps), (25_000, 25_000));
     assert!(
         !frame(&mut s, false).unwrap().is_empty(),
         "the session goes on"
@@ -212,6 +212,7 @@ fn a_refused_reset_puts_the_encoder_out_of_use() {
             "{e}"
         );
         assert!(s.stopped().is_none(), "the device still answers");
+        assert_eq!(s.rate_in_force(), RateInForce::Unknown);
         let pictures = log.lock().unwrap().frame_types.len();
         assert_eq!(frame(&mut s, false).err(), Some(e.clone()), "no picture");
         assert_eq!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).unwrap_err(), e);
@@ -243,7 +244,38 @@ fn init_leaves_room_for_a_boosted_keyframe() {
     let (fake, _) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(keyframe_rate(24.0, 60_000, 10)).unwrap();
-    assert_eq!(s.rate_in_force(), Some(239_998));
+    assert_eq!(s.rate_in_force(), RateInForce::Known(239_998));
+}
+
+/// A frame rate the runtime reports as a fraction (30000/1001) is kept as one, wherever it
+/// turns a rate asked per second at the stream's picture rate into TargetKbps and back.
+#[test]
+fn a_fractional_frame_rate_is_kept_as_a_fraction() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.frame_rate = Some((30_000, 1_001));
+    let mut s = Session::new(Box::new(fake), &cfg(2_000)).unwrap();
+    s.set_rate(RateConfig::new(24.0, 12_000, 10)).unwrap();
+    // 12000 kbit/s at 10 pictures a second is 1200 kbit a picture: 35964 kbit/s at
+    // 30000/1001 (34800 if that were taken for 29).
+    assert_eq!(kbps(&log.lock().unwrap().reset[0]), 35_964);
+    assert_eq!(s.rate_in_force(), RateInForce::Known(12_000));
+}
+
+/// A rate change that fails, even after the runtime took the Reset (here the read-back
+/// fails), leaves the rate unknown: never the one before it, never the one asked for.
+#[test]
+fn a_failed_rate_change_leaves_the_rate_unknown() {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.video_param = VecDeque::from([0, 0, 0, 0, -1]);
+    let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap();
+    assert_eq!(s.rate_in_force(), RateInForce::Known(at(12_000)));
+    let e = s.set_rate(RateConfig::new(24.0, 6_000, 30)).unwrap_err();
+    assert!(e.0.contains("GetVideoParam"), "{e}");
+    assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+    assert!(frame(&mut s, false).is_err());
+    assert!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).is_err());
+    assert_eq!(s.rate_in_force(), RateInForce::Unknown, "still unknown");
 }
 
 /// A Reset starts from what the runtime says the encoder runs with (GetVideoParam), which

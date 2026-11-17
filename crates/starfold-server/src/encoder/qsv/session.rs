@@ -25,7 +25,7 @@ use super::ffi::{
 use crate::encoder::hw::{self, Rc};
 use crate::encoder::{
     AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    RateInForce, VideoEncoder,
 };
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
@@ -187,8 +187,9 @@ pub struct Session {
     /// The rate last asked for, so the same request isn't made twice. What the encoder runs
     /// is `in_force`.
     rc: Rc,
-    /// What the encoder runs with, as the runtime last reported it.
-    in_force: InForce,
+    /// What the encoder runs with, as the runtime last reported it; None once a rate change
+    /// failed and nothing has been read back since.
+    in_force: Option<InForce>,
     /// The next picture must be an IDR: the first frame, or the last encode failed.
     need_idr: bool,
     stream: hw::Stream,
@@ -209,8 +210,15 @@ pub struct InForce {
     pub buffer_kb: u32,
     pub initial_delay_kb: u32,
     pub multiplier: u16,
-    /// Frames per second, as FrameRateExtN / FrameRateExtD.
-    pub fps: u32,
+    /// The frame rate as the runtime reports it: FrameRateExtN / FrameRateExtD frames per
+    /// second, kept as that fraction (30000/1001 is not 29 or 30).
+    pub fps_n: u32,
+    pub fps_d: u32,
+}
+
+/// `a / b`, rounded to the nearest.
+fn div_round(a: u64, b: u64) -> u64 {
+    (2 * a + b) / (2 * b.max(1))
 }
 
 impl InForce {
@@ -225,8 +233,24 @@ impl InForce {
             buffer_kb: k(m.buffer_size_in_kb),
             initial_delay_kb: k(m.initial_delay_in_kb),
             multiplier: mult,
-            fps: fi.frame_rate_ext_n / fi.frame_rate_ext_d.max(1),
+            fps_n: fi.frame_rate_ext_n,
+            fps_d: fi.frame_rate_ext_d.max(1),
         }
+    }
+
+    /// TargetKbps for `kbps` asked at `fps` pictures a second: the same budget per picture
+    /// at this encoder's own frame rate. None if the runtime reports no frame rate.
+    fn target_for(&self, kbps: u64, fps: u32) -> Option<u64> {
+        (self.fps_n > 0)
+            .then(|| div_round(kbps * self.fps_n as u64, self.fps_d as u64 * fps.max(1) as u64))
+    }
+
+    /// What this TargetKbps comes to per second at `fps` pictures a second.
+    fn kbps_at(&self, fps: u32) -> Option<u32> {
+        (self.fps_n > 0).then(|| {
+            let per_second = self.target_kbps as u64 * fps.max(1) as u64 * self.fps_d as u64;
+            div_round(per_second, self.fps_n as u64) as u32
+        })
     }
 }
 
@@ -276,7 +300,7 @@ impl Session {
             low_power: false,
             low_power_why: None,
             rc,
-            in_force: InForce::default(),
+            in_force: None,
             need_idr: true,
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
             stopped: None,
@@ -341,7 +365,7 @@ impl Session {
 
     /// What the encoder runs with, as the runtime last reported it.
     #[cfg(test)]
-    pub fn in_force(&self) -> InForce {
+    pub fn in_force(&self) -> Option<InForce> {
         self.in_force
     }
 
@@ -381,7 +405,7 @@ impl Session {
     /// output buffer.
     fn refit(&mut self) -> Result<(), EncodeError> {
         let got = self.working()?;
-        self.in_force = InForce::of(&got.mfx);
+        self.in_force = Some(InForce::of(&got.mfx));
         if got.mfx.gop_ref_dist > 1 {
             return Err(EncodeError(format!(
                 "the runtime set up B frames (GopRefDist {})",
@@ -431,8 +455,8 @@ impl Session {
     }
 }
 
-impl VideoEncoder for Session {
-    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+impl Session {
+    fn change_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         self.running()?;
         let rc = Rc::new(self.codec, &rate, Some(&self.rc));
         if rc == self.rc {
@@ -446,7 +470,10 @@ impl VideoEncoder for Session {
         if rc.cbr {
             // The same budget per picture at the encoder's own frame rate, which stays.
             let ran = InForce::of(m);
-            let kbps = rc.bps as u64 / 1000 * ran.fps.max(1) as u64 / rc.fps.max(1) as u64;
+            let Some(kbps) = ran.target_for(rc.bps as u64 / 1000, rc.fps) else {
+                let e = EncodeError("the encoder reports no frame rate".into());
+                return Err(self.out_of_use(e));
+            };
             let field = (kbps / ran.multiplier as u64).max(1);
             if field > u16::MAX as u64 {
                 let e = EncodeError(format!(
@@ -476,14 +503,33 @@ impl VideoEncoder for Session {
         }
         Ok(())
     }
+}
+
+impl VideoEncoder for Session {
+    /// A rate change that fails, however, leaves the rate in force unknown until the next
+    /// read-back.
+    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+        let r = self.change_rate(rate);
+        if r.is_err() {
+            self.in_force = None;
+        }
+        r
+    }
 
     /// The bitrate in force, in the terms it was asked in: per second at the rate the
     /// stream takes pictures at, which TargetKbps scales to the encoder's own frame rate.
-    fn rate_in_force(&self) -> Option<u32> {
-        let f = self.in_force;
-        f.cbr.then(|| {
-            (f.target_kbps as u64 * self.rc.fps.max(1) as u64 / f.fps.max(1) as u64) as u32
-        })
+    /// Unknown once a rate change failed, or once the session is stopped or out of use.
+    fn rate_in_force(&self) -> RateInForce {
+        if self.stopped.is_some() || self.out_of_use.is_some() {
+            return RateInForce::Unknown;
+        }
+        match self.in_force {
+            None => RateInForce::Unknown,
+            Some(f) if !f.cbr => RateInForce::NotRead,
+            Some(f) => f
+                .kbps_at(self.rc.fps)
+                .map_or(RateInForce::Unknown, RateInForce::Known),
+        }
     }
 
     fn encode(

@@ -294,6 +294,10 @@ pub(super) struct Fake {
     /// A Reset above this TargetKbps runs at it instead, answered
     /// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM.
     pub(super) correct: Option<u16>,
+    /// The frame rate Init sets up, as FrameRateExtN/FrameRateExtD, whatever it was asked.
+    pub(super) frame_rate: Option<(u32, u32)>,
+    /// What GetVideoParam calls answer, in turn (MFX_ERR_NONE once it runs out).
+    pub(super) video_param: VecDeque<Status>,
     /// Its Init turned NalHrdConformance off.
     hrd_off: bool,
     /// IDRs after the first come without parameter sets.
@@ -320,6 +324,8 @@ impl Fake {
                 got: None,
                 running: None,
                 correct: None,
+                frame_rate: None,
+                video_param: VecDeque::new(),
                 hrd_off: false,
                 sets_once: false,
                 idrs: 0,
@@ -364,7 +370,12 @@ impl Runtime for Fake {
         drop(log);
         let r = self.init.pop_front().unwrap_or(0);
         if r >= 0 {
-            self.running = Some(*par);
+            let mut runs = *par;
+            if let Some((n, d)) = self.frame_rate {
+                runs.mfx.frame_info.frame_rate_ext_n = n;
+                runs.mfx.frame_info.frame_rate_ext_d = d;
+            }
+            self.running = Some(runs);
             self.hrd_off = hrd.is_some_and(|h| h.0 == ffi::CODINGOPTION_OFF);
         }
         r
@@ -404,6 +415,10 @@ impl Runtime for Fake {
 
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
         drop(self.call());
+        let r = self.video_param.pop_front().unwrap_or(0);
+        if r < 0 {
+            return r;
+        }
         *par = self.got.or(self.running).unwrap_or_default();
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;

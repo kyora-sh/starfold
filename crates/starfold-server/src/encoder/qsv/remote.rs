@@ -22,7 +22,7 @@ use super::proto::{Decoder, Open, Rate, Reply, Request};
 use crate::encoder::hw;
 use crate::encoder::{
     AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    RateInForce, VideoEncoder,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -337,8 +337,9 @@ pub struct Remote {
     section: Section,
     size: (u32, u32),
     rate: Rate,
-    /// The bitrate the helper's encoder runs at, as it read it back after the last rate change.
-    in_force: Option<u32>,
+    /// The bitrate the helper's encoder runs at, as it read it back after the last rate
+    /// change; unknown after a change that failed.
+    in_force: RateInForce,
     stream: hw::Stream,
     /// Why this helper is no longer used.
     gone: Option<String>,
@@ -418,7 +419,7 @@ impl Remote {
                 ColorInfo::SRGB_BT601_LIMITED,
                 true,
             ),
-            in_force: None,
+            in_force: RateInForce::NotRead,
             gone: None,
             name: String::new(),
             low_power: false,
@@ -590,8 +591,8 @@ impl Remote {
     }
 }
 
-impl VideoEncoder for Remote {
-    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+impl Remote {
+    fn change_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         self.usable()?;
         let r = rate_of(&rate);
         if r == self.rate {
@@ -600,8 +601,11 @@ impl VideoEncoder for Remote {
         match self.request(&Request::Rate(r), "a rate change", self.policy.timing.frame)? {
             Reply::RateSet { kbps } => {
                 self.rate = r;
-                self.in_force = (kbps > 0).then_some(kbps);
-                if let Some(k) = self.in_force {
+                self.in_force = match kbps {
+                    0 => RateInForce::NotRead,
+                    k => RateInForce::Known(k),
+                };
+                if let RateInForce::Known(k) = self.in_force {
                     log::info!(
                         "qsv helper {}: rate asked {} kbps, in force {k} kbps",
                         self.proc.id(),
@@ -613,6 +617,18 @@ impl VideoEncoder for Remote {
             Reply::Error { stopped, reason } => Err(self.refused(stopped, reason)),
             _ => Err(self.broke("answered a rate change out of turn")),
         }
+    }
+}
+
+impl VideoEncoder for Remote {
+    /// A rate change that fails, however, leaves the rate in force unknown until the helper
+    /// reads one back again.
+    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+        let r = self.change_rate(rate);
+        if r.is_err() {
+            self.in_force = RateInForce::Unknown;
+        }
+        r
     }
 
     fn encode(
@@ -647,7 +663,11 @@ impl VideoEncoder for Remote {
         }
     }
 
-    fn rate_in_force(&self) -> Option<u32> {
+    /// Unknown, too, once this helper is gone or Quick Sync is given up.
+    fn rate_in_force(&self) -> RateInForce {
+        if self.gone.is_some() || self.policy.off().is_some() {
+            return RateInForce::Unknown;
+        }
         self.in_force
     }
 
