@@ -2469,13 +2469,30 @@ struct StripeJob {
     force_idr: bool,
     boost: bool,
     crf: f32,
-    cap: u32,
+    /// The cohort's target (0 = uncapped), its stripes, and whether this is a paint-over:
+    /// the worker takes its share from them with the encoder it has at the time.
+    target: u32,
+    stripes: usize,
+    paintover: bool,
     refine: Option<PassBudget>,
     fps: u32,
     /// The cohort's cap: the encoder's opening rate and the governor's frame budget.
     max_fps: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
+}
+
+impl StripeJob {
+    /// This stripe's cap, on an encoder that does or doesn't `hold` its cap; a paint-over
+    /// gets twice it.
+    fn cap(&self, holds: bool) -> u32 {
+        let share = stripe_share(self.target, self.stripes, holds);
+        if self.paintover {
+            share.saturating_mul(2)
+        } else {
+            share
+        }
+    }
 }
 
 /// A refining pass's QP, what its frame may cost, and what a tail pass after it may on a busy
@@ -2613,20 +2630,21 @@ fn stripe_worker(
         let refine = job
             .refine
             .filter(|_| !job.force_idr && s.cfg.backend.refines_by_qp());
+        let cap = job.cap(s.enc.holds_cap());
         let rate = if refine.is_some() {
             None
         } else if job.force_idr && job.boost {
             s.applied_kbps = None;
-            Some(keyframe_rate(job.crf, job.cap, job.fps))
+            Some(keyframe_rate(job.crf, cap, job.fps))
         } else {
             let moved = s
                 .applied_kbps
-                .is_none_or(|a| (job.cap as f64 - a as f64).abs() > a as f64 * 0.04);
+                .is_none_or(|a| (cap as f64 - a as f64).abs() > a as f64 * 0.04);
             (job.crf != s.applied_crf || moved || job.fps != s.applied_fps).then(|| {
                 s.applied_crf = job.crf;
-                s.applied_kbps = Some(job.cap);
+                s.applied_kbps = Some(cap);
                 s.applied_fps = job.fps;
-                RateConfig::new(job.crf, job.cap, job.fps)
+                RateConfig::new(job.crf, cap, job.fps)
             })
         };
         if let Some(r) = rate {
@@ -2787,7 +2805,6 @@ fn encode_loop(
     let start = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
-    let holds = stripes_in.iter().all(|s| s.enc.holds_cap());
     let debug_stripes = crate::compat::is_set("STARFOLD_DEBUG_STRIPES");
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
@@ -2846,11 +2863,6 @@ fn encode_loop(
         }
         let target = sh.target.load(Ordering::Relaxed);
         let want_crf = if job.paintover { po_crf } else { crf };
-        let share = if uncapped {
-            0
-        } else {
-            stripe_share(target, n, holds)
-        };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         let budget =
             |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);
@@ -2871,18 +2883,15 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover {
-                    share.saturating_mul(2)
-                } else {
-                    share
-                };
                 let _ = workers[i].0.send(StripeJob {
                     buf: job.buf.clone(),
                     ts,
                     force_idr,
                     boost,
                     crf: want_crf,
-                    cap,
+                    target: if uncapped { 0 } else { target },
+                    stripes: n,
+                    paintover: job.paintover,
                     refine,
                     fps,
                     max_fps: sh.cap(),

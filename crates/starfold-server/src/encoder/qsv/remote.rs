@@ -343,6 +343,8 @@ pub struct Remote {
     /// The implementation the helper opened, and whether it runs LowPower.
     pub name: String,
     pub low_power: bool,
+    /// Whether the helper's session holds its cap, as it said when it opened.
+    holds_cap: bool,
     /// Every frame request sent: pts, IDR asked.
     #[cfg(test)]
     pub sent: Vec<(i64, bool)>,
@@ -419,6 +421,7 @@ impl Remote {
             gone: None,
             name: String::new(),
             low_power: false,
+            holds_cap: false,
             #[cfg(test)]
             sent: Vec::new(),
             #[cfg(test)]
@@ -437,7 +440,11 @@ impl Remote {
             luid,
         });
         match r.request(&open, "opening", policy.timing.open)? {
-            Reply::Opened { low_power, name } => {
+            Reply::Opened {
+                low_power,
+                holds_cap,
+                name,
+            } => {
                 let codec = if cfg.codec == Codec::Hevc {
                     "HEVC"
                 } else {
@@ -455,6 +462,7 @@ impl Remote {
                 }
                 r.name = name;
                 r.low_power = low_power;
+                r.holds_cap = holds_cap;
                 Ok(r)
             }
             Reply::Error { stopped, reason } => {
@@ -642,9 +650,8 @@ impl VideoEncoder for Remote {
         Ok(Vec::new())
     }
 
-    /// The helper's encoder runs constant bitrate whenever it is capped.
     fn holds_cap(&self) -> bool {
-        true
+        self.holds_cap
     }
 }
 

@@ -2,6 +2,7 @@ use super::*;
 use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo};
 use crate::input::InputEvent;
 use crate::negotiate::Implementation;
+use std::collections::HashMap;
 use std::sync::{Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -84,7 +85,12 @@ struct Fake {
     slow_keys: Option<(usize, Duration)>,
     /// Runs at its cap whatever the picture.
     holds: bool,
+    /// Which open this encoder is (0 = the sample's), and every encode's (open, rate, keyframe).
+    id: usize,
+    encodes: Option<Encodes>,
 }
+
+type Encodes = Arc<StdMutex<Vec<(usize, u32, bool)>>>;
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
 
@@ -128,6 +134,11 @@ impl VideoEncoder for Fake {
         }
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
+        }
+        if let Some(e) = &self.encodes {
+            e.lock()
+                .unwrap()
+                .push((self.id, self.kbps, opts.force_keyframe));
         }
         if let (Some(step), Some(r)) = (self.step_bytes, opts.refine) {
             if r.max_bytes.is_some_and(|m| m < step) {
@@ -243,6 +254,12 @@ struct Opts {
     h264_hw_slow_keys: Option<(usize, Duration)>,
     /// Hardware H.264 encoders hold their cap.
     h264_hw_holds: bool,
+    /// Which hardware H.264 opens (0 = the sample's) hold their cap, over `h264_hw_holds`.
+    h264_hw_holding: Option<fn(usize) -> bool>,
+    /// The hardware H.264 encoder of this open fails this one picture.
+    h264_hw_fail_once: Option<(usize, usize)>,
+    /// Every hardware H.264 encode's (open, rate, keyframe).
+    h264_hw_encodes: Option<Encodes>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -269,7 +286,9 @@ fn fakes(o: Opts) -> Open {
                 } else {
                     1
                 }),
-                fail_at: None,
+                fail_at: o
+                    .h264_hw_fail_once
+                    .and_then(|(open, at)| (open == earlier).then_some(at)),
                 gate: None,
                 keys: None,
                 kbps: 0,
@@ -281,7 +300,9 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
-                holds: o.h264_hw_holds,
+                holds: o.h264_hw_holding.map_or(o.h264_hw_holds, |f| f(earlier)),
+                id: earlier,
+                encodes: o.h264_hw_encodes.clone(),
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -329,6 +350,8 @@ fn fakes(o: Opts) -> Open {
             delay: None,
             slow_keys: None,
             holds: false,
+            id: 0,
+            encodes: None,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -3254,6 +3277,67 @@ fn a_cohort_that_holds_its_cap_gets_no_headroom() {
     let (_, free) = free.last().copied().unwrap();
     assert_eq!(held, start * 2, "a paint-over's double of the exact share");
     assert_eq!(free, start * 4, "a paint-over's double of twice the share");
+}
+
+/// A hardware H.264 cohort on `cfg` whose opens hold their cap as `holding` says, after
+/// a viewer and some moving frames: each open's last (non-keyframe) rate, and the target.
+fn shares_by_open(
+    cfg: VideoConfig,
+    holding: fn(usize) -> bool,
+    fail_once: Option<(usize, usize)>,
+) -> (HashMap<usize, u32>, u32) {
+    let encodes = Encodes::default();
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_holding: Some(holding),
+        h264_hw_fail_once: fail_once,
+        h264_hw_encodes: Some(encodes.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264_HW], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    for _ in 0..12 {
+        push(&mut eng);
+        settle(&eng);
+        acked(&c, &mut rx);
+    }
+    let target = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    let mut last = HashMap::new();
+    for &(open, kbps, key) in encodes.lock().unwrap().iter() {
+        if !key {
+            last.insert(open, kbps);
+        }
+    }
+    (last, target)
+}
+
+/// Within the 4% a stripe lets its rate drift before it sets it again.
+fn near(got: u32, want: u32) -> bool {
+    (got as f64 - want as f64).abs() <= want as f64 * 0.04
+}
+
+/// Two stripes, one on an encoder that holds its cap and one on one that doesn't: each
+/// gets its own share.
+#[test]
+fn each_stripe_gets_the_share_of_its_own_encoder() {
+    let (last, target) = shares_by_open(two_stripes(), |open| open == 1, None);
+    let (held, free) = (last[&1], last[&2]);
+    assert!(near(held, stripe_share(target, 2, true)), "{held} at {target}");
+    assert!(near(free, stripe_share(target, 2, false)), "{free} at {target}");
+}
+
+/// A stripe whose encoder holds its cap, replaced after a failure by one that doesn't, gets
+/// twice its share from then on.
+#[test]
+fn a_replaced_encoder_gets_the_share_of_the_new_one() {
+    let (last, target) = shares_by_open(config(), |open| open <= 1, Some((1, 3)));
+    assert!(near(last[&1], stripe_share(target, 1, true)), "{last:?} at {target}");
+    let after = last.iter().filter(|(&o, _)| o > 1).map(|(_, &k)| k).collect::<Vec<_>>();
+    assert!(!after.is_empty(), "no encode after the replacement: {last:?}");
+    for k in after {
+        assert!(near(k, stripe_share(target, 1, false)), "{k} at {target}");
+    }
 }
 
 /// Real OpenH264 through the engine: whether the library takes the switch or refuses it,
