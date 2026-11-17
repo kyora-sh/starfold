@@ -448,6 +448,9 @@ pub struct Hub {
     /// its generation: capability hellos for an older one are ignored.
     pub offers: Mutex<Vec<Offer>>,
     pub offer_gen: AtomicU64,
+    /// Orders a generation bump against a first hello's check (a leaf lock: held only
+    /// around that one bump or read, never with another lock or across an enqueue).
+    gen_order: Mutex<()>,
     /// Viewers changed: the video thread routes them again.
     pub replan: AtomicBool,
     /// Test hook: the video thread treats the H.264 encoder as failed.
@@ -482,6 +485,7 @@ impl Hub {
             activity: Default::default(),
             offers: Mutex::new(Vec::new()),
             offer_gen: AtomicU64::new(0),
+            gen_order: Mutex::new(()),
             replan: AtomicBool::new(false),
             fail_h264: AtomicBool::new(false),
             next_cohort: AtomicU64::new(1),
@@ -566,7 +570,7 @@ impl Hub {
 
     /// [`Hub::hello`] and the offer generation it carries (read once, for both).
     pub fn hello_gen(&self) -> (u64, String) {
-        let gen = self.offer_gen.load(Ordering::SeqCst);
+        let gen = self.offer_gen.load(Ordering::Relaxed);
         let mut m = self.hello_extra.lock().clone();
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
@@ -588,19 +592,32 @@ impl Hub {
     /// [`Hub::send_first_hello`], calling `step` at each point a test needs to reach.
     ///
     /// The generation is read AFTER each hello is enqueued, and another hello follows if
-    /// it moved: a new generation's restart hello enqueued before ours is then followed by
-    /// ours at that generation or newer, and one enqueued after ours already is the newest.
+    /// it moved. The read holds `gen_order`, as [`Hub::next_offer_gen`]'s bump does: if
+    /// this read's section comes first, our enqueue happens before the bump and so before
+    /// the restart hello's enqueue, which lands later in the channel; if the bump's section
+    /// comes first, this read sees the new generation and another hello follows.
     pub fn send_first_hello_with(&self, c: &Client, mut step: impl FnMut(HelloStep)) {
         loop {
             let (gen, hello) = self.hello_gen();
             step(HelloStep::Built(gen));
             c.send(Out::Text(hello));
             step(HelloStep::Sent(gen));
-            std::sync::atomic::fence(Ordering::SeqCst);
-            if self.offer_gen.load(Ordering::SeqCst) == gen {
+            let now = {
+                let _order = self.gen_order.lock();
+                self.offer_gen.load(Ordering::Relaxed)
+            };
+            if now == gen {
                 return;
             }
         }
+    }
+
+    /// The next offer generation, for offers about to be sent to every client. The bump
+    /// holds `gen_order`, as the read in [`Hub::send_first_hello_with`] does (see there),
+    /// and releases it before any hello is enqueued.
+    pub fn next_offer_gen(&self) -> u64 {
+        let _order = self.gen_order.lock();
+        self.offer_gen.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Whether a viewer's answer to the offers of generation `offer` is for the offers in

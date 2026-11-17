@@ -598,7 +598,7 @@ mod tests {
     /// What the video thread does for a new screen size: a new offer generation, then a
     /// hello at it to every connected client.
     fn new_size(hub: &Hub) {
-        hub.offer_gen.fetch_add(1, Ordering::SeqCst);
+        hub.next_offer_gen();
         hub.restart_clients();
     }
 
