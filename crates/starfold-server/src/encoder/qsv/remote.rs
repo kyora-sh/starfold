@@ -64,8 +64,6 @@ struct State {
     /// Helpers killed that did not exit: never dropped, so never mistaken for gone.
     stuck: Vec<Arc<Proc>>,
     watchdog: bool,
-    #[cfg(test)]
-    said: Vec<String>,
 }
 
 /// What [`Policy::settle`] does to a helper's entry: a new deadline, none, or off the list
@@ -109,8 +107,6 @@ impl Policy {
                 live: Vec::new(),
                 stuck: Vec::new(),
                 watchdog: false,
-                #[cfg(test)]
-                said: Vec::new(),
             }),
             timing,
             start_watchdog,
@@ -132,19 +128,6 @@ impl Policy {
         })
     }
 
-    /// Logs `line` about a helper at `level`; a test reads them back with [`Policy::said`].
-    fn say(&self, level: log::Level, line: String) {
-        log::log!(level, "{line}");
-        #[cfg(test)]
-        self.lock().said.push(line);
-    }
-
-    /// Every line logged about a helper so far.
-    #[cfg(all(test, unix))]
-    pub fn said(&self) -> Vec<String> {
-        self.lock().said.clone()
-    }
-
     /// Helpers started so far.
     #[cfg(all(test, unix))]
     pub fn spawned(&self) -> u32 {
@@ -154,10 +137,9 @@ impl Policy {
     /// Turns Quick Sync off for good: every missed deadline and every stopped device, from
     /// any helper or the probe, ends here. Under the lock it only marks Quick Sync off and
     /// signals every helper, and `also` if it isn't one of them; they are reaped against one
-    /// deadline after it, and only then is anything logged: one line for each tracked helper
-    /// it ended, then the reason. The first reason stays.
+    /// deadline after it, and only then is anything logged. The first reason stays.
     pub fn give_up(&self, why: &str, also: Option<&Arc<Proc>>) {
-        let (live, tracked, first) = {
+        let (live, first) = {
             let mut s = self.lock();
             let first = s.off.is_none();
             if first {
@@ -167,22 +149,17 @@ impl Policy {
                 .into_iter()
                 .map(|l| l.proc)
                 .collect();
-            let tracked: Vec<u32> = live.iter().map(|p| p.id()).collect();
             if let Some(p) = also.filter(|p| !live.iter().any(|q| Arc::ptr_eq(q, p))) {
                 live.push(p.clone());
             }
             for p in &live {
                 p.kill();
             }
-            (live, tracked, first)
+            (live, first)
         };
         let left = end_all(&live, self.timing.grace);
         let stuck = left.len();
         self.keep(left);
-        for pid in tracked {
-            let line = format!("qsv helper {pid}: ended: killed, Quick Sync given up ({why})");
-            self.say(log::Level::Warn, line);
-        }
         if first {
             log::error!("qsv given up: {why}; Quick Sync is off until starfold restarts");
         }
@@ -369,6 +346,9 @@ pub struct Remote {
     /// Every frame request sent: pts, IDR asked.
     #[cfg(test)]
     pub sent: Vec<(i64, bool)>,
+    /// The line logged when the session opened.
+    #[cfg(test)]
+    pub opened: String,
 }
 
 fn rate_of(r: &RateConfig) -> Rate {
@@ -441,6 +421,8 @@ impl Remote {
             low_power: false,
             #[cfg(test)]
             sent: Vec::new(),
+            #[cfg(test)]
+            opened: String::new(),
         };
         let shared = r.section.share(&r.proc).map_err(EncodeError)?;
         let open = Request::Open(Open {
@@ -456,9 +438,23 @@ impl Remote {
         });
         match r.request(&open, "opening", policy.timing.open)? {
             Reply::Opened { low_power, name } => {
+                let codec = if cfg.codec == Codec::Hevc {
+                    "HEVC"
+                } else {
+                    "H.264"
+                };
+                let mode = if low_power { "on" } else { "off" };
+                let line = format!(
+                    "qsv helper {}: opened {name} for {codec}, LowPower {mode}",
+                    r.proc.id()
+                );
+                log::info!("{line}");
+                #[cfg(test)]
+                {
+                    r.opened = line;
+                }
                 r.name = name;
                 r.low_power = low_power;
-                policy.say(log::Level::Info, r.opened_line(cfg.codec));
                 Ok(r)
             }
             Reply::Error { stopped, reason } => {
@@ -468,23 +464,6 @@ impl Remote {
             }
             _ => Err(r.broke("answered before it opened")),
         }
-    }
-
-    /// The line logged when the helper opened its session for `codec`: its process, the
-    /// implementation, the codec, and whether LowPower is on (only when the runtime refused it
-    /// off; the helper's own line says how).
-    fn opened_line(&self, codec: Codec) -> String {
-        let codec = if codec == Codec::Hevc {
-            "HEVC"
-        } else {
-            "H.264"
-        };
-        let mode = if self.low_power { "on" } else { "off" };
-        format!(
-            "qsv helper {}: opened {} for {codec}, LowPower {mode}",
-            self.proc.id(),
-            self.name
-        )
     }
 
     /// The helper's process id.
@@ -522,17 +501,11 @@ impl Remote {
 
     /// The helper died or broke the protocol: it is ended and counted.
     fn broke(&mut self, what: &str) -> EncodeError {
-        let listed = self.policy.settle(self.id, Then::Forget);
-        if !listed && self.policy.off().is_some() {
+        if !self.policy.settle(self.id, Then::Forget) && self.policy.off().is_some() {
             return self.stopped();
         }
-        let pid = self.proc.id();
-        let why = format!("helper {pid} {what}");
+        let why = format!("helper {} {what}", self.proc.id());
         self.policy.end(&self.proc);
-        if listed {
-            let line = format!("qsv helper {pid}: ended: {what}");
-            self.policy.say(log::Level::Warn, line);
-        }
         self.policy.died(&why);
         self.gone = Some(why);
         self.stopped()
@@ -672,10 +645,9 @@ impl VideoEncoder for Remote {
 
 impl Drop for Remote {
     /// Closes the helper's stdin, gives it a moment to leave, then ends it either way. One
-    /// found dead before that died on its own: it counts. Its end is logged here unless the
-    /// path that took it off the list (a give-up, a failed request) logged it already.
+    /// found dead before that died on its own: it counts.
     fn drop(&mut self) {
-        let listed = self.policy.settle(self.id, Then::Forget);
+        self.policy.settle(self.id, Then::Forget);
         let died = self.gone.is_none() && self.policy.off().is_none() && self.proc.exited();
         let pipes = std::mem::replace(&mut self.pipes, closed());
         drop(pipes);
@@ -684,16 +656,6 @@ impl Drop for Remote {
             std::thread::sleep(Duration::from_millis(5));
         }
         self.policy.end(&self.proc);
-        if listed {
-            let pid = self.proc.id();
-            let (level, how) = if died {
-                (log::Level::Warn, "exited while idle")
-            } else {
-                (log::Level::Info, "closed")
-            };
-            self.policy
-                .say(level, format!("qsv helper {pid}: ended: {how}"));
-        }
         if died {
             self.policy
                 .died(&format!("helper {} exited while idle", self.proc.id()));

@@ -484,113 +484,32 @@ mod remote {
         assert_eq!(p.spawned(), spawned, "nothing starts after the give-up");
     }
 
-    /// The lines logged about helper `pid`, in order.
-    fn lines_of(p: &'static Policy, pid: u32) -> Vec<String> {
-        let me = format!("qsv helper {pid}: ");
-        p.said()
-            .into_iter()
-            .filter(|l| l.starts_with(&me))
-            .collect()
+    /// The line logged when a helper with `low_power` opens its session.
+    fn open_line(low_power: bool) -> (u32, String) {
+        let opened = says(&Reply::Opened {
+            low_power,
+            name: "fake-gen".into(),
+        });
+        let enc = start(policy(QUICK), format!("{opened}; sleep 30"));
+        (enc.pid(), enc.opened.clone())
     }
 
-    /// Helper `pid` was logged opening, then ending once, with an end line starting `ended`.
-    fn opened_then(p: &'static Policy, pid: u32, ended: &[&str]) {
-        let l = lines_of(p, pid);
-        let open = format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on");
-        assert_eq!(l.len(), 2, "one open line, one end line: {l:?}");
-        assert_eq!(l[0], open);
-        let end = format!("qsv helper {pid}: ended: ");
-        assert!(
-            ended.iter().any(|e| l[1].starts_with(&format!("{end}{e}"))),
-            "{l:?}"
+    #[test]
+    fn the_open_line_says_low_power_off() {
+        let (pid, line) = open_line(false);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower off")
         );
     }
 
-    /// A helper that opens with LowPower on, then does `then`.
-    fn opens_and(then: &str) -> String {
-        format!("{}; {then}", opened())
-    }
-
     #[test]
-    fn the_open_line_names_the_codec_and_the_mode() {
-        for (low_power, mode) in [(false, "off"), (true, "on")] {
-            let p = policy(QUICK);
-            let opened = says(&Reply::Opened {
-                low_power,
-                name: "fake-gen".into(),
-            });
-            let enc = start(p, format!("{opened}; sleep 30"));
-            let pid = enc.pid();
-            drop(enc);
-            assert_eq!(
-                lines_of(p, pid),
-                vec![
-                    format!("qsv helper {pid}: opened fake-gen for H.264, LowPower {mode}"),
-                    format!("qsv helper {pid}: ended: closed"),
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn each_way_a_helper_ends_is_logged_once() {
-        let p = policy(QUICK);
-        let mut enc = start(p, opens_and("sleep 30"));
-        let pid = enc.pid();
-        let _ = frame(&mut enc, 1);
-        drop(enc);
-        let killed = format!("killed, Quick Sync given up (helper {pid} missed its deadline");
-        opened_then(p, pid, &[&killed]);
-
-        let p = policy(QUICK);
-        let mut enc = start(p, opens_and("sleep 0.1; exit 1"));
-        let pid = enc.pid();
-        fails_within(&mut enc, Duration::from_secs(2));
-        drop(enc);
-        let died = [
-            "exited",
-            "closed its stdout",
-            "closed its stdin",
-            "could not be",
-        ];
-        opened_then(p, pid, &died);
-
-        let p = policy(QUICK);
-        let idle = start(p, opens_and("sleep 30"));
-        let mut hangs = start(p, opens_and("sleep 30"));
-        let (idle_pid, hangs_pid) = (idle.pid(), hangs.pid());
-        let _ = frame(&mut hangs, 1);
-        drop(hangs);
-        drop(idle);
-        let by = format!("killed, Quick Sync given up (helper {hangs_pid} missed its deadline");
-        opened_then(p, idle_pid, &[&by]);
-    }
-
-    /// A helper that dies while idle is noticed at the next request or when its encoder is
-    /// dropped, whichever comes first, and its end is logged then, once.
-    #[test]
-    fn an_idle_helper_that_dies_is_logged_when_it_is_noticed() {
-        let p = policy(QUICK);
-        let enc = start(p, opens_and("exit 0"));
-        let pid = enc.pid();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(lines_of(p, pid).len(), 1, "not noticed yet");
-        drop(enc);
-        opened_then(p, pid, &["exited while idle"]);
-
-        let p = policy(QUICK);
-        let mut enc = start(p, opens_and("exit 0"));
-        let pid = enc.pid();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(frame(&mut enc, 1).is_err());
-        drop(enc);
-        let died = [
-            "exited",
-            "closed its stdout",
-            "closed its stdin",
-            "could not be",
-        ];
-        opened_then(p, pid, &died);
+    fn the_open_line_says_low_power_on() {
+        let (pid, line) = open_line(true);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on")
+        );
     }
 
     #[test]
