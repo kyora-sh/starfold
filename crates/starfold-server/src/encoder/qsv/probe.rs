@@ -4,11 +4,12 @@
 //! gets no Quick Sync rather than a probe of its own.
 //!
 //! What it verified is kept: sessions open on the adapter that passed, not merely the
-//! first one listed. A device that stops answering during the probe ends Quick Sync for
-//! the process, as one that stops while streaming does, whatever passed before it.
+//! first one listed. A device that stops answering during the probe, or a probe helper that
+//! misses its deadline, ends Quick Sync for the process, as either does while streaming,
+//! whatever passed before it; once it is off no probe starts.
 
 use super::driver::STOPPED;
-use super::proc::{NotStarted, Pipes, Proc};
+use super::proc::{NotStarted, Pipes, Proc, Ready};
 use super::remote::Policy;
 use crate::encoder::caps::{Probe as Found, ProbeProvider, ProbeStatus};
 use crate::encoder::{isolate, Backend, Codec};
@@ -97,6 +98,9 @@ impl ProbeProvider for Probe {
                 "needs the helper process: this program doesn't run starfold's helpers",
             );
         }
+        if let Some(off) = self.policy.off() {
+            return Found::failed(Backend::Qsv, off);
+        }
         let mut found = self.run();
         if let Some(why) = stopped(&found) {
             for c in &mut found.caps {
@@ -104,7 +108,15 @@ impl ProbeProvider for Probe {
                     c.status = ProbeStatus::Unavailable(format!("probe: {why}"));
                 }
             }
-            self.policy.give_up(&format!("the probe: {why}"));
+            self.policy.give_up(&format!("the probe: {why}"), None);
+        }
+        if let Some(off) = self.policy.off() {
+            for c in &mut found.caps {
+                if matches!(c.status, ProbeStatus::Verified | ProbeStatus::Discovered) {
+                    c.status = ProbeStatus::Unavailable(format!("probe: {off}"));
+                }
+            }
+            found.note(Backend::Qsv, None, off);
         }
         self.verified.set(&found);
         found
@@ -116,6 +128,8 @@ impl ProbeProvider for Probe {
 }
 
 impl Probe {
+    /// Runs the probe helper, tracked by the policy as any helper is: given up with them,
+    /// and its deadline held by the watchdog as well as here.
     fn run(&self) -> Found {
         let (proc, pipes) = match (self.spawn)() {
             Ok(p) => p,
@@ -123,49 +137,69 @@ impl Probe {
                 let stuck = !n.left.is_empty();
                 self.policy.keep(n.left);
                 if stuck {
-                    self.policy.give_up(&format!(
-                        "a probe helper that failed to start did not exit ({})",
-                        n.why
-                    ));
+                    self.policy.give_up(
+                        &format!(
+                            "a probe helper that failed to start did not exit ({})",
+                            n.why
+                        ),
+                        None,
+                    );
                 }
                 return Found::failed(Backend::Qsv, format!("probe didn't start: {}", n.why));
             }
         };
         let proc = Arc::new(proc);
-        let Pipes { tx, mut rx } = pipes;
+        let Pipes { tx, rx } = pipes;
         drop(tx);
+        let id = match self.policy.register(proc.clone()) {
+            Ok(id) => id,
+            Err(e) => return Found::failed(Backend::Qsv, e),
+        };
         let deadline = Instant::now() + self.timeout;
+        self.policy.due(id, Some((deadline, "probing")));
+        let found = self.read(id, &proc, rx, deadline);
+        self.policy.forget(id);
+        found
+    }
+
+    fn read(&self, id: u64, proc: &Arc<Proc>, mut rx: Box<dyn Ready>, deadline: Instant) -> Found {
         let mut out = Vec::new();
         let mut chunk = [0u8; 1 << 14];
-        let late = loop {
+        let broke = loop {
+            if Instant::now() >= deadline {
+                drop(rx);
+                self.policy.missed(proc, "probing");
+                return Found::failed(
+                    Backend::Qsv,
+                    format!(
+                        "probe did not finish in {} ms and was killed",
+                        self.timeout.as_millis()
+                    ),
+                );
+            }
             match rx.read_ready(&mut chunk) {
                 Ok(Some(0)) => break None,
                 Ok(Some(n)) if out.len() + n > MAX_OUTPUT => {
                     break Some(format!("probe printed more than {} KiB", MAX_OUTPUT >> 10))
                 }
                 Ok(Some(n)) => out.extend_from_slice(&chunk[..n]),
-                Ok(None) if Instant::now() >= deadline => {
-                    break Some(format!(
-                        "probe did not finish in {} s and was killed",
-                        self.timeout.as_secs()
-                    ))
-                }
                 Ok(None) => std::thread::sleep(POLL),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => break Some(format!("probe output: {e}")),
             }
         };
         drop(rx);
-        if let Some(e) = late {
-            self.policy.end(&proc);
+        if let Some(e) = broke {
+            self.policy.end(proc);
             return Found::failed(Backend::Qsv, e);
         }
         let exit = Instant::now() + self.policy.timing().grace;
+        self.policy.due(id, Some((exit, "exiting after the probe")));
         while !proc.exited() && Instant::now() < exit {
             std::thread::sleep(POLL);
         }
         if !proc.exited() {
-            self.policy.end(&proc);
+            self.policy.missed(proc, "exiting after the probe");
             return Found::failed(Backend::Qsv, "probe closed its output but did not exit");
         }
         isolate::parse(&out, Backend::Qsv)
