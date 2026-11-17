@@ -19,6 +19,8 @@ mod helper;
 mod helper_tests;
 #[cfg(windows)]
 mod locate;
+#[cfg(all(test, unix))]
+mod mode_tests;
 #[cfg(test)]
 mod low_power_tests;
 mod probe;
@@ -53,6 +55,12 @@ use windows_impl::{open_session, probe_here};
 #[cfg(windows)]
 pub fn off() -> Option<String> {
     remote::POLICY.off()
+}
+
+/// Whether the last Quick Sync session a helper opened in this process runs with LowPower
+/// on; `None` before any.
+pub fn low_power() -> Option<bool> {
+    remote::POLICY.low_power()
 }
 
 /// More than any runtime lists; bounds what is read from its descriptions.

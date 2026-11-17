@@ -485,6 +485,24 @@ mod remote {
     }
 
     #[test]
+    fn the_open_line_names_the_mode_the_session_opened_with() {
+        for (low_power, mode) in [
+            (false, "LowPower off"),
+            (true, "LowPower on (the runtime refused LowPower off)"),
+        ] {
+            let p = policy(QUICK);
+            let opened = says(&Reply::Opened {
+                low_power,
+                name: "fake-gen".into(),
+            });
+            let enc = start(p, format!("{opened}; sleep 30"));
+            let line = format!("qsv helper {}: opened fake-gen, {mode}", enc.pid());
+            assert_eq!(enc.opened_line(), line);
+            assert_eq!(p.low_power(), Some(low_power));
+        }
+    }
+
+    #[test]
     fn a_helper_that_hangs_on_a_frame_is_killed_at_the_deadline() {
         let p = policy(QUICK);
         let mut enc = start(p, format!("{}; sleep 30", opened()));

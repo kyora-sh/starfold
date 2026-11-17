@@ -64,6 +64,8 @@ struct State {
     /// Helpers killed that did not exit: never dropped, so never mistaken for gone.
     stuck: Vec<Arc<Proc>>,
     watchdog: bool,
+    /// Whether the last helper to open a session opened it with LowPower on.
+    low_power: Option<bool>,
 }
 
 /// What [`Policy::settle`] does to a helper's entry: a new deadline, none, or off the list
@@ -107,6 +109,7 @@ impl Policy {
                 live: Vec::new(),
                 stuck: Vec::new(),
                 watchdog: false,
+                low_power: None,
             }),
             timing,
             start_watchdog,
@@ -126,6 +129,11 @@ impl Policy {
             0 => o,
             n => format!("{o}; {n} helper(s) did not exit"),
         })
+    }
+
+    /// Whether the last session a helper opened runs with LowPower on; `None` before any.
+    pub fn low_power(&self) -> Option<bool> {
+        self.lock().low_power
     }
 
     /// Helpers started so far.
@@ -435,6 +443,8 @@ impl Remote {
             Reply::Opened { low_power, name } => {
                 r.name = name;
                 r.low_power = low_power;
+                policy.lock().low_power = Some(low_power);
+                log::info!("{}", r.opened_line());
                 Ok(r)
             }
             Reply::Error { stopped, reason } => {
@@ -444,6 +454,17 @@ impl Remote {
             }
             _ => Err(r.broke("answered before it opened")),
         }
+    }
+
+    /// The line logged when the helper opened its session: what it opened, in which mode.
+    /// LowPower is on only when the runtime refused it off; the helper's own line says how.
+    pub fn opened_line(&self) -> String {
+        let mode = if self.low_power {
+            "LowPower on (the runtime refused LowPower off)"
+        } else {
+            "LowPower off"
+        };
+        format!("qsv helper {}: opened {}, {mode}", self.proc.id(), self.name)
     }
 
     /// The helper's process id.
