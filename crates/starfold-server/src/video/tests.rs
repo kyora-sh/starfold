@@ -4080,7 +4080,8 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         .contains(&true));
     p.eng.cfg.source_fps = 120;
     for c in &mut p.eng.cohorts {
-        c.last_take = Some(later - Duration::from_millis(5));
+        let fps = c.fps();
+        c.take.took(later - Duration::from_millis(5), frame_interval(fps));
     }
     let turn = p.eng.turn(&views, 33.0, later);
     assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
@@ -4227,4 +4228,127 @@ fn no_software_encoders_share_moves() {
         }
     }
     assert!(opened > 0);
+}
+
+/// Captures as the capture loop takes them while damage never stops: as soon as the schedule
+/// allows, the wait rounded up to whole milliseconds, plus the loop's own `overhead`. Returns
+/// when each capture came, over `secs` seconds at `fps`.
+fn continuous(fps: u32, secs: u64, overhead: Duration) -> Vec<Duration> {
+    let start = Instant::now();
+    let interval = frame_interval(fps);
+    let mut s = Schedule::default();
+    let mut now = start;
+    let mut at = Vec::new();
+    while now < start + Duration::from_secs(secs) {
+        let rem = s.wait(now, interval);
+        if !rem.is_zero() {
+            now += Duration::from_millis(rem.as_micros().div_ceil(1000) as u64);
+            continue;
+        }
+        s.took(now, interval);
+        at.push(now - start);
+        now += overhead;
+    }
+    at
+}
+
+#[test]
+fn continuous_damage_is_captured_at_the_framerate_on_average() {
+    for fps in [30, 60] {
+        for overhead in [Duration::ZERO, Duration::from_micros(700)] {
+            let n = continuous(fps, 10, overhead).len() as f64 / 10.0;
+            assert!(
+                (n - fps as f64).abs() <= fps as f64 * 0.02,
+                "{n}/s at --framerate {fps}, overhead {overhead:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_early_capture_borrows_from_the_next() {
+    let fps = 30;
+    let interval = frame_interval(fps);
+    let at = continuous(fps, 10, Duration::from_micros(300));
+    let bound = (1.0 / interval.as_secs_f64() + EARLY_SHARE).floor() as usize + 1;
+    assert_eq!(bound, 31, "at most one capture over the rate in any second");
+    for (i, &a) in at.iter().enumerate() {
+        let n = at[i..]
+            .iter()
+            .take_while(|&&b| b < a + Duration::from_secs(1))
+            .count();
+        assert!(n <= bound, "{n} captures in the second from {a:?}");
+    }
+    for w in at.windows(2) {
+        assert!(
+            w[1] - w[0] >= interval.mul_f64(1.0 - EARLY_SHARE) - Duration::from_micros(1),
+            "{:?} -> {:?}",
+            w[0],
+            w[1]
+        );
+    }
+    let mut s = Schedule::default();
+    let t = Instant::now();
+    s.took(t, interval);
+    let early = t + interval.mul_f64(1.0 - EARLY_SHARE);
+    assert!(s.wait(early, interval).is_zero(), "early by the allowance");
+    s.took(early, interval);
+    let again = early + interval.mul_f64(1.0 - EARLY_SHARE);
+    assert!(
+        s.wait(again, interval) >= interval.mul_f64(EARLY_SHARE) - Duration::from_micros(1),
+        "not another early capture right after the first"
+    );
+    assert!(
+        s.wait(t + interval.mul_f64(2.0 - EARLY_SHARE) + Duration::from_micros(1), interval)
+            .is_zero(),
+        "the next is due a whole interval after the one the early capture was due for"
+    );
+}
+
+#[test]
+fn a_slower_source_is_not_held_back() {
+    let interval = frame_interval(30);
+    for gaps in [[40, 40], [38, 31], [45, 35]] {
+        let mut s = Schedule::default();
+        let mut t = Instant::now();
+        for i in 0..300 {
+            assert_eq!(
+                s.wait(t, interval),
+                Duration::ZERO,
+                "frame {i} of a {gaps:?} ms source"
+            );
+            s.took(t, interval);
+            t += Duration::from_millis(gaps[i % 2]);
+        }
+    }
+}
+
+#[test]
+fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
+    let hub = Hub::new();
+    let mut eng = Engine::new(high_fps(), hub.clone(), W, H, &[H264], fakes(Opts::default())).unwrap();
+    eng.cfg.source_fps = 120;
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    let mut t = Instant::now();
+    let mut got = 0;
+    for _ in 0..(2000 / 15) {
+        eng.replan();
+        let views = eng.views();
+        eng.update_rates(&views);
+        assert_eq!((eng.arrival_fps(&views), eng.cohorts[0].fps()), (120, 60));
+        let turn = eng.turn(&views, 1000.0 / 120.0, t);
+        eng.mark(&views, None);
+        eng.dispatch(&whole(W, H), &views, &turn, t);
+        settle(&eng);
+        for v in videos(&drain(&mut rx)) {
+            got += 1;
+            assert!(c.ack(None, v.2));
+        }
+        t += Duration::from_millis(15);
+    }
+    assert!(
+        (got as f64 - 120.0).abs() <= 120.0 * 0.03,
+        "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms"
+    );
 }

@@ -426,8 +426,40 @@ struct Cohort {
     viewers: Vec<u64>,
     refine: Refinement,
     pace: Pace,
-    /// The capture this cohort last took a frame from.
-    last_take: Option<Instant>,
+    /// When this cohort's next frame is due at its cap.
+    take: Schedule,
+}
+
+/// How early a capture may come before it is due, as a share of the frame interval, so
+/// source jitter doesn't alias into dropped frames.
+const EARLY_SHARE: f64 = 0.15;
+
+/// The frame interval at `fps`.
+fn frame_interval(fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / fps.max(1) as f64)
+}
+
+/// When the next capture at a rate is due. An early capture moves the due time on from
+/// the one it came early for, so the next gives the time back: at most one capture more
+/// than the rate allows in any window, never more on average. A late one starts afresh.
+#[derive(Clone, Copy, Debug, Default)]
+struct Schedule {
+    due: Option<Instant>,
+}
+
+impl Schedule {
+    /// How long until a capture at `interval` may come, from `now` (zero: it may).
+    fn wait(&self, now: Instant, interval: Duration) -> Duration {
+        self.due.map_or(Duration::ZERO, |d| {
+            d.saturating_duration_since(now)
+                .saturating_sub(interval.mul_f64(EARLY_SHARE))
+        })
+    }
+
+    /// A capture at `interval` came at `at`.
+    fn took(&mut self, at: Instant, interval: Duration) {
+        self.due = Some(self.due.map_or(at, |d| d.max(at)) + interval);
+    }
 }
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
@@ -1049,7 +1081,7 @@ impl Engine {
                 self.h,
             ),
             pace: Pace::new(fps),
-            last_take: None,
+            take: Schedule::default(),
         })
     }
 
@@ -1382,7 +1414,7 @@ impl Engine {
             .collect()
     }
 
-    /// Cohorts capped below the capture rate whose last frame is too recent for their cap
+    /// Cohorts capped below the capture rate whose next frame isn't due yet at their cap
     /// (with the capture's early allowance).
     fn early(&self, views: &[View], now: Instant) -> Vec<bool> {
         let capture = self.arrival_fps(views);
@@ -1390,10 +1422,7 @@ impl Engine {
             .iter()
             .map(|c| {
                 let fps = c.fps();
-                fps < capture
-                    && c.last_take.is_some_and(|t| {
-                        now.saturating_duration_since(t).as_secs_f64() < 0.85 / fps.max(1) as f64
-                    })
+                fps < capture && !c.take.wait(now, frame_interval(fps)).is_zero()
             })
             .collect()
     }
@@ -1539,7 +1568,7 @@ impl Engine {
                 },
             }) {
                 Ok(()) => {
-                    c.last_take = Some(turn.at);
+                    c.take.took(turn.at, frame_interval(max_fps));
                     if motion {
                         c.pace.took(now, max_fps, c.shared.id);
                     }
@@ -2305,6 +2334,7 @@ fn capture_loop(
     let mut pool = Pool::new(w, h, cap.full());
     let mut fps = cfg.fps;
     let mut last_capture = Instant::now() - Duration::from_secs(1);
+    let mut schedule = Schedule::default();
     let mut had_clients = false;
     let mut full_next = true;
     let debug_marker = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
@@ -2359,9 +2389,7 @@ fn capture_loop(
             log::info!("capture {fps} -> {want} fps");
             fps = want;
         }
-        let interval = Duration::from_secs_f64(1.0 / fps as f64);
-        // Allow slight early capture so source jitter doesn't alias into dropped frames.
-        let min_interval = interval.mul_f64(0.85);
+        let interval = frame_interval(fps);
         let interval_ms = interval.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let turn = eng.turn(&views, interval_ms, now);
@@ -2372,9 +2400,8 @@ fn capture_loop(
             );
             continue;
         }
-        let since = last_capture.elapsed();
-        if since < min_interval {
-            let rem = min_interval - since;
+        let rem = schedule.wait(Instant::now(), interval);
+        if !rem.is_zero() {
             wait_any(
                 &[hub.waker.waitable()],
                 (rem.as_micros() as i32 + 999) / 1000,
@@ -2453,6 +2480,7 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         last_capture = t0;
+        schedule.took(t0, interval);
         eng.dispatch(
             &Frame {
                 buf,
