@@ -766,7 +766,7 @@ mod remote {
     #[test]
     fn a_probe_helper_that_hangs_is_killed_at_its_deadline() {
         let verified: &'static Verified = Box::leak(Box::default());
-        let p = policy(QUICK);
+        let p: &'static Policy = Box::leak(Box::new(Policy::with_watchdog(QUICK, |_| Ok(()))));
         let started = Arc::new(AtomicBool::new(false));
         let t = Instant::now();
         let found = prober(p, verified, true, "sleep 30".into(), started).probe();
@@ -776,7 +776,25 @@ mod remote {
             "{:?}",
             found.diagnostics
         );
-        assert!(p.off().is_none(), "reaped: nothing kept");
+        let off = p.off().expect("Quick Sync off");
+        assert!(off.contains("missed its deadline (probing)"), "{off}");
+    }
+
+    #[test]
+    fn the_watchdog_alone_gives_up_on_an_overdue_helper() {
+        let p: &'static Policy = Box::leak(Box::new(Policy::with_watchdog(QUICK, |_| Ok(()))));
+        let other = start(p, format!("{}; sleep 30", opened()));
+        let enc = start(p, format!("{}; sleep 30", opened()));
+        let (pid, other_pid) = (enc.pid(), other.pid());
+        assert!(!p.look(), "nothing is due");
+        enc.overdue("a frame");
+        assert!(p.look());
+        given_up(
+            p,
+            pid,
+            &format!("helper {pid} missed its deadline (a frame)"),
+        );
+        assert!(!alive(other_pid), "every helper goes");
     }
 
     #[test]

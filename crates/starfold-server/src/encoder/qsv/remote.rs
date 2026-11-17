@@ -4,7 +4,8 @@
 //! can be ended.
 //!
 //! - Every request has a deadline: opening 10 s, a frame or a rate change 2 s. The caller
-//!   waits for the reply until then, and a watchdog thread holds the server to it as well.
+//!   waits for the reply until then, and a watchdog thread holds the server to it as well;
+//!   a reply read at or past its deadline is a miss, however long it waited to be read.
 //! - A missed deadline, or a helper reporting that the device hung, failed or was lost,
 //!   gives Quick Sync up for the process: every helper is signalled at once, then all are
 //!   reaped against one deadline, the reason is logged and returned (it shows in `/stats`),
@@ -63,6 +64,14 @@ struct State {
     /// Helpers killed that did not exit: never dropped, so never mistaken for gone.
     stuck: Vec<Arc<Proc>>,
     watchdog: bool,
+}
+
+/// What [`Policy::settle`] does to a helper's entry: a new deadline, none, or off the list
+/// (the caller ends the helper).
+pub enum Then {
+    Due(Instant, &'static str),
+    Clear,
+    Forget,
 }
 
 /// Starts the thread that enforces `policy`'s deadlines.
@@ -125,20 +134,24 @@ impl Policy {
         self.lock().spawned
     }
 
-    /// Turns Quick Sync off for good. Under the lock it only marks Quick Sync off and
-    /// signals every helper; they are reaped against one deadline after it, and only then
-    /// is anything logged. The first reason stays.
-    pub fn give_up(&self, why: &str) {
+    /// Turns Quick Sync off for good: every missed deadline and every stopped device, from
+    /// any helper or the probe, ends here. Under the lock it only marks Quick Sync off and
+    /// signals every helper, and `also` if it isn't one of them; they are reaped against one
+    /// deadline after it, and only then is anything logged. The first reason stays.
+    pub fn give_up(&self, why: &str, also: Option<&Arc<Proc>>) {
         let (live, first) = {
             let mut s = self.lock();
             let first = s.off.is_none();
             if first {
                 s.off = Some(format!("qsv given up: {why}"));
             }
-            let live: Vec<Arc<Proc>> = std::mem::take(&mut s.live)
+            let mut live: Vec<Arc<Proc>> = std::mem::take(&mut s.live)
                 .into_iter()
                 .map(|l| l.proc)
                 .collect();
+            if let Some(p) = also.filter(|p| !live.iter().any(|q| Arc::ptr_eq(q, p))) {
+                live.push(p.clone());
+            }
             for p in &live {
                 p.kill();
             }
@@ -153,6 +166,12 @@ impl Policy {
         if stuck > 0 {
             log::error!("{stuck} Quick Sync helper(s) did not exit after being killed");
         }
+    }
+
+    /// `p` missed its deadline for `what`: Quick Sync is given up, `p` with every helper.
+    pub fn missed(&self, p: &Arc<Proc>, what: &str) {
+        let why = format!("helper {} missed its deadline ({what})", p.id());
+        self.give_up(&why, Some(p));
     }
 
     pub fn timing(&self) -> Timing {
@@ -178,10 +197,10 @@ impl Policy {
         let left = end_all(std::slice::from_ref(p), self.timing.grace);
         if !left.is_empty() {
             self.keep(left);
-            self.give_up(&format!(
-                "helper {} did not exit after being killed",
-                p.id()
-            ));
+            self.give_up(
+                &format!("helper {} did not exit after being killed", p.id()),
+                None,
+            );
         }
     }
 
@@ -193,7 +212,7 @@ impl Policy {
             s.deaths
         };
         if deaths >= 2 {
-            self.give_up(&format!("a second helper failed ({why})"));
+            self.give_up(&format!("a second helper failed ({why})"), None);
         } else {
             log::warn!("a Quick Sync helper failed: {why}; one more may start");
         }
@@ -201,7 +220,7 @@ impl Policy {
 
     /// Tracks `proc`, starting the watchdog first if it isn't running. A helper that can't
     /// be held to its deadlines is ended.
-    fn register(&'static self, proc: Arc<Proc>) -> Result<u64, String> {
+    pub(super) fn register(&'static self, proc: Arc<Proc>) -> Result<u64, String> {
         let mut s = self.lock();
         if let Some(off) = s.off.clone() {
             drop(s);
@@ -228,34 +247,59 @@ impl Policy {
         Ok(id)
     }
 
-    fn due(&self, id: u64, due: Option<(Instant, &'static str)>) {
-        if let Some(l) = self.lock().live.iter_mut().find(|l| l.id == id) {
-            l.due = due;
-        }
-    }
-
-    /// Takes helper `id` off the list; the caller ends it.
-    fn forget(&self, id: u64) {
-        self.lock().live.retain(|l| l.id != id);
+    /// The one way a helper's entry changes once it is registered (a give-up takes them all).
+    /// Under the lock the clock is read first: an entry at or past its deadline is a miss,
+    /// however the helper's work ended or how long that took to be seen, so Quick Sync is
+    /// given up with that helper and `then` is not applied. Whether `then` was applied;
+    /// false too if Quick Sync is off or `id` is no longer listed.
+    pub(super) fn settle(&self, id: u64, then: Then) -> bool {
+        let (proc, what) = {
+            let mut s = self.lock();
+            if s.off.is_some() {
+                return false;
+            }
+            let Some(i) = s.live.iter().position(|l| l.id == id) else {
+                return false;
+            };
+            match s.live[i].due {
+                Some((at, what)) if Instant::now() >= at => (s.live[i].proc.clone(), what),
+                _ => {
+                    match then {
+                        Then::Due(at, what) => s.live[i].due = Some((at, what)),
+                        Then::Clear => s.live[i].due = None,
+                        Then::Forget => drop(s.live.remove(i)),
+                    }
+                    return true;
+                }
+            }
+        };
+        self.missed(&proc, what);
+        false
     }
 
     fn watch(&'static self) {
-        loop {
+        while !self.look() {
             std::thread::sleep(WATCH);
-            let late = {
-                let s = self.lock();
-                if s.off.is_some() {
-                    return;
-                }
-                let now = Instant::now();
-                s.live
-                    .iter()
-                    .find_map(|l| l.due.filter(|d| d.0 <= now).map(|d| (l.proc.id(), d.1)))
-            };
-            if let Some((pid, what)) = late {
-                self.give_up(&format!("helper {pid} missed its deadline ({what})"));
-            }
         }
+    }
+
+    /// One look of the watchdog: a helper past its deadline gives Quick Sync up. Whether
+    /// Quick Sync is off.
+    pub(super) fn look(&self) -> bool {
+        let late = {
+            let s = self.lock();
+            if s.off.is_some() {
+                return true;
+            }
+            let now = Instant::now();
+            s.live
+                .iter()
+                .find_map(|l| l.due.filter(|d| d.0 <= now).map(|d| (l.proc.clone(), d.1)))
+        };
+        if let Some((proc, what)) = late {
+            self.missed(&proc, what);
+        }
+        self.lock().off.is_some()
     }
 }
 
@@ -339,10 +383,10 @@ impl Remote {
             Err(n) => {
                 if !n.left.is_empty() {
                     policy.keep(n.left);
-                    policy.give_up(&format!(
-                        "a helper that failed to start did not exit ({})",
-                        n.why
-                    ));
+                    policy.give_up(
+                        &format!("a helper that failed to start did not exit ({})", n.why),
+                        None,
+                    );
                 }
                 return Err(EncodeError(n.why));
             }
@@ -429,7 +473,7 @@ impl Remote {
     /// The helper reported an error: the device stopping gives Quick Sync up.
     fn refused(&mut self, stopped: bool, reason: String) -> EncodeError {
         if stopped {
-            self.policy.give_up(&reason);
+            self.policy.give_up(&reason, Some(&self.proc));
             return self.stopped();
         }
         EncodeError(reason)
@@ -437,21 +481,21 @@ impl Remote {
 
     /// The helper died or broke the protocol: it is ended and counted.
     fn broke(&mut self, what: &str) -> EncodeError {
+        if !self.policy.settle(self.id, Then::Forget) && self.policy.off().is_some() {
+            return self.stopped();
+        }
         let why = format!("helper {} {what}", self.proc.id());
-        self.policy.forget(self.id);
         self.policy.end(&self.proc);
         self.policy.died(&why);
         self.gone = Some(why);
         self.stopped()
     }
 
-    fn send(&mut self, r: &Request, until: Instant) -> Result<(), EncodeError> {
+    fn send(&mut self, r: &Request, what: &str, until: Instant) -> Result<(), EncodeError> {
         match write_by(&mut *self.pipes.tx, &r.bytes(), until) {
             Ok(()) => Ok(()),
             Err(Unwritten::Late) => {
-                let pid = self.proc.id();
-                self.policy
-                    .give_up(&format!("helper {pid} missed its deadline (a request)"));
+                self.policy.missed(&self.proc, what);
                 Err(self.stopped())
             }
             Err(Unwritten::Closed(how)) => Err(self.broke(&how)),
@@ -459,7 +503,7 @@ impl Remote {
     }
 
     /// Sends `req` and waits for its reply, `deadline` at most: past it, Quick Sync is
-    /// given up.
+    /// given up, even if the reply is there by the time it is read.
     fn request(
         &mut self,
         req: &Request,
@@ -467,23 +511,24 @@ impl Remote {
         deadline: Duration,
     ) -> Result<Reply, EncodeError> {
         let until = Instant::now() + deadline;
-        self.policy.due(self.id, Some((until, what)));
-        self.send(req, until)?;
-        loop {
-            match self.next(until)? {
-                Some(r) => {
-                    self.policy.due(self.id, None);
-                    return Ok(r);
-                }
-                None if Instant::now() >= until => {
-                    let pid = self.proc.id();
-                    self.policy
-                        .give_up(&format!("helper {pid} missed its deadline ({what})"));
-                    return Err(self.stopped());
-                }
-                None => {}
+        if !self.policy.settle(self.id, Then::Due(until, what)) {
+            return Err(self.stopped());
+        }
+        self.send(req, what, until)?;
+        match self.next(until)? {
+            Some(r) if self.policy.settle(self.id, Then::Clear) => Ok(r),
+            Some(_) => Err(self.stopped()),
+            None => {
+                self.policy.missed(&self.proc, what);
+                Err(self.stopped())
             }
         }
+    }
+
+    /// Sets this helper's deadline for `what` to now, as a request that is overdue.
+    #[cfg(all(test, unix))]
+    pub fn overdue(&self, what: &'static str) {
+        self.policy.settle(self.id, Then::Due(Instant::now(), what));
     }
 
     /// The next reply, waiting until `until` at most; `None` if none came.
@@ -582,7 +627,7 @@ impl Drop for Remote {
     /// Closes the helper's stdin, gives it a moment to leave, then ends it either way. One
     /// found dead before that died on its own: it counts.
     fn drop(&mut self) {
-        self.policy.forget(self.id);
+        self.policy.settle(self.id, Then::Forget);
         let died = self.gone.is_none() && self.policy.off().is_none() && self.proc.exited();
         let pipes = std::mem::replace(&mut self.pipes, closed());
         drop(pipes);

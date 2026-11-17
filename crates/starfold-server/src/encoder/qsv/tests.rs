@@ -938,3 +938,28 @@ fn qsv_is_experimental_and_hardware_h264_and_hevc_only() {
     #[cfg(not(windows))]
     assert!(Backend::parse("qsv").unwrap_err().contains("Windows-only"));
 }
+
+#[test]
+fn a_probe_sample_that_stops_keeps_its_whole_session() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.sync = VecDeque::from([ffi::WRN_IN_EXECUTION]);
+    let s = super::session::Session::new(Box::new(fake), &cfg(Codec::H264, 160, 160, 2000));
+    let mut kept = Vec::new();
+    let e = sample_on(s.unwrap(), 160, &mut kept).unwrap_err();
+    assert!(e.0.starts_with(super::driver::STOPPED), "{e}");
+    assert_eq!(kept.len(), 1, "the session, its buffers and bitstream stay");
+    assert_eq!(kept[0].stopped(), Some(e.0.as_str()));
+    let l = log.lock().unwrap();
+    assert!(!l.dropped, "the runtime is left for the process to end");
+    assert_eq!(l.live, 1, "the frame in flight keeps its surface");
+    drop(l);
+
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.encode = VecDeque::from([-1]);
+    let s = super::session::Session::new(Box::new(fake), &cfg(Codec::H264, 160, 160, 2000));
+    let mut kept = Vec::new();
+    let e = sample_on(s.unwrap(), 160, &mut kept).unwrap_err();
+    assert!(!e.0.starts_with(super::driver::STOPPED), "{e}");
+    assert!(kept.is_empty(), "a session that still answers is closed");
+    assert!(log.lock().unwrap().dropped);
+}

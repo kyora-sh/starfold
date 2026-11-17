@@ -12,6 +12,8 @@
 
 mod driver;
 mod ffi;
+#[cfg(all(test, unix))]
+mod give_up_tests;
 mod helper;
 #[cfg(test)]
 mod helper_tests;
@@ -266,6 +268,22 @@ fn session(
     Ok(Box::new(session::Session::new(rt, cfg)?))
 }
 
+/// Encodes a sample of `side` x `side` on `s`. A session that stopped is put in `kept`, not
+/// dropped: a frame may still be in flight in it, writing into its buffers, so all of it
+/// (runtime, buffers, bitstream) stays until the process exits.
+#[cfg(any(windows, test))]
+fn sample_on(
+    mut s: session::Session,
+    side: u32,
+    kept: &mut Vec<session::Session>,
+) -> Result<(), super::EncodeError> {
+    let r = super::hw::sample(&mut s, side, side);
+    if s.stopped().is_some() {
+        kept.push(s);
+    }
+    r
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus};
@@ -365,6 +383,7 @@ mod windows_impl {
             Err(e) => return Found::failed(Backend::Qsv, e),
         };
         let mut found = Found::default();
+        let mut kept = Vec::new();
         if adapters.is_empty() {
             found.note(Backend::Qsv, None, "no Intel graphics adapter");
         }
@@ -390,7 +409,7 @@ mod windows_impl {
                 .iter_mut()
                 .filter(|c| c.status == ProbeStatus::Discovered)
             {
-                stopped = verify(c, a.luid);
+                stopped = verify(c, a.luid, &mut kept);
                 if stopped.is_some() {
                     break;
                 }
@@ -405,19 +424,23 @@ mod windows_impl {
                 break;
             }
         }
+        std::mem::forget(kept);
         found
     }
 
     /// Marks `c` verified if a session on `luid` encodes a sample, unavailable if not; the
     /// reason (starting with [`STOPPED`]) if the device stopped answering (hung, failed or
-    /// was lost).
-    fn verify(c: &mut super::EncoderCapability, luid: u64) -> Option<String> {
+    /// was lost), its session then in `kept`.
+    fn verify(
+        c: &mut super::EncoderCapability,
+        luid: u64,
+        kept: &mut Vec<Session>,
+    ) -> Option<String> {
         if !Backend::Qsv.implements(c.codec) {
             return None;
         }
         let cfg = hw::sample_config(Backend::Qsv, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
-        let r = open_session(&cfg, luid)
-            .and_then(|(mut s, _)| hw::sample(&mut s, SAMPLE_SIDE, SAMPLE_SIDE));
+        let r = open_session(&cfg, luid).and_then(|(s, _)| super::sample_on(s, SAMPLE_SIDE, kept));
         match r {
             Ok(()) => {
                 c.status = ProbeStatus::Verified;
