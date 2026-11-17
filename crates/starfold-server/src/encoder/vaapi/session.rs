@@ -151,8 +151,9 @@ impl Choice {
 }
 
 /// The first of `profiles` (best first) the driver encodes 8-bit 4:2:0 at `size` with
-/// one reference. The full entrypoint goes first; low-power only where the driver offers
-/// nothing else for the profile.
+/// one reference. Per profile the full entrypoint goes first; low-power is taken where the
+/// full one is not advertised, its attributes cannot be read or it fails a check (no 8-bit
+/// 4:2:0, no reference frames, picture too large), before the next profile is tried.
 pub fn choose(
     drv: &mut dyn Driver,
     profiles: &[c_int],
