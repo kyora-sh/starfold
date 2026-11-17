@@ -25,7 +25,10 @@ fn cfg() -> EncoderConfig {
 }
 
 fn frame(s: &mut Session, key: bool) -> Result<Vec<AccessUnit>, EncodeError> {
-    let (y, uv) = (vec![16u8; (W * H) as usize], vec![128u8; (W * H / 4) as usize]);
+    let (y, uv) = (
+        vec![16u8; (W * H) as usize],
+        vec![128u8; (W * H / 4) as usize],
+    );
     let f = FrameView {
         width: W,
         height: H,
@@ -113,7 +116,10 @@ fn a_reset_the_runtime_refuses_reopens_at_the_new_rate() {
         Some((ffi::CODINGOPTION_OFF, ffi::CODINGOPTION_OFF))
     );
     assert_eq!(
-        (l.inited[1].mfx.frame_info.crop_w, l.inited[1].mfx.frame_info.crop_h),
+        (
+            l.inited[1].mfx.frame_info.crop_w,
+            l.inited[1].mfx.frame_info.crop_h
+        ),
         (W as u16, H as u16)
     );
 }
@@ -132,6 +138,10 @@ fn a_reset_starts_from_what_the_encoder_runs_with() {
     s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap();
     let l = log.lock().unwrap();
     let r = l.reset[0].mfx;
-    assert_eq!((r.gop_pic_size, r.target_usage), (300, 4), "the runtime's values");
+    assert_eq!(
+        (r.gop_pic_size, r.target_usage),
+        (300, 4),
+        "the runtime's values"
+    );
     assert_eq!(kbps(&l.reset[0]), 12_000);
 }

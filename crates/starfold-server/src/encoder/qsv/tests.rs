@@ -351,7 +351,8 @@ impl Runtime for Fake {
             let b = unsafe { *par.ext_param.add(i) };
             match unsafe { (*b).buffer_id } {
                 ffi::EXTBUFF_VIDEO_SIGNAL_INFO => {
-                    log.signal.push(unsafe { *(b as *const ExtVideoSignalInfo) });
+                    log.signal
+                        .push(unsafe { *(b as *const ExtVideoSignalInfo) });
                 }
                 CODING_OPTION => {
                     let at = |off: usize| unsafe { *((b as *const u8).add(off) as *const u16) };
