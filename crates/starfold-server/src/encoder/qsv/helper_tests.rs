@@ -491,7 +491,8 @@ mod remote {
             low_power,
             name: "fake-gen".into(),
         });
-        let enc = start(policy(QUICK), format!("{opened}; sleep 30"));
+        let reads = super::super::r1_tests::READS_OPEN;
+        let enc = start(policy(QUICK), format!("{reads}; {opened}; sleep 30"));
         (enc.pid(), enc.opened.clone())
     }
 
