@@ -298,7 +298,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let client = s.hub.add_client(tx);
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
+    s.hub.send_first_hello(&client);
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
@@ -406,7 +406,7 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             set_hz(c, hz);
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
-            if offer.is_some_and(|o| o != gen) {
+            if !Hub::answers(offer, gen) {
                 return;
             }
             c.caps_hello(crate::negotiate::decode_caps(&decode), gen);
@@ -573,6 +573,87 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::HelloStep;
+
+    /// A client as `handle_socket` registers one, and the generations of the hellos queued
+    /// to it, in order.
+    fn connected(hub: &Hub) -> (Arc<Client>, mpsc::UnboundedReceiver<Out>) {
+        let (tx, rx) = mpsc::unbounded_channel::<Out>();
+        (hub.add_client(tx), rx)
+    }
+
+    fn hello_gens(rx: &mut mpsc::UnboundedReceiver<Out>) -> Vec<u64> {
+        let mut v = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Out::Text(t) = m {
+                let j: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if j["t"] == "hello" {
+                    v.push(j["offer"].as_u64().unwrap());
+                }
+            }
+        }
+        v
+    }
+
+    /// What the video thread does for a new screen size: a new offer generation, then a
+    /// hello at it to every connected client.
+    fn new_size(hub: &Hub) {
+        hub.offer_gen.fetch_add(1, Ordering::SeqCst);
+        hub.restart_clients();
+    }
+
+    /// A new size between a client's registration and its first hello's enqueue: its
+    /// queue still ends on the newest generation, and only that one's answer is taken.
+    #[test]
+    fn a_new_size_while_a_viewer_connects_ends_its_queue_on_the_newest_hello() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        hub.send_first_hello_with(&c, |s| {
+            if s == HelloStep::Built(0) {
+                new_size(&hub);
+            }
+        });
+        let gens = hello_gens(&mut rx);
+        assert_eq!(gens, vec![1, 0, 1], "restart hello, ours at 0, ours at 1");
+        let now = hub.offer_gen.load(Ordering::SeqCst);
+        assert_eq!(gens.last(), Some(&now));
+        assert!(Hub::answers(gens.last().copied(), now));
+        assert!(!Hub::answers(Some(0), now), "an answer to the stale hello is refused");
+    }
+
+    /// Two new sizes between a check and the next enqueue: the loop checks again after
+    /// every enqueue, so the queue still ends on the newest.
+    #[test]
+    fn two_new_sizes_between_a_check_and_the_next_hello_still_end_on_the_newest() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        hub.send_first_hello_with(&c, |s| match s {
+            HelloStep::Built(0) => new_size(&hub),
+            HelloStep::Built(1) => {
+                new_size(&hub);
+                new_size(&hub);
+            }
+            _ => {}
+        });
+        let gens = hello_gens(&mut rx);
+        assert_eq!(gens, vec![1, 0, 2, 3, 1, 3]);
+        let now = hub.offer_gen.load(Ordering::SeqCst);
+        assert_eq!((now, gens.last()), (3, Some(&3)));
+        assert!(Hub::answers(Some(3), now));
+    }
+
+    /// No new size meanwhile: exactly one hello.
+    #[test]
+    fn a_viewer_that_connects_gets_one_hello_when_nothing_changes() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        let mut steps = Vec::new();
+        hub.send_first_hello_with(&c, |s| steps.push(s));
+        assert_eq!(steps, vec![HelloStep::Built(0), HelloStep::Sent(0)]);
+        assert_eq!(hello_gens(&mut rx), vec![0]);
+        hub.send_first_hello(&c);
+        assert_eq!(hello_gens(&mut rx), vec![0], "the plain entry point: one hello");
+    }
 
     #[tokio::test]
     async fn dav1d_wasm_is_served_as_wasm() {

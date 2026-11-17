@@ -14,6 +14,15 @@ pub enum Out {
     Text(String),
 }
 
+/// Where [`Hub::send_first_hello_with`] is, with the generation of the hello it built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloStep {
+    /// Built, not yet enqueued.
+    Built(u64),
+    /// Enqueued, generation not yet read again.
+    Sent(u64),
+}
+
 pub struct Inflight {
     pub id: u32,
     pub sent: Instant,
@@ -552,18 +561,52 @@ impl Hub {
     /// The `hello` message: current geometry plus the server's settings, and for
     /// protocol 2 clients the codecs on offer. `stripes` is the H.264 stream's layout.
     pub fn hello(&self) -> String {
+        self.hello_gen().1
+    }
+
+    /// [`Hub::hello`] and the offer generation it carries (read once, for both).
+    pub fn hello_gen(&self) -> (u64, String) {
+        let gen = self.offer_gen.load(Ordering::SeqCst);
         let mut m = self.hello_extra.lock().clone();
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
         m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
         m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
         m.insert("protocol".into(), crate::negotiate::PROTOCOL.into());
-        m.insert(
-            "offer".into(),
-            self.offer_gen.load(Ordering::Relaxed).into(),
-        );
+        m.insert("offer".into(), gen.into());
         m.insert("videoOffers".into(), serde_json::json!(*self.offers.lock()));
-        serde_json::Value::Object(m).to_string()
+        (gen, serde_json::Value::Object(m).to_string())
+    }
+
+    /// Sends a client that just connected its first hello, ending on the newest offer
+    /// generation: the offers can change (a new screen size) between its registration
+    /// and this, and the browser answers only the last hello it got.
+    pub fn send_first_hello(&self, c: &Client) {
+        self.send_first_hello_with(c, |_| {});
+    }
+
+    /// [`Hub::send_first_hello`], calling `step` at each point a test needs to reach.
+    ///
+    /// The generation is read AFTER each hello is enqueued, and another hello follows if
+    /// it moved: a new generation's restart hello enqueued before ours is then followed by
+    /// ours at that generation or newer, and one enqueued after ours already is the newest.
+    pub fn send_first_hello_with(&self, c: &Client, mut step: impl FnMut(HelloStep)) {
+        loop {
+            let (gen, hello) = self.hello_gen();
+            step(HelloStep::Built(gen));
+            c.send(Out::Text(hello));
+            step(HelloStep::Sent(gen));
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.offer_gen.load(Ordering::SeqCst) == gen {
+                return;
+            }
+        }
+    }
+
+    /// Whether a viewer's answer to the offers of generation `offer` is for the offers in
+    /// force at `gen` (an answer that names none is taken).
+    pub fn answers(offer: Option<u64>, gen: u64) -> bool {
+        offer.is_none_or(|o| o == gen)
     }
 
     /// Video clients on cohort `id` that get its frames.

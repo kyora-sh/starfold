@@ -802,7 +802,7 @@ impl Engine {
             .collect();
         eng.cohorts.push(c);
         *hub.offers.lock() = eng.offers.clone();
-        hub.offer_gen.fetch_add(1, Ordering::Relaxed);
+        hub.offer_gen.fetch_add(1, Ordering::SeqCst);
         eng.publish();
         // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
         hub.restart_clients();
