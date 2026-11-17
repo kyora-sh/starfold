@@ -163,6 +163,9 @@ pub struct Session {
     stream: hw::Stream,
     /// Why the device is not asked again.
     stopped: Option<String>,
+    /// Why this encoder takes no more requests: closed to change its rate, it didn't open
+    /// again in full. The stream replaces it; the device itself answers.
+    unusable: Option<String>,
 }
 
 // The raw pointers point into the session's own boxes, or at the runtime's surface.
@@ -213,6 +216,7 @@ impl Session {
             need_idr: true,
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
             stopped: None,
+            unusable: None,
         };
         let mut refused = Vec::new();
         for low_power in [false, true] {
@@ -284,20 +288,35 @@ impl Session {
 
     /// Closes the encoder and opens it again at `rc`, with the session's size and LowPower
     /// mode: what oneVPL asks for when Reset can't apply a change. The next picture is an
-    /// IDR.
+    /// IDR. Once closed, anything short of a full Init (an error, or one only partly in
+    /// hardware, which [`Session::new`] refuses too) leaves the encoder unusable: no request
+    /// goes through it again, and the stream replaces it.
     fn reopen(&mut self, rc: &Rc) -> Result<(), EncodeError> {
         let r = self.rt.close();
         if r < ffi::ERR_NONE {
-            return Err(self.failed("MFXVideoENCODE_Close", r));
+            let e = self.failed("MFXVideoENCODE_Close", r);
+            return Err(self.unusable(e));
         }
         let mut p = self.with_ext(params(self.codec, self.size, rc, self.low_power));
         let r = self.rt.init(&mut p);
         if r == ffi::WRN_PARTIAL_ACCELERATION || r < ffi::ERR_NONE {
-            return Err(self.failed("MFXVideoENCODE_Init", r));
+            let e = self.failed("MFXVideoENCODE_Init", r);
+            return Err(self.unusable(e));
         }
         self.par = p;
         self.need_idr = true;
         Ok(())
+    }
+
+    /// Takes this encoder out of use after `e`, unless the device stopped (that ends
+    /// Quick Sync instead).
+    fn unusable(&mut self, e: EncodeError) -> EncodeError {
+        if self.stopped.is_some() {
+            return e;
+        }
+        let why = format!("the encoder didn't reopen at a new rate: {}", e.0);
+        self.unusable = Some(why.clone());
+        EncodeError(why)
     }
 
     /// Reads back what the encoder runs with: refuses B frames, sizes the output buffer.
@@ -349,7 +368,7 @@ impl Session {
     }
 
     fn running(&self) -> Result<(), EncodeError> {
-        match &self.stopped {
+        match self.stopped.as_ref().or(self.unusable.as_ref()) {
             Some(why) => Err(EncodeError(why.clone())),
             None => Ok(()),
         }

@@ -269,7 +269,7 @@ pub(super) struct Log {
     /// Encoders closed (MFXVideoENCODE_Close).
     pub(super) closes: usize,
     /// The frame type asked of each encode call, if it asked for one.
-    frame_types: Vec<Option<u16>>,
+    pub(super) frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
     surfaces: Vec<u64>,
     pub(super) live: i32,

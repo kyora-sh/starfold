@@ -3,6 +3,7 @@
 //! stream's first rate change right after open, its steady-state ones, a Reset the runtime
 //! still refuses, and what a Reset starts from.
 
+use super::driver::STOPPED;
 use super::ffi::{self, VideoParam};
 use super::session::Session;
 use super::tests::{Fake, INCOMPATIBLE_VIDEO_PARAM};
@@ -122,6 +123,35 @@ fn a_reset_the_runtime_refuses_reopens_at_the_new_rate() {
         ),
         (W as u16, H as u16)
     );
+}
+
+/// Closed to change its rate, an encoder that doesn't open again in full (only partly in
+/// hardware, or refused) takes no more pictures or rate changes. Its error is not a stopped
+/// device, so the helper answers it as an ordinary failure, the stream opens a fresh encoder
+/// for the next picture (and moves on to the next one if that keeps failing), and Quick Sync
+/// is not given up.
+#[test]
+fn an_encoder_that_does_not_reopen_in_full_is_out_of_use() {
+    for reinit in [ffi::WRN_PARTIAL_ACCELERATION, -15] {
+        let (mut fake, log) = Fake::new(Codec::H264);
+        fake.reset = VecDeque::from([INCOMPATIBLE_VIDEO_PARAM]);
+        fake.init = VecDeque::from([0, reinit]);
+        let mut s = Session::new(Box::new(fake), &cfg()).unwrap();
+        frame(&mut s, false).unwrap();
+        let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
+        let said = ffi::status_name(reinit);
+        assert!(
+            e.0.contains("didn't reopen") && e.0.contains(said) && !e.0.starts_with(STOPPED),
+            "{e}"
+        );
+        assert!(s.stopped().is_none(), "the device still answers");
+        let pictures = log.lock().unwrap().frame_types.len();
+        assert_eq!(frame(&mut s, false).unwrap_err(), e, "no picture through it");
+        assert_eq!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).unwrap_err(), e);
+        let l = log.lock().unwrap();
+        assert_eq!(l.frame_types.len(), pictures, "nothing reached the runtime");
+        assert_eq!((l.reset.len(), l.closes, l.inited.len()), (1, 1, 2));
+    }
 }
 
 /// A Reset starts from what the runtime says the encoder runs with (GetVideoParam), which
