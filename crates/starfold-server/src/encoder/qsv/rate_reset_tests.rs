@@ -5,7 +5,7 @@
 
 use super::ffi::{self, VideoParam};
 use super::session::Session;
-use super::tests::Fake;
+use super::tests::{Fake, INCOMPATIBLE_VIDEO_PARAM};
 use crate::encoder::hw::{sample_config, Rc};
 use crate::encoder::{
     AccessUnit, Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
@@ -98,7 +98,7 @@ fn steady_state_rate_changes_go_through() {
 #[test]
 fn a_reset_the_runtime_refuses_reopens_at_the_new_rate() {
     let (mut fake, log) = Fake::new(Codec::H264);
-    fake.reset = VecDeque::from([ffi::ERR_INCOMPATIBLE_VIDEO_PARAM]);
+    fake.reset = VecDeque::from([INCOMPATIBLE_VIDEO_PARAM]);
     let mut s = Session::new(Box::new(fake), &cfg()).unwrap();
     assert!(frame(&mut s, false).unwrap()[0].keyframe);
     assert!(!frame(&mut s, false).unwrap()[0].keyframe);

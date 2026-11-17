@@ -256,7 +256,7 @@ pub(super) fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
 const CODING_OPTION: u32 = u32::from_le_bytes(*b"CDOP");
 const NAL_HRD_CONFORMANCE: usize = 34;
 const VUI_NAL_HRD_PARAMETERS: usize = 62;
-const INCOMPATIBLE_VIDEO_PARAM: Status = -14;
+pub(super) const INCOMPATIBLE_VIDEO_PARAM: Status = -14;
 
 #[derive(Default)]
 pub(super) struct Log {
