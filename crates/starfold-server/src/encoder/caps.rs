@@ -450,7 +450,7 @@ impl ProbeProvider for Software {
     fn probe(&self) -> Probe {
         // Cisco's OpenH264 says which file it is, and the attribution its licence asks for.
         let device: String = match self.0 {
-            #[cfg(feature = "openh264-cisco")]
+            #[cfg(openh264_cisco)]
             Backend::OpenH264 => match super::cisco::load(None) {
                 Ok(what) => format!("cpu, {what}"),
                 Err(_) => "cpu".into(),

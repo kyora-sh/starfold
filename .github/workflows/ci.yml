@@ -201,11 +201,19 @@ jobs:
           [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
           grep -q "no OpenH264 library" "$RUNNER_TEMP/nolib.log"
       # Cisco's own file, fetched from Cisco and checked against the pin: every library test
-      # runs on it (the_library_tests_run_on asserts 2.6), then the server starts with it.
+      # runs on it (the_library_tests_run_on asserts 2.6). Then the server starts with it, from
+      # a plain build of the feature: the binary `cargo test` builds also links the tests'
+      # OpenH264 (the dev-dependency's source feature), so this step builds its own and checks
+      # that one.
       - name: On Cisco's OpenH264
         run: |
           lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
           STARFOLD_OPENH264_LIB="$lib" cargo test --no-default-features --features openh264-cisco --locked
+          cargo build --no-default-features --features openh264-cisco --locked
+          syms=$(nm --defined-only target/debug/starfold)
+          if awk '{ print $NF }' <<< "$syms" | grep -qx WelsCreateSVCEncoder; then
+            echo "::error::the binary contains OpenH264"; exit 1
+          fi
           BENCH_DISPLAY=:99 bench/env/xvfb.sh > /dev/null 2>&1 &
           for _ in $(seq 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done
           log=$RUNNER_TEMP/cisco.log

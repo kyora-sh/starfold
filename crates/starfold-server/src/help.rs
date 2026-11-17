@@ -228,7 +228,7 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
-    #[cfg(feature = "openh264-cisco")]
+    #[cfg(openh264_cisco)]
     let openh264 = entry(
         "--openh264-lib",
         &format!(
@@ -239,7 +239,7 @@ fn encoder_entries(usage: &str) -> String {
             crate::encoder::cisco::ATTRIBUTION
         ),
     );
-    #[cfg(not(feature = "openh264-cisco"))]
+    #[cfg(not(openh264_cisco))]
     let openh264 = String::new();
     usage
         .replace("OPENH264_ENTRY\n", &openh264)
@@ -363,15 +363,15 @@ mod tests {
         let attribution = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
         assert_eq!(
             words.contains(attribution),
-            cfg!(feature = "openh264-cisco"),
+            cfg!(openh264_cisco),
             "{words}"
         );
         assert_eq!(
             words.contains("--openh264-lib"),
-            cfg!(feature = "openh264-cisco"),
+            cfg!(openh264_cisco),
             "{words}"
         );
-        #[cfg(feature = "openh264-cisco")]
+        #[cfg(openh264_cisco)]
         assert_eq!(crate::encoder::cisco::ATTRIBUTION, attribution);
     }
 

@@ -60,7 +60,8 @@ pub const ENCODERS: &[Encoder] = &[
     },
     Encoder {
         name: "openh264",
-        built: cfg!(any(feature = "openh264", feature = "openh264-cisco")),
+        // Cisco's only where a build is pinned for the target.
+        built: cfg!(openh264_any),
         hardware: false,
         h264: true,
         crf: Some("lowest QP in motion"),
@@ -69,7 +70,7 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
-        library: if cfg!(feature = "openh264-cisco") {
+        library: if cfg!(openh264_cisco) {
             Library::CiscoBinary
         } else {
             Library::Linked
@@ -376,7 +377,7 @@ mod tests {
             .filter(|e| e.library == Library::CiscoBinary)
             .map(|e| e.name)
             .collect();
-        let want: &[&str] = if cfg!(feature = "openh264-cisco") {
+        let want: &[&str] = if cfg!(openh264_cisco) {
             &["openh264"]
         } else {
             &[]
@@ -385,7 +386,7 @@ mod tests {
         let labels = software_encoder_labels().join(", ");
         assert_eq!(
             labels.contains("openh264 [Cisco's binary, loaded at run time]"),
-            cfg!(feature = "openh264-cisco"),
+            cfg!(openh264_cisco),
             "{labels}"
         );
         assert!(ENCODERS

@@ -16,7 +16,7 @@ mod aom;
 )]
 mod av1;
 pub mod caps;
-#[cfg(feature = "openh264-cisco")]
+#[cfg(openh264_cisco)]
 pub mod cisco;
 mod h264;
 #[cfg(any(
@@ -235,10 +235,16 @@ pub trait VideoEncoder: Send {
     }
 }
 
-#[cfg(not(any(feature = "x264", openh264_any)))]
+#[cfg(not(any(feature = "x264", openh264_any, openh264_cisco_unpinned)))]
 compile_error!(
     "starfold needs a software H.264 encoder: the `x264` (default), `openh264` or \
      `openh264-cisco` feature"
+);
+
+#[cfg(all(openh264_cisco_unpinned, not(feature = "x264")))]
+compile_error!(
+    "`openh264-cisco`: no Cisco OpenH264 build is pinned for this target, so without x264 \
+     this build would have no software H.264 encoder"
 );
 
 #[cfg(all(feature = "openh264", feature = "openh264-cisco"))]

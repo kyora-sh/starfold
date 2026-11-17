@@ -13,11 +13,27 @@ fn main() {
     if cfg!(feature = "openh264") {
         nasm_check();
     }
-    // `openh264_any`: the OpenH264 backend is built in, compiled from source or Cisco's.
-    println!("cargo::rustc-check-cfg=cfg(openh264_any)");
-    if cfg!(any(feature = "openh264", feature = "openh264-cisco")) {
+    // `openh264_cisco`: Cisco's binary is loaded at run time, on a target it has a pinned build
+    // for (`openh264_cisco_unpinned` on any other). `openh264_any`: the OpenH264 backend is
+    // built in, compiled from source or Cisco's.
+    println!("cargo::rustc-check-cfg=cfg(openh264_any, openh264_cisco, openh264_cisco_unpinned)");
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let pinned = matches!(
+        (target.as_str(), arch.as_str()),
+        ("linux" | "macos", "x86_64" | "aarch64") | ("windows", "x86_64")
+    );
+    let cisco = cfg!(feature = "openh264-cisco");
+    if cisco && pinned {
+        println!("cargo::rustc-cfg=openh264_cisco");
+    } else if cisco {
+        println!("cargo::rustc-cfg=openh264_cisco_unpinned");
+        println!("cargo::warning=openh264-cisco: no Cisco build is pinned for {target} {arch}; this build has no OpenH264");
+    }
+    if cfg!(feature = "openh264") || (cisco && pinned) {
         println!("cargo::rustc-cfg=openh264_any");
     }
+    let triple = std::env::var("TARGET").unwrap_or_default();
+    println!("cargo::rustc-env=STARFOLD_TARGET={triple}");
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
 }

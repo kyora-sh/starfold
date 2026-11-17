@@ -350,22 +350,38 @@ neither contains nor downloads. The binary stays under starfold's MIT licence.
   - The pinned files are `libopenh264-2.6.0-linux64.8.so`, `libopenh264-2.6.0-linux-arm64.8.so`,
     `libopenh264-2.6.0-mac-x64.dylib`, `libopenh264-2.6.0-mac-arm64.dylib` and
     `openh264-2.6.0-win64.dll`.
-- **Checks:** starfold loads the file only if its sha256 is the pinned build for this platform and
-  the library reports version 2.6.
-  - It loads the bytes it checked, from a copy no other process can change:
-    - Linux: a sealed memfd.
-    - macOS: a private copy in a directory only the user can enter.
-    - Windows: the file itself, held open so that it can't be written, renamed or deleted until
-      it is loaded.
-  - Windows takes local absolute paths only, loaded without the DLL search path.
-- **Platforms:** Linux x86-64 and arm64, macOS x86-64 and arm64, Windows x64. No Cisco build is
-  pinned for Windows on Arm, so there it is refused.
+- **Checks:** starfold loads only bytes it wrote itself after hashing them.
+  - It reads the given file once into memory. The file must be a regular file of at most 16 MiB,
+    opened without blocking, and its sha256 must be the pinned build for this platform.
+  - It writes those bytes under a random name into a new directory it creates in the temporary
+    directory (`TMPDIR` on Linux and macOS), reads them back, hashes them again, and loads that
+    copy.
+  - The directory is only the user's: mode 0700 on Linux and macOS. On Windows it inherits the
+    ACL of the user's own temporary directory, and the path is refused if any part of it is a
+    reparse point.
+  - The library must also report version 2.6.
+  - The copy is removed once loaded. On Windows a loaded DLL can't be removed: the copy is held
+    open until the process ends, so it can't be written, renamed or deleted, and the next start
+    removes copies older than an hour.
+  - Loading needs a temporary directory that allows executable mappings (not mounted `noexec`).
+- **What this protects against:** an attacker who can replace the file at the given path is in
+  scope. One who controls starfold's environment or its private directory is not.
+  - On macOS starfold refuses to load while a dyld variable that could substitute another library
+    is set (`DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES` and the like).
+- **Platforms:** Linux x86-64 and arm64, macOS x86-64 and arm64, Windows x64.
+  - Elsewhere (Windows on Arm, for one) no Cisco build is pinned. There `openh264-cisco` alone
+    fails to build, and `x264` with `openh264-cisco` builds without OpenH264, with a build warning.
 - **macOS, unverified:** a signed starfold with the hardened runtime may need the
   `com.apple.security.cs.disable-library-validation` entitlement to load Cisco's dylib.
 - **Without the library, or with any other file:** OpenH264 is unavailable, and the log and `/stats`
   say why.
-  - `--encoder auto` still uses a hardware encoder where there is one.
-  - Without one, startup fails with that reason. starfold never falls back to another encoder.
+  - `--encoder auto` still uses a hardware encoder where there is one, and x264 in a build that
+    has it.
+  - Without either, startup fails with that reason (exit 2), as does `--encoder openh264`.
+    starfold never falls back to another encoder.
+- **Test builds:** `cargo test` builds starfold with the tests' OpenH264, compiled from source by
+  the dev-dependency, so that the tests can encode without Cisco's file. A plain `cargo build` of
+  the feature contains no OpenH264, and CI checks that binary.
 - **What it shows:** when it loads the library, starfold logs
   "OpenH264 Video Codec provided by Cisco Systems, Inc.", and `/stats` and `--help` show the same
   text.
