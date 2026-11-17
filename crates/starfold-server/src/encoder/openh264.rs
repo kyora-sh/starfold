@@ -19,10 +19,10 @@ pub(crate) struct Api {
     pub create: unsafe extern "C" fn(*mut *mut sys::ISVCEncoder) -> c_int,
     pub destroy: unsafe extern "C" fn(*mut sys::ISVCEncoder),
     #[cfg_attr(
-        feature = "openh264",
+        not(openh264_cisco_loadable),
         allow(
             dead_code,
-            reason = "read by the Cisco loader's version check and the tests"
+            reason = "read by the Linux Cisco loader's version check and its tests"
         )
     )]
     pub version: unsafe extern "C" fn() -> sys::OpenH264Version,
