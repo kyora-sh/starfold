@@ -4285,7 +4285,13 @@ fn on_a_grid(fps: u32, grid: Duration, secs: u64) -> Vec<Duration> {
 
 #[test]
 fn captures_offered_on_any_grid_up_to_the_interval_come_at_the_rate() {
-    for (fps, grid_us) in [(60, 15_000), (100, 8_333), (60, 8_333), (30, 30_000), (30, 20_000)] {
+    for (fps, grid_us) in [
+        (60, 15_000),
+        (100, 8_333),
+        (60, 8_333),
+        (30, 30_000),
+        (30, 20_000),
+    ] {
         let n = on_a_grid(fps, Duration::from_micros(grid_us), 10).len() as f64 / 10.0;
         assert!(
             (n - fps as f64).abs() <= 0.2,
@@ -4340,7 +4346,10 @@ fn no_more_than_two_captures_over_the_rate_in_any_second() {
     let mut s = Schedule::default();
     let t = Instant::now();
     s.took(t, interval);
-    assert!(!s.wait(t, interval).is_zero(), "nor after the first capture");
+    assert!(
+        !s.wait(t, interval).is_zero(),
+        "nor after the first capture"
+    );
 }
 
 #[test]
@@ -4406,7 +4415,10 @@ fn frames_on_a_grid(
         eng.replan();
         let views = eng.views();
         eng.update_rates(&views);
-        assert_eq!((eng.arrival_fps(&views), eng.cohorts[k].fps()), (arrival, cap));
+        assert_eq!(
+            (eng.arrival_fps(&views), eng.cohorts[k].fps()),
+            (arrival, cap)
+        );
         let turn = eng.turn(&views, 1000.0 / arrival as f64, t);
         eng.mark(&views, None);
         eng.dispatch(&whole(W, H), &views, &turn, t);
