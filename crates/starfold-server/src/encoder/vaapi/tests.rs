@@ -1450,7 +1450,11 @@ fn only_intels_driver_holds_its_cap() {
     let all = ffi::RC_CBR | ffi::RC_VBR | ffi::RC_CQP;
     assert!(holds(IHD, all, 4_000));
     assert!(!holds(MESA, all, 4_000), "radeonsi");
-    assert!(!holds("Mesa Gallium driver 26.0.8 for virgl (virgl)", all, 4_000));
+    assert!(!holds(
+        "Mesa Gallium driver 26.0.8 for virgl (virgl)",
+        all,
+        4_000
+    ));
     assert!(!holds("", all, 4_000), "a driver with no vendor string");
     assert!(!holds(IHD, all, 0), "uncapped: constant QP");
     assert!(

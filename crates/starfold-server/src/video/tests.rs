@@ -3827,7 +3827,11 @@ fn an_encoder_that_holds_its_cap_gets_exactly_its_area_share() {
 fn an_encoder_under_its_cap_keeps_twice_its_area_share() {
     for n in 1..=8 {
         for t in TARGETS {
-            assert_eq!(stripe_share(t, n, false), twice_the_area_share(t, n), "{t}/{n}");
+            assert_eq!(
+                stripe_share(t, n, false),
+                twice_the_area_share(t, n),
+                "{t}/{n}"
+            );
         }
     }
     assert_eq!(stripe_share(30_000, 1, false), 60_000);
