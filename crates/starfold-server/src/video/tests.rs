@@ -3509,8 +3509,80 @@ fn a_cohort_that_holds_its_cap_gets_no_headroom() {
     let free = refines_through_holding(H264_HW, false);
     let (_, held) = held.last().copied().unwrap();
     let (_, free) = free.last().copied().unwrap();
-    assert_eq!(held, start * 2, "a paint-over's double of the exact share");
+    assert_eq!(held, start, "a paint-over at the exact share");
     assert_eq!(free, start * 4, "a paint-over's double of twice the share");
+}
+
+#[test]
+fn a_paint_over_doubles_the_cap_only_where_it_is_a_ceiling() {
+    let job = |paintover: bool| StripeJob {
+        buf: Arc::new(I420::new(W as usize, H as usize)),
+        ts: 0,
+        force_idr: false,
+        boost: false,
+        crf: 24.0,
+        target: 8000,
+        stripes: 2,
+        paintover,
+        refine: None,
+        fps: 30,
+        max_fps: 30,
+        mb_dirty: None,
+        mb_cols: W.div_ceil(16) as usize,
+    };
+    assert_eq!(job(false).cap(true), 4000);
+    assert_eq!(job(true).cap(true), 4000, "holds its cap: the area share");
+    assert_eq!(job(false).cap(false), 8000);
+    assert_eq!(job(true).cap(false), 16000, "a ceiling: twice its share");
+}
+
+/// Motion, a paint-over and motion again on an encoder that does or doesn't hold its cap:
+/// the distinct rates its non-keyframe pictures ran at.
+fn rates_through_a_paint_over(holds: bool) -> Vec<u32> {
+    let encodes = Encodes::default();
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_holds: holds,
+        h264_hw_encodes: Some(encodes.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(config(), hub.clone(), W, H, &[H264_HW], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    let mut t = Instant::now();
+    fn moving(eng: &mut Engine, t: &mut Instant, c: &Client, rx: &mut UnboundedReceiver<Out>) {
+        for _ in 0..4 {
+            capture(eng, W, H, Some(Band { y0: 0, y1: H }), *t);
+            acked(c, rx);
+            *t += Duration::from_millis(33);
+        }
+    }
+    moving(&mut eng, &mut t, &c, &mut rx);
+    for _ in 0..2 {
+        still(&mut eng, &mut t);
+        acked(&c, &mut rx);
+    }
+    moving(&mut eng, &mut t, &c, &mut rx);
+    let mut rates: Vec<u32> = encodes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| !e.2)
+        .map(|e| e.1)
+        .collect();
+    rates.dedup();
+    rates
+}
+
+#[test]
+fn a_holding_encoder_keeps_one_rate_through_a_paint_over() {
+    let held = rates_through_a_paint_over(true);
+    assert_eq!(held, vec![START_KBPS as u32], "{held:?}");
+    let free = rates_through_a_paint_over(false);
+    assert!(
+        free.contains(&(START_KBPS as u32 * 4)),
+        "the control: a paint-over happened, at twice the share: {free:?}"
+    );
 }
 
 /// A hardware H.264 cohort on `cfg` whose opens hold their cap as `holding` says, after
