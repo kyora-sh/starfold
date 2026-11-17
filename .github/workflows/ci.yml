@@ -189,7 +189,9 @@ jobs:
       - name: No OpenH264 without a library
         run: |
           cargo build --no-default-features --features openh264-cisco --locked
-          if nm --defined-only target/debug/starfold | grep -q WelsCreateSVCEncoder; then
+          # OpenH264's own C entry point, not the binding's Rust methods of the same name.
+          syms=$(nm --defined-only target/debug/starfold)
+          if awk '{ print $NF }' <<< "$syms" | grep -qx WelsCreateSVCEncoder; then
             echo "::error::the binary contains OpenH264"; exit 1
           fi
           target/debug/starfold --version
