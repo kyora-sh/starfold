@@ -47,6 +47,7 @@ pub(super) const READS_OPEN: &str = concat!(
 fn opened() -> String {
     let opened = says(&Reply::Opened {
         low_power: true,
+        holds_cap: true,
         name: "fake-gen".into(),
     });
     format!("{READS_OPEN}; {opened}")

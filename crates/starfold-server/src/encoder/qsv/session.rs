@@ -427,4 +427,8 @@ impl VideoEncoder for Session {
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
     }
+
+    fn holds_cap(&self) -> bool {
+        self.rc.cbr
+    }
 }

@@ -63,6 +63,12 @@ fn requests_and_replies_round_trip() {
     let replies = [
         Reply::Opened {
             low_power: true,
+            holds_cap: false,
+            name: "mfx-gen".into(),
+        },
+        Reply::Opened {
+            low_power: false,
+            holds_cap: true,
             name: "mfx-gen".into(),
         },
         Reply::Done {
@@ -191,6 +197,7 @@ fn the_helper_serves_a_session() {
         replies[0],
         Reply::Opened {
             low_power: false,
+            holds_cap: true,
             name: "fake-gen".into()
         }
     );
@@ -206,6 +213,29 @@ fn the_helper_serves_a_session() {
         assert_eq!(units[0].data, bitstream(Codec::H264, true, true));
     }
     assert_eq!(replies[4], Reply::RateSet);
+}
+
+/// The helper says whether its session holds its cap: a capped one runs constant bitrate,
+/// an uncapped one constant QP.
+#[test]
+fn the_helper_says_whether_its_session_holds_its_cap() {
+    for (max_kbps, holds) in [(2000, true), (0, false)] {
+        let (fake, _) = Fake::new(Codec::H264);
+        let mut o = open(Codec::H264, 640, 480);
+        o.rate.max_kbps = max_kbps;
+        let mut out = Vec::new();
+        let input = Request::Open(o).bytes();
+        serve(
+            input.as_slice(),
+            &mut out,
+            |o| Ok(grey(o)),
+            session_on(fake),
+        );
+        match Reply::parse(&bodies(&out)[0]).unwrap() {
+            Reply::Opened { holds_cap, .. } => assert_eq!(holds_cap, holds, "{max_kbps}"),
+            r => panic!("{r:?}"),
+        }
+    }
 }
 
 #[test]
@@ -430,8 +460,14 @@ mod remote {
     }
 
     fn opened() -> String {
+        opened_holding(true)
+    }
+
+    /// A helper's open, its session holding its cap or not.
+    fn opened_holding(holds_cap: bool) -> String {
         let opened = says(&Reply::Opened {
             low_power: true,
+            holds_cap,
             name: "fake-gen".into(),
         });
         format!("{}; {opened}", super::super::r1_tests::READS_OPEN)
@@ -529,6 +565,7 @@ mod remote {
     fn open_line(low_power: bool) -> (u32, String) {
         let opened = says(&Reply::Opened {
             low_power,
+            holds_cap: true,
             name: "fake-gen".into(),
         });
         let reads = super::super::r1_tests::READS_OPEN;
@@ -880,5 +917,17 @@ mod remote {
             why.starts_with("qsv given up: the probe: ") && why.contains("MFX_ERR_GPU_HANG"),
             "{e}"
         );
+    }
+
+    /// The helper's encoder holds its cap as the helper's session said when it opened.
+    #[test]
+    fn the_helpers_encoder_holds_its_cap_as_its_session_does() {
+        for holds in [true, false] {
+            let enc = start(
+                policy(QUICK),
+                format!("{}; sleep 30", opened_holding(holds)),
+            );
+            assert_eq!(enc.holds_cap(), holds);
+        }
     }
 }

@@ -68,6 +68,8 @@ pub struct Unit {
 pub enum Reply {
     Opened {
         low_power: bool,
+        /// The session holds its cap ([`crate::encoder::VideoEncoder::holds_cap`]).
+        holds_cap: bool,
         name: String,
     },
     /// The frame in `slot` is coded; its units, none if it was skipped.
@@ -183,9 +185,14 @@ impl Reply {
     pub fn bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         match self {
-            Reply::Opened { low_power, name } => {
+            Reply::Opened {
+                low_power,
+                holds_cap,
+                name,
+            } => {
                 b.push(OPENED);
                 b.push(*low_power as u8);
+                b.push(*holds_cap as u8);
                 put_text(&mut b, name);
             }
             Reply::Done { slot, units } => {
@@ -214,6 +221,7 @@ impl Reply {
         let r = match c.u8()? {
             OPENED => Reply::Opened {
                 low_power: c.flag()?,
+                holds_cap: c.flag()?,
                 name: c.text()?,
             },
             DONE => {

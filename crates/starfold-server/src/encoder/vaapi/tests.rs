@@ -1429,3 +1429,36 @@ fn hardware_run(moving: bool, name: &str) {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+const IHD: &str = "Intel iHD driver for Intel(R) Gen Graphics - 26.1.2 ()";
+
+/// Whether a session on the driver named `vendor`, offered `rc` modes and capped at
+/// `max_kbps`, holds its cap.
+fn holds(vendor: &'static str, rc: u32, max_kbps: u32) -> bool {
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.vendor = vendor;
+    fake.rc = rc;
+    let mut c = cfg(Codec::H264, 320, 240);
+    c.rate = RateConfig::new(24.0, max_kbps, 30);
+    session(Box::new(fake), &c).unwrap().holds_cap()
+}
+
+/// Intel's media driver runs a capped stream at its cap on any picture; Mesa's radeonsi
+/// stays under it since filler data is off, and a driver not seen yet is taken to as well.
+#[test]
+fn only_intels_driver_holds_its_cap() {
+    let all = ffi::RC_CBR | ffi::RC_VBR | ffi::RC_CQP;
+    assert!(holds(IHD, all, 4_000));
+    assert!(!holds(MESA, all, 4_000), "radeonsi");
+    assert!(!holds(
+        "Mesa Gallium driver 26.0.8 for virgl (virgl)",
+        all,
+        4_000
+    ));
+    assert!(!holds("", all, 4_000), "a driver with no vendor string");
+    assert!(!holds(IHD, all, 0), "uncapped: constant QP");
+    assert!(
+        !holds(IHD, ffi::RC_VBR | ffi::RC_CQP, 4_000),
+        "no CBR offered: variable bitrate"
+    );
+}

@@ -857,6 +857,17 @@ fn imp(luid: Option<u64>, device: Option<u16>, id: u32) -> ImplInfo {
     }
 }
 
+/// A capped session runs constant bitrate, which Quick Sync holds at its cap on any
+/// picture; an uncapped one runs constant QP.
+#[test]
+fn a_capped_session_holds_its_cap() {
+    for (kbps, holds) in [(2000, true), (0, false)] {
+        let (fake, _) = Fake::new(Codec::H264);
+        let enc = session(Box::new(fake), &cfg(Codec::H264, 640, 480, kbps)).unwrap();
+        assert_eq!(enc.holds_cap(), holds, "{kbps}");
+    }
+}
+
 #[test]
 fn the_implementation_for_an_adapter() {
     let a = Adapter {

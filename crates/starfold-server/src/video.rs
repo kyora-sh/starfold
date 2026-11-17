@@ -553,10 +553,15 @@ fn encoder_config(
 }
 
 /// Each stripe may use up to twice its area share of the budget; the delay-based
-/// controller reins the total in if several stripes move at once. 0 = uncapped.
-fn stripe_share(target: u32, n: usize) -> u32 {
+/// controller reins the total in if several stripes move at once. An encoder that
+/// `holds` its cap runs at it on any picture, so it gets its area share exactly.
+/// 0 = uncapped.
+fn stripe_share(target: u32, n: usize, holds: bool) -> u32 {
     if target == 0 {
         return 0;
+    }
+    if holds {
+        return (target as u64 / n as u64).max(1) as u32;
     }
     ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
 }
@@ -590,7 +595,11 @@ fn sample(
     let target = if cfg.max_kbps == 0 {
         0
     } else {
-        stripe_share(START_KBPS.min(cfg.max_kbps as f64) as u32, n)
+        stripe_share(
+            START_KBPS.min(cfg.max_kbps as f64) as u32,
+            n,
+            enc.holds_cap(),
+        )
     };
     enc.set_rate(keyframe_rate(cfg.crf, target, ecfg.fps))?;
     let (w, h) = (ecfg.width as usize, ecfg.height as usize);
@@ -2460,13 +2469,30 @@ struct StripeJob {
     force_idr: bool,
     boost: bool,
     crf: f32,
-    cap: u32,
+    /// The cohort's target (0 = uncapped), its stripes, and whether this is a paint-over:
+    /// the worker takes its share from them with the encoder it has at the time.
+    target: u32,
+    stripes: usize,
+    paintover: bool,
     refine: Option<PassBudget>,
     fps: u32,
     /// The cohort's cap: the encoder's opening rate and the governor's frame budget.
     max_fps: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
+}
+
+impl StripeJob {
+    /// This stripe's cap, on an encoder that does or doesn't `hold` its cap; a paint-over
+    /// gets twice it.
+    fn cap(&self, holds: bool) -> u32 {
+        let share = stripe_share(self.target, self.stripes, holds);
+        if self.paintover {
+            share.saturating_mul(2)
+        } else {
+            share
+        }
+    }
 }
 
 /// A refining pass's QP, what its frame may cost, and what a tail pass after it may on a busy
@@ -2604,20 +2630,21 @@ fn stripe_worker(
         let refine = job
             .refine
             .filter(|_| !job.force_idr && s.cfg.backend.refines_by_qp());
+        let cap = job.cap(s.enc.holds_cap());
         let rate = if refine.is_some() {
             None
         } else if job.force_idr && job.boost {
             s.applied_kbps = None;
-            Some(keyframe_rate(job.crf, job.cap, job.fps))
+            Some(keyframe_rate(job.crf, cap, job.fps))
         } else {
             let moved = s
                 .applied_kbps
-                .is_none_or(|a| (job.cap as f64 - a as f64).abs() > a as f64 * 0.04);
+                .is_none_or(|a| (cap as f64 - a as f64).abs() > a as f64 * 0.04);
             (job.crf != s.applied_crf || moved || job.fps != s.applied_fps).then(|| {
                 s.applied_crf = job.crf;
-                s.applied_kbps = Some(job.cap);
+                s.applied_kbps = Some(cap);
                 s.applied_fps = job.fps;
-                RateConfig::new(job.crf, job.cap, job.fps)
+                RateConfig::new(job.crf, cap, job.fps)
             })
         };
         if let Some(r) = rate {
@@ -2836,9 +2863,6 @@ fn encode_loop(
         }
         let target = sh.target.load(Ordering::Relaxed);
         let want_crf = if job.paintover { po_crf } else { crf };
-        // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once.
-        let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         let budget =
             |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);
@@ -2859,18 +2883,15 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover {
-                    share.saturating_mul(2)
-                } else {
-                    share
-                };
                 let _ = workers[i].0.send(StripeJob {
                     buf: job.buf.clone(),
                     ts,
                     force_idr,
                     boost,
                     crf: want_crf,
-                    cap,
+                    target: if uncapped { 0 } else { target },
+                    stripes: n,
+                    paintover: job.paintover,
                     refine,
                     fps,
                     max_fps: sh.cap(),
