@@ -390,10 +390,11 @@ mod remote {
     }
 
     fn opened() -> String {
-        says(&Reply::Opened {
+        let opened = says(&Reply::Opened {
             low_power: true,
             name: "fake-gen".into(),
-        })
+        });
+        format!("{}; {opened}", super::super::r1_tests::READS_OPEN)
     }
 
     fn done(slot: u8, key: bool) -> String {
@@ -490,7 +491,8 @@ mod remote {
             low_power,
             name: "fake-gen".into(),
         });
-        let enc = start(policy(QUICK), format!("{opened}; sleep 30"));
+        let reads = super::super::r1_tests::READS_OPEN;
+        let enc = start(policy(QUICK), format!("{reads}; {opened}; sleep 30"));
         (enc.pid(), enc.opened.clone())
     }
 
