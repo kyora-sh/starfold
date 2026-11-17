@@ -1001,8 +1001,15 @@ fn a_hellos_offers_match_its_generation() {
         .unwrap()
         .push((Backend::VideoToolbox, GIVEN_UP.into()));
     let (w2, h2) = (320, 240);
-    let _b = Engine::new(config(), hub.clone(), w2, h2, &[HEVC, H264], fakes(Opts::default()))
-        .unwrap();
+    let _b = Engine::new(
+        config(),
+        hub.clone(),
+        w2,
+        h2,
+        &[HEVC, H264],
+        fakes(Opts::default()),
+    )
+    .unwrap();
     let (g2, hello2) = hub.hello_gen();
     let hello2 = parse(&hello2);
     assert_eq!((g2, hello2["offer"].as_u64()), (g1 + 1, Some(g1 + 1)));
