@@ -3758,11 +3758,24 @@ fn stats_show_the_bitrate_the_encoders_run_at() {
         capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
         acked(&c, &mut rx);
     }
-    let target = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    let reporting = eng
+        .cohorts
+        .iter()
+        .find(|c| c.shared.in_force.load(Ordering::Relaxed) == 12_345)
+        .expect("a cohort whose encoders say what they run at");
+    let target = reporting.shared.target.load(Ordering::Relaxed);
     assert_ne!(target, 12_345, "the stream's own target is another");
     assert_eq!(hub.target_kbps.load(Ordering::Relaxed), 12_345);
+    let id = reporting.shared.id;
+    eng.publish();
     let cohorts = hub.cohorts.lock().clone();
-    assert_eq!(cohorts[0]["target_kbps"], 12_345, "{cohorts}");
+    let shown = cohorts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .map(|c| c["target_kbps"].clone());
+    assert_eq!(shown, Some(serde_json::json!(12_345)), "{cohorts}");
 }
 
 #[test]

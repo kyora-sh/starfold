@@ -806,7 +806,9 @@ fn rate_changes_reset_the_encoder() {
         !encode(enc.as_mut(), 640, 480, false)[0].keyframe,
         "a raised rate needs no IDR"
     );
-    let e = enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap_err();
+    let e = enc
+        .set_rate(RateConfig::new(24.0, 100_000, 30))
+        .unwrap_err();
     assert!(e.0.contains("BRCParamMultiplier"), "{e}");
     let l = log.lock().unwrap();
     let m = |p: &VideoParam| p.mfx;

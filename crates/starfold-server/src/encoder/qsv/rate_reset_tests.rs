@@ -133,12 +133,20 @@ fn a_reset_changes_the_bitrate_only() {
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 12_000, 10)).unwrap();
     let per_picture = at(12_000 * 30 / 10);
-    assert_eq!(s.rate_in_force(), Some(per_picture * 10 / 30), "per second at 10 fps");
+    assert_eq!(
+        s.rate_in_force(),
+        Some(per_picture * 10 / 30),
+        "per second at 10 fps"
+    );
     let l = log.lock().unwrap();
     let (init, reset) = (l.inited[0], l.reset[0]);
     assert_eq!(rest(&reset), rest(&init));
     assert_eq!(reset.mfx.max_kbps, reset.mfx.target_kbps);
-    assert_eq!(kbps(&reset), per_picture, "12 Mbit/s at 10 fps, per picture at 30 fps");
+    assert_eq!(
+        kbps(&reset),
+        per_picture,
+        "12 Mbit/s at 10 fps, per picture at 30 fps"
+    );
 }
 
 /// A rate change raises no IDR: with HRD conformance off a constant-bitrate encoder changes
@@ -147,10 +155,16 @@ fn a_reset_changes_the_bitrate_only() {
 fn a_raised_rate_needs_no_idr() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-    assert!(frame(&mut s, false).unwrap()[0].keyframe, "the first picture");
+    assert!(
+        frame(&mut s, false).unwrap()[0].keyframe,
+        "the first picture"
+    );
     assert!(!frame(&mut s, false).unwrap()[0].keyframe);
     s.set_rate(RateConfig::new(24.0, 60_000, 30)).unwrap();
-    assert!(!frame(&mut s, false).unwrap()[0].keyframe, "a raise, no IDR");
+    assert!(
+        !frame(&mut s, false).unwrap()[0].keyframe,
+        "a raise, no IDR"
+    );
     assert!(frame(&mut s, true).unwrap()[0].keyframe, "one asked for");
     let l = log.lock().unwrap();
     let idr = Some(ffi::FRAMETYPE_I | ffi::FRAMETYPE_REF | ffi::FRAMETYPE_IDR);
@@ -168,8 +182,15 @@ fn a_corrected_rate_is_reported_as_the_one_in_force() {
     assert_eq!(s.rate_in_force(), Some(25_000));
     assert_eq!(s.in_force().target_kbps, 25_000);
     assert_eq!(s.in_force().max_kbps, 25_000);
-    assert!(!frame(&mut s, false).unwrap().is_empty(), "the session goes on");
-    assert_eq!(kbps(&log.lock().unwrap().reset[0]), 40_000, "what was asked");
+    assert!(
+        !frame(&mut s, false).unwrap().is_empty(),
+        "the session goes on"
+    );
+    assert_eq!(
+        kbps(&log.lock().unwrap().reset[0]),
+        40_000,
+        "what was asked"
+    );
 }
 
 /// A Reset the runtime refuses (incompatible, invalid, or only partly in hardware) takes the
@@ -179,11 +200,7 @@ fn a_corrected_rate_is_reported_as_the_one_in_force() {
 /// to the next one if that keeps failing); Quick Sync is not given up.
 #[test]
 fn a_refused_reset_puts_the_encoder_out_of_use() {
-    for refused in [
-        INCOMPATIBLE_VIDEO_PARAM,
-        -15,
-        ffi::WRN_PARTIAL_ACCELERATION,
-    ] {
+    for refused in [INCOMPATIBLE_VIDEO_PARAM, -15, ffi::WRN_PARTIAL_ACCELERATION] {
         let (mut fake, log) = Fake::new(Codec::H264);
         fake.reset = VecDeque::from([refused]);
         let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
