@@ -968,6 +968,53 @@ fn a_backend_that_goes_off_while_the_engine_starts_is_not_offered() {
     assert!(eng.failed.contains(&HEVC) && eng.failed.contains(&H264_HW));
 }
 
+/// A hello's offers are the ones of the generation it carries: after each new size, a
+/// hello names that size's generation and offers coded at that size, with the backends
+/// that are off left out.
+#[test]
+fn a_hellos_offers_match_its_generation() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let sized = |h: &serde_json::Value| -> Vec<(u64, u64)> {
+        h["videoOffers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|o| o["stripes"].as_array().cloned().unwrap_or_default())
+            .map(|s| {
+                let c = &s["config"];
+                (
+                    c["codedWidth"].as_u64().unwrap(),
+                    c["codedHeight"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+    let _a = engine(&hub, &[HEVC, H264], Opts::default());
+    let (g1, h1) = hub.hello_gen();
+    let h1 = parse(&h1);
+    assert_eq!(h1["offer"], g1);
+    assert!(sized(&h1).iter().all(|&(w, _)| w >= W as u64));
+    assert_eq!(h1["videoOffers"], offers_of(&hub, &[HEVC, H264]));
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    let (w2, h2) = (320, 240);
+    let _b = Engine::new(config(), hub.clone(), w2, h2, &[HEVC, H264], fakes(Opts::default()))
+        .unwrap();
+    let (g2, hello2) = hub.hello_gen();
+    let hello2 = parse(&hello2);
+    assert_eq!((g2, hello2["offer"].as_u64()), (g1 + 1, Some(g1 + 1)));
+    assert_eq!(hello2["videoOffers"], offers_of(&hub, &[H264]));
+    let s2 = sized(&hello2);
+    assert!(!s2.is_empty());
+    assert!(
+        s2.iter().all(|&(w, h)| w < W as u64 && h < H as u64),
+        "offers coded at {w2}x{h2}: {s2:?}"
+    );
+}
+
 #[test]
 fn errors_and_timeouts_walk_down_to_no_codec() {
     let hub = Hub::new();

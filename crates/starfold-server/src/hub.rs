@@ -14,6 +14,15 @@ pub enum Out {
     Text(String),
 }
 
+/// Where [`Hub::send_first_hello_with`] is, with the generation of the hello it built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloStep {
+    /// Built, not yet enqueued.
+    Built(u64),
+    /// Enqueued, generation not yet read again.
+    Sent(u64),
+}
+
 pub struct Inflight {
     pub id: u32,
     pub sent: Instant,
@@ -439,6 +448,9 @@ pub struct Hub {
     /// its generation: capability hellos for an older one are ignored.
     pub offers: Mutex<Vec<Offer>>,
     pub offer_gen: AtomicU64,
+    /// Orders a generation bump against a first hello's check (a leaf lock: held only
+    /// around that one bump or read, never with another lock or across an enqueue).
+    gen_order: Mutex<()>,
     /// Viewers changed: the video thread routes them again.
     pub replan: AtomicBool,
     /// Test hook: the video thread treats the H.264 encoder as failed.
@@ -480,6 +492,7 @@ impl Hub {
             activity: Default::default(),
             offers: Mutex::new(Vec::new()),
             offer_gen: AtomicU64::new(0),
+            gen_order: Mutex::new(()),
             replan: AtomicBool::new(false),
             fail_h264: AtomicBool::new(false),
             next_cohort: AtomicU64::new(1),
@@ -567,6 +580,13 @@ impl Hub {
     /// protocol 2 clients the codecs on offer, without the backends that are off as it is
     /// built. `stripes` is the H.264 stream's layout.
     pub fn hello(&self) -> String {
+        self.hello_gen().1
+    }
+
+    /// [`Hub::hello`] and the offer generation it carries (read once, for both). The
+    /// generation is read first, then the offers it names, minus the backends off now.
+    pub fn hello_gen(&self) -> (u64, String) {
+        let gen = self.offer_gen.load(Ordering::Relaxed);
         let off: Vec<crate::encoder::Backend> = self.off().into_iter().map(|(b, _)| b).collect();
         let offers: Vec<Offer> = self
             .offers
@@ -581,12 +601,53 @@ impl Hub {
         m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
         m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
         m.insert("protocol".into(), crate::negotiate::PROTOCOL.into());
-        m.insert(
-            "offer".into(),
-            self.offer_gen.load(Ordering::Relaxed).into(),
-        );
+        m.insert("offer".into(), gen.into());
         m.insert("videoOffers".into(), serde_json::json!(offers));
-        serde_json::Value::Object(m).to_string()
+        (gen, serde_json::Value::Object(m).to_string())
+    }
+
+    /// Sends a client that just connected its first hello, ending on the newest offer
+    /// generation: the offers can change (a new screen size) between its registration
+    /// and this, and the browser answers only the last hello it got.
+    pub fn send_first_hello(&self, c: &Client) {
+        self.send_first_hello_with(c, |_| {});
+    }
+
+    /// [`Hub::send_first_hello`], calling `step` at each point a test needs to reach.
+    ///
+    /// The generation is read AFTER each hello is enqueued, and another hello follows if
+    /// it moved. The read holds `gen_order`, as [`Hub::next_offer_gen`]'s bump does: if
+    /// this read's section comes first, our enqueue happens before the bump and so before
+    /// the restart hello's enqueue, which lands later in the channel; if the bump's section
+    /// comes first, this read sees the new generation and another hello follows.
+    pub fn send_first_hello_with(&self, c: &Client, mut step: impl FnMut(HelloStep)) {
+        loop {
+            let (gen, hello) = self.hello_gen();
+            step(HelloStep::Built(gen));
+            c.send(Out::Text(hello));
+            step(HelloStep::Sent(gen));
+            let now = {
+                let _order = self.gen_order.lock();
+                self.offer_gen.load(Ordering::Relaxed)
+            };
+            if now == gen {
+                return;
+            }
+        }
+    }
+
+    /// The next offer generation, for offers about to be sent to every client. The bump
+    /// holds `gen_order`, as the read in [`Hub::send_first_hello_with`] does (see there),
+    /// and releases it before any hello is enqueued.
+    pub fn next_offer_gen(&self) -> u64 {
+        let _order = self.gen_order.lock();
+        self.offer_gen.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Whether a viewer's answer to the offers of generation `offer` is for the offers in
+    /// force at `gen` (an answer that names none is taken).
+    pub fn answers(offer: Option<u64>, gen: u64) -> bool {
+        offer.is_none_or(|o| o == gen)
     }
 
     /// Video clients on cohort `id` that get its frames.
