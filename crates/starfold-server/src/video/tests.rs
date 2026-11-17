@@ -3323,8 +3323,14 @@ fn near(got: u32, want: u32) -> bool {
 fn each_stripe_gets_the_share_of_its_own_encoder() {
     let (last, target) = shares_by_open(two_stripes(), |open| open == 1, None);
     let (held, free) = (last[&1], last[&2]);
-    assert!(near(held, stripe_share(target, 2, true)), "{held} at {target}");
-    assert!(near(free, stripe_share(target, 2, false)), "{free} at {target}");
+    assert!(
+        near(held, stripe_share(target, 2, true)),
+        "{held} at {target}"
+    );
+    assert!(
+        near(free, stripe_share(target, 2, false)),
+        "{free} at {target}"
+    );
 }
 
 /// A stripe whose encoder holds its cap, replaced after a failure by one that doesn't, gets
@@ -3332,11 +3338,24 @@ fn each_stripe_gets_the_share_of_its_own_encoder() {
 #[test]
 fn a_replaced_encoder_gets_the_share_of_the_new_one() {
     let (last, target) = shares_by_open(config(), |open| open <= 1, Some((1, 3)));
-    assert!(near(last[&1], stripe_share(target, 1, true)), "{last:?} at {target}");
-    let after = last.iter().filter(|(&o, _)| o > 1).map(|(_, &k)| k).collect::<Vec<_>>();
-    assert!(!after.is_empty(), "no encode after the replacement: {last:?}");
+    assert!(
+        near(last[&1], stripe_share(target, 1, true)),
+        "{last:?} at {target}"
+    );
+    let after = last
+        .iter()
+        .filter(|(&o, _)| o > 1)
+        .map(|(_, &k)| k)
+        .collect::<Vec<_>>();
+    assert!(
+        !after.is_empty(),
+        "no encode after the replacement: {last:?}"
+    );
     for k in after {
-        assert!(near(k, stripe_share(target, 1, false)), "{k} at {target}");
+        assert!(
+            near(k, stripe_share(target, 1, false)),
+            "{k} at {target}"
+        );
     }
 }
 

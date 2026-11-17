@@ -225,7 +225,12 @@ fn the_helper_says_whether_its_session_holds_its_cap() {
         o.rate.max_kbps = max_kbps;
         let mut out = Vec::new();
         let input = Request::Open(o).bytes();
-        serve(input.as_slice(), &mut out, |o| Ok(grey(o)), session_on(fake));
+        serve(
+            input.as_slice(),
+            &mut out,
+            |o| Ok(grey(o)),
+            session_on(fake),
+        );
         match Reply::parse(&bodies(&out)[0]).unwrap() {
             Reply::Opened { holds_cap, .. } => assert_eq!(holds_cap, holds, "{max_kbps}"),
             r => panic!("{r:?}"),
@@ -918,7 +923,10 @@ mod remote {
     #[test]
     fn the_helpers_encoder_holds_its_cap_as_its_session_does() {
         for holds in [true, false] {
-            let enc = start(policy(QUICK), format!("{}; sleep 30", opened_holding(holds)));
+            let enc = start(
+                policy(QUICK),
+                format!("{}; sleep 30", opened_holding(holds)),
+            );
             assert_eq!(enc.holds_cap(), holds);
         }
     }
