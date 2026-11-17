@@ -939,8 +939,7 @@ impl Engine {
             .iter()
             .filter(|o| {
                 o.cand == self.h264
-                    || (!self.failed.contains(&o.cand)
-                        && !self.off_seen.contains(&o.cand.backend))
+                    || (!self.failed.contains(&o.cand) && !self.off_seen.contains(&o.cand.backend))
             })
             .cloned()
             .collect()
@@ -967,7 +966,11 @@ impl Engine {
                 .filter(|c| c.backend == *b && !self.failed.contains(c))
                 .collect();
             for c in cands {
-                log::warn!("{:?} from {} is off: {why}; no longer offered", c.codec, b.name());
+                log::warn!(
+                    "{:?} from {} is off: {why}; no longer offered",
+                    c.codec,
+                    b.name()
+                );
                 self.fail(c, why.clone());
             }
         }
