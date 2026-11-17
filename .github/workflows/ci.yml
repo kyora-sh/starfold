@@ -146,6 +146,70 @@ jobs:
           cargo test --features openh264 --locked
           cargo test --no-default-features --features openh264 --locked
 
+  bench-arms:
+    name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The Rust job's libraries, plus the arms' build tools, x265 as bench/arms/libs.sh takes it
+      # (Ubuntu's package) and Xvfb for the startup check.
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm pkg-config libx265-dev xvfb; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - id: svt-av1
+        uses: actions/cache@v4
+        with:
+          path: ~/arm-libs
+          key: arm-libs-svt-av1-${{ runner.os }}-${{ hashFiles('bench/arms/libs.sh') }}
+      # libs.sh's pinned release, checked against its tag's commit.
+      - name: SVT-AV1
+        if: steps.svt-av1.outputs.cache-hit != 'true'
+        run: bash bench/arms/libs.sh svt-av1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-bench-arms-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-bench-arms-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo clippy --features svt-av1,x265 --all-targets --locked -- -D warnings
+      - name: Test
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo test --features svt-av1,x265 --locked
+      # Each arm with a preset of its own must open its encoder and reach "listening on".
+      - name: Startup on Xvfb
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo build --features svt-av1,x265 --locked
+          BENCH_DISPLAY=:99 bench/env/xvfb.sh >/dev/null 2>&1 &
+          for _ in $(seq 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done
+          for arm in svt-av1:12 x265:ultrafast; do
+            enc=${arm%%:*} preset=${arm#*:} log=$RUNNER_TEMP/$enc.log
+            DISPLAY=:99 RUST_LOG=info target/debug/starfold --encoder="$enc" --preset="$preset" --port=6901 --enable-basic-auth=false --audio-enabled=false > "$log" 2>&1 &
+            pid=$!
+            up() { grep -q 'listening on' "$log" && grep -q "offering .* from $enc:" "$log"; }
+            for _ in $(seq 60); do up && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+            sleep 3
+            grep -v '^Svt' "$log" | cut -c1-240 || true
+            ok=1
+            up && kill -0 $pid 2>/dev/null || ok=0
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+            [ $ok = 1 ] || { echo "::error::--encoder=$enc --preset=$preset did not start"; exit 1; }
+          done
+
   musl:
     name: Linux musl (clippy)
     runs-on: kyora-8x16
