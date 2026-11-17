@@ -509,7 +509,11 @@ mod remote {
         let lives = start(p, format!("{}; sleep 30", opened()));
         assert_eq!(p.modes(), vec![(Codec::H264, true); 2]);
         fails_within(&mut dies, Duration::from_secs(2));
-        assert_eq!(p.modes(), vec![(Codec::H264, true)], "an ended helper's goes");
+        assert_eq!(
+            p.modes(),
+            vec![(Codec::H264, true)],
+            "an ended helper's goes"
+        );
         p.give_up("a test", None);
         assert!(p.modes().is_empty(), "a give-up takes every one");
         drop(lives);

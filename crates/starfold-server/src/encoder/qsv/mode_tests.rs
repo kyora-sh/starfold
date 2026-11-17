@@ -6,7 +6,7 @@ use super::proc::{self, NotStarted, Pipes, Proc};
 use super::proto::Reply;
 use super::remote::{Remote, POLICY};
 use crate::encoder::hw::sample_config;
-use crate::encoder::{with_live, Backend, Codec, EncoderConfig, RateConfig};
+use crate::encoder::{with_live, Backend, Codec, RateConfig};
 use std::process::Command;
 
 fn helper(low_power: bool) -> impl FnOnce() -> Result<(Proc, Pipes), NotStarted> {
