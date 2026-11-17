@@ -28,6 +28,8 @@ pub trait Runtime: Send {
     fn query(&mut self, par: &mut VideoParam) -> Status;
     fn init(&mut self, par: &mut VideoParam) -> Status;
     fn reset(&mut self, par: &mut VideoParam) -> Status;
+    /// Closes the encoder (MFXVideoENCODE_Close), keeping the session for another Init.
+    fn close(&mut self) -> Status;
     fn video_param(&mut self, par: &mut VideoParam) -> Status;
     /// A runtime surface holding `f` as NV12 (the session's size, the last column and row
     /// repeated), stamped `ts` (90 kHz). The caller releases it.
@@ -123,6 +125,14 @@ mod real {
 
         fn reset(&mut self, par: &mut VideoParam) -> Status {
             unsafe { (self.rt.encode_reset)(self.session, par) }
+        }
+
+        fn close(&mut self) -> Status {
+            if !self.encoder {
+                return ffi::ERR_NONE;
+            }
+            self.encoder = false;
+            unsafe { (self.rt.encode_close)(self.session) }
         }
 
         fn video_param(&mut self, par: &mut VideoParam) -> Status {

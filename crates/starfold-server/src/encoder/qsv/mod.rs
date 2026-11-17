@@ -26,6 +26,8 @@ mod proc;
 mod proto;
 #[cfg(all(test, unix))]
 mod r1_tests;
+#[cfg(test)]
+mod rate_reset_tests;
 mod remote;
 mod session;
 #[cfg(test)]

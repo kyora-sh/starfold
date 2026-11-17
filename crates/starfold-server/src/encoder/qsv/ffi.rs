@@ -16,6 +16,7 @@ pub type Hdl = *mut c_void;
 pub const ERR_NONE: Status = 0;
 pub const ERR_MORE_DATA: Status = -10;
 pub const ERR_DEVICE_LOST: Status = -13;
+pub const ERR_INCOMPATIBLE_VIDEO_PARAM: Status = -14;
 pub const ERR_DEVICE_FAILED: Status = -17;
 pub const ERR_GPU_HANG: Status = -21;
 pub const WRN_IN_EXECUTION: Status = 1;
@@ -71,6 +72,7 @@ pub const CODEC_AVC: u32 = fourcc(*b"AVC ");
 pub const CODEC_HEVC: u32 = fourcc(*b"HEVC");
 pub const FOURCC_NV12: u32 = fourcc(*b"NV12");
 pub const EXTBUFF_VIDEO_SIGNAL_INFO: u32 = fourcc(*b"VSIN");
+pub const EXTBUFF_CODING_OPTION: u32 = fourcc(*b"CDOP");
 
 /// mfxImplType, mfxAccelerationMode, mfxImplCapsDeliveryFormat, mfxResourceType.
 pub const IMPL_TYPE_HARDWARE: u32 = 2;
@@ -370,6 +372,40 @@ pub struct ExtVideoSignalInfo {
     pub colour_primaries: u16,
     pub transfer_characteristics: u16,
     pub matrix_coefficients: u16,
+}
+
+/// mfxExtCodingOption. Only the HRD fields are set; the rest stay zero (unknown, or the
+/// reserved values the header asks for).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExtCodingOption {
+    pub header: ExtBuffer,
+    pub reserved1: u16,
+    pub rate_distortion_opt: u16,
+    pub me_cost_type: u16,
+    pub me_search_type: u16,
+    pub mv_search_window: [i16; 2],
+    pub end_of_sequence: u16,
+    pub frame_picture: u16,
+    pub cavlc: u16,
+    pub reserved2: [u16; 2],
+    pub recovery_point_sei: u16,
+    pub view_output: u16,
+    pub nal_hrd_conformance: u16,
+    pub single_sei_nal_unit: u16,
+    pub vui_vcl_hrd_parameters: u16,
+    pub ref_pic_list_reordering: u16,
+    pub reset_ref_list: u16,
+    pub ref_pic_mark_rep: u16,
+    pub field_output: u16,
+    pub intra_pred_block_size: u16,
+    pub inter_pred_block_size: u16,
+    pub mv_precision: u16,
+    pub max_dec_frame_buffering: u16,
+    pub au_delimiter: u16,
+    pub end_of_stream: u16,
+    pub pic_timing_sei: u16,
+    pub vui_nal_hrd_parameters: u16,
 }
 
 /// mfxEncodeCtrl.

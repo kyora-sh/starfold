@@ -3,6 +3,12 @@
 //! through the runtime's own system-memory NV12 surfaces. It opens on the full encoder
 //! (LowPower off), and on the low-power one (VDEnc) only if the runtime refuses that.
 //!
+//! The stream is not held to HRD conformance (NalHrdConformance off, no NAL HRD parameters
+//! in its VUI): oneVPL lets a constant-bitrate encoder change its bitrate through Reset only
+//! then (the spec's "Dynamic Bitrate Change"), and every rate change goes through Reset. A
+//! Reset the runtime still can't apply closes the encoder and opens it again at the new
+//! rate, starting with an IDR.
+//!
 //! It runs in the encoder helper process (see [`super::remote`]). A device that hangs or is
 //! lost stops the session: it calls the runtime no more, not even to close it, and its error
 //! starts with [`STOPPED`]; the helper reports that and exits, and the server ends every
@@ -10,7 +16,9 @@
 //! killing the helper.
 
 use super::driver::{fatal, Fault, Runtime, STOPPED};
-use super::ffi::{self, Bitstream, EncodeCtrl, ExtBuffer, ExtVideoSignalInfo, VideoParam};
+use super::ffi::{
+    self, Bitstream, EncodeCtrl, ExtBuffer, ExtCodingOption, ExtVideoSignalInfo, VideoParam,
+};
 use crate::encoder::hw::{self, Rc};
 use crate::encoder::{
     AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
@@ -111,6 +119,19 @@ fn signal(c: ColorInfo) -> ExtVideoSignalInfo {
     }
 }
 
+/// No HRD conformance and no NAL HRD parameters, so a bitrate change can go through Reset.
+fn coding_option() -> ExtCodingOption {
+    ExtCodingOption {
+        header: ExtBuffer {
+            buffer_id: ffi::EXTBUFF_CODING_OPTION,
+            buffer_sz: std::mem::size_of::<ExtCodingOption>() as u32,
+        },
+        nal_hrd_conformance: ffi::CODINGOPTION_OFF,
+        vui_nal_hrd_parameters: ffi::CODINGOPTION_OFF,
+        ..Default::default()
+    }
+}
+
 pub struct Session {
     /// Dropped (closed) only while the device answers; see [`Session::stopped`].
     rt: ManuallyDrop<Box<dyn Runtime>>,
@@ -120,7 +141,8 @@ pub struct Session {
     /// What the encoder was set up with; its extension buffer list points at `ext`.
     par: VideoParam,
     signal: Box<ExtVideoSignalInfo>,
-    ext: Box<[*mut ExtBuffer; 1]>,
+    coding: Box<ExtCodingOption>,
+    ext: Box<[*mut ExtBuffer; 2]>,
     /// The output buffer and the descriptors the runtime is handed, at fixed addresses.
     buf: Vec<u8>,
     bs: Box<Bitstream>,
@@ -178,7 +200,8 @@ impl Session {
             color,
             par: VideoParam::default(),
             signal: Box::new(signal(color)),
-            ext: Box::new([std::ptr::null_mut()]),
+            coding: Box::new(coding_option()),
+            ext: Box::new([std::ptr::null_mut(); 2]),
             buf: Vec::new(),
             bs: Box::new(Bitstream::over(&mut [])),
             ctrl: Box::default(),
@@ -248,13 +271,33 @@ impl Session {
         self.stopped.as_deref()
     }
 
-    /// `p` with the session's extension buffers.
+    /// `p` with the session's extension buffers: its colour signalling, and no HRD.
     fn with_ext(&mut self, mut p: VideoParam) -> VideoParam {
         *self.signal = signal(self.color);
+        *self.coding = coding_option();
         self.ext[0] = &mut *self.signal as *mut ExtVideoSignalInfo as *mut ExtBuffer;
+        self.ext[1] = &mut *self.coding as *mut ExtCodingOption as *mut ExtBuffer;
         p.ext_param = self.ext.as_mut_ptr();
-        p.num_ext_param = 1;
+        p.num_ext_param = 2;
         p
+    }
+
+    /// Closes the encoder and opens it again at `rc`, with the session's size and LowPower
+    /// mode: what oneVPL asks for when Reset can't apply a change. The next picture is an
+    /// IDR.
+    fn reopen(&mut self, rc: &Rc) -> Result<(), EncodeError> {
+        let r = self.rt.close();
+        if r < ffi::ERR_NONE {
+            return Err(self.failed("MFXVideoENCODE_Close", r));
+        }
+        let mut p = self.with_ext(params(self.codec, self.size, rc, self.low_power));
+        let r = self.rt.init(&mut p);
+        if r == ffi::WRN_PARTIAL_ACCELERATION || r < ffi::ERR_NONE {
+            return Err(self.failed("MFXVideoENCODE_Init", r));
+        }
+        self.par = p;
+        self.need_idr = true;
+        Ok(())
     }
 
     /// Reads back what the encoder runs with: refuses B frames, sizes the output buffer.
@@ -323,13 +366,22 @@ impl VideoEncoder for Session {
         let raise = rc.bps > self.peak_bps;
         let mut asked = rc;
         asked.buffer_bits = asked.buffer_bits.min(self.max_buffer_bits);
-        let mut p = self.par;
-        apply(&asked, &mut p.mfx);
-        let r = self.rt.reset(&mut p);
+        let mut working = VideoParam::default();
+        let r = self.rt.video_param(&mut working);
         if r < ffi::ERR_NONE {
-            return Err(self.failed("MFXVideoENCODE_Reset", r));
+            return Err(self.failed("MFXVideoENCODE_GetVideoParam", r));
         }
-        self.par = p;
+        apply(&asked, &mut working.mfx);
+        let mut p = self.with_ext(working);
+        match self.rt.reset(&mut p) {
+            ffi::ERR_INCOMPATIBLE_VIDEO_PARAM => {
+                let mut init = asked;
+                init.buffer_bits = self.max_buffer_bits;
+                self.reopen(&init)?;
+            }
+            r if r < ffi::ERR_NONE => return Err(self.failed("MFXVideoENCODE_Reset", r)),
+            _ => self.par = p,
+        }
         self.rc = rc;
         if raise {
             self.peak_bps = rc.bps;
