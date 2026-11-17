@@ -42,8 +42,9 @@ Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esb
 toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
-`--no-default-features --features openh264-cisco` builds without either and encodes H.264 with
-Cisco's OpenH264 binary, loaded at run time (see [OpenH264 from Cisco](#openh264-from-cisco)).
+On Linux (x86-64 and arm64, glibc), `--no-default-features --features openh264-cisco` builds
+without either and encodes H.264 with Cisco's OpenH264 binary, loaded at run time (see
+[OpenH264 from Cisco](#openh264-from-cisco)).
 
 ```sh
 nix-shell --arg withRust true
@@ -341,48 +342,46 @@ the encoders a binary includes and its licence.
 
 ### OpenH264 from Cisco
 
+On Linux x86-64 and arm64 with glibc,
 `cargo build --release --no-default-features --features openh264-cisco` builds a binary with no
 H.264 encoder of its own. It encodes H.264 with Cisco's OpenH264 2.6.0 binary, which starfold
 neither contains nor downloads. The binary stays under starfold's MIT licence.
 
 - **Loading it:** pass the file's path with `--openh264-lib PATH` or `STARFOLD_OPENH264_LIB`.
-  - Cisco publishes the file at `https://ciscobinary.openh264.org/<file>.bz2`.
-  - The pinned files are `libopenh264-2.6.0-linux64.8.so`, `libopenh264-2.6.0-linux-arm64.8.so`,
-    `libopenh264-2.6.0-mac-x64.dylib`, `libopenh264-2.6.0-mac-arm64.dylib` and
-    `openh264-2.6.0-win64.dll`.
-- **Checks:** starfold loads only bytes it wrote itself after hashing them.
+  - Cisco publishes the file at `https://ciscobinary.openh264.org/<file>.bz2`;
+    `scripts/fetch-openh264.sh` fetches it and checks it against the pin.
+  - The pinned files are `libopenh264-2.6.0-linux64.8.so` and
+    `libopenh264-2.6.0-linux-arm64.8.so`.
+- **Checks:** starfold loads only bytes it checked itself, and writes nothing to disk.
   - It reads the given file once into memory. The file must be a regular file of at most 16 MiB,
-    opened without blocking, and its sha256 must be the pinned build for this platform.
-  - It writes those bytes under a random name into a new directory it creates in the temporary
-    directory (`TMPDIR` on Linux and macOS), reads them back, hashes them again, and loads that
-    copy.
-  - The directory is only the user's: mode 0700 on Linux and macOS. On Windows it gets a protected
-    ACL (its owner and SYSTEM, nothing inherited), and the path is refused if any part of it is a
-    reparse point.
-  - The library must also report version 2.6.
-  - The copy is removed once loaded. On Windows a loaded DLL can't be removed: the copy is held
-    open until the process ends, so it can't be written, renamed or deleted. The next start
-    removes copies older than an hour, touching only names starfold gives them and never
-    following a reparse point.
-  - Loading needs a temporary directory that allows executable mappings (not mounted `noexec`).
-- **What this protects against:** an attacker who can replace the file at the given path is in
-  scope. One who controls starfold's environment or its private directory is not.
-  - On macOS starfold refuses to load while a dyld variable that could substitute another library
-    is set (`DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES` and the like).
-- **Platforms:** Linux x86-64 and arm64, macOS x86-64 and arm64, Windows x64.
-  - Elsewhere (Windows on Arm, for one) no Cisco build is pinned. There `openh264-cisco` alone
-    fails to build, and `x264` with `openh264-cisco` builds without OpenH264, with a build warning.
-- **macOS, unverified:** a signed starfold with the hardened runtime may need the
-  `com.apple.security.cs.disable-library-validation` entitlement to load Cisco's dylib.
-- **Without the library, or with any other file:** OpenH264 is unavailable, and the log and `/stats`
-  say why.
-  - `--encoder auto` still uses a hardware encoder where there is one, and x264 in a build that
-    has it.
-  - Without either, startup fails with that reason (exit 2), as does `--encoder openh264`.
-    starfold never falls back to another encoder.
+    opened without blocking, and its sha256 must be the pinned build for this architecture.
+  - It writes those bytes to a memfd, seals it so that nothing can write to it, grow it or shrink
+    it any more, reads it back and hashes it again.
+  - It loads the library from `/proc/self/fd/N`, and keeps the memfd open for the life of the
+    process. If an object is already loaded under that name (glibc would hand that object back),
+    starfold uses a duplicate of the memfd numbered above every such name.
+  - Each entry point it takes from the library must lie in the memfd's own mapping, and the
+    library must report version 2.6.
+- **What this protects against:** an attacker who can replace the file at the given path, before
+  or after the check, is in scope. One who controls starfold's environment (`LD_PRELOAD`, for
+  one) or its process is not.
+- **Other platforms:** not yet. On macOS, Windows, musl (static or not) and any other target,
+  `openh264-cisco` builds, and OpenH264 is unavailable: `--version`, `--help`, the startup log
+  and `/stats` say "OpenH264 (Cisco) is not available on this platform yet".
+- **Without the library, or with any other file:** OpenH264 is unavailable, and the startup log
+  says why.
+  - `--encoder auto` takes x264 in a build that has it. It never takes VA-API or NVENC, which
+    are experimental and run only when named with `--encoder`.
+  - When another encoder serves H.264, starfold starts and `/stats` shows the reason too.
+  - Otherwise, as with `--encoder openh264`, startup fails with that reason (exit 2) before
+    starfold listens, so there is no `/stats`. starfold never falls back to another encoder.
 - **Test builds:** `cargo test` builds starfold with the tests' OpenH264, compiled from source by
   the dev-dependency, so that the tests can encode without Cisco's file. A plain `cargo build` of
   the feature contains no OpenH264, and CI checks that binary.
+- **Embedding:** starfold calls the loaded library only through the entry points it took from it.
+  An application that embeds this build may also use openh264-sys2's `source` feature itself;
+  Cargo then builds that encoder for starfold too, and starfold still never refers to it. CI
+  builds such an application and checks this.
 - **What it shows:** when it loads the library, starfold logs
   "OpenH264 Video Codec provided by Cisco Systems, Inc.", and `/stats` and `--help` show the same
   text.

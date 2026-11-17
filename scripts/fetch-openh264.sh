@@ -9,14 +9,11 @@ dir=${1:-${XDG_CACHE_HOME:-$HOME/.cache}/starfold}
 case "$(uname -s)-$(uname -m)" in
 Linux-x86_64) f=libopenh264-2.6.0-linux64.8.so ;;
 Linux-aarch64 | Linux-arm64) f=libopenh264-2.6.0-linux-arm64.8.so ;;
-Darwin-x86_64) f=libopenh264-2.6.0-mac-x64.dylib ;;
-Darwin-arm64) f=libopenh264-2.6.0-mac-arm64.dylib ;;
-MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64) f=openh264-2.6.0-win64.dll ;;
-*) echo "fetch-openh264.sh: no Cisco build pinned for $(uname -s) $(uname -m)" >&2; exit 1 ;;
+*) echo "fetch-openh264.sh: starfold loads Cisco's OpenH264 only on Linux x86-64 and arm64, not $(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac
 want=$(grep -B1 "^        \"$f\",$" "$here/crates/starfold-server/src/encoder/cisco.rs" | head -1 | tr -d ' ",')
 [ ${#want} -eq 64 ] || { echo "fetch-openh264.sh: no pinned sha256 for $f" >&2; exit 1; }
-sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
 mkdir -p "$dir"
 out=$dir/$f
 if [ ! -f "$out" ] || [ "$(sha "$out")" != "$want" ]; then

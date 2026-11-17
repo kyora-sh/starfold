@@ -1,0 +1,16 @@
+# An application that embeds starfold built with `openh264-cisco` and also uses OpenH264
+# compiled from source itself, so Cargo builds openh264-sys2 with its `source` feature for both.
+# CI checks that starfold's code never refers to that encoder (see ci.yml).
+[package]
+name = "embed-source"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+starfold-server = { path = "../../../crates/starfold-server", default-features = false, features = [
+	"openh264-cisco",
+] }
+openh264-sys2 = { version = "=0.9.9", default-features = false, features = ["source"] }

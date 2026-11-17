@@ -13,14 +13,16 @@
   release attaches the exact x264 source of its Linux, macOS and Windows builds, kept in
   [third_party/x264](third_party/x264/README.md).
 - **OpenH264** (BSD-2-Clause), built from source and linked by a build with the `openh264` feature,
-  and by the test builds (the tests' dev-dependency), whatever their features.
+  by the test builds (the tests' dev-dependency), whatever their features, and by an application
+  that embeds starfold and enables openh264-sys2's `source` feature itself.
   `--no-default-features --features openh264` builds without x264, and that binary stays under
   starfold's MIT licence.
 - **Cisco's OpenH264 binary** (BSD-2-Clause, with Cisco's AVC/H.264 patent licence conditions): not
-  bundled. A build with the `openh264-cisco` feature loads it at run time from a path the user gives:
-  it checks the file against the pinned sha256 and loads its own copy of the checked bytes. starfold
-  neither contains nor downloads it. Licence,
-  verbatim from Cisco: [licenses/openh264-cisco-binary.txt](licenses/openh264-cisco-binary.txt).
+  bundled. On Linux x86-64 and arm64 with glibc, a build with the `openh264-cisco` feature loads it
+  at run time from a path the user gives: it checks the file against the pinned sha256 and loads
+  the checked bytes from a sealed memfd. On other targets that feature loads nothing and has no
+  OpenH264. starfold neither contains nor downloads it. Licence, verbatim from Cisco:
+  [licenses/openh264-cisco-binary.txt](licenses/openh264-cisco-binary.txt).
 - **Intel libvpl API headers** (MIT, Copyright Intel Corporation,
   [intel/libvpl](https://github.com/intel/libvpl) v2.17.0, commit
   d77f9195cf495b937631607333288fd917ae8939): the Windows Quick Sync encoder's struct layouts and

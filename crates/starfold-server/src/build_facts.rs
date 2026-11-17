@@ -42,7 +42,14 @@ pub enum Library {
     Driver,
     /// Cisco's OpenH264 binary, loaded at run time from a path; never part of the binary.
     CiscoBinary,
+    /// Cisco's OpenH264 binary, which starfold does not load on this target yet: the backend is
+    /// built in and always unavailable, with that reason.
+    CiscoNotOnThisPlatform,
 }
+
+/// What `--version` says of a build of `openh264-cisco` for a target starfold doesn't load
+/// Cisco's binary on.
+pub const CISCO_NOT_YET: &str = "OpenH264 (Cisco) is not available on this platform yet";
 
 pub const ENCODERS: &[Encoder] = &[
     Encoder {
@@ -60,7 +67,6 @@ pub const ENCODERS: &[Encoder] = &[
     },
     Encoder {
         name: "openh264",
-        // Cisco's only where a build is pinned for the target.
         built: cfg!(openh264_any),
         hardware: false,
         h264: true,
@@ -70,8 +76,10 @@ pub const ENCODERS: &[Encoder] = &[
         refines_to_paintover_crf: false,
         uncapped_only: false,
         gpl: false,
-        library: if cfg!(openh264_cisco) {
+        library: if cfg!(openh264_cisco_loadable) {
             Library::CiscoBinary
+        } else if cfg!(feature = "openh264-cisco") {
+            Library::CiscoNotOnThisPlatform
         } else {
             Library::Linked
         },
@@ -206,11 +214,13 @@ fn software() -> impl Iterator<Item = &'static Encoder> {
 }
 
 /// Every software encoder this binary includes, H.264 and bench arms, as `--version` names
-/// them: by feature name, and one loaded from Cisco's binary says so.
+/// them: by feature name, and one loaded from Cisco's binary says so, or that it is not
+/// available on this platform.
 pub fn software_encoder_labels() -> Vec<String> {
     software()
         .map(|e| match e.library {
             Library::CiscoBinary => format!("{} [Cisco's binary, loaded at run time]", e.name),
+            Library::CiscoNotOnThisPlatform => format!("{} [{CISCO_NOT_YET}]", e.name),
             _ => e.name.to_string(),
         })
         .collect()
@@ -368,27 +378,45 @@ mod tests {
         }
     }
 
-    /// Only a build with `openh264-cisco` loads Cisco's binary, and it says so in `--version`;
-    /// the binary itself stays under starfold's own licence unless x264 is in it.
+    /// Only a build with `openh264-cisco` loads Cisco's binary, on Linux x86-64 and arm64 with
+    /// glibc, and it says so in `--version`; for any other target it says the binary is not
+    /// available there yet.
     #[test]
     fn cisco_binary_only_with_its_feature() {
-        let cisco: Vec<&str> = ENCODERS
-            .iter()
-            .filter(|e| e.library == Library::CiscoBinary)
-            .map(|e| e.name)
-            .collect();
-        let want: &[&str] = if cfg!(openh264_cisco) {
-            &["openh264"]
-        } else {
-            &[]
+        let rows = |l: Library| -> Vec<&str> {
+            ENCODERS
+                .iter()
+                .filter(|e| e.library == l)
+                .map(|e| e.name)
+                .collect()
         };
-        assert_eq!(cisco, want);
+        let cisco = cfg!(feature = "openh264-cisco");
+        let loadable = cfg!(openh264_cisco_loadable);
+        let only = |on: bool| -> Vec<&str> {
+            if on {
+                vec!["openh264"]
+            } else {
+                vec![]
+            }
+        };
+        assert_eq!(rows(Library::CiscoBinary), only(loadable));
+        assert_eq!(
+            rows(Library::CiscoNotOnThisPlatform),
+            only(cisco && !loadable)
+        );
         let labels = software_encoder_labels().join(", ");
         assert_eq!(
             labels.contains("openh264 [Cisco's binary, loaded at run time]"),
-            cfg!(openh264_cisco),
+            loadable,
             "{labels}"
         );
+        assert_eq!(
+            labels.contains(&format!("openh264 [{CISCO_NOT_YET}]")),
+            cisco && !loadable,
+            "{labels}"
+        );
+        #[cfg(feature = "openh264-cisco")]
+        assert!(crate::encoder::cisco::NOT_AVAILABLE.starts_with(CISCO_NOT_YET));
         assert!(ENCODERS
             .iter()
             .all(|e| e.hardware == (e.library == Library::Driver)));

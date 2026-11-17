@@ -1,21 +1,20 @@
-//! Cisco's OpenH264 binary, loaded at run time (the `openh264-cisco` feature, on a target with a
-//! pinned Cisco build). starfold neither contains nor downloads it.
+//! Cisco's OpenH264 binary, loaded at run time (the `openh264-cisco` feature). starfold neither
+//! contains nor downloads it, and loads it only on Linux x86-64 and arm64 with glibc; on any
+//! other target the feature builds, and OpenH264 is unavailable with [`NOT_AVAILABLE`].
 //!
-//! One rule on every platform: the process loads only bytes it wrote itself after hashing them.
 //! The file from `--openh264-lib` or `$STARFOLD_OPENH264_LIB` is read once into memory (a
-//! regular file of at most 16 MiB, opened without blocking), its sha256 must be the pinned Cisco
-//! build for this platform, and those bytes are written under a random name into a new directory
-//! starfold creates for this user alone, read back and hashed again, and loaded from there. The
-//! copy is removed once loaded; on Windows, where a loaded DLL can't be removed, it is held open
-//! against writing and deleting until the process ends, and a later start removes it.
+//! regular file of at most 16 MiB, opened without blocking), and its sha256 must be the pinned
+//! Cisco build. Those bytes go into a memfd sealed against writing, growing and shrinking,
+//! which is read back and hashed again, and the library is loaded from `/proc/self/fd/N`, a
+//! name no loaded object already has. Its entry points must lie in that memfd's own mapping.
+//! The memfd stays open for the life of the process; nothing is written to disk. starfold
+//! calls the library only through the entry points held here, never through openh264-sys2's
+//! `DynamicAPI`, so a build in which a dependent enables OpenH264's source build still never
+//! calls that.
 
-use openh264_sys2 as sys;
-use sha2::Digest;
-use std::fs::File;
-use std::io::{Read, Write};
+use super::openh264::Api;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use sys::API;
 
 /// Cisco's OpenH264 2.6.0 builds starfold loads: (sha256, Cisco's file name). Each is also in
 /// openh264-sys2's own list of the builds its bindings fit.
@@ -28,18 +27,6 @@ pub const PINS: &[(&str, &str)] = &[
         "12e7b33623667cdab0e575170c147b1b36eadb77d0d2aa7ceb5afd3e58902140",
         "libopenh264-2.6.0-linux-arm64.8.so",
     ),
-    (
-        "e3dc8bc01fe69363f61fd3c02fd27798537a585eadd38cd808f303d1ee505a19",
-        "libopenh264-2.6.0-mac-x64.dylib",
-    ),
-    (
-        "052e98bfcf7a9167d22f3bbb3f5988ef79065591f36af8b52924b22b13624551",
-        "libopenh264-2.6.0-mac-arm64.dylib",
-    ),
-    (
-        "2076cb5675ec6c1a4c70e7a2a322552f547b6eeed649d6dfcd9e02a543b24691",
-        "openh264-2.6.0-win64.dll",
-    ),
 ];
 
 /// The library's path when `--openh264-lib` isn't given.
@@ -48,42 +35,28 @@ pub const LIB_ENV: &str = "STARFOLD_OPENH264_LIB";
 /// The text Cisco's binary licence asks software using it to display.
 pub const ATTRIBUTION: &str = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
 
-/// Larger than any pinned build (the biggest is under 2 MiB).
-const MAX_BYTES: u64 = 16 << 20;
+/// Why a build of the feature for any other target has no OpenH264.
+pub const NOT_AVAILABLE: &str = "OpenH264 (Cisco) is not available on this platform yet: \
+     starfold loads Cisco's binary only on Linux x86-64 and arm64 with glibc";
 
-/// The prefix of the private directories the checked copies are written to.
-const DIR_PREFIX: &str = "starfold-openh264-";
-
-/// Cisco's file name for this platform, if a build is pinned for it.
+/// Cisco's file name for this target, where starfold loads it.
 pub fn platform_file() -> Option<&'static str> {
-    let name = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => "libopenh264-2.6.0-linux64.8.so",
-        ("linux", "aarch64") => "libopenh264-2.6.0-linux-arm64.8.so",
-        ("macos", "x86_64") => "libopenh264-2.6.0-mac-x64.dylib",
-        ("macos", "aarch64") => "libopenh264-2.6.0-mac-arm64.dylib",
-        ("windows", "x86_64") => "openh264-2.6.0-win64.dll",
-        _ => return None,
-    };
-    Some(name)
-}
-
-fn platform_pins() -> Vec<(&'static str, &'static str)> {
-    PINS.iter()
-        .copied()
-        .filter(|(_, name)| Some(*name) == platform_file())
-        .collect()
+    if !cfg!(openh264_cisco_loadable) {
+        None
+    } else if cfg!(target_arch = "x86_64") {
+        Some("libopenh264-2.6.0-linux64.8.so")
+    } else {
+        Some("libopenh264-2.6.0-linux-arm64.8.so")
+    }
 }
 
 struct Loaded {
-    api: sys::DynamicAPI,
+    api: Api,
     what: String,
-    /// Windows: the copy, held open until the process ends.
-    _copy: Option<PrivateCopy>,
+    /// The memfd and the loader's handle, held for the life of the process.
+    #[cfg(openh264_cisco_loadable)]
+    _held: Option<linux::Held>,
 }
-
-// The library's entry points are plain C functions, callable from any thread.
-unsafe impl Send for Loaded {}
-unsafe impl Sync for Loaded {}
 
 static LIBRARY: OnceLock<Result<Loaded, String>> = OnceLock::new();
 
@@ -91,18 +64,19 @@ static LIBRARY: OnceLock<Result<Loaded, String>> = OnceLock::new();
 /// process, and says what was loaded; later calls return the first call's outcome.
 pub fn load(path: Option<&Path>) -> Result<&'static str, String> {
     LIBRARY
-        .get_or_init(|| open(path))
+        .get_or_init(|| open(path, || {}))
         .as_ref()
         .map(|l| l.what.as_str())
         .map_err(Clone::clone)
 }
 
-/// The loaded library (loading it from `$STARFOLD_OPENH264_LIB` if nothing has yet).
-pub fn library() -> Result<&'static sys::DynamicAPI, String> {
+/// The loaded library's entry points (loading it from `$STARFOLD_OPENH264_LIB` if nothing
+/// has yet).
+pub(crate) fn api() -> Result<Api, String> {
     LIBRARY
-        .get_or_init(|| open(None))
+        .get_or_init(|| open(None, || {}))
         .as_ref()
-        .map(|l| &l.api)
+        .map(|l| l.api)
         .map_err(Clone::clone)
 }
 
@@ -112,608 +86,332 @@ fn no_library() -> String {
             "no OpenH264 library: get Cisco's {f} from https://www.openh264.org and pass its \
              path with --openh264-lib or {LIB_ENV}"
         ),
-        None => format!(
-            "no Cisco OpenH264 build is pinned for {} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ),
+        None => NOT_AVAILABLE.into(),
     }
 }
 
-fn open(path: Option<&Path>) -> Result<Loaded, String> {
+/// Loads the library at `path`, else at `$STARFOLD_OPENH264_LIB`; `after_check` runs once its
+/// bytes have passed the pin, before anything is loaded.
+fn open(path: Option<&Path>, after_check: impl FnOnce()) -> Result<Loaded, String> {
     let env = std::env::var_os(LIB_ENV).filter(|p| !p.is_empty());
     let Some(path) = path.map(Path::to_path_buf).or(env.map(PathBuf::from)) else {
         // Tests encode with the dev-dependency's OpenH264 unless $STARFOLD_OPENH264_LIB
         // names Cisco's file; a starfold binary has no such fallback.
         #[cfg(test)]
         return Ok(Loaded {
-            api: sys::DynamicAPI::from_source(),
+            api: super::openh264::SOURCE,
             what: "OpenH264 compiled from source (tests only)".into(),
-            _copy: None,
+            #[cfg(openh264_cisco_loadable)]
+            _held: None,
         });
         #[cfg(not(test))]
         return Err(no_library());
     };
-    #[cfg(target_os = "macos")]
-    if let Some(v) = dyld_overrides(std::env::vars_os()).first() {
-        return Err(format!(
-            "not loading OpenH264 while {v} is set: dyld could load another library in its place"
-        ));
-    }
-    let checked = Checked::read(&path, &platform_pins())?;
-    let copy = PrivateCopy::new(&checked).map_err(|e| {
-        format!(
-            "OpenH264 library {}: writing the checked copy: {e}",
-            path.display()
-        )
-    })?;
-    let api = copy.load()?;
-    let v = unsafe { api.WelsGetCodecVersion() };
-    if (v.uMajor, v.uMinor) != (2, 6) {
-        return Err(format!(
-            "OpenH264 library {}: reports version {}.{}, not 2.6",
-            path.display(),
-            v.uMajor,
-            v.uMinor
-        ));
-    }
-    let what = format!(
-        "{ATTRIBUTION} ({}, sha256 {})",
-        checked.file, checked.sha256
-    );
-    log::info!("{what}, from {}", path.display());
-    // The mapping outlives the file everywhere but on Windows.
-    #[cfg(not(windows))]
-    let copy = {
-        drop(copy);
-        None
-    };
-    #[cfg(windows)]
-    let copy = Some(copy);
-    Ok(Loaded {
-        api,
-        what,
-        _copy: copy,
-    })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-fn random_hex() -> std::io::Result<String> {
-    let mut tag = [0u8; 12];
-    getrandom::fill(&mut tag).map_err(std::io::Error::other)?;
-    Ok(tag.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// A candidate's bytes, read once, whose sha256 is the pinned build `file`.
-struct Checked {
-    bytes: Vec<u8>,
-    sha256: String,
-    file: &'static str,
-}
-
-impl Checked {
-    fn read(path: &Path, pins: &[(&'static str, &'static str)]) -> Result<Self, String> {
-        let shown = path.display();
-        let fail = |e: std::io::Error| format!("OpenH264 library {shown}: {e}");
-        let f = open_candidate(path).map_err(fail)?;
-        let meta = f.metadata().map_err(fail)?;
-        if !meta.is_file() {
-            return Err(format!("OpenH264 library {shown}: not a regular file"));
-        }
-        let too_large = || {
-            format!(
-                "OpenH264 library {shown}: larger than {} MiB, not a Cisco build",
-                MAX_BYTES >> 20
-            )
-        };
-        if meta.len() > MAX_BYTES {
-            return Err(too_large());
-        }
-        let mut bytes = Vec::new();
-        f.take(MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(fail)?;
-        if bytes.len() as u64 > MAX_BYTES {
-            return Err(too_large());
-        }
-        let sha256 = sha256_hex(&bytes);
-        let Some(&(_, file)) = pins.iter().find(|(h, _)| *h == sha256) else {
-            return Err(match platform_file() {
-                Some(f) => format!(
-                    "OpenH264 library {shown}: sha256 {sha256} is not Cisco's {f}, the build \
-                     starfold pins for this platform"
-                ),
-                None => no_library(),
-            });
-        };
-        Ok(Checked {
-            bytes,
-            sha256,
-            file,
-        })
-    }
-}
-
-/// Opens the candidate for reading without blocking (a FIFO would otherwise hang here).
-fn open_candidate(path: &Path) -> std::io::Result<File> {
-    #[cfg(unix)]
+    #[cfg(openh264_cisco_loadable)]
+    return linux::open(&path, after_check);
+    #[cfg(not(openh264_cisco_loadable))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
+        let _ = (path, after_check);
+        Err(NOT_AVAILABLE.into())
     }
-    #[cfg(windows)]
-    File::open(path)
 }
 
-/// Checked bytes written by this process into a new directory only this user can enter, under
-/// a random name, read back and hashed again. Removed when dropped.
-struct PrivateCopy {
-    dir: PathBuf,
-    file: PathBuf,
-    /// Windows: open with read sharing only, so nobody can write, rename or delete the file.
-    held: Option<File>,
-}
+#[cfg(openh264_cisco_loadable)]
+mod linux {
+    use super::{no_library, platform_file, Api, Loaded, ATTRIBUTION, PINS};
+    use sha2::Digest;
+    use std::ffi::{c_int, c_void, CStr};
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::path::Path;
 
-impl PrivateCopy {
-    fn new(c: &Checked) -> std::io::Result<Self> {
-        Self::new_in(&std::env::temp_dir(), c)
+    /// Larger than any pinned build (the biggest is under 2 MiB).
+    pub(super) const MAX_BYTES: u64 = 16 << 20;
+
+    /// What keeps the library loaded: the loader's handle and the memfd it was loaded from.
+    pub(super) struct Held {
+        _lib: libloading::Library,
+        _fd: OwnedFd,
+        /// The name it was loaded under, `/proc/self/fd/N`.
+        pub(super) name: String,
     }
 
-    fn new_in(base: &Path, c: &Checked) -> std::io::Result<Self> {
-        #[cfg(windows)]
-        {
-            no_reparse_points(base)?;
-            remove_stale(base);
-        }
-        let dir = base.join(format!("{DIR_PREFIX}{}", random_hex()?));
-        create_private_dir(&dir)?;
-        let ext = Path::new(c.file)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("lib");
-        let file = dir.join(format!("{}.{ext}", random_hex()?));
-        let mut copy = PrivateCopy {
-            dir,
-            file,
-            held: None,
-        };
-        let mut w = create_private_file(&copy.file)?;
-        w.write_all(&c.bytes)?;
-        w.sync_all()?;
-        drop(w);
-        let mut held = open_held(&copy.file)?;
-        let mut again = Vec::new();
-        (&mut held).take(MAX_BYTES + 1).read_to_end(&mut again)?;
-        if sha256_hex(&again) != c.sha256 {
-            return Err(std::io::Error::other(
-                "the copy is not the bytes that were checked",
+    pub(super) fn open(path: &Path, after_check: impl FnOnce()) -> Result<Loaded, String> {
+        let shown = path.display();
+        let checked = Checked::read(path, &platform_pins())?;
+        after_check();
+        let fd = sealed_memfd(&checked.bytes, &checked.sha256)
+            .map_err(|e| format!("OpenH264 library {shown}: its sealed copy: {e}"))?;
+        drop(checked.bytes);
+        let (api, held) = load_memfd(fd).map_err(|e| format!("OpenH264 library {shown}: {e}"))?;
+        let v = unsafe { (api.version)() };
+        if (v.uMajor, v.uMinor) != (2, 6) {
+            return Err(format!(
+                "OpenH264 library {shown}: reports version {}.{}, not 2.6",
+                v.uMajor, v.uMinor
             ));
         }
-        #[cfg(windows)]
-        no_reparse_points(&copy.file)?;
-        copy.held = Some(held);
-        Ok(copy)
+        let what = format!(
+            "{ATTRIBUTION} ({}, sha256 {})",
+            checked.file, checked.sha256
+        );
+        log::info!("{what}, from {shown}, loaded as {}", held.name);
+        Ok(Loaded {
+            api,
+            what,
+            _held: Some(held),
+        })
     }
 
-    fn load(&self) -> Result<sys::DynamicAPI, String> {
-        let shown = self.file.display();
-        // An absolute path: dlopen opens exactly that file, with no search.
-        #[cfg(unix)]
-        let api = unsafe { sys::libloading::APILoader::new(&self.file) };
-        #[cfg(windows)]
-        let api = unsafe {
-            let path = self
-                .file
-                .to_str()
-                .ok_or_else(|| format!("OpenH264 copy {shown}: not a UTF-8 path"))?;
-            let lib = crate::winlib::absolute(path)?;
-            sys::libloading::APILoader::from_library(lib)
-        };
-        api.map(sys::DynamicAPI::Libloading)
-            .map_err(|e| format!("OpenH264 copy {shown}: {e}"))
+    pub(super) fn platform_pins() -> Vec<(&'static str, &'static str)> {
+        PINS.iter()
+            .copied()
+            .filter(|(_, name)| Some(*name) == platform_file())
+            .collect()
     }
-}
 
-impl Drop for PrivateCopy {
-    fn drop(&mut self) {
-        self.held.take();
-        let _ = std::fs::remove_file(&self.file);
-        let _ = std::fs::remove_dir(&self.dir);
+    pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
-}
 
-#[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(dir)
-}
-
-/// Created with a protected DACL: full access for its owner and SYSTEM, nothing inherited.
-#[cfg(windows)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"),
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )
+    /// A candidate's bytes, read once, whose sha256 is the pinned build `file`.
+    pub(super) struct Checked {
+        pub(super) bytes: Vec<u8>,
+        pub(super) sha256: String,
+        pub(super) file: &'static str,
     }
-    .map_err(std::io::Error::other)?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: false.into(),
-    };
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-    let made = unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&sa)) };
-    unsafe { LocalFree(Some(HLOCAL(sd.0))) };
-    made.map_err(std::io::Error::other)
-}
 
-#[cfg(unix)]
-fn create_private_file(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn open_held(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-#[cfg(windows)]
-fn create_private_file(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-/// Others may only read the file while this handle is open.
-#[cfg(windows)]
-fn open_held(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_SHARE_READ: u32 = 0x1;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-/// Refuses a path with a symbolic link, junction or other reparse point anywhere on it.
-#[cfg(windows)]
-fn no_reparse_points(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    for p in path.ancestors().filter(|p| p.parent().is_some()) {
-        if std::fs::symlink_metadata(p)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(std::io::Error::other(format!(
-                "{} is a reparse point",
-                p.display()
-            )));
+    impl Checked {
+        pub(super) fn read(
+            path: &Path,
+            pins: &[(&'static str, &'static str)],
+        ) -> Result<Self, String> {
+            let shown = path.display();
+            let fail = |e: std::io::Error| format!("OpenH264 library {shown}: {e}");
+            // Without blocking: a FIFO would otherwise hang here.
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .map_err(fail)?;
+            let meta = f.metadata().map_err(fail)?;
+            if !meta.is_file() {
+                return Err(format!("OpenH264 library {shown}: not a regular file"));
+            }
+            let too_large = || {
+                format!(
+                    "OpenH264 library {shown}: larger than {} MiB, not a Cisco build",
+                    MAX_BYTES >> 20
+                )
+            };
+            if meta.len() > MAX_BYTES {
+                return Err(too_large());
+            }
+            let mut bytes = Vec::new();
+            f.take(MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(fail)?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err(too_large());
+            }
+            let sha256 = sha256_hex(&bytes);
+            let Some(&(_, file)) = pins.iter().find(|(h, _)| *h == sha256) else {
+                return Err(match platform_file() {
+                    Some(f) => format!(
+                        "OpenH264 library {shown}: sha256 {sha256} is not Cisco's {f}, the build \
+                         starfold pins for this platform"
+                    ),
+                    None => no_library(),
+                });
+            };
+            Ok(Checked {
+                bytes,
+                sha256,
+                file,
+            })
         }
     }
-    Ok(())
-}
 
-/// Removes copies earlier processes left (a loaded DLL can't be removed while they run): only
-/// directories and files named as starfold names them, never through a reparse point, and
-/// none younger than an hour, which may belong to a process starting now. A copy still in use
-/// refuses to go.
-#[cfg(windows)]
-fn remove_stale(base: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    let plain = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
-    };
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let old = std::fs::symlink_metadata(e.path())
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age.as_secs() > 3600);
-        if !(old && is_copy_dir_name(&name) && plain(&e.path())) {
-            continue;
+    const SEALS: c_int =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+
+    /// `bytes` in a new memfd, sealed so that nothing can write, grow or shrink it any more,
+    /// then read back and hashed again.
+    pub(super) fn sealed_memfd(bytes: &[u8], sha256: &str) -> std::io::Result<OwnedFd> {
+        let name = c"starfold-openh264";
+        let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+        // MFD_EXEC keeps it executable where vm.memfd_noexec would make it not; kernels
+        // before 6.3 don't know the flag.
+        let mut fd = unsafe { libc::memfd_create(name.as_ptr(), flags | libc::MFD_EXEC) };
+        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
         }
-        if let Ok(files) = std::fs::read_dir(e.path()) {
-            for f in files.flatten() {
-                let leaf = f.file_name().to_string_lossy().into_owned();
-                if is_copy_file_name(&leaf) && plain(&f.path()) {
-                    let _ = std::fs::remove_file(f.path());
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut f = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        f.write_all(bytes)?;
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sealed = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GET_SEALS) };
+        if sealed < 0 || sealed & SEALS != SEALS {
+            return Err(std::io::Error::other("the memfd did not take its seals"));
+        }
+        let mut again = vec![0u8; bytes.len()];
+        f.read_exact_at(&mut again, 0)?;
+        if f.metadata()?.len() != bytes.len() as u64 || sha256_hex(&again) != sha256 {
+            return Err(std::io::Error::other(
+                "the sealed copy is not the bytes that were checked",
+            ));
+        }
+        Ok(f.into())
+    }
+
+    pub(super) fn proc_name(fd: c_int) -> String {
+        format!("/proc/self/fd/{fd}")
+    }
+
+    /// N, for a name that is exactly `/proc/self/fd/N`.
+    pub(super) fn fd_of_name(name: &str) -> Option<c_int> {
+        let digits = name.strip_prefix("/proc/self/fd/")?;
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: c_int = digits.parse().ok()?;
+        (n.to_string() == digits).then_some(n)
+    }
+
+    /// N for every loaded object named `/proc/self/fd/N`.
+    pub(super) fn loaded_fd_names() -> Vec<c_int> {
+        unsafe extern "C" fn each(
+            info: *mut libc::dl_phdr_info,
+            _: libc::size_t,
+            names: *mut c_void,
+        ) -> c_int {
+            let (names, name) = unsafe { (&mut *names.cast::<Vec<c_int>>(), (*info).dlpi_name) };
+            if !name.is_null() {
+                let name = unsafe { CStr::from_ptr(name) };
+                if let Some(n) = name.to_str().ok().and_then(fd_of_name) {
+                    names.push(n);
                 }
             }
+            0
         }
-        let _ = std::fs::remove_dir(e.path());
+        let mut names: Vec<c_int> = Vec::new();
+        unsafe { libc::dl_iterate_phdr(Some(each), (&raw mut names).cast()) };
+        names
     }
-}
 
-/// `starfold-openh264-` and 24 lowercase hex digits, as [`PrivateCopy`] names its directory.
-#[cfg(any(windows, test))]
-fn is_copy_dir_name(name: &str) -> bool {
-    name.strip_prefix(DIR_PREFIX).is_some_and(is_tag)
-}
+    /// `fd` if no loaded object is named `/proc/self/fd/<fd>`, else a duplicate numbered above
+    /// every such name: glibc's dlopen returns an object already loaded under the name it is
+    /// given, whatever file that name now opens.
+    pub(super) fn unused_name(fd: OwnedFd) -> std::io::Result<OwnedFd> {
+        let taken = loaded_fd_names();
+        if !taken.contains(&fd.as_raw_fd()) {
+            return Ok(fd);
+        }
+        let above = taken.iter().max().map_or(0, |n| n + 1);
+        let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, above) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+    }
 
-/// 24 lowercase hex digits and Cisco's extension, as [`PrivateCopy`] names its file.
-#[cfg(any(windows, test))]
-fn is_copy_file_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(tag, ext)| is_tag(tag) && matches!(ext, "dll" | "so" | "dylib"))
-}
+    /// A file's device (major, minor) and inode.
+    pub(super) type FileId = (u32, u32, u64);
 
-#[cfg(any(windows, test))]
-fn is_tag(s: &str) -> bool {
-    s.len() == 24
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+    pub(super) fn file_id(fd: &OwnedFd) -> std::io::Result<FileId> {
+        let m = std::fs::metadata(proc_name(fd.as_raw_fd()))?;
+        Ok((libc::major(m.dev()), libc::minor(m.dev()), m.ino()))
+    }
 
-/// The dyld variables that can make it load another library than the path it is given.
-#[cfg(any(target_os = "macos", test))]
-fn dyld_overrides(
-    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Vec<String> {
-    const NAMES: [&str; 9] = [
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FALLBACK_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "DYLD_FALLBACK_FRAMEWORK_PATH",
-        "DYLD_VERSIONED_LIBRARY_PATH",
-        "DYLD_VERSIONED_FRAMEWORK_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_IMAGE_SUFFIX",
-        "DYLD_ROOT_PATH",
-    ];
-    vars.filter(|(k, v)| !v.is_empty() && NAMES.iter().any(|n| k == n))
-        .map(|(k, _)| k.to_string_lossy().into_owned())
-        .collect()
+    /// The file mapped at `addr` in this process, from `/proc/self/maps`.
+    pub(super) fn mapping_of(addr: usize) -> std::io::Result<Option<FileId>> {
+        let maps = std::fs::read_to_string("/proc/self/maps")?;
+        Ok(maps.lines().find_map(|l| {
+            let mut w = l.split_whitespace();
+            let (lo, hi) = w.next()?.split_once('-')?;
+            let lo = usize::from_str_radix(lo, 16).ok()?;
+            let hi = usize::from_str_radix(hi, 16).ok()?;
+            if !(lo..hi).contains(&addr) {
+                return None;
+            }
+            let (major, minor) = w.nth(2)?.split_once(':')?;
+            Some((
+                u32::from_str_radix(major, 16).ok()?,
+                u32::from_str_radix(minor, 16).ok()?,
+                w.next()?.parse().ok()?,
+            ))
+        }))
+    }
+
+    /// Loads the library in the sealed memfd `fd` from `/proc/self/fd/N`, under a number no
+    /// loaded object is named by, and makes sure each entry point lies in that memfd's own
+    /// mapping, not in an object loaded earlier.
+    pub(super) fn load_memfd(fd: OwnedFd) -> Result<(Api, Held), String> {
+        let fd = unused_name(fd).map_err(|e| format!("choosing its descriptor: {e}"))?;
+        let name = proc_name(fd.as_raw_fd());
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "Linux only: a /proc/self/fd path to a sealed memfd, with no search"
+        )]
+        let lib = unsafe { libloading::Library::new(&name) }.map_err(|e| format!("{name}: {e}"))?;
+        unsafe fn entry<T: Copy>(lib: &libloading::Library, sym: &str) -> Result<T, String> {
+            let s = unsafe { lib.get::<T>(sym.as_bytes()) }.map_err(|e| format!("{sym}: {e}"))?;
+            Ok(*s)
+        }
+        let api = unsafe {
+            Api {
+                create: entry(&lib, "WelsCreateSVCEncoder")?,
+                destroy: entry(&lib, "WelsDestroySVCEncoder")?,
+                version: entry(&lib, "WelsGetCodecVersion")?,
+            }
+        };
+        let ours = file_id(&fd).map_err(|e| format!("{name}: {e}"))?;
+        for (sym, addr) in [
+            ("WelsCreateSVCEncoder", api.create as usize),
+            ("WelsDestroySVCEncoder", api.destroy as usize),
+            ("WelsGetCodecVersion", api.version as usize),
+        ] {
+            let found = mapping_of(addr).map_err(|e| format!("/proc/self/maps: {e}"))?;
+            if found != Some(ours) {
+                return Err(format!(
+                    "{name}: {sym} is not in the sealed copy ({found:?}, not {ours:?}): another \
+                     object was loaded under that name"
+                ));
+            }
+        }
+        Ok((
+            api,
+            Held {
+                _lib: lib,
+                _fd: fd,
+                name,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    impl Held {
+        pub(super) fn fd(&self) -> &OwnedFd {
+            &self._fd
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sf-cisco-{tag}-{}", random_hex().unwrap()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn pin_of(bytes: &[u8]) -> [(&'static str, &'static str); 1] {
-        [(sha256_hex(bytes).leak() as &str, "lib.so")]
-    }
-
-    #[test]
-    fn only_the_pinned_build_is_read() {
-        let dir = scratch("refuse");
-        let missing = dir.join("missing.so");
-        let e = Checked::read(&missing, &platform_pins()).err().unwrap();
-        assert!(e.contains("missing.so"), "{e}");
-        let other = dir.join("libopenh264.so");
-        std::fs::write(&other, b"not cisco").unwrap();
-        let e = Checked::read(&other, &platform_pins()).err().unwrap();
-        assert!(e.contains(&sha256_hex(b"not cisco")), "{e}");
-        assert!(
-            e.contains("not Cisco's") || platform_file().is_none(),
-            "{e}"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Another platform's pinned build is refused here, whatever its hash.
-    #[test]
-    fn only_this_platforms_pin_counts() {
-        let here = platform_pins();
-        assert!(here.len() <= 1);
-        if let Some(f) = platform_file() {
-            assert_eq!(here, vec![*PINS.iter().find(|p| p.1 == f).unwrap()]);
-        }
-    }
-
-    #[test]
-    fn a_large_or_special_file_is_refused_before_reading() {
-        let dir = scratch("large");
-        let big = dir.join("big.so");
-        File::create(&big).unwrap().set_len(MAX_BYTES + 1).unwrap();
-        let e = Checked::read(&big, &platform_pins()).err().unwrap();
-        assert!(e.contains("larger than"), "{e}");
-        #[cfg(unix)]
-        {
-            let e = Checked::read(Path::new("/dev/zero"), &platform_pins())
-                .err()
-                .unwrap();
-            assert!(e.contains("not a regular file"), "{e}");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A FIFO with no writer would block an ordinary open; it is refused at once.
-    #[cfg(unix)]
-    #[test]
-    fn a_fifo_is_refused_without_blocking() {
-        let dir = scratch("fifo");
-        let fifo = dir.join("lib.so");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let p = fifo.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(Checked::read(&p, &platform_pins()).err());
-        });
-        let e = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("reading a FIFO blocked")
-            .expect("a FIFO was accepted");
-        assert!(e.contains("not a regular file"), "{e}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The copy starfold loads is its own: a new private directory, a random name, the
-    /// checked bytes; and it is gone once dropped.
-    #[test]
-    fn the_copy_is_private_random_and_the_checked_bytes() {
-        let dir = scratch("copy");
-        let given = dir.join("lib.so");
-        let bytes = b"the checked bytes".to_vec();
-        std::fs::write(&given, &bytes).unwrap();
-        let checked = Checked::read(&given, &pin_of(&bytes)).unwrap();
-        let copy = PrivateCopy::new_in(&dir, &checked).unwrap();
-        assert!(copy.file.starts_with(&copy.dir));
-        let leaf = copy
-            .file
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(is_copy_file_name(&leaf), "{leaf}");
-        let dir_name = copy.dir.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(is_copy_dir_name(&dir_name), "{dir_name}");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&copy.dir).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o700);
-        }
-        assert_eq!(std::fs::read(&copy.file).unwrap(), bytes);
-        let (d, f) = (copy.dir.clone(), copy.file.clone());
-        drop(copy);
-        assert!(!f.exists() && !d.exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Replacing the given file after the check, in place or by a rename over it, changes
-    /// nothing that is loaded: the loader reads starfold's own copy of the checked bytes.
-    #[test]
-    fn a_file_swapped_after_the_check_is_not_what_loads() {
-        let dir = scratch("swap");
-        let given = dir.join("lib.so");
-        let bytes = b"the checked bytes".to_vec();
-        std::fs::write(&given, &bytes).unwrap();
-        let checked = Checked::read(&given, &pin_of(&bytes)).unwrap();
-        std::fs::write(&given, b"swapped in place").unwrap();
-        assert_eq!(std::fs::read(&given).unwrap(), b"swapped in place");
-        let other = dir.join("other");
-        std::fs::write(&other, b"swapped by rename").unwrap();
-        std::fs::rename(&other, &given).unwrap();
-        assert_eq!(std::fs::read(&given).unwrap(), b"swapped by rename");
-        let copy = PrivateCopy::new_in(&dir, &checked).unwrap();
-        assert_ne!(copy.file, given);
-        assert_eq!(std::fs::read(&copy.file).unwrap(), bytes);
-        drop(copy);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// With Cisco's real file (`$STARFOLD_OPENH264_LIB`, as CI fetches it): after the check,
-    /// the given file is replaced by bytes that are no library at all, and what loads is
-    /// still Cisco's OpenH264 2.6.
-    #[test]
-    fn ciscos_bytes_load_after_the_given_file_is_replaced() {
-        let Some(real) = std::env::var_os(LIB_ENV).filter(|p| !p.is_empty()) else {
-            eprintln!("skipped: {LIB_ENV} is not set");
-            return;
-        };
-        let dir = scratch("real");
-        let given = dir.join(platform_file().unwrap());
-        std::fs::copy(&real, &given).unwrap();
-        let checked = Checked::read(&given, &platform_pins()).unwrap();
-        std::fs::write(&given, b"not a library").unwrap();
-        assert_eq!(std::fs::read(&given).unwrap(), b"not a library");
-        let copy = PrivateCopy::new_in(&dir, &checked).unwrap();
-        let api = copy.load().unwrap();
-        let v = unsafe { api.WelsGetCodecVersion() };
-        assert_eq!((v.uMajor, v.uMinor), (2, 6));
-        drop(api);
-        drop(copy);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The Windows clean-up touches only names starfold gives its copies.
-    #[test]
-    fn only_starfolds_own_copy_names_are_matched() {
-        let tag = "0123456789abcdef01234567";
-        assert!(is_copy_dir_name(&format!("{DIR_PREFIX}{tag}")));
-        assert!(is_copy_file_name(&format!("{tag}.dll")));
-        for name in [
-            "starfold-openh264-",
-            "starfold-openh264-0123456789ABCDEF01234567",
-            "starfold-openh264-0123456789abcdef0123456",
-            "starfold-openh264-0123456789abcdef01234567x",
-            "other-0123456789abcdef01234567",
-        ] {
-            assert!(!is_copy_dir_name(name), "{name}");
-        }
-        for name in [
-            "openh264-2.6.0-win64.dll",
-            "0123456789abcdef01234567.exe",
-            "0123456789abcdef01234567",
-            "../0123456789abcdef0123.dll",
-        ] {
-            assert!(!is_copy_file_name(name), "{name}");
-        }
-    }
-
-    #[test]
-    fn dyld_path_variables_are_named() {
-        let vars = [
-            ("DYLD_LIBRARY_PATH", "/tmp/x"),
-            ("DYLD_PRINT_LIBRARIES", "1"),
-            ("DYLD_INSERT_LIBRARIES", "/tmp/y.dylib"),
-            ("DYLD_FALLBACK_LIBRARY_PATH", ""),
-            ("PATH", "/bin"),
-        ]
-        .map(|(k, v): (&str, &str)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
-        assert_eq!(
-            dyld_overrides(vars.into_iter()),
-            ["DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"]
-        );
-    }
-
     #[test]
     fn pins_are_sha256_and_in_openh264_sys2s_own_list() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
         let meta = std::process::Command::new(env!("CARGO"))
             .args(["metadata", "--format-version", "1", "--locked"])
             .args(["--filter-platform", env!("STARFOLD_TARGET")])
@@ -758,9 +456,227 @@ mod tests {
     /// testing the source build instead.
     #[test]
     fn the_library_tests_run_on() {
-        let v = unsafe { library().unwrap().WelsGetCodecVersion() };
+        let v = unsafe { (api().unwrap().version)() };
         let cisco = std::env::var_os(LIB_ENV).is_some();
         let want = if cisco { (2, 6) } else { (2, 7) };
         assert_eq!((v.uMajor, v.uMinor), want);
+    }
+
+    #[test]
+    fn only_linux_gnu_x86_64_and_arm64_load_it() {
+        assert_eq!(
+            platform_file().is_some(),
+            cfg!(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
+        );
+        assert!(NOT_AVAILABLE.starts_with("OpenH264 (Cisco) is not available on this platform yet"));
+    }
+}
+
+#[cfg(all(test, openh264_cisco_loadable))]
+mod linux_tests {
+    use super::linux::*;
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let mut r = [0u8; 12];
+        getrandom::fill(&mut r).unwrap();
+        let r: String = r.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("sf-cisco-{tag}-{r}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pin_of(bytes: &[u8]) -> [(&'static str, &'static str); 1] {
+        [(sha256_hex(bytes).leak() as &str, "lib.so")]
+    }
+
+    /// Cisco's real file, as CI fetches it.
+    fn real_lib() -> Option<PathBuf> {
+        let p = std::env::var_os(LIB_ENV).filter(|p| !p.is_empty());
+        if p.is_none() {
+            eprintln!("skipped: {LIB_ENV} is not set");
+        }
+        p.map(PathBuf::from)
+    }
+
+    #[test]
+    fn only_the_pinned_build_is_read() {
+        let dir = scratch("refuse");
+        let missing = dir.join("missing.so");
+        let e = Checked::read(&missing, &platform_pins()).err().unwrap();
+        assert!(e.contains("missing.so"), "{e}");
+        let other = dir.join("libopenh264.so");
+        std::fs::write(&other, b"not cisco").unwrap();
+        let e = Checked::read(&other, &platform_pins()).err().unwrap();
+        assert!(e.contains(&sha256_hex(b"not cisco")), "{e}");
+        assert!(e.contains("not Cisco's"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The other architecture's pinned build is refused here, whatever its hash.
+    #[test]
+    fn only_this_platforms_pin_counts() {
+        let f = platform_file().unwrap();
+        assert_eq!(
+            platform_pins(),
+            vec![*PINS.iter().find(|p| p.1 == f).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_large_or_special_file_is_refused_before_reading() {
+        let dir = scratch("large");
+        let big = dir.join("big.so");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_BYTES + 1)
+            .unwrap();
+        let e = Checked::read(&big, &platform_pins()).err().unwrap();
+        assert!(e.contains("larger than"), "{e}");
+        let e = Checked::read(Path::new("/dev/zero"), &platform_pins())
+            .err()
+            .unwrap();
+        assert!(e.contains("not a regular file"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A FIFO with no writer would block an ordinary open; it is refused at once.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = scratch("fifo");
+        let fifo = dir.join("lib.so");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Checked::read(&p, &platform_pins()).err());
+        });
+        let e = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO blocked")
+            .expect("a FIFO was accepted");
+        assert!(e.contains("not a regular file"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The memfd holds the checked bytes, not what the given file holds later, and nothing can
+    /// change it: not a write, not a resize, not a write through a name reopened for writing.
+    #[test]
+    fn the_sealed_copy_is_the_checked_bytes_and_cannot_change() {
+        use std::io::Write;
+        let dir = scratch("seal");
+        let given = dir.join("lib.so");
+        let bytes = b"the checked bytes".to_vec();
+        std::fs::write(&given, &bytes).unwrap();
+        let checked = Checked::read(&given, &pin_of(&bytes)).unwrap();
+        std::fs::write(&given, b"swapped in place").unwrap();
+        let fd = sealed_memfd(&checked.bytes, &checked.sha256).unwrap();
+        let name = proc_name(fd.as_raw_fd());
+        assert_eq!(std::fs::read(&name).unwrap(), bytes);
+        let mut f = std::fs::File::from(fd);
+        assert!(f.write_all(b"x").is_err());
+        assert!(f.set_len(1).is_err());
+        assert!(f.set_len(1 << 20).is_err());
+        let reopened = std::fs::OpenOptions::new().write(true).open(&name);
+        assert!(reopened.and_then(|mut w| w.write_all(b"x")).is_err());
+        assert_eq!(std::fs::read(&name).unwrap(), bytes);
+        let e = sealed_memfd(&bytes, &sha256_hex(b"other")).err().unwrap();
+        assert!(e.to_string().contains("not the bytes"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_is_exactly_proc_self_fd_n() {
+        assert_eq!(fd_of_name("/proc/self/fd/42"), Some(42));
+        assert_eq!(fd_of_name("/proc/self/fd/0"), Some(0));
+        for name in [
+            "/proc/self/fd/042",
+            "/proc/self/fd/",
+            "/proc/self/fd/4x",
+            "/proc/self/fd/-1",
+            "/proc/self/fd/42/",
+            "/proc/1/fd/42",
+            "proc/self/fd/42",
+        ] {
+            assert_eq!(fd_of_name(name), None, "{name}");
+        }
+    }
+
+    /// A descriptor no loaded object is named after keeps its number.
+    #[test]
+    fn a_free_name_is_kept() {
+        let fd = sealed_memfd(b"x", &sha256_hex(b"x")).unwrap();
+        let n = fd.as_raw_fd();
+        assert!(!loaded_fd_names().contains(&n));
+        assert_eq!(unused_name(fd).unwrap().as_raw_fd(), n);
+    }
+
+    /// With Cisco's real file: after the check, the given file is replaced, in place and then
+    /// by a rename over it, by bytes that are no library at all, and what production's
+    /// `open()` loads is still Cisco's OpenH264 2.6, from the memfd, not from the given file.
+    #[test]
+    fn ciscos_bytes_load_after_the_given_file_is_replaced() {
+        let Some(real) = real_lib() else { return };
+        let dir = scratch("swap");
+        let given = dir.join(platform_file().unwrap());
+        std::fs::copy(&real, &given).unwrap();
+        let other = dir.join("other");
+        let loaded = super::open(Some(&given), || {
+            std::fs::write(&given, b"not a library").unwrap();
+            std::fs::write(&other, b"not a library either").unwrap();
+            std::fs::rename(&other, &given).unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&given).unwrap(), b"not a library either");
+        let v = unsafe { (loaded.api.version)() };
+        assert_eq!((v.uMajor, v.uMinor), (2, 6));
+        let held = loaded._held.as_ref().unwrap();
+        assert_eq!(
+            mapping_of(loaded.api.create as usize).unwrap(),
+            Some(file_id(held.fd()).unwrap())
+        );
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(!maps.contains(dir.to_str().unwrap()), "{maps}");
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// With Cisco's real file as the dummy: an object is loaded first under the name
+    /// `/proc/self/fd/N`, from another memfd, and then N is made to refer to the sealed memfd
+    /// starfold loads. glibc would hand back the dummy for that name; starfold loads its
+    /// memfd under another number, and its entry points are in that memfd's mapping.
+    #[test]
+    fn an_object_already_loaded_under_the_name_is_not_what_loads() {
+        let Some(real) = real_lib() else { return };
+        let bytes = std::fs::read(&real).unwrap();
+        let sha = sha256_hex(&bytes);
+        let handed = sealed_memfd(&bytes, &sha).unwrap();
+        let n = handed.as_raw_fd();
+        let dummy_name = proc_name(n);
+        #[allow(clippy::disallowed_methods, reason = "a test's dummy, from a memfd")]
+        let dummy = unsafe { libloading::Library::new(&dummy_name) }.unwrap();
+        let dummy_id = file_id(&handed).unwrap();
+        assert!(loaded_fd_names().contains(&n));
+        let ours = sealed_memfd(&bytes, &sha).unwrap();
+        let ours_id = file_id(&ours).unwrap();
+        assert_ne!(ours_id, dummy_id);
+        // n is this test's own descriptor: it now refers to the memfd starfold is handed.
+        assert_eq!(unsafe { libc::dup2(ours.as_raw_fd(), n) }, n);
+        drop(ours);
+        assert_eq!(file_id(&handed).unwrap(), ours_id);
+        let (api, held) = load_memfd(handed).unwrap();
+        assert_ne!(held.name, dummy_name);
+        assert_eq!(mapping_of(api.create as usize).unwrap(), Some(ours_id));
+        assert_eq!(mapping_of(api.version as usize).unwrap(), Some(ours_id));
+        let v = unsafe { (api.version)() };
+        assert_eq!((v.uMajor, v.uMinor), (2, 6));
+        drop(held);
+        drop(dummy);
     }
 }

@@ -228,18 +228,23 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
-    #[cfg(openh264_cisco)]
-    let openh264 = entry(
-        "--openh264-lib",
-        &format!(
-            "Cisco's OpenH264 binary ({}), loaded only if its sha256 is the build starfold pins \
-             (default ${}); without it there is no OpenH264. {}",
-            crate::encoder::cisco::platform_file().unwrap_or("none pinned for this platform"),
-            crate::encoder::cisco::LIB_ENV,
-            crate::encoder::cisco::ATTRIBUTION
-        ),
-    );
-    #[cfg(not(openh264_cisco))]
+    #[cfg(feature = "openh264-cisco")]
+    let openh264 = {
+        use crate::encoder::cisco;
+        entry(
+            "--openh264-lib",
+            &match cisco::platform_file() {
+                Some(f) => format!(
+                    "Cisco's OpenH264 binary ({f}), loaded only if its sha256 is the build \
+                     starfold pins (default ${}); without it there is no OpenH264. {}",
+                    cisco::LIB_ENV,
+                    cisco::ATTRIBUTION
+                ),
+                None => format!("{}.", cisco::NOT_AVAILABLE),
+            },
+        )
+    };
+    #[cfg(not(feature = "openh264-cisco"))]
     let openh264 = String::new();
     usage
         .replace("OPENH264_ENTRY\n", &openh264)
@@ -353,7 +358,8 @@ mod tests {
     }
 
     /// A build that loads Cisco's binary shows `--openh264-lib` with Cisco's attribution
-    /// exactly; no other build mentions either.
+    /// exactly; the feature on a target starfold doesn't load it on says it is not available
+    /// there yet; no other build mentions either.
     #[test]
     fn help_shows_ciscos_attribution_only_with_its_binary() {
         let words = help_text("1.2.3", "0.0.0.0")
@@ -361,13 +367,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let attribution = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
-        assert_eq!(words.contains(attribution), cfg!(openh264_cisco), "{words}");
-        assert_eq!(
-            words.contains("--openh264-lib"),
-            cfg!(openh264_cisco),
-            "{words}"
-        );
-        #[cfg(openh264_cisco)]
+        let not_yet = "OpenH264 (Cisco) is not available on this platform yet";
+        let cisco = cfg!(feature = "openh264-cisco");
+        let loadable = cfg!(openh264_cisco_loadable);
+        assert_eq!(words.contains(attribution), loadable, "{words}");
+        assert_eq!(words.contains(not_yet), cisco && !loadable, "{words}");
+        assert_eq!(words.contains("--openh264-lib"), cisco, "{words}");
+        #[cfg(feature = "openh264-cisco")]
         assert_eq!(crate::encoder::cisco::ATTRIBUTION, attribution);
     }
 

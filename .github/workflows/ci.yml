@@ -190,8 +190,9 @@ jobs:
         run: |
           cargo build --no-default-features --features openh264-cisco --locked
           # OpenH264's own C entry point, not the binding's Rust methods of the same name.
-          syms=$(nm --defined-only target/debug/starfold)
-          if awk '{ print $NF }' <<< "$syms" | grep -qx WelsCreateSVCEncoder; then
+          nm --defined-only target/debug/starfold > "$RUNNER_TEMP/syms.txt"
+          [ -s "$RUNNER_TEMP/syms.txt" ] || { echo "::error::nm printed no symbols"; exit 1; }
+          if grep -Eq ' [A-Za-z] WelsCreateSVCEncoder$' "$RUNNER_TEMP/syms.txt"; then
             echo "::error::the binary contains OpenH264"; exit 1
           fi
           target/debug/starfold --version
@@ -200,18 +201,53 @@ jobs:
           cat "$RUNNER_TEMP/nolib.log"
           [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
           grep -q "no OpenH264 library" "$RUNNER_TEMP/nolib.log"
+      # An application embedding this build that also uses OpenH264 compiled from source, so
+      # Cargo builds openh264-sys2 with the source encoder for starfold too. That encoder is in
+      # the binary, since the application calls it; what must hold is that starfold's code
+      # never refers to it. In the debug build each function keeps its own calls, and
+      # referrers.awk follows calls, jumps and addresses taken in code, named or through GOT
+      # slots, back from OpenH264's C entry points (not references held only in other data). The
+      # application's own call must show up, or the check sees nothing. Without a library,
+      # starfold in that binary still does not start.
+      - name: Embedded beside OpenH264 from source
+        run: |
+          cp Cargo.lock .github/fixtures/embed-source/Cargo.lock
+          cd .github/fixtures/embed-source
+          cargo build
+          cargo tree -e features -i openh264-sys2 > "$RUNNER_TEMP/embed-tree.txt"
+          grep -q 'openh264-sys2 feature "source"' "$RUNNER_TEMP/embed-tree.txt" || { cat "$RUNNER_TEMP/embed-tree.txt"; echo "::error::openh264-sys2 is not built with its source encoder here"; exit 1; }
+          bin=target/debug/embed-source
+          nm --defined-only "$bin" > "$RUNNER_TEMP/embed-syms.txt"
+          grep -Eq ' [A-Za-z] WelsCreateSVCEncoder$' "$RUNNER_TEMP/embed-syms.txt" || { echo "::error::the application's source encoder is not in the binary"; exit 1; }
+          objdump -d --no-show-raw-insn "$bin" > "$RUNNER_TEMP/embed.dis"
+          [ -s "$RUNNER_TEMP/embed.dis" ] || { echo "::error::objdump printed nothing"; exit 1; }
+          objdump -R "$bin" > "$RUNNER_TEMP/embed.rel"
+          [ -s "$RUNNER_TEMP/embed.rel" ] || { echo "::error::objdump -R printed nothing"; exit 1; }
+          awk -f referrers.awk "$RUNNER_TEMP/embed.rel" "$RUNNER_TEMP/embed.dis" > "$RUNNER_TEMP/embed-refs.txt"
+          grep -q own_encoder "$RUNNER_TEMP/embed-refs.txt" || { echo "::error::the check does not see the application's own call"; exit 1; }
+          if grep -E '[^0-9]8starfold|\$LT\$starfold\.\.' "$RUNNER_TEMP/embed-refs.txt"; then
+            echo "::error::starfold refers to OpenH264 compiled from source"; exit 1
+          fi
+          "$bin" --own-encoder
+          rc=0
+          timeout 60 "$bin" --enable-basic-auth=false --audio-enabled=false --port=6903 > "$RUNNER_TEMP/embed.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/embed.log"
+          [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
+          grep -q "no OpenH264 library" "$RUNNER_TEMP/embed.log"
       # Cisco's own file, fetched from Cisco and checked against the pin: every library test
-      # runs on it (the_library_tests_run_on asserts 2.6). Then the server starts with it, from
-      # a plain build of the feature: the binary `cargo test` builds also links the tests'
-      # OpenH264 (the dev-dependency's source feature), so this step builds its own and checks
-      # that one.
+      # runs on it (the_library_tests_run_on asserts 2.6), with the swap and name-reuse tests.
+      # Then the server starts with it, from a plain build of the feature: the binary
+      # `cargo test` builds also links the tests' OpenH264 (the dev-dependency's source
+      # feature), so this step builds its own and checks that one, and that the library is
+      # mapped from the sealed memfd, not from the file.
       - name: On Cisco's OpenH264
         run: |
           lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
           STARFOLD_OPENH264_LIB="$lib" cargo test --no-default-features --features openh264-cisco --locked
           cargo build --no-default-features --features openh264-cisco --locked
-          syms=$(nm --defined-only target/debug/starfold)
-          if awk '{ print $NF }' <<< "$syms" | grep -qx WelsCreateSVCEncoder; then
+          nm --defined-only target/debug/starfold > "$RUNNER_TEMP/syms.txt"
+          [ -s "$RUNNER_TEMP/syms.txt" ] || { echo "::error::nm printed no symbols"; exit 1; }
+          if grep -Eq ' [A-Za-z] WelsCreateSVCEncoder$' "$RUNNER_TEMP/syms.txt"; then
             echo "::error::the binary contains OpenH264"; exit 1
           fi
           BENCH_DISPLAY=:99 bench/env/xvfb.sh > /dev/null 2>&1 &
@@ -225,6 +261,9 @@ jobs:
           cut -c1-240 "$log" || true
           ok=1
           up && grep -qF 'OpenH264 Video Codec provided by Cisco Systems, Inc.' "$log" && kill -0 $pid 2>/dev/null || ok=0
+          cat "/proc/$pid/maps" > "$RUNNER_TEMP/maps.txt" || ok=0
+          grep -q '/memfd:starfold-openh264' "$RUNNER_TEMP/maps.txt" || { echo "::error::no mapping of the sealed memfd"; ok=0; }
+          if grep -qF "$lib" "$RUNNER_TEMP/maps.txt"; then echo "::error::$lib itself is mapped"; ok=0; fi
           kill $pid 2>/dev/null || true
           wait $pid 2>/dev/null || true
           [ $ok = 1 ] || { echo "::error::starfold did not start on Cisco's OpenH264"; exit 1; }
@@ -319,12 +358,15 @@ jobs:
             target
           key: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      # Then openh264-cisco, which starfold doesn't load with musl: it builds, without OpenH264.
       - name: Clippy
         env:
           PKG_CONFIG_ALLOW_CROSS: '1'
           CC_x86_64_unknown_linux_musl: musl-gcc
           CXX_x86_64_unknown_linux_musl: g++
-        run: cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --all-targets --locked -- -D warnings
+          cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --features openh264-cisco --locked -- -D warnings
 
   windows:
     name: Windows (clippy, cross-compiled on Linux)
@@ -371,8 +413,9 @@ jobs:
             target
           key: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
-      # Then the code that loads Cisco's DLL (library and binary; its tests build OpenH264
-      # from source, which this cross-compile doesn't).
+      # Then openh264-cisco, which starfold doesn't load on Windows yet: it builds, without
+      # OpenH264 (library and binary; its tests build OpenH264 from source, which this
+      # cross-compile doesn't).
       - name: Clippy
         run: |
           cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings

@@ -11,24 +11,56 @@ use super::{
 use openh264_sys2 as sys;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use sys::API;
 
-#[cfg(feature = "openh264")]
-struct Source(sys::DynamicAPI);
+/// The library's entry points the encoder calls: compiled in, or held by [`super::cisco`]
+/// from Cisco's loaded binary. Nothing else in starfold calls OpenH264 outside its vtable.
+#[derive(Clone, Copy)]
+pub(crate) struct Api {
+    pub create: unsafe extern "C" fn(*mut *mut sys::ISVCEncoder) -> c_int,
+    pub destroy: unsafe extern "C" fn(*mut sys::ISVCEncoder),
+    #[cfg_attr(
+        feature = "openh264",
+        allow(
+            dead_code,
+            reason = "read by the Cisco loader's version check and the tests"
+        )
+    )]
+    pub version: unsafe extern "C" fn() -> sys::OpenH264Version,
+}
 
-// The compiled-in library's entry points are plain C functions, callable from any thread.
-#[cfg(feature = "openh264")]
-unsafe impl Sync for Source {}
+/// OpenH264 compiled from source by openh264-sys2: the `openh264` feature's, and the tests'
+/// where no Cisco file is given.
+#[cfg(any(feature = "openh264", test))]
+pub(crate) const SOURCE: Api = Api {
+    create: source::create,
+    destroy: source::destroy,
+    version: source::version,
+};
 
-#[cfg(feature = "openh264")]
-static SOURCE: Source = Source(sys::DynamicAPI::from_source());
+#[cfg(any(feature = "openh264", test))]
+mod source {
+    use openh264_sys2 as sys;
+    use std::os::raw::c_int;
+
+    pub unsafe extern "C" fn create(enc: *mut *mut sys::ISVCEncoder) -> c_int {
+        unsafe { sys::source::APILoader::WelsCreateSVCEncoder(enc) }
+    }
+
+    pub unsafe extern "C" fn destroy(enc: *mut sys::ISVCEncoder) {
+        unsafe { sys::source::APILoader::WelsDestroySVCEncoder(enc) }
+    }
+
+    pub unsafe extern "C" fn version() -> sys::OpenH264Version {
+        unsafe { sys::source::APILoader::WelsGetCodecVersion() }
+    }
+}
 
 /// The OpenH264 this build encodes with.
-fn library() -> Result<&'static sys::DynamicAPI, EncodeError> {
+fn api() -> Result<Api, EncodeError> {
     #[cfg(feature = "openh264")]
-    return Ok(&SOURCE.0);
+    return Ok(SOURCE);
     #[cfg(not(feature = "openh264"))]
-    return super::cisco::library().map_err(EncodeError);
+    return super::cisco::api().map_err(EncodeError);
 }
 
 /// OpenH264 clamps the frame rate it plans rate control for to this, so above it the
@@ -37,7 +69,7 @@ const MAX_FPS: u32 = 60;
 /// What an uncapped rate (`max_kbps` 0) becomes: level 5.2's bitrate.
 const UNCAPPED_BPS: c_int = 240_000_000;
 pub struct OpenH264 {
-    lib: &'static sys::DynamicAPI,
+    api: Api,
     enc: *mut sys::ISVCEncoder,
     info: Box<sys::SFrameBSInfo>,
     params: ParamSets,
@@ -77,14 +109,14 @@ fn bps(max_kbps: u32, fps: u32) -> c_int {
 
 impl OpenH264 {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, EncodeError> {
-        let lib = library()?;
+        let api = api()?;
         let mut enc = ptr::null_mut();
-        let r = unsafe { lib.WelsCreateSVCEncoder(&mut enc) };
+        let r = unsafe { (api.create)(&mut enc) };
         if r != 0 || enc.is_null() {
             return Err(EncodeError(format!("WelsCreateSVCEncoder failed ({r})")));
         }
         let mut me = OpenH264 {
-            lib,
+            api,
             enc,
             info: Box::default(),
             params: ParamSets::default(),
@@ -358,7 +390,7 @@ impl Drop for OpenH264 {
     fn drop(&mut self) {
         unsafe {
             self.vt().Uninitialize.unwrap()(self.enc);
-            self.lib.WelsDestroySVCEncoder(self.enc);
+            (self.api.destroy)(self.enc);
         }
     }
 }
