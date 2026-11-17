@@ -146,7 +146,7 @@ fn an_encoder_that_does_not_reopen_in_full_is_out_of_use() {
         );
         assert!(s.stopped().is_none(), "the device still answers");
         let pictures = log.lock().unwrap().frame_types.len();
-        assert_eq!(frame(&mut s, false).unwrap_err(), e, "no picture through it");
+        assert_eq!(frame(&mut s, false).err(), Some(e.clone()), "no picture");
         assert_eq!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).unwrap_err(), e);
         let l = log.lock().unwrap();
         assert_eq!(l.frame_types.len(), pictures, "nothing reached the runtime");
