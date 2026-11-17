@@ -641,6 +641,11 @@ impl VideoEncoder for Remote {
         self.usable()?;
         Ok(Vec::new())
     }
+
+    /// The helper's encoder runs constant bitrate whenever it is capped.
+    fn holds_cap(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for Remote {

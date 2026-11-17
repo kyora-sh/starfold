@@ -553,10 +553,15 @@ fn encoder_config(
 }
 
 /// Each stripe may use up to twice its area share of the budget; the delay-based
-/// controller reins the total in if several stripes move at once. 0 = uncapped.
-fn stripe_share(target: u32, n: usize) -> u32 {
+/// controller reins the total in if several stripes move at once. An encoder that
+/// `holds` its cap runs at it on any picture, so it gets its area share exactly.
+/// 0 = uncapped.
+fn stripe_share(target: u32, n: usize, holds: bool) -> u32 {
     if target == 0 {
         return 0;
+    }
+    if holds {
+        return (target as u64 / n as u64).max(1) as u32;
     }
     ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
 }
@@ -590,7 +595,11 @@ fn sample(
     let target = if cfg.max_kbps == 0 {
         0
     } else {
-        stripe_share(START_KBPS.min(cfg.max_kbps as f64) as u32, n)
+        stripe_share(
+            START_KBPS.min(cfg.max_kbps as f64) as u32,
+            n,
+            enc.holds_cap(),
+        )
     };
     enc.set_rate(keyframe_rate(cfg.crf, target, ecfg.fps))?;
     let (w, h) = (ecfg.width as usize, ecfg.height as usize);
@@ -2778,6 +2787,7 @@ fn encode_loop(
     let start = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
+    let holds = stripes_in.iter().all(|s| s.enc.holds_cap());
     let debug_stripes = crate::compat::is_set("STARFOLD_DEBUG_STRIPES");
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
@@ -2836,9 +2846,11 @@ fn encode_loop(
         }
         let target = sh.target.load(Ordering::Relaxed);
         let want_crf = if job.paintover { po_crf } else { crf };
-        // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once.
-        let share = if uncapped { 0 } else { stripe_share(target, n) };
+        let share = if uncapped {
+            0
+        } else {
+            stripe_share(target, n, holds)
+        };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         let budget =
             |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);

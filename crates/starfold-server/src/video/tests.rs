@@ -82,6 +82,8 @@ struct Fake {
     delay: Option<Duration>,
     /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
     slow_keys: Option<(usize, Duration)>,
+    /// Runs at its cap whatever the picture.
+    holds: bool,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -191,6 +193,10 @@ impl VideoEncoder for Fake {
                 .step_bytes
                 .is_none_or(|b| r.max_bytes.is_none_or(|m| m >= b))
     }
+
+    fn holds_cap(&self) -> bool {
+        self.holds
+    }
 }
 
 #[derive(Default)]
@@ -235,6 +241,8 @@ struct Opts {
     h264_hw_delay: Option<Duration>,
     /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
     h264_hw_slow_keys: Option<(usize, Duration)>,
+    /// Hardware H.264 encoders hold their cap.
+    h264_hw_holds: bool,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -273,6 +281,7 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
+                holds: o.h264_hw_holds,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -319,6 +328,7 @@ fn fakes(o: Opts) -> Open {
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
             delay: None,
             slow_keys: None,
+            holds: false,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -2498,6 +2508,11 @@ fn what_an_uncapped_stream_spent_is_no_debt_under_a_cap() {
 }
 
 fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
+    refines_through_holding(cand, false)
+}
+
+/// Every encode's refine option and rate, on encoders that do or don't `hold` their cap.
+fn refines_through_holding(cand: Candidate, holds: bool) -> Vec<(Option<Refine>, u32)> {
     let seen = Refines::default();
     let hub = Hub::new();
     let cands = [cand];
@@ -2506,6 +2521,7 @@ fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
         &cands,
         Opts {
             refines: Some(seen.clone()),
+            h264_hw_holds: holds,
             ..Default::default()
         },
     );
@@ -2535,7 +2551,7 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     );
     assert_ne!(
         kbps,
-        stripe_share(START_KBPS as u32, 1) * 2,
+        stripe_share(START_KBPS as u32, 1, false) * 2,
         "paint-over rate applied"
     );
 }
@@ -3225,7 +3241,19 @@ fn a_pass_stays_a_rate_change_for_other_encoders() {
     let seen = refines_through(H264_HW);
     let (refine, kbps) = seen.last().copied().unwrap();
     assert_eq!(refine, None);
-    assert_eq!(kbps, stripe_share(START_KBPS as u32, 1) * 2);
+    assert_eq!(kbps, stripe_share(START_KBPS as u32, 1, false) * 2);
+}
+
+/// A cohort whose encoder holds its cap runs it at the cohort's share, not twice it.
+#[test]
+fn a_cohort_that_holds_its_cap_gets_no_headroom() {
+    let start = START_KBPS as u32;
+    let held = refines_through_holding(H264_HW, true);
+    let free = refines_through_holding(H264_HW, false);
+    let (_, held) = held.last().copied().unwrap();
+    let (_, free) = free.last().copied().unwrap();
+    assert_eq!(held, start * 2, "a paint-over's double of the exact share");
+    assert_eq!(free, start * 4, "a paint-over's double of twice the share");
 }
 
 /// Real OpenH264 through the engine: whether the library takes the switch or refuses it,
@@ -3774,4 +3802,91 @@ fn viewers_change_nothing_without_high_fps() {
         push(&mut eng);
         assert!(eng.cohorts.iter().all(|c| c.fps() == 30), "{hz}");
     }
+}
+
+/// The share every stripe got before encoders said whether they hold their cap.
+fn twice_the_area_share(target: u32, n: usize) -> u32 {
+    if target == 0 {
+        return 0;
+    }
+    ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
+}
+
+const TARGETS: [u32; 5] = [0, 1, 4_000, 30_000, 120_001];
+
+#[test]
+fn an_encoder_that_holds_its_cap_gets_exactly_its_area_share() {
+    for n in [1, 2, 4] {
+        assert_eq!(stripe_share(30_000, n, true), 30_000 / n as u32, "{n}");
+        assert_eq!(stripe_share(0, n, true), 0, "uncapped stays uncapped");
+    }
+    assert_eq!(stripe_share(3, 4, true), 1, "never a zero cap");
+}
+
+#[test]
+fn an_encoder_under_its_cap_keeps_twice_its_area_share() {
+    for n in 1..=8 {
+        for t in TARGETS {
+            assert_eq!(stripe_share(t, n, false), twice_the_area_share(t, n), "{t}/{n}");
+        }
+    }
+    assert_eq!(stripe_share(30_000, 1, false), 60_000);
+}
+
+/// Every software encoder this build has, opened capped as a stream opens it, keeps the
+/// share it had.
+#[test]
+fn no_software_encoders_share_moves() {
+    let codecs = [
+        Codec::H264,
+        Codec::Hevc,
+        Codec::Av1,
+        #[cfg(feature = "libvpx")]
+        Codec::Vp8,
+        #[cfg(feature = "libvpx")]
+        Codec::Vp9,
+    ];
+    let software = [
+        Backend::OpenH264,
+        #[cfg(feature = "x264")]
+        Backend::X264,
+        #[cfg(feature = "libvpx")]
+        Backend::Libvpx,
+        #[cfg(feature = "libaom")]
+        Backend::Libaom,
+        #[cfg(feature = "svt-av1")]
+        Backend::SvtAv1,
+        #[cfg(feature = "kvazaar")]
+        Backend::Kvazaar,
+        #[cfg(feature = "x265")]
+        Backend::X265,
+    ];
+    let mut opened = 0;
+    for backend in software {
+        for codec in codecs.into_iter().filter(|&c| backend.implements(c)) {
+            let cfg = EncoderConfig {
+                backend,
+                codec,
+                width: 320,
+                height: 192,
+                fps: 30,
+                threads: 1,
+                rate: RateConfig::new(24.0, 4_000, 30),
+                best_quality: 16.0,
+                preset: crate::encoder::DEFAULT_PRESET.into(),
+            };
+            let enc = crate::encoder::open(&cfg).unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+            for n in 1..=8 {
+                for t in TARGETS {
+                    assert_eq!(
+                        stripe_share(t, n, enc.holds_cap()),
+                        twice_the_area_share(t, n),
+                        "{backend:?} {codec:?} {t}/{n}"
+                    );
+                }
+            }
+            opened += 1;
+        }
+    }
+    assert!(opened > 0);
 }

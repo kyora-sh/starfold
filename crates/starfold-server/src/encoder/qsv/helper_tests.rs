@@ -841,4 +841,10 @@ mod remote {
             "{e}"
         );
     }
+
+    #[test]
+    fn the_helpers_encoder_holds_its_cap() {
+        let enc = start(policy(QUICK), format!("{}; sleep 30", opened()));
+        assert!(enc.holds_cap());
+    }
 }

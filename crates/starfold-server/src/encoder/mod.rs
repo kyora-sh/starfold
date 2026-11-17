@@ -225,6 +225,12 @@ pub trait VideoEncoder: Send {
     fn refinable(&self, _r: Refine) -> bool {
         false
     }
+    /// Runs at its cap whatever the picture (constant bitrate, padded): seen on Quick Sync
+    /// and on Intel's VA-API driver. Such an encoder gets exactly its area share of the
+    /// budget, not the headroom one that stays under its cap gets.
+    fn holds_cap(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(any(feature = "x264", feature = "openh264")))]
@@ -727,5 +733,9 @@ impl VideoEncoder for Pad {
 
     fn refinable(&self, r: Refine) -> bool {
         self.inner.refinable(r)
+    }
+
+    fn holds_cap(&self) -> bool {
+        self.inner.holds_cap()
     }
 }
