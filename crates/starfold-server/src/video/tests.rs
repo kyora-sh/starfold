@@ -4375,22 +4375,27 @@ fn a_slower_source_is_not_held_back() {
     }
 }
 
-/// Offers the engine's one cohort a capture every `grid` for 2 s, its viewer acking each
-/// frame; the frames it got. The capture comes at `arrival` fps, the cohort is capped at `cap`.
+/// Offers `cand`'s cohort a capture every `grid` for 2 s, its viewer acking each frame; the
+/// frames it got. The capture comes at `arrival` fps, the cohort is capped at `cap`.
 fn frames_on_a_grid(
     eng: &mut Engine,
-    c: &Client,
-    rx: &mut UnboundedReceiver<Out>,
+    (c, rx): (&Client, &mut UnboundedReceiver<Out>),
+    cand: Candidate,
     grid: Duration,
     (arrival, cap): (u32, u32),
 ) -> usize {
+    let k = eng
+        .cohorts
+        .iter()
+        .position(|c| c.shared.cand == cand)
+        .unwrap();
     let mut t = Instant::now();
     let mut got = 0;
     for _ in 0..(2_000_000_000 / grid.as_nanos()) {
         eng.replan();
         let views = eng.views();
         eng.update_rates(&views);
-        assert_eq!((eng.arrival_fps(&views), eng.cohorts[0].fps()), (arrival, cap));
+        assert_eq!((eng.arrival_fps(&views), eng.cohorts[k].fps()), (arrival, cap));
         let turn = eng.turn(&views, 1000.0 / arrival as f64, t);
         eng.mark(&views, None);
         eng.dispatch(&whole(W, H), &views, &turn, t);
@@ -4421,7 +4426,8 @@ fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     eng.cfg.source_fps = 120;
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
-    let got = frames_on_a_grid(&mut eng, &c, &mut rx, Duration::from_millis(15), (120, 60));
+    let grid = Duration::from_millis(15);
+    let got = frames_on_a_grid(&mut eng, (&c, &mut rx), H264, grid, (120, 60));
     assert!(
         got.abs_diff(120) <= 1,
         "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms"
@@ -4436,7 +4442,7 @@ fn a_100_fps_cohort_on_a_120_fps_capture_takes_100_frames_a_second() {
         hub.clone(),
         W,
         H,
-        &[HEVC],
+        &[HEVC, H264],
         fakes(Opts::default()),
     )
     .unwrap();
@@ -4448,8 +4454,8 @@ fn a_100_fps_cohort_on_a_120_fps_capture_takes_100_frames_a_second() {
     ready(&c, &drain(&mut rx));
     let got = frames_on_a_grid(
         &mut eng,
-        &c,
-        &mut rx,
+        (&c, &mut rx),
+        HEVC,
         Duration::from_nanos(1_000_000_000 / 120),
         (120, 100),
     );
