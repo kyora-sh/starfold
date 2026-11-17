@@ -116,7 +116,10 @@ impl Rc {
             r.data.target_percentage = if self.mode == RcMode::Cbr { 100 } else { 95 };
             r.data.window_size =
                 ((self.buffer_bits as u64 * 1000 / self.bps.max(1) as u64) as u32).max(1);
-            r.data.rc_flags = reset as u32 | 1 << 1;
+            r.data.rc_flags = ffi::RC_FLAG_DISABLE_FRAME_SKIP | ffi::RC_FLAG_DISABLE_BIT_STUFFING;
+            if reset {
+                r.data.rc_flags |= ffi::RC_FLAG_RESET;
+            }
         });
         let hrd = ffi::param(|h: &mut ffi::Misc<ffi::VAEncMiscParameterHRD>| {
             h.kind = ffi::MISC_HRD;

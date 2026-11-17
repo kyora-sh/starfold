@@ -494,7 +494,7 @@ fn rate_control_follows_rate_config() {
     let r: ffi::Misc<ffi::VAEncMiscParameterRateControl> = ffi::read(&misc[1].data);
     assert_eq!(
         (r.kind, r.data.bits_per_second, r.data.rc_flags),
-        (1, 8_000_000, 3)
+        (1, 8_000_000, 0b111)
     );
     assert_eq!(Rc::new(RcMode::Cqp, &uncapped, None).misc(false).len(), 1);
 
@@ -518,6 +518,66 @@ fn rate_control_follows_rate_config() {
         (r.data.bits_per_second, r.data.rc_flags & 1),
         (2_000_000, 1)
     );
+}
+
+/// Without `disable_bit_stuffing` a constant-bitrate driver pads every picture with
+/// filler data up to the target rate, so every rate control buffer sends it.
+#[test]
+fn rate_control_turns_off_filler_data() {
+    for (codec, profile, slice, extra) in [
+        (
+            Codec::H264,
+            ffi::PROFILE_H264_HIGH,
+            h264_slice as fn(bool) -> Vec<u8>,
+            vec![],
+        ),
+        (
+            Codec::Hevc,
+            ffi::PROFILE_HEVC_MAIN,
+            hevc_slice,
+            vec![None, None],
+        ),
+        (
+            Codec::Av1,
+            ffi::PROFILE_AV1_0,
+            av1_tile_group,
+            vec![Some(0x1f), Some(3 << 2 | 4 << 4)],
+        ),
+    ] {
+        let (mut fake, log) = Fake::new(profile, slice);
+        fake.extra = extra;
+        let mut enc = session(Box::new(fake), &cfg(codec, 640, 480)).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        enc.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        encode(enc.as_mut(), 640, 480, true).unwrap();
+        drop(enc);
+        let log = log.lock().unwrap();
+        let rc: Vec<(u32, u32, u32)> = log
+            .frames
+            .iter()
+            .flat_map(|f| find(f, ffi::BUF_MISC))
+            .filter(|b| b[..4] == ffi::MISC_RATE_CONTROL.to_ne_bytes())
+            .map(|b| ffi::read::<ffi::Misc<ffi::VAEncMiscParameterRateControl>>(&b))
+            .map(|m| {
+                (
+                    m.data.target_percentage,
+                    m.data.bits_per_second,
+                    m.data.rc_flags,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rc,
+            vec![
+                (100, 4_000_000, 0b110),
+                (100, 2_000_000, 0b111),
+                (100, 2_000_000, 0b110)
+            ],
+            "{codec:?}"
+        );
+    }
 }
 
 #[test]
@@ -1224,6 +1284,18 @@ fn au_shape(codec: Codec, a: &AccessUnit, key: bool, first: bool) -> Result<(), 
 #[test]
 #[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
 fn hardware_minute() {
+    hardware_run(true, "minute");
+}
+
+/// [`hardware_minute`] on a picture that never changes, where a constant-bitrate stream
+/// has nothing to spend its rate on. Streams go to `$STARFOLD_VAAPI_OUT/static.{h264,hevc}`.
+#[test]
+#[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
+fn hardware_minute_static() {
+    hardware_run(false, "static");
+}
+
+fn hardware_run(moving: bool, name: &str) {
     use std::time::{Duration, Instant};
     let node = render_nodes()
         .ok()
@@ -1245,9 +1317,10 @@ fn hardware_minute() {
         let start = Instant::now();
         let mut run = || -> Result<(), String> {
             for i in 0..fps * 60 {
+                let shift = if moving { 8 * i as usize } else { 0 };
                 for (row, line) in y.chunks_mut(w as usize).enumerate() {
                     for (col, p) in line.iter_mut().enumerate() {
-                        *p = ((col + row + 8 * i as usize) % 220 + 16) as u8;
+                        *p = ((col + row + shift) % 220 + 16) as u8;
                     }
                 }
                 let f = FrameView {
@@ -1292,7 +1365,7 @@ fn hardware_minute() {
             stream.len() as f64 * 8.0 / secs / 1000.0
         );
         if let Some(dir) = &out {
-            std::fs::write(dir.join(format!("minute.{ext}")), &stream).unwrap();
+            std::fs::write(dir.join(format!("{name}.{ext}")), &stream).unwrap();
         }
         if let Err(e) = r {
             failed.push(format!("{codec:?}: {e}"));
