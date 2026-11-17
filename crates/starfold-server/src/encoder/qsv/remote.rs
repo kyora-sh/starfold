@@ -337,6 +337,8 @@ pub struct Remote {
     section: Section,
     size: (u32, u32),
     rate: Rate,
+    /// The bitrate the helper's encoder runs at, as it read it back after the last rate change.
+    in_force: Option<u32>,
     stream: hw::Stream,
     /// Why this helper is no longer used.
     gone: Option<String>,
@@ -416,6 +418,7 @@ impl Remote {
                 ColorInfo::SRGB_BT601_LIMITED,
                 true,
             ),
+            in_force: None,
             gone: None,
             name: String::new(),
             low_power: false,
@@ -595,8 +598,16 @@ impl VideoEncoder for Remote {
             return Ok(());
         }
         match self.request(&Request::Rate(r), "a rate change", self.policy.timing.frame)? {
-            Reply::RateSet => {
+            Reply::RateSet { kbps } => {
                 self.rate = r;
+                self.in_force = (kbps > 0).then_some(kbps);
+                if let Some(k) = self.in_force {
+                    log::info!(
+                        "qsv helper {}: rate asked {} kbps, in force {k} kbps",
+                        self.proc.id(),
+                        r.max_kbps
+                    );
+                }
                 Ok(())
             }
             Reply::Error { stopped, reason } => Err(self.refused(stopped, reason)),
@@ -634,6 +645,10 @@ impl VideoEncoder for Remote {
             Reply::Error { stopped, reason } => Err(self.refused(stopped, reason)),
             _ => Err(self.broke("answered a frame out of turn")),
         }
+    }
+
+    fn rate_in_force(&self) -> Option<u32> {
+        self.in_force
     }
 
     /// Nothing is ever in flight between calls.

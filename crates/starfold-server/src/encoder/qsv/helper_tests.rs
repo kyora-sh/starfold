@@ -76,7 +76,7 @@ fn requests_and_replies_round_trip() {
             slot: 1,
             units: Vec::new(),
         },
-        Reply::RateSet,
+        Reply::RateSet { kbps: 7_990 },
         Reply::Error {
             stopped: true,
             reason: "Quick Sync stopped: x".into(),
@@ -205,7 +205,11 @@ fn the_helper_serves_a_session() {
     if let Reply::Done { units, .. } = &replies[1] {
         assert_eq!(units[0].data, bitstream(Codec::H264, true, true));
     }
-    assert_eq!(replies[4], Reply::RateSet);
+    assert_eq!(
+        replies[4],
+        Reply::RateSet { kbps: 5_000 },
+        "what the encoder reads back that it runs"
+    );
 }
 
 #[test]

@@ -194,7 +194,9 @@ pub fn serve(
                     quality: r.quality,
                 };
                 match session.set_rate(rate) {
-                    Ok(()) => Reply::RateSet,
+                    Ok(()) => Reply::RateSet {
+                        kbps: session.rate_in_force().unwrap_or(0),
+                    },
                     Err(e) => error(&e, session.stopped().is_some()),
                 }
             }

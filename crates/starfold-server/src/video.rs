@@ -272,6 +272,9 @@ struct Shared {
     idr_inflight: AtomicBool,
     /// Adaptive bitrate cap (kbit/s).
     target: AtomicU32,
+    /// What the cohort's encoders say they run at, all stripes together (kbit/s; 0 until
+    /// every stripe's encoder has said, or for encoders that don't read their rate back).
+    in_force: AtomicU32,
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
     failures: AtomicU32,
@@ -307,6 +310,15 @@ const FAIL_AFTER: u32 = 3;
 const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 impl Shared {
+    /// The bitrate `/stats` shows for the cohort: what its encoders say they run at, where
+    /// they say it, else its target.
+    fn shown_kbps(&self) -> u32 {
+        match self.in_force.load(Ordering::Relaxed) {
+            0 => self.target.load(Ordering::Relaxed),
+            k => k,
+        }
+    }
+
     /// The most the cohort takes frames at now: its cap, held down by its slowest viewer.
     fn cap(&self) -> u32 {
         let hz = self.hz.load(Ordering::Acquire).max(self.base_fps);
@@ -432,7 +444,7 @@ struct Cohort {
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
 /// second's worth of the cap.
-const FPS_FLOOR: u32 = 10;
+pub(crate) const FPS_FLOOR: u32 = 10;
 
 /// How often a cohort takes a frame while the picture moves. Flow control and a busy encoder
 /// skip frames, and an encoder that budgets for every capture would starve the ones that go out.
@@ -554,7 +566,7 @@ fn encoder_config(
 
 /// Each stripe may use up to twice its area share of the budget; the delay-based
 /// controller reins the total in if several stripes move at once. 0 = uncapped.
-fn stripe_share(target: u32, n: usize) -> u32 {
+pub(crate) fn stripe_share(target: u32, n: usize) -> u32 {
     if target == 0 {
         return 0;
     }
@@ -945,6 +957,7 @@ impl Engine {
             fps: AtomicU32::new(fps),
             base_fps: base_fps(&self.cfg),
             hz: AtomicU32::new(u32::MAX),
+            in_force: AtomicU32::new(0),
             w: self.w,
             h: self.h,
         });
@@ -1189,7 +1202,7 @@ impl Engine {
                     "backend": s.cand.backend,
                     "hardware": s.cand.hardware,
                     "viewers": self.hub.cohort_clients(s.id).len(),
-                    "target_kbps": s.target.load(Ordering::Relaxed),
+                    "target_kbps": s.shown_kbps(),
                     "fps": c.fps(),
                     "stripes": s.offer.lock().stripes,
                 })
@@ -1272,11 +1285,11 @@ impl Engine {
             c.shared.hz.store(hz.unwrap_or(u32::MAX), Ordering::Release);
             c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
             if c.active {
-                shown = shown.max(c.rc.target as u32);
+                shown = shown.max(c.shared.shown_kbps());
             }
         }
         if shown == 0 {
-            shown = self.cohorts.first().map_or(0, |c| c.rc.target as u32);
+            shown = self.cohorts.first().map_or(0, |c| c.shared.shown_kbps());
         }
         self.hub.target_kbps.store(shown, Ordering::Relaxed);
     }
@@ -2492,6 +2505,8 @@ struct StripeResult {
     /// at the ladder's.
     refinable: bool,
     refinable_small: bool,
+    /// The bitrate the stripe's encoder says it runs at (kbit/s), if it reads it back.
+    in_force: Option<u32>,
 }
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
@@ -2758,6 +2773,7 @@ fn stripe_worker(
             refinable_small,
             failed,
             error,
+            in_force: s.enc.rate_in_force(),
         };
         if done.send(r).is_err() {
             return;
@@ -2784,6 +2800,8 @@ fn encode_loop(
         stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
     // Consecutive failed encodes per stripe; a stripe not asked to encode hasn't recovered.
     let mut fails = vec![0u32; n];
+    // What each stripe's encoder last said it runs at.
+    let mut in_force: Vec<Option<u32>> = vec![None; n];
     let mut slow = SlowWatch::default();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
@@ -2894,10 +2912,13 @@ fn encode_loop(
                 refinable[r.i] = r.refinable;
                 refinable_small |= r.refinable_small;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
+                in_force[r.i] = r.in_force;
                 results[r.i] = r.out;
                 configs[r.i] = r.config;
             }
         }
+        let all: Option<u32> = in_force.iter().copied().sum();
+        sh.in_force.store(all.unwrap_or(0), Ordering::Relaxed);
         if job.refine_qp.is_some() {
             sh.refinable
                 .store(refinable.contains(&true), Ordering::Release);

@@ -16,7 +16,6 @@ pub type Hdl = *mut c_void;
 pub const ERR_NONE: Status = 0;
 pub const ERR_MORE_DATA: Status = -10;
 pub const ERR_DEVICE_LOST: Status = -13;
-pub const ERR_INCOMPATIBLE_VIDEO_PARAM: Status = -14;
 pub const ERR_DEVICE_FAILED: Status = -17;
 pub const ERR_GPU_HANG: Status = -21;
 pub const WRN_IN_EXECUTION: Status = 1;

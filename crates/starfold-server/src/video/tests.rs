@@ -82,6 +82,8 @@ struct Fake {
     delay: Option<Duration>,
     /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
     slow_keys: Option<(usize, Duration)>,
+    /// The bitrate it says it runs at, whatever it was asked for.
+    in_force: Option<u32>,
 }
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
@@ -104,6 +106,10 @@ impl VideoEncoder for Fake {
             rates.lock().unwrap().push(r.fps);
         }
         Ok(())
+    }
+
+    fn rate_in_force(&self) -> Option<u32> {
+        self.in_force
     }
 
     fn encode(
@@ -235,6 +241,8 @@ struct Opts {
     h264_hw_delay: Option<Duration>,
     /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
     h264_hw_slow_keys: Option<(usize, Duration)>,
+    /// H.264 encoders say they run at this, whatever they are asked for.
+    h264_in_force: Option<u32>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -273,6 +281,7 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
+                in_force: None,
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -319,6 +328,7 @@ fn fakes(o: Opts) -> Open {
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
             delay: None,
             slow_keys: None,
+            in_force: o.h264_in_force.filter(|_| !hevc),
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -3726,6 +3736,33 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         turn.work(),
         "the loop waits for the cap, not the idle timeout"
     );
+}
+
+/// `/stats` shows the bitrate a cohort's encoders say they run at, read back from the
+/// encoder, not the target the stream asked them for.
+#[test]
+fn stats_show_the_bitrate_the_encoders_run_at() {
+    let hub = Hub::new();
+    let opts = Opts {
+        h264_in_force: Some(12_345),
+        ..Default::default()
+    };
+    let mut eng = engine(&hub, &[H264], opts);
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    acked(&c, &mut rx);
+    let mut t = Instant::now();
+    for _ in 0..3 {
+        t += Duration::from_millis(100);
+        capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+        acked(&c, &mut rx);
+    }
+    let target = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    assert_ne!(target, 12_345, "the stream's own target is another");
+    assert_eq!(hub.target_kbps.load(Ordering::Relaxed), 12_345);
+    let cohorts = hub.cohorts.lock().clone();
+    assert_eq!(cohorts[0]["target_kbps"], 12_345, "{cohorts}");
 }
 
 #[test]

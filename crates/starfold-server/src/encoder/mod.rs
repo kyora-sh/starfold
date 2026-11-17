@@ -225,6 +225,11 @@ pub trait VideoEncoder: Send {
     fn refinable(&self, _r: Refine) -> bool {
         false
     }
+    /// The bitrate (kbit/s) the encoder says it runs at, for an encoder that reads its
+    /// rate back after a change; None for one that doesn't.
+    fn rate_in_force(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(not(any(feature = "x264", feature = "openh264")))]
@@ -727,5 +732,9 @@ impl VideoEncoder for Pad {
 
     fn refinable(&self, r: Refine) -> bool {
         self.inner.refinable(r)
+    }
+
+    fn rate_in_force(&self) -> Option<u32> {
+        self.inner.rate_in_force()
     }
 }

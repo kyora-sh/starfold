@@ -206,12 +206,7 @@ fn the_coding_option_matches_the_libvpl_headers() {
         ("the fake's NalHrdConformance", NAL_HRD_CONFORMANCE, 34),
         ("the fake's VuiNalHrdParameters", VUI_NAL_HRD_PARAMETERS, 62),
         (
-            "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM",
-            (-ffi::ERR_INCOMPATIBLE_VIDEO_PARAM) as usize,
-            14,
-        ),
-        (
-            "the fake's INCOMPATIBLE_VIDEO_PARAM",
+            "the fake's INCOMPATIBLE_VIDEO_PARAM (mfxdefs.h)",
             (-INCOMPATIBLE_VIDEO_PARAM) as usize,
             14,
         ),
@@ -257,6 +252,8 @@ const CODING_OPTION: u32 = u32::from_le_bytes(*b"CDOP");
 const NAL_HRD_CONFORMANCE: usize = 34;
 const VUI_NAL_HRD_PARAMETERS: usize = 62;
 pub(super) const INCOMPATIBLE_VIDEO_PARAM: Status = -14;
+/// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: the runtime took the call and changed what it asked.
+const WRN_INCOMPATIBLE_VIDEO_PARAM: Status = 5;
 
 #[derive(Default)]
 pub(super) struct Log {
@@ -266,8 +263,6 @@ pub(super) struct Log {
     pub(super) reset: Vec<VideoParam>,
     /// Each Init's NalHrdConformance and VuiNalHrdParameters, if it set them.
     pub(super) hrd: Vec<Option<(u16, u16)>>,
-    /// Encoders closed (MFXVideoENCODE_Close).
-    pub(super) closes: usize,
     /// The frame type asked of each encode call, if it asked for one.
     pub(super) frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
@@ -296,6 +291,9 @@ pub(super) struct Fake {
     pub(super) got: Option<VideoParam>,
     /// What the encoder runs with: the last Init or Reset it took.
     running: Option<VideoParam>,
+    /// A Reset above this TargetKbps runs at it instead, answered
+    /// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM.
+    pub(super) correct: Option<u16>,
     /// Its Init turned NalHrdConformance off.
     hrd_off: bool,
     /// IDRs after the first come without parameter sets.
@@ -321,6 +319,7 @@ impl Fake {
                 surface: VecDeque::new(),
                 got: None,
                 running: None,
+                correct: None,
                 hrd_off: false,
                 sets_once: false,
                 idrs: 0,
@@ -389,15 +388,18 @@ impl Runtime for Fake {
         if cbr && kbps(par) != kbps(&now) && !self.hrd_off {
             return INCOMPATIBLE_VIDEO_PARAM;
         }
-        self.running = Some(*par);
-        0
-    }
-
-    fn close(&mut self) -> Status {
-        self.call().closes += 1;
-        self.running = None;
-        self.hrd_off = false;
-        0
+        let mut runs = *par;
+        let corrected = self.correct.filter(|&c| runs.mfx.target_kbps > c);
+        if let Some(c) = corrected {
+            runs.mfx.target_kbps = c;
+            runs.mfx.max_kbps = c;
+        }
+        self.running = Some(runs);
+        if corrected.is_some() {
+            WRN_INCOMPATIBLE_VIDEO_PARAM
+        } else {
+            0
+        }
     }
 
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
@@ -533,13 +535,18 @@ fn h264_cbr_with_an_idr_on_request() {
         assert_eq!((m.gop_ref_dist, m.num_ref_frame), (1, 1), "no B frames");
         assert_eq!((m.gop_pic_size, m.idr_interval), (u16::MAX, 0));
         assert_eq!(m.rate_control_method, ffi::RATECONTROL_CBR);
-        let rate = (m.target_kbps, m.max_kbps, m.buffer_size_in_kb);
+        let mult = m.brc_param_multiplier as u32;
+        let k = |v: u16| v as u32 * mult;
+        let rate = (k(m.target_kbps), k(m.max_kbps), k(m.buffer_size_in_kb));
         assert_eq!(
             rate,
-            (6000, 6000, 800),
+            (6000, 6000, 798),
             "the buffer an IDR at 4x the cap needs"
         );
-        assert_eq!(m.brc_param_multiplier, 1);
+        assert_eq!(
+            mult, 3,
+            "room for a Reset to a keyframe's boost of a stripe's 2x share at 10 fps"
+        );
         let fi = m.frame_info;
         assert_eq!((fi.width, fi.height), (1920, 1088), "16-aligned");
         assert_eq!((fi.crop_w, fi.crop_h), (1920, 1080));
@@ -794,11 +801,13 @@ fn rate_changes_reset_the_encoder() {
     assert_eq!(resets, 0, "the same rate is no reset");
     enc.set_rate(RateConfig::new(24.0, 1000, 30)).unwrap();
     assert!(!encode(enc.as_mut(), 640, 480, false)[0].keyframe);
-    enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
+    enc.set_rate(RateConfig::new(24.0, 50_000, 30)).unwrap();
     assert!(
-        encode(enc.as_mut(), 640, 480, false)[0].keyframe,
-        "a raised peak goes out at an IDR"
+        !encode(enc.as_mut(), 640, 480, false)[0].keyframe,
+        "a raised rate needs no IDR"
     );
+    let e = enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap_err();
+    assert!(e.0.contains("BRCParamMultiplier"), "{e}");
     let l = log.lock().unwrap();
     let m = |p: &VideoParam| p.mfx;
     let r: Vec<(u16, u16, u16)> = l
@@ -807,7 +816,11 @@ fn rate_changes_reset_the_encoder() {
         .map(m)
         .map(|m| (m.target_kbps, m.max_kbps, m.brc_param_multiplier))
         .collect();
-    assert_eq!(r, vec![(1000, 1000, 1), (50_000, 50_000, 2)]);
+    assert_eq!(
+        r,
+        vec![(1000, 1000, 1), (50_000, 50_000, 1)],
+        "100 Mbit/s needs a multiplier Reset doesn't change: no Reset"
+    );
     assert!(l.reset.iter().all(|p| p.num_ext_param == 2));
 }
 

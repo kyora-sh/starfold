@@ -75,7 +75,11 @@ pub enum Reply {
         slot: u8,
         units: Vec<Unit>,
     },
-    RateSet,
+    /// The rate is set; `kbps`: the bitrate the encoder reads back that it runs at (0: none,
+    /// as at a constant QP).
+    RateSet {
+        kbps: u32,
+    },
     /// The request failed; `stopped`: the device hung, failed or was lost.
     Error {
         stopped: bool,
@@ -198,7 +202,10 @@ impl Reply {
                     b.extend_from_slice(&u.data);
                 }
             }
-            Reply::RateSet => b.push(RATE_SET),
+            Reply::RateSet { kbps } => {
+                b.push(RATE_SET);
+                b.extend_from_slice(&kbps.to_le_bytes());
+            }
             Reply::Error { stopped, reason } => {
                 b.push(ERROR);
                 b.push(*stopped as u8);
@@ -233,7 +240,7 @@ impl Reply {
                 }
                 Reply::Done { slot, units }
             }
-            RATE_SET => Reply::RateSet,
+            RATE_SET => Reply::RateSet { kbps: c.u32()? },
             ERROR => Reply::Error {
                 stopped: c.flag()?,
                 reason: c.text()?,

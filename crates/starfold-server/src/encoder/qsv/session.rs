@@ -6,8 +6,11 @@
 //! The stream is not held to HRD conformance (NalHrdConformance off, no NAL HRD parameters
 //! in its VUI): oneVPL lets a constant-bitrate encoder change its bitrate through Reset only
 //! then (the spec's "Dynamic Bitrate Change"), and every rate change goes through Reset. A
-//! Reset the runtime still can't apply closes the encoder and opens it again at the new
-//! rate, starting with an IDR.
+//! Reset changes TargetKbps (and MaxKbps with it) and nothing else of what the encoder runs
+//! with, as the spec allows; what it then runs is read back (GetVideoParam) and is what the
+//! session reports, never what it asked for. A Reset the runtime refuses, or a rate it can
+//! only reach by changing more, takes this encoder out of use: it takes no more pictures and
+//! the stream opens a fresh one.
 //!
 //! It runs in the encoder helper process (see [`super::remote`]). A device that hangs or is
 //! lost stops the session: it calls the runtime no more, not even to close it, and its error
@@ -119,6 +122,36 @@ fn signal(c: ColorInfo) -> ExtVideoSignalInfo {
     }
 }
 
+/// The most kbit/s a Reset may put in TargetKbps for a stream capped at `cap_kbps` and
+/// coded at `fps`: a first keyframe's boost of the largest share one stripe gets, held to
+/// its budget per picture at the slowest rate the stream budgets for.
+fn ceiling_kbps(cap_kbps: u32, fps: u32) -> u64 {
+    let share = crate::video::stripe_share(cap_kbps, 1);
+    let boost = crate::video::keyframe_rate(0.0, share, fps).max_kbps as u64;
+    boost * fps.max(1) as u64 / crate::video::FPS_FLOOR.min(fps.max(1)) as u64
+}
+
+/// `p` with a BRCParamMultiplier large enough that a Reset never needs another to reach
+/// `ceiling` kbit/s: the rate fields rescaled to it, their values unchanged.
+fn sized(mut p: VideoParam, ceiling: u64) -> VideoParam {
+    let m = &mut p.mfx;
+    if m.rate_control_method != ffi::RATECONTROL_CBR {
+        return p;
+    }
+    let was = InForce::of(m);
+    let mult = ceiling
+        .div_ceil(u16::MAX as u64)
+        .max(was.multiplier as u64)
+        .min(u16::MAX as u64) as u16;
+    let field = |v: u32| (v / mult as u32).clamp(1, u16::MAX as u32) as u16;
+    m.brc_param_multiplier = mult;
+    m.target_kbps = field(was.target_kbps);
+    m.max_kbps = field(was.max_kbps);
+    m.buffer_size_in_kb = field(was.buffer_kb);
+    m.initial_delay_in_kb = field(was.initial_delay_kb);
+    p
+}
+
 /// No HRD conformance and no NAL HRD parameters, so a bitrate change can go through Reset.
 fn coding_option() -> ExtCodingOption {
     ExtCodingOption {
@@ -151,27 +184,58 @@ pub struct Session {
     pub low_power: bool,
     /// Why it does: how the runtime refused the full encoder.
     pub low_power_why: Option<String>,
+    /// The rate last asked for, so the same request isn't made twice. What the encoder runs
+    /// is `in_force`.
     rc: Rc,
-    /// The rate buffer Init sized the session for: Reset can't ask for more, so no rate
-    /// change does.
-    max_buffer_bits: u32,
-    /// The highest bitrate the session has been set up for: a higher one goes out at an IDR.
-    peak_bps: u32,
-    /// The next picture must be an IDR: first frame, a raised rate, or the last encode
-    /// failed.
+    /// What the encoder runs with, as the runtime last reported it.
+    in_force: InForce,
+    /// The next picture must be an IDR: the first frame, or the last encode failed.
     need_idr: bool,
     stream: hw::Stream,
     /// Why the device is not asked again.
     stopped: Option<String>,
-    /// Why this encoder takes no more requests: closed to change its rate, it didn't open
-    /// again in full. The stream replaces it; the device itself answers.
-    unusable: Option<String>,
+    /// Why this encoder takes no more requests: the runtime refused a change, or couldn't
+    /// say what it runs. The stream replaces it; the device itself answers.
+    out_of_use: Option<String>,
+}
+
+/// The rate control an encoder runs with, as GetVideoParam reports it, BRCParamMultiplier
+/// applied: kbit/s and KB.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InForce {
+    pub cbr: bool,
+    pub target_kbps: u32,
+    pub max_kbps: u32,
+    pub buffer_kb: u32,
+    pub initial_delay_kb: u32,
+    pub multiplier: u16,
+    /// Frames per second, as FrameRateExtN / FrameRateExtD.
+    pub fps: u32,
+}
+
+impl InForce {
+    fn of(m: &ffi::InfoMfx) -> InForce {
+        let mult = m.brc_param_multiplier.max(1);
+        let k = |v: u16| v as u32 * mult as u32;
+        let fi = &m.frame_info;
+        InForce {
+            cbr: m.rate_control_method == ffi::RATECONTROL_CBR,
+            target_kbps: k(m.target_kbps),
+            max_kbps: k(m.max_kbps),
+            buffer_kb: k(m.buffer_size_in_kb),
+            initial_delay_kb: k(m.initial_delay_in_kb),
+            multiplier: mult,
+            fps: fi.frame_rate_ext_n / fi.frame_rate_ext_d.max(1),
+        }
+    }
 }
 
 // The raw pointers point into the session's own boxes, or at the runtime's surface.
 unsafe impl Send for Session {}
 
 impl Drop for Session {
+    /// A stopped session (given up, killed, deadline missed) never calls the runtime; an
+    /// out-of-use but healthy session closes normally.
     fn drop(&mut self) {
         if self.stopped.is_none() {
             unsafe { ManuallyDrop::drop(&mut self.rt) };
@@ -195,6 +259,7 @@ impl Session {
         init.buffer_bits = rc
             .buffer_bits
             .max(Rc::new(cfg.codec, &boosted, None).buffer_bits);
+        let ceiling = ceiling_kbps(r.max_kbps, r.fps);
         let size = (cfg.width, cfg.height);
         let mut s = Session {
             rt: ManuallyDrop::new(rt),
@@ -211,12 +276,11 @@ impl Session {
             low_power: false,
             low_power_why: None,
             rc,
-            max_buffer_bits: init.buffer_bits,
-            peak_bps: rc.bps,
+            in_force: InForce::default(),
             need_idr: true,
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
             stopped: None,
-            unusable: None,
+            out_of_use: None,
         };
         let mut refused = Vec::new();
         for low_power in [false, true] {
@@ -225,7 +289,7 @@ impl Session {
             } else {
                 "LowPower off"
             };
-            let mut q = s.with_ext(params(cfg.codec, size, &init, low_power));
+            let mut q = s.with_ext(sized(params(cfg.codec, size, &init, low_power), ceiling));
             let r = s.rt.query(&mut q);
             if fatal(r) {
                 return Err(s.failed("MFXVideoENCODE_Query", r));
@@ -237,7 +301,7 @@ impl Session {
                 ));
                 continue;
             }
-            let mut p = s.with_ext(params(cfg.codec, size, &init, low_power));
+            let mut p = s.with_ext(sized(params(cfg.codec, size, &init, low_power), ceiling));
             let r = s.rt.init(&mut p);
             if r == ffi::WRN_PARTIAL_ACCELERATION {
                 return Err(EncodeError(
@@ -275,6 +339,12 @@ impl Session {
         self.stopped.as_deref()
     }
 
+    /// What the encoder runs with, as the runtime last reported it.
+    #[cfg(test)]
+    pub fn in_force(&self) -> InForce {
+        self.in_force
+    }
+
     /// `p` with the session's extension buffers: its colour signalling, and no HRD.
     fn with_ext(&mut self, mut p: VideoParam) -> VideoParam {
         *self.signal = signal(self.color);
@@ -286,46 +356,32 @@ impl Session {
         p
     }
 
-    /// Closes the encoder and opens it again at `rc`, with the session's size and LowPower
-    /// mode: what oneVPL asks for when Reset can't apply a change. The next picture is an
-    /// IDR. Once closed, anything short of a full Init (an error, or one only partly in
-    /// hardware, which [`Session::new`] refuses too) leaves the encoder unusable: no request
-    /// goes through it again, and the stream replaces it.
-    fn reopen(&mut self, rc: &Rc) -> Result<(), EncodeError> {
-        let r = self.rt.close();
-        if r < ffi::ERR_NONE {
-            let e = self.failed("MFXVideoENCODE_Close", r);
-            return Err(self.unusable(e));
-        }
-        let mut p = self.with_ext(params(self.codec, self.size, rc, self.low_power));
-        let r = self.rt.init(&mut p);
-        if r == ffi::WRN_PARTIAL_ACCELERATION || r < ffi::ERR_NONE {
-            let e = self.failed("MFXVideoENCODE_Init", r);
-            return Err(self.unusable(e));
-        }
-        self.par = p;
-        self.need_idr = true;
-        Ok(())
-    }
-
     /// Takes this encoder out of use after `e`, unless the device stopped (that ends
-    /// Quick Sync instead).
-    fn unusable(&mut self, e: EncodeError) -> EncodeError {
+    /// Quick Sync instead): no request goes through it again, and the stream replaces it.
+    fn out_of_use(&mut self, e: EncodeError) -> EncodeError {
         if self.stopped.is_some() {
             return e;
         }
-        let why = format!("the encoder didn't reopen at a new rate: {}", e.0);
-        self.unusable = Some(why.clone());
+        let why = format!("this Quick Sync encoder is out of use: {}", e.0);
+        self.out_of_use = Some(why.clone());
         EncodeError(why)
     }
 
-    /// Reads back what the encoder runs with: refuses B frames, sizes the output buffer.
-    fn refit(&mut self) -> Result<(), EncodeError> {
+    /// What the encoder runs with now (GetVideoParam).
+    fn working(&mut self) -> Result<VideoParam, EncodeError> {
         let mut got = VideoParam::default();
         let r = self.rt.video_param(&mut got);
         if r < ffi::ERR_NONE {
             return Err(self.failed("MFXVideoENCODE_GetVideoParam", r));
         }
+        Ok(got)
+    }
+
+    /// Reads back what the encoder runs with and keeps it: refuses B frames, sizes the
+    /// output buffer.
+    fn refit(&mut self) -> Result<(), EncodeError> {
+        let got = self.working()?;
+        self.in_force = InForce::of(&got.mfx);
         if got.mfx.gop_ref_dist > 1 {
             return Err(EncodeError(format!(
                 "the runtime set up B frames (GopRefDist {})",
@@ -368,7 +424,7 @@ impl Session {
     }
 
     fn running(&self) -> Result<(), EncodeError> {
-        match self.stopped.as_ref().or(self.unusable.as_ref()) {
+        match self.stopped.as_ref().or(self.out_of_use.as_ref()) {
             Some(why) => Err(EncodeError(why.clone())),
             None => Ok(()),
         }
@@ -382,31 +438,52 @@ impl VideoEncoder for Session {
         if rc == self.rc {
             return Ok(());
         }
-        let raise = rc.bps > self.peak_bps;
-        let mut asked = rc;
-        asked.buffer_bits = asked.buffer_bits.min(self.max_buffer_bits);
-        let mut working = VideoParam::default();
-        let r = self.rt.video_param(&mut working);
-        if r < ffi::ERR_NONE {
-            return Err(self.failed("MFXVideoENCODE_GetVideoParam", r));
-        }
-        apply(&asked, &mut working.mfx);
-        let mut p = self.with_ext(working);
-        match self.rt.reset(&mut p) {
-            ffi::ERR_INCOMPATIBLE_VIDEO_PARAM => {
-                let mut init = asked;
-                init.buffer_bits = self.max_buffer_bits;
-                self.reopen(&init)?;
+        let mut working = match self.working() {
+            Ok(w) => w,
+            Err(e) => return Err(self.out_of_use(e)),
+        };
+        let m = &mut working.mfx;
+        if rc.cbr {
+            // The same budget per picture at the encoder's own frame rate, which stays.
+            let ran = InForce::of(m);
+            let kbps = rc.bps as u64 / 1000 * ran.fps.max(1) as u64 / rc.fps.max(1) as u64;
+            let field = (kbps / ran.multiplier as u64).max(1);
+            if field > u16::MAX as u64 {
+                let e = EncodeError(format!(
+                    "{kbps} kbit/s needs a BRCParamMultiplier above the encoder's {}",
+                    ran.multiplier
+                ));
+                return Err(self.out_of_use(e));
             }
-            r if r < ffi::ERR_NONE => return Err(self.failed("MFXVideoENCODE_Reset", r)),
-            _ => self.par = p,
+            m.target_kbps = field as u16;
+            m.max_kbps = field as u16;
+        } else {
+            let qp = rc.qp.min(51) as u16;
+            m.initial_delay_in_kb = qp;
+            m.target_kbps = qp;
+            m.max_kbps = qp;
         }
+        let mut p = self.with_ext(working);
+        let r = self.rt.reset(&mut p);
+        if r == ffi::WRN_PARTIAL_ACCELERATION || r < ffi::ERR_NONE {
+            let e = self.failed("MFXVideoENCODE_Reset", r);
+            return Err(self.out_of_use(e));
+        }
+        self.par = p;
         self.rc = rc;
-        if raise {
-            self.peak_bps = rc.bps;
-            self.need_idr = true;
+        if let Err(e) = self.refit() {
+            return Err(self.out_of_use(e));
         }
-        self.refit()
+        Ok(())
+    }
+
+    /// The bitrate in force, in the terms it was asked in: per second at the rate the
+    /// stream takes pictures at, which TargetKbps scales to the encoder's own frame rate.
+    fn rate_in_force(&self) -> Option<u32> {
+        let f = self.in_force;
+        f.cbr.then(|| {
+            (f.target_kbps as u64 * self.rc.fps.max(1) as u64 / f.fps.max(1) as u64) as u32
+        })
     }
 
     fn encode(
