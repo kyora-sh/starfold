@@ -460,7 +460,14 @@ pub struct Hub {
     pub cohorts: Mutex<serde_json::Value>,
     /// `--encoder` and the encoder each codec streams from, for /stats.
     pub encoder: Mutex<serde_json::Value>,
+    /// The backends turned off for this process and why ([`crate::encoder::turned_off`]; a
+    /// fake in tests). Read when a hello is built and each time the video thread routes
+    /// viewers.
+    pub off: Mutex<Off>,
 }
+
+/// Where the video thread reads which backends are turned off.
+pub type Off = Arc<dyn Fn() -> Vec<(crate::encoder::Backend, String)> + Send + Sync>;
 
 impl Hub {
     pub fn new() -> Arc<Self> {
@@ -491,6 +498,7 @@ impl Hub {
             next_cohort: AtomicU64::new(1),
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
             encoder: Mutex::new(serde_json::Value::Null),
+            off: Mutex::new(Arc::new(crate::encoder::turned_off)),
         })
     }
 
@@ -511,6 +519,12 @@ impl Hub {
         if matches!(ev, crate::input::InputEvent::Key { .. }) {
             *self.key_at.lock() = Some(now);
         }
+    }
+
+    /// The backends turned off now, and why.
+    pub fn off(&self) -> Vec<(crate::encoder::Backend, String)> {
+        let f = self.off.lock().clone();
+        f()
     }
 
     /// Asks the video thread to route viewers again.
@@ -563,14 +577,24 @@ impl Hub {
     }
 
     /// The `hello` message: current geometry plus the server's settings, and for
-    /// protocol 2 clients the codecs on offer. `stripes` is the H.264 stream's layout.
+    /// protocol 2 clients the codecs on offer, without the backends that are off as it is
+    /// built. `stripes` is the H.264 stream's layout.
     pub fn hello(&self) -> String {
         self.hello_gen().1
     }
 
-    /// [`Hub::hello`] and the offer generation it carries (read once, for both).
+    /// [`Hub::hello`] and the offer generation it carries (read once, for both). The
+    /// generation is read first, then the offers it names, minus the backends off now.
     pub fn hello_gen(&self) -> (u64, String) {
         let gen = self.offer_gen.load(Ordering::Relaxed);
+        let off: Vec<crate::encoder::Backend> = self.off().into_iter().map(|(b, _)| b).collect();
+        let offers: Vec<Offer> = self
+            .offers
+            .lock()
+            .iter()
+            .filter(|o| !off.contains(&o.cand.backend))
+            .cloned()
+            .collect();
         let mut m = self.hello_extra.lock().clone();
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
@@ -578,7 +602,7 @@ impl Hub {
         m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
         m.insert("protocol".into(), crate::negotiate::PROTOCOL.into());
         m.insert("offer".into(), gen.into());
-        m.insert("videoOffers".into(), serde_json::json!(*self.offers.lock()));
+        m.insert("videoOffers".into(), serde_json::json!(offers));
         (gen, serde_json::Value::Object(m).to_string())
     }
 
