@@ -157,7 +157,10 @@ fn open(path: Option<&Path>) -> Result<Loaded, String> {
             v.uMinor
         ));
     }
-    let what = format!("{ATTRIBUTION} ({}, sha256 {})", checked.file, checked.sha256);
+    let what = format!(
+        "{ATTRIBUTION} ({}, sha256 {})",
+        checked.file, checked.sha256
+    );
     log::info!("{what}, from {}", path.display());
     // The mapping outlives the file everywhere but on Windows.
     #[cfg(not(windows))]
@@ -289,9 +292,7 @@ impl PrivateCopy {
         drop(w);
         let mut held = open_held(&copy.file)?;
         let mut again = Vec::new();
-        (&mut held)
-            .take(MAX_BYTES + 1)
-            .read_to_end(&mut again)?;
+        (&mut held).take(MAX_BYTES + 1).read_to_end(&mut again)?;
         if sha256_hex(&again) != c.sha256 {
             return Err(std::io::Error::other(
                 "the copy is not the bytes that were checked",
@@ -336,10 +337,36 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
-/// In the user's own temporary directory, whose ACL keeps other users out.
+/// Created with a protected DACL: full access for its owner and SYSTEM, nothing inherited.
 #[cfg(windows)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(dir)
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let made = unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&sa)) };
+    unsafe { LocalFree(Some(HLOCAL(sd.0))) };
+    made.map_err(std::io::Error::other)
 }
 
 #[cfg(unix)]
@@ -404,24 +431,61 @@ fn no_reparse_points(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Removes copies earlier processes left (a loaded DLL can't be removed while they run); one
-/// still in use refuses, and one younger than an hour may belong to a process starting now.
+/// Removes copies earlier processes left (a loaded DLL can't be removed while they run): only
+/// directories and files named as starfold names them, never through a reparse point, and
+/// none younger than an hour, which may belong to a process starting now. A copy still in use
+/// refuses to go.
 #[cfg(windows)]
 fn remove_stale(base: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let plain = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+    };
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
     for e in entries.flatten() {
-        let old = e
-            .metadata()
+        let name = e.file_name().to_string_lossy().into_owned();
+        let old = std::fs::symlink_metadata(e.path())
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age.as_secs() > 3600);
-        if old && e.file_name().to_string_lossy().starts_with(DIR_PREFIX) {
-            let _ = std::fs::remove_dir_all(e.path());
+        if !(old && is_copy_dir_name(&name) && plain(&e.path())) {
+            continue;
         }
+        if let Ok(files) = std::fs::read_dir(e.path()) {
+            for f in files.flatten() {
+                let leaf = f.file_name().to_string_lossy().into_owned();
+                if is_copy_file_name(&leaf) && plain(&f.path()) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(e.path());
     }
+}
+
+/// `starfold-openh264-` and 24 lowercase hex digits, as [`PrivateCopy`] names its directory.
+#[cfg(any(windows, test))]
+fn is_copy_dir_name(name: &str) -> bool {
+    name.strip_prefix(DIR_PREFIX).is_some_and(is_tag)
+}
+
+/// 24 lowercase hex digits and Cisco's extension, as [`PrivateCopy`] names its file.
+#[cfg(any(windows, test))]
+fn is_copy_file_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(tag, ext)| is_tag(tag) && matches!(ext, "dll" | "so" | "dylib"))
+}
+
+#[cfg(any(windows, test))]
+fn is_tag(s: &str) -> bool {
+    s.len() == 24
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The dyld variables that can make it load another library than the path it is given.
@@ -535,14 +599,15 @@ mod tests {
         let checked = Checked::read(&given, &pin_of(&bytes)).unwrap();
         let copy = PrivateCopy::new_in(&dir, &checked).unwrap();
         assert!(copy.file.starts_with(&copy.dir));
-        let leaf = copy.file.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(!leaf.contains("lib") && leaf.len() > 24, "{leaf}");
-        assert!(copy
-            .dir
+        let leaf = copy
+            .file
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with(DIR_PREFIX));
+            .into_owned();
+        assert!(is_copy_file_name(&leaf), "{leaf}");
+        let dir_name = copy.dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(is_copy_dir_name(&dir_name), "{dir_name}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -600,6 +665,31 @@ mod tests {
         drop(api);
         drop(copy);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The Windows clean-up touches only names starfold gives its copies.
+    #[test]
+    fn only_starfolds_own_copy_names_are_matched() {
+        let tag = "0123456789abcdef01234567";
+        assert!(is_copy_dir_name(&format!("{DIR_PREFIX}{tag}")));
+        assert!(is_copy_file_name(&format!("{tag}.dll")));
+        for name in [
+            "starfold-openh264-",
+            "starfold-openh264-0123456789ABCDEF01234567",
+            "starfold-openh264-0123456789abcdef0123456",
+            "starfold-openh264-0123456789abcdef01234567x",
+            "other-0123456789abcdef01234567",
+        ] {
+            assert!(!is_copy_dir_name(name), "{name}");
+        }
+        for name in [
+            "openh264-2.6.0-win64.dll",
+            "0123456789abcdef01234567.exe",
+            "0123456789abcdef01234567",
+            "../0123456789abcdef0123.dll",
+        ] {
+            assert!(!is_copy_file_name(name), "{name}");
+        }
     }
 
     #[test]

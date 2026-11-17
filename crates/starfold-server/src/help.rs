@@ -361,11 +361,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let attribution = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
-        assert_eq!(
-            words.contains(attribution),
-            cfg!(openh264_cisco),
-            "{words}"
-        );
+        assert_eq!(words.contains(attribution), cfg!(openh264_cisco), "{words}");
         assert_eq!(
             words.contains("--openh264-lib"),
             cfg!(openh264_cisco),

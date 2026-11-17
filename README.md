@@ -356,13 +356,14 @@ neither contains nor downloads. The binary stays under starfold's MIT licence.
   - It writes those bytes under a random name into a new directory it creates in the temporary
     directory (`TMPDIR` on Linux and macOS), reads them back, hashes them again, and loads that
     copy.
-  - The directory is only the user's: mode 0700 on Linux and macOS. On Windows it inherits the
-    ACL of the user's own temporary directory, and the path is refused if any part of it is a
+  - The directory is only the user's: mode 0700 on Linux and macOS. On Windows it gets a protected
+    ACL (its owner and SYSTEM, nothing inherited), and the path is refused if any part of it is a
     reparse point.
   - The library must also report version 2.6.
   - The copy is removed once loaded. On Windows a loaded DLL can't be removed: the copy is held
-    open until the process ends, so it can't be written, renamed or deleted, and the next start
-    removes copies older than an hour.
+    open until the process ends, so it can't be written, renamed or deleted. The next start
+    removes copies older than an hour, touching only names starfold gives them and never
+    following a reparse point.
   - Loading needs a temporary directory that allows executable mappings (not mounted `noexec`).
 - **What this protects against:** an attacker who can replace the file at the given path is in
   scope. One who controls starfold's environment or its private directory is not.
