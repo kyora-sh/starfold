@@ -4295,7 +4295,8 @@ fn captures_offered_on_any_grid_up_to_the_interval_come_at_the_rate() {
 }
 
 /// The cost of keeping a late capture's lateness: at most two captures over the rate in any
-/// second, and a capture right after a late one; never three within an interval.
+/// second, and a capture right after a late one; never three within an interval, and none
+/// right after a pause.
 #[test]
 fn no_more_than_two_captures_over_the_rate_in_any_second() {
     let fps = 30;
@@ -4330,6 +4331,16 @@ fn no_more_than_two_captures_over_the_rate_in_any_second() {
     );
     s.took(late, interval);
     assert!(!s.wait(late, interval).is_zero(), "but not by a third");
+    let paused = s.due.unwrap() + interval;
+    s.took(paused, interval);
+    assert!(
+        s.wait(paused, interval) >= interval.mul_f64(1.0 - EARLY_SHARE) - Duration::from_micros(1),
+        "after a pause the schedule starts afresh"
+    );
+    let mut s = Schedule::default();
+    let t = Instant::now();
+    s.took(t, interval);
+    assert!(!s.wait(t, interval).is_zero(), "nor after the first capture");
 }
 
 #[test]
