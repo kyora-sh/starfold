@@ -802,7 +802,9 @@ impl Engine {
             .collect();
         eng.cohorts.push(c);
         *hub.offers.lock() = eng.offers.clone();
-        hub.offer_gen.fetch_add(1, Ordering::Relaxed);
+        // Under the lock a connecting viewer's first-hello check also takes
+        // (Hub::send_first_hello_with), released before the restart hellos below.
+        hub.next_offer_gen();
         eng.publish();
         // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
         hub.restart_clients();
