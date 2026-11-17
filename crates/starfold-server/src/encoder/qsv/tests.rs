@@ -298,6 +298,9 @@ pub(super) struct Fake {
     pub(super) frame_rate: Option<(u32, u32)>,
     /// What GetVideoParam calls answer, in turn (MFX_ERR_NONE once it runs out).
     pub(super) video_param: VecDeque<Status>,
+    /// GetVideoParam reports the smallest BRCParamMultiplier that holds the rates, as
+    /// Intel's H.264 runtime does, rather than the one it was given.
+    pub(super) normalize: bool,
     /// Its Init turned NalHrdConformance off.
     hrd_off: bool,
     /// IDRs after the first come without parameter sets.
@@ -326,6 +329,7 @@ impl Fake {
                 correct: None,
                 frame_rate: None,
                 video_param: VecDeque::new(),
+                normalize: false,
                 hrd_off: false,
                 sets_once: false,
                 idrs: 0,
@@ -420,6 +424,17 @@ impl Runtime for Fake {
             return r;
         }
         *par = self.got.or(self.running).unwrap_or_default();
+        if self.normalize && par.mfx.rate_control_method == ffi::RATECONTROL_CBR {
+            let m = &mut par.mfx;
+            let k = m.brc_param_multiplier.max(1) as u32;
+            let [t, x, b, d] =
+                [m.target_kbps, m.max_kbps, m.buffer_size_in_kb, m.initial_delay_in_kb]
+                    .map(|v| v as u32 * k);
+            let n = t.max(x).max(b).max(d).div_ceil(u16::MAX as u32).max(1);
+            m.brc_param_multiplier = n as u16;
+            [m.target_kbps, m.max_kbps, m.buffer_size_in_kb, m.initial_delay_in_kb] =
+                [t, x, b, d].map(|v| (v / n) as u16);
+        }
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;
         0
@@ -816,15 +831,17 @@ fn rate_changes_reset_the_encoder() {
     assert_eq!(resets, 0, "the same rate is no reset");
     enc.set_rate(RateConfig::new(24.0, 1000, 30)).unwrap();
     assert!(!encode(enc.as_mut(), 640, 480, false)[0].keyframe);
-    enc.set_rate(RateConfig::new(24.0, 50_000, 30)).unwrap();
+    enc.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
     assert!(
         !encode(enc.as_mut(), 640, 480, false)[0].keyframe,
         "a raised rate needs no IDR"
     );
-    let e = enc
-        .set_rate(RateConfig::new(24.0, 100_000, 30))
-        .unwrap_err();
-    assert!(e.0.contains("BRCParamMultiplier"), "{e}");
+    enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
+    assert_eq!(
+        enc.rate_in_force(),
+        crate::encoder::RateInForce::Known(48_000),
+        "clamped to what a 2 Mbit/s cap at 30 fps was sized for"
+    );
     let l = log.lock().unwrap();
     let m = |p: &VideoParam| p.mfx;
     let r: Vec<(u16, u16, u16)> = l
@@ -835,8 +852,7 @@ fn rate_changes_reset_the_encoder() {
         .collect();
     assert_eq!(
         r,
-        vec![(1000, 1000, 1), (50_000, 50_000, 1)],
-        "100 Mbit/s needs a multiplier Reset doesn't change: no Reset"
+        vec![(1000, 1000, 1), (40_000, 40_000, 1), (48_000, 48_000, 1)]
     );
     assert!(l.reset.iter().all(|p| p.num_ext_param == 2));
 }

@@ -222,19 +222,73 @@ fn a_refused_reset_puts_the_encoder_out_of_use() {
     }
 }
 
-/// A rate the encoder's multiplier can't express needs a change Reset doesn't make: the
-/// encoder goes out of use, and no Reset is sent.
+/// A rate above what the session was sized for is clamped to it: the encoder stays in use,
+/// and what it runs at is reported as what was read back, not what was asked.
 #[test]
-fn a_rate_beyond_the_multiplier_puts_the_encoder_out_of_use() {
+fn a_rate_above_the_ceiling_is_clamped_to_it() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(2_000)).unwrap();
-    let e = s.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap_err();
-    assert!(
-        e.0.contains("out of use") && e.0.contains("BRCParamMultiplier"),
-        "{e}"
+    s.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
+    assert_eq!(
+        s.rate_in_force(),
+        RateInForce::Known(48_000),
+        "a 2 Mbit/s cap's boosted keyframe at 10 fps, per picture at 30"
     );
-    assert!(frame(&mut s, false).is_err());
-    assert!(log.lock().unwrap().reset.is_empty());
+    assert_eq!(kbps(&log.lock().unwrap().reset[0]), 48_000);
+    assert!(!frame(&mut s, false).unwrap().is_empty(), "still in use");
+}
+
+/// The rates a stream asks while it ramps up and boosts a keyframe, at 22 pictures a second
+/// on an encoder opened at 30: what the box asked of one opened at a 30 Mbit/s cap.
+fn the_box_ramp() -> [RateConfig; 5] {
+    [
+        RateConfig::new(24.0, 16_000, 22),
+        RateConfig::new(24.0, 24_000, 22),
+        RateConfig::new(24.0, 45_616, 22),
+        RateConfig::new(24.0, 66_207, 22),
+        keyframe_rate(24.0, 60_000, 22),
+    ]
+}
+
+/// On a runtime that reports the smallest multiplier that holds the rates (Intel's H.264
+/// runtime turned the 11 Init asked into 1), each rate goes in at that multiplier: one above
+/// what it holds (65535 kbit/s per picture) is clamped there, the session stays in use, and
+/// what runs is read back.
+#[test]
+fn a_runtime_that_normalizes_the_multiplier_clamps_at_what_it_holds() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.normalize = true;
+    let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    let mut ran = Vec::new();
+    for r in the_box_ramp() {
+        s.set_rate(r).unwrap();
+        ran.push(s.rate_in_force());
+    }
+    // Per picture at 30 fps: 21818, 32727, 62204 fit; 90282 and 327273 are held to 65535,
+    // which is 48059 kbit/s at 22 pictures a second.
+    let want = [16_000, 24_000, 45_616, 48_059, 48_059].map(RateInForce::Known);
+    assert_eq!(ran, want);
+    let l = log.lock().unwrap();
+    assert!(l.reset.iter().all(|p| p.mfx.brc_param_multiplier == 1));
+    assert_eq!(kbps(&l.reset[4]), 65_535);
+}
+
+/// On a runtime that keeps the multiplier Init asked (HEVC's did), the same ramp and boost
+/// run as asked, within the multiplier's steps.
+#[test]
+fn a_runtime_that_keeps_the_multiplier_runs_the_ramp_as_asked() {
+    let (fake, log) = Fake::new(Codec::H264);
+    let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    for r in the_box_ramp() {
+        s.set_rate(r).unwrap();
+        let RateInForce::Known(k) = s.rate_in_force() else {
+            panic!("{:?}", s.rate_in_force())
+        };
+        let asked = r.max_kbps;
+        assert!(asked.abs_diff(k) <= 8, "asked {asked}, in force {k}");
+    }
+    let l = log.lock().unwrap();
+    assert!(l.reset.iter().all(|p| p.mfx.brc_param_multiplier == 11));
 }
 
 /// Init leaves room in the multiplier for the most a Reset can ask: a first keyframe's boost

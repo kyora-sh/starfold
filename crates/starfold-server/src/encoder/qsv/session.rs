@@ -131,6 +131,14 @@ fn ceiling_kbps(cap_kbps: u32, fps: u32) -> u64 {
     boost * fps.max(1) as u64 / crate::video::FPS_FLOOR.min(fps.max(1)) as u64
 }
 
+/// The most TargetKbps (kbit/s, per picture at the encoder's own frame rate) a session may
+/// be given: what Init sized it for (`sized_for`, from the configured maximum), and what
+/// the BRCParamMultiplier the runtime reports can hold. Init and every Reset go by it; a
+/// request above it is clamped to it.
+fn brc_ceiling(sized_for: u64, multiplier: u16) -> u64 {
+    sized_for.min(u16::MAX as u64 * multiplier.max(1) as u64)
+}
+
 /// `p` with a BRCParamMultiplier large enough that a Reset never needs another to reach
 /// `ceiling` kbit/s: the rate fields rescaled to it, their values unchanged.
 fn sized(mut p: VideoParam, ceiling: u64) -> VideoParam {
@@ -187,6 +195,9 @@ pub struct Session {
     /// The rate last asked for, so the same request isn't made twice. What the encoder runs
     /// is `in_force`.
     rc: Rc,
+    /// The most kbit/s TargetKbps may be given, from the configured maximum (see
+    /// [`brc_ceiling`]).
+    sized_for: u64,
     /// What the encoder runs with, as the runtime last reported it; None once a rate change
     /// failed and nothing has been read back since.
     in_force: Option<InForce>,
@@ -283,7 +294,8 @@ impl Session {
         init.buffer_bits = rc
             .buffer_bits
             .max(Rc::new(cfg.codec, &boosted, None).buffer_bits);
-        let ceiling = ceiling_kbps(r.max_kbps, r.fps);
+        // No multiplier is in force yet: Init asks for room for the whole ceiling.
+        let ceiling = brc_ceiling(ceiling_kbps(r.max_kbps, r.fps), u16::MAX);
         let size = (cfg.width, cfg.height);
         let mut s = Session {
             rt: ManuallyDrop::new(rt),
@@ -300,6 +312,7 @@ impl Session {
             low_power: false,
             low_power_why: None,
             rc,
+            sized_for: ceiling,
             in_force: None,
             need_idr: true,
             stream: hw::Stream::new("Quick Sync", cfg.codec, size, color, true),
@@ -470,20 +483,15 @@ impl Session {
         if rc.cbr {
             // The same budget per picture at the encoder's own frame rate, which stays.
             let ran = InForce::of(m);
-            let Some(kbps) = ran.target_for(rc.bps as u64 / 1000, rc.fps) else {
+            let Some(asked) = ran.target_for(rc.bps as u64 / 1000, rc.fps) else {
                 let e = EncodeError("the encoder reports no frame rate".into());
                 return Err(self.out_of_use(e));
             };
-            let field = (kbps / ran.multiplier as u64).max(1);
-            if field > u16::MAX as u64 {
-                let e = EncodeError(format!(
-                    "{kbps} kbit/s needs a BRCParamMultiplier above the encoder's {}",
-                    ran.multiplier
-                ));
-                return Err(self.out_of_use(e));
-            }
-            m.target_kbps = field as u16;
-            m.max_kbps = field as u16;
+            // Above what the session can be given, it gets that, and the read-back says so.
+            let kbps = asked.min(brc_ceiling(self.sized_for, ran.multiplier));
+            let field = (kbps / ran.multiplier as u64).clamp(1, u16::MAX as u64) as u16;
+            m.target_kbps = field;
+            m.max_kbps = field;
         } else {
             let qp = rc.qp.min(51) as u16;
             m.initial_delay_in_kb = qp;
