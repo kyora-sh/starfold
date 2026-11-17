@@ -487,7 +487,10 @@ mod remote {
     /// The lines logged about helper `pid`, in order.
     fn lines_of(p: &'static Policy, pid: u32) -> Vec<String> {
         let me = format!("qsv helper {pid}: ");
-        p.said().into_iter().filter(|l| l.starts_with(&me)).collect()
+        p.said()
+            .into_iter()
+            .filter(|l| l.starts_with(&me))
+            .collect()
     }
 
     /// Helper `pid` was logged opening, then ending once, with an end line starting `ended`.
@@ -544,7 +547,12 @@ mod remote {
         let pid = enc.pid();
         fails_within(&mut enc, Duration::from_secs(2));
         drop(enc);
-        let died = ["exited", "closed its stdout", "closed its stdin", "could not be"];
+        let died = [
+            "exited",
+            "closed its stdout",
+            "closed its stdin",
+            "could not be",
+        ];
         opened_then(p, pid, &died);
 
         let p = policy(QUICK);
@@ -576,7 +584,12 @@ mod remote {
         std::thread::sleep(Duration::from_millis(300));
         assert!(frame(&mut enc, 1).is_err());
         drop(enc);
-        let died = ["exited", "closed its stdout", "closed its stdin", "could not be"];
+        let died = [
+            "exited",
+            "closed its stdout",
+            "closed its stdin",
+            "could not be",
+        ];
         opened_then(p, pid, &died);
     }
 

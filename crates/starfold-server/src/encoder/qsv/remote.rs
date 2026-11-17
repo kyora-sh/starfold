@@ -474,7 +474,11 @@ impl Remote {
     /// implementation, the codec, and whether LowPower is on (only when the runtime refused it
     /// off; the helper's own line says how).
     fn opened_line(&self, codec: Codec) -> String {
-        let codec = if codec == Codec::Hevc { "HEVC" } else { "H.264" };
+        let codec = if codec == Codec::Hevc {
+            "HEVC"
+        } else {
+            "H.264"
+        };
         let mode = if self.low_power { "on" } else { "off" };
         format!(
             "qsv helper {}: opened {} for {codec}, LowPower {mode}",
@@ -687,7 +691,8 @@ impl Drop for Remote {
             } else {
                 (log::Level::Info, "closed")
             };
-            self.policy.say(level, format!("qsv helper {pid}: ended: {how}"));
+            self.policy
+                .say(level, format!("qsv helper {pid}: ended: {how}"));
         }
         if died {
             self.policy
