@@ -190,7 +190,7 @@ fn the_helper_serves_a_session() {
     assert_eq!(
         replies[0],
         Reply::Opened {
-            low_power: true,
+            low_power: false,
             name: "fake-gen".into()
         }
     );

@@ -1,6 +1,7 @@
 //! One Quick Sync session: IDR then P frames off the last frame only (one reference, no B
 //! frames, one frame in flight), an IDR on request, parameter sets with every IDR, input
-//! through the runtime's own system-memory NV12 surfaces.
+//! through the runtime's own system-memory NV12 surfaces. It opens on the full encoder
+//! (LowPower off), and on the low-power one (VDEnc) only if the runtime refuses that.
 //!
 //! It runs in the encoder helper process (see [`super::remote`]). A device that hangs or is
 //! lost stops the session: it calls the runtime no more, not even to close it, and its error
@@ -126,6 +127,8 @@ pub struct Session {
     ctrl: Box<EncodeCtrl>,
     /// The session runs on VDEnc (fixed-function, LowPower on).
     pub low_power: bool,
+    /// Why it does: how the runtime refused the full encoder.
+    pub low_power_why: Option<String>,
     rc: Rc,
     /// The rate buffer Init sized the session for: Reset can't ask for more, so no rate
     /// change does.
@@ -179,7 +182,8 @@ impl Session {
             buf: Vec::new(),
             bs: Box::new(Bitstream::over(&mut [])),
             ctrl: Box::default(),
-            low_power: true,
+            low_power: false,
+            low_power_why: None,
             rc,
             max_buffer_bits: init.buffer_bits,
             peak_bps: rc.bps,
@@ -188,7 +192,7 @@ impl Session {
             stopped: None,
         };
         let mut refused = Vec::new();
-        for low_power in [true, false] {
+        for low_power in [false, true] {
             let mode = if low_power {
                 "LowPower on"
             } else {
@@ -226,6 +230,7 @@ impl Session {
             }
             s.par = p;
             s.low_power = low_power;
+            s.low_power_why = low_power.then(|| refused.join("; "));
             s.refit()?;
             return Ok(s);
         }

@@ -211,7 +211,7 @@ pub(super) fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
 
 #[derive(Default)]
 pub(super) struct Log {
-    queried: Vec<VideoParam>,
+    pub(super) queried: Vec<VideoParam>,
     pub(super) inited: Vec<VideoParam>,
     signal: Vec<ExtVideoSignalInfo>,
     pub(super) reset: Vec<VideoParam>,
@@ -233,8 +233,8 @@ unsafe impl Send for Log {}
 pub(super) struct Fake {
     codec: Codec,
     log: Arc<Mutex<Log>>,
-    query: VecDeque<Status>,
-    init: VecDeque<Status>,
+    pub(super) query: VecDeque<Status>,
+    pub(super) init: VecDeque<Status>,
     reset: VecDeque<Status>,
     encode: VecDeque<Status>,
     pub(super) sync: VecDeque<Status>,
@@ -415,7 +415,7 @@ fn fails(enc: &mut dyn VideoEncoder, key: bool) -> EncodeError {
 const IDR: Option<u16> = Some(ffi::FRAMETYPE_I | ffi::FRAMETYPE_REF | ffi::FRAMETYPE_IDR);
 
 #[test]
-fn h264_low_power_cbr_with_an_idr_on_request() {
+fn h264_cbr_with_an_idr_on_request() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut enc = session(Box::new(fake), &cfg(Codec::H264, 1920, 1080, 6000)).unwrap();
     {
@@ -428,7 +428,7 @@ fn h264_low_power_cbr_with_an_idr_on_request() {
         );
         let m = p.mfx;
         assert_eq!(m.codec_id, ffi::CODEC_AVC);
-        assert_eq!(m.low_power, ffi::CODINGOPTION_ON);
+        assert_eq!(m.low_power, ffi::CODINGOPTION_OFF);
         assert_eq!(m.target_usage, ffi::TARGETUSAGE_BEST_SPEED);
         assert_eq!((m.gop_ref_dist, m.num_ref_frame), (1, 1), "no B frames");
         assert_eq!((m.gop_pic_size, m.idr_interval), (u16::MAX, 0));
@@ -524,42 +524,19 @@ fn av1_and_others_are_refused() {
 }
 
 #[test]
-fn low_power_off_when_the_runtime_refuses_it() {
-    let (mut fake, log) = Fake::new(Codec::H264);
-    fake.query = VecDeque::from([-3]);
-    encode(
-        session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000))
-            .unwrap()
-            .as_mut(),
-        640,
-        480,
-        false,
-    );
-    let l = log.lock().unwrap();
-    assert_eq!(l.queried[0].mfx.low_power, ffi::CODINGOPTION_ON);
-    assert_eq!(l.inited.len(), 1);
-    assert_eq!(l.inited[0].mfx.low_power, ffi::CODINGOPTION_OFF);
-
-    let (mut fake, log) = Fake::new(Codec::H264);
-    fake.init = VecDeque::from([-15]);
-    assert!(session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000)).is_ok());
-    let l = log.lock().unwrap();
-    assert_eq!(
-        l.inited.iter().map(|p| p.mfx.low_power).collect::<Vec<_>>(),
-        vec![ffi::CODINGOPTION_ON, ffi::CODINGOPTION_OFF],
-        "an Init that refuses LowPower is tried without it"
-    );
-
+fn the_refusal_that_turned_low_power_on_is_kept() {
+    let c = cfg(Codec::H264, 640, 480, 2000);
     let (mut fake, _) = Fake::new(Codec::H264);
-    fake.query = VecDeque::from([-3, -3]);
-    let e = session(Box::new(fake), &cfg(Codec::H264, 640, 480, 2000))
-        .err()
-        .unwrap();
-    assert!(
-        e.0.contains("LowPower on: MFXVideoENCODE_Query: MFX_ERR_UNSUPPORTED")
-            && e.0.contains("LowPower off"),
-        "{e}"
+    fake.query = VecDeque::from([-3]);
+    let s = super::session::Session::new(Box::new(fake), &c).unwrap();
+    assert!(s.low_power);
+    assert_eq!(
+        s.low_power_why.as_deref(),
+        Some("LowPower off: MFXVideoENCODE_Query: MFX_ERR_UNSUPPORTED")
     );
+    let (fake, _) = Fake::new(Codec::H264);
+    let s = super::session::Session::new(Box::new(fake), &c).unwrap();
+    assert!(!s.low_power && s.low_power_why.is_none());
 }
 
 #[test]
@@ -654,7 +631,7 @@ fn a_hung_or_lost_device_stops_the_session_without_another_call() {
 }
 
 #[test]
-fn a_fatal_query_stops_instead_of_trying_without_low_power() {
+fn a_fatal_query_stops_instead_of_trying_with_low_power() {
     for status in [
         ffi::ERR_DEVICE_LOST,
         ffi::ERR_DEVICE_FAILED,
@@ -672,7 +649,7 @@ fn a_fatal_query_stops_instead_of_trying_without_low_power() {
         );
         assert!(e.0.starts_with(super::driver::STOPPED), "{e}");
         let l = log.lock().unwrap();
-        assert_eq!(l.queried.len(), 1, "no second Query with LowPower off");
+        assert_eq!(l.queried.len(), 1, "no second Query with LowPower on");
         assert!(l.inited.is_empty() && !l.dropped);
     }
 }
