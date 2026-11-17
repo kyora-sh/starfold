@@ -10,7 +10,7 @@
 
 use super::driver::STOPPED;
 use super::proc::{NotStarted, Pipes, Proc, Ready};
-use super::remote::Policy;
+use super::remote::{Policy, Then};
 use crate::encoder::caps::{Probe as Found, ProbeProvider, ProbeStatus};
 use crate::encoder::{isolate, Backend, Codec};
 use std::sync::{Arc, Mutex};
@@ -129,7 +129,8 @@ impl ProbeProvider for Probe {
 
 impl Probe {
     /// Runs the probe helper, tracked by the policy as any helper is: given up with them,
-    /// and its deadline held by the watchdog as well as here.
+    /// and its deadlines held by the watchdog as well as here. Each phase ends through
+    /// [`Policy::settle`], so one that ends at or past its deadline is a miss.
     fn run(&self) -> Found {
         let (proc, pipes) = match (self.spawn)() {
             Ok(p) => p,
@@ -156,10 +157,10 @@ impl Probe {
             Err(e) => return Found::failed(Backend::Qsv, e),
         };
         let deadline = Instant::now() + self.timeout;
-        self.policy.due(id, Some((deadline, "probing")));
-        let found = self.read(id, &proc, rx, deadline);
-        self.policy.forget(id);
-        found
+        if !self.policy.settle(id, Then::Due(deadline, "probing")) {
+            return Found::default();
+        }
+        self.read(id, &proc, rx, deadline)
     }
 
     fn read(&self, id: u64, proc: &Arc<Proc>, mut rx: Box<dyn Ready>, deadline: Instant) -> Found {
@@ -190,17 +191,24 @@ impl Probe {
         };
         drop(rx);
         if let Some(e) = broke {
-            self.policy.end(proc);
+            if self.policy.settle(id, Then::Forget) {
+                self.policy.end(proc);
+            }
             return Found::failed(Backend::Qsv, e);
         }
         let exit = Instant::now() + self.policy.timing().grace;
-        self.policy.due(id, Some((exit, "exiting after the probe")));
+        if !self.policy.settle(id, Then::Due(exit, "exiting after the probe")) {
+            return Found::default();
+        }
         while !proc.exited() && Instant::now() < exit {
             std::thread::sleep(POLL);
         }
         if !proc.exited() {
             self.policy.missed(proc, "exiting after the probe");
             return Found::failed(Backend::Qsv, "probe closed its output but did not exit");
+        }
+        if !self.policy.settle(id, Then::Forget) {
+            return Found::default();
         }
         isolate::parse(&out, Backend::Qsv)
     }

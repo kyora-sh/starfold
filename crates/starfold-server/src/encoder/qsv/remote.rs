@@ -66,6 +66,14 @@ struct State {
     watchdog: bool,
 }
 
+/// What [`Policy::settle`] does to a helper's entry: a new deadline, none, or off the list
+/// (the caller ends the helper).
+pub enum Then {
+    Due(Instant, &'static str),
+    Clear,
+    Forget,
+}
+
 /// Starts the thread that enforces `policy`'s deadlines.
 pub type StartWatchdog = fn(&'static Policy) -> std::io::Result<()>;
 
@@ -239,28 +247,34 @@ impl Policy {
         Ok(id)
     }
 
-    pub(super) fn due(&self, id: u64, due: Option<(Instant, &'static str)>) {
-        if let Some(l) = self.lock().live.iter_mut().find(|l| l.id == id) {
-            l.due = due;
-        }
-    }
-
-    /// Whether helper `id`'s reply came within `until`, clearing its deadline if so. A reply
-    /// read at or past it is a miss, however long it has been waiting to be read.
-    fn answered(&self, id: u64, until: Instant) -> bool {
-        let mut s = self.lock();
-        if s.off.is_some() || Instant::now() >= until {
-            return false;
-        }
-        if let Some(l) = s.live.iter_mut().find(|l| l.id == id) {
-            l.due = None;
-        }
-        true
-    }
-
-    /// Takes helper `id` off the list; the caller ends it.
-    pub(super) fn forget(&self, id: u64) {
-        self.lock().live.retain(|l| l.id != id);
+    /// The one way a helper's entry changes once it is registered (a give-up takes them all).
+    /// Under the lock the clock is read first: an entry at or past its deadline is a miss,
+    /// however the helper's work ended or how long that took to be seen, so Quick Sync is
+    /// given up with that helper and `then` is not applied. Whether `then` was applied;
+    /// false too if Quick Sync is off or `id` is no longer listed.
+    pub(super) fn settle(&self, id: u64, then: Then) -> bool {
+        let (proc, what) = {
+            let mut s = self.lock();
+            if s.off.is_some() {
+                return false;
+            }
+            let Some(i) = s.live.iter().position(|l| l.id == id) else {
+                return false;
+            };
+            match s.live[i].due {
+                Some((at, what)) if Instant::now() >= at => (s.live[i].proc.clone(), what),
+                _ => {
+                    match then {
+                        Then::Due(at, what) => s.live[i].due = Some((at, what)),
+                        Then::Clear => s.live[i].due = None,
+                        Then::Forget => drop(s.live.remove(i)),
+                    }
+                    return true;
+                }
+            }
+        };
+        self.missed(&proc, what);
+        false
     }
 
     fn watch(&'static self) {
@@ -467,8 +481,10 @@ impl Remote {
 
     /// The helper died or broke the protocol: it is ended and counted.
     fn broke(&mut self, what: &str) -> EncodeError {
+        if !self.policy.settle(self.id, Then::Forget) && self.policy.off().is_some() {
+            return self.stopped();
+        }
         let why = format!("helper {} {what}", self.proc.id());
-        self.policy.forget(self.id);
         self.policy.end(&self.proc);
         self.policy.died(&why);
         self.gone = Some(why);
@@ -495,11 +511,14 @@ impl Remote {
         deadline: Duration,
     ) -> Result<Reply, EncodeError> {
         let until = Instant::now() + deadline;
-        self.policy.due(self.id, Some((until, what)));
+        if !self.policy.settle(self.id, Then::Due(until, what)) {
+            return Err(self.stopped());
+        }
         self.send(req, what, until)?;
         match self.next(until)? {
-            Some(r) if self.policy.answered(self.id, until) => Ok(r),
-            _ => {
+            Some(r) if self.policy.settle(self.id, Then::Clear) => Ok(r),
+            Some(_) => Err(self.stopped()),
+            None => {
                 self.policy.missed(&self.proc, what);
                 Err(self.stopped())
             }
@@ -509,7 +528,7 @@ impl Remote {
     /// Sets this helper's deadline for `what` to now, as a request that is overdue.
     #[cfg(all(test, unix))]
     pub fn overdue(&self, what: &'static str) {
-        self.policy.due(self.id, Some((Instant::now(), what)));
+        self.policy.settle(self.id, Then::Due(Instant::now(), what));
     }
 
     /// The next reply, waiting until `until` at most; `None` if none came.
@@ -608,7 +627,7 @@ impl Drop for Remote {
     /// Closes the helper's stdin, gives it a moment to leave, then ends it either way. One
     /// found dead before that died on its own: it counts.
     fn drop(&mut self) {
-        self.policy.forget(self.id);
+        self.policy.settle(self.id, Then::Forget);
         let died = self.gone.is_none() && self.policy.off().is_none() && self.proc.exited();
         let pipes = std::mem::replace(&mut self.pipes, closed());
         drop(pipes);

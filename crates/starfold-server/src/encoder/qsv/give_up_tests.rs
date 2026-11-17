@@ -4,7 +4,7 @@
 //! helper would.
 
 use super::probe::{Probe as Prober, Verified};
-use super::proc::{self, NotStarted, Pipes, Proc};
+use super::proc::{self, NotStarted, Pipes, Proc, Ready};
 use super::proto::{Reply, Unit};
 use super::remote::{Policy, Remote, Timing};
 use super::tests::bitstream;
@@ -279,6 +279,131 @@ fn every_missed_deadline_and_stopped_device_gives_quick_sync_up() {
         let pid = Arc::new(AtomicU32::new(0));
         let seen = drive(p, pid.clone());
         if let Some(w) = after(p, pid.load(Ordering::SeqCst), said) {
+            wrong.push(format!("{name}: {w} (the caller saw: {seen})"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// Reads as `inner` does but takes `delay` to see its end, as a reader descheduled just as
+/// the helper's output ends.
+struct SlowEnd {
+    inner: Box<dyn Ready>,
+    delay: Duration,
+}
+
+impl Ready for SlowEnd {
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        let r = self.inner.read_ready(buf);
+        if matches!(r, Ok(Some(0))) {
+            std::thread::sleep(self.delay);
+        }
+        r
+    }
+
+    fn write_ready(&mut self, buf: &[u8]) -> std::io::Result<Option<usize>> {
+        self.inner.write_ready(buf)
+    }
+}
+
+/// `start`, then `wait` for the helper to write what it will, its output's end seen
+/// `delay` late.
+fn late_end(
+    start: impl Fn() -> Result<(Proc, Pipes), NotStarted> + Send + 'static,
+    wait: Duration,
+    delay: Duration,
+) -> impl Fn() -> Result<(Proc, Pipes), NotStarted> + Send + 'static {
+    move || {
+        let (p, Pipes { tx, rx }) = start()?;
+        std::thread::sleep(wait);
+        let rx = Box::new(SlowEnd { inner: rx, delay });
+        Ok((p, Pipes { tx, rx }))
+    }
+}
+
+/// A probe that verifies H.264, started by `spawn` under `p`: what it said, and whether
+/// H.264 came out verified.
+fn verifying_probe(
+    p: &'static Policy,
+    spawn: impl Fn() -> Result<(Proc, Pipes), NotStarted> + Send + 'static,
+    timeout: Duration,
+) -> String {
+    let verified: &'static Verified = Box::leak(Box::default());
+    let found = Prober {
+        helpers: true,
+        spawn: Box::new(spawn),
+        policy: p,
+        verified,
+        timeout,
+    }
+    .probe();
+    let notes: Vec<&str> = found
+        .diagnostics
+        .iter()
+        .map(|d| d.reason.as_str())
+        .collect();
+    match verified.adapter(Codec::H264) {
+        Some(_) => format!("{}; H.264 VERIFIED", notes.join("; ")),
+        None => notes.join("; "),
+    }
+}
+
+fn verified_report() -> String {
+    report(vec![cap(Codec::H264, ProbeStatus::Verified)], &[])
+}
+
+type Late = fn(Arc<AtomicU32>) -> (&'static Policy, String);
+
+/// Work that ends at or past its deadline, seen by the caller before any watchdog looks,
+/// is a miss however it ended: a closed pipe, the probe's output ending, or its exit.
+#[test]
+fn work_that_ends_past_its_deadline_is_a_miss() {
+    let rows: [(&str, &str, Late); 3] = [
+        (
+            "a frame's helper closes its stdout late",
+            "missed its deadline (a frame)",
+            |pid| {
+                let p = unwatched(T);
+                let start = sh(format!("{}; exec 1>&-; sleep 30", opened()), pid);
+                let spawn = late_end(start, Duration::ZERO, T.frame + T.frame);
+                let mut enc = Remote::open(p, spawn, &cfg(), 1).unwrap();
+                (p, frame(&mut enc).err().map(|e| e.0).unwrap_or_default())
+            },
+        ),
+        (
+            "the probe's output ends late",
+            "missed its deadline (probing)",
+            |pid| {
+                let p = unwatched(T);
+                let wait = Duration::from_millis(300);
+                let spawn = late_end(sh(verified_report(), pid), wait, wait);
+                (p, verifying_probe(p, spawn, Duration::from_millis(100)))
+            },
+        ),
+        (
+            "the probe exits late",
+            "missed its deadline (exiting after the probe)",
+            |pid| {
+                let p = unwatched(Timing {
+                    grace: Duration::ZERO,
+                    ..T
+                });
+                let wait = Duration::from_millis(300);
+                let spawn = late_end(sh(verified_report(), pid), wait, Duration::ZERO);
+                (p, verifying_probe(p, spawn, T.open))
+            },
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, said, drive) in rows {
+        let pid = Arc::new(AtomicU32::new(0));
+        let (p, seen) = drive(pid.clone());
+        let w = if seen.contains("H.264 VERIFIED") {
+            Some("H.264 verified".to_string())
+        } else {
+            after(p, pid.load(Ordering::SeqCst), said)
+        };
+        if let Some(w) = w {
             wrong.push(format!("{name}: {w} (the caller saw: {seen})"));
         }
     }
