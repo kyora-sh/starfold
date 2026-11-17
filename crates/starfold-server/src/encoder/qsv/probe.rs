@@ -197,7 +197,10 @@ impl Probe {
             return Found::failed(Backend::Qsv, e);
         }
         let exit = Instant::now() + self.policy.timing().grace;
-        if !self.policy.settle(id, Then::Due(exit, "exiting after the probe")) {
+        if !self
+            .policy
+            .settle(id, Then::Due(exit, "exiting after the probe"))
+        {
             return Found::default();
         }
         while !proc.exited() && Instant::now() < exit {
