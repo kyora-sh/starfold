@@ -3352,10 +3352,7 @@ fn a_replaced_encoder_gets_the_share_of_the_new_one() {
         "no encode after the replacement: {last:?}"
     );
     for k in after {
-        assert!(
-            near(k, stripe_share(target, 1, false)),
-            "{k} at {target}"
-        );
+        assert!(near(k, stripe_share(target, 1, false)), "{k} at {target}");
     }
 }
 
