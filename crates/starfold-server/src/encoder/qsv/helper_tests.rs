@@ -63,6 +63,12 @@ fn requests_and_replies_round_trip() {
     let replies = [
         Reply::Opened {
             low_power: true,
+            holds_cap: false,
+            name: "mfx-gen".into(),
+        },
+        Reply::Opened {
+            low_power: false,
+            holds_cap: true,
             name: "mfx-gen".into(),
         },
         Reply::Done {
@@ -191,6 +197,7 @@ fn the_helper_serves_a_session() {
         replies[0],
         Reply::Opened {
             low_power: false,
+            holds_cap: true,
             name: "fake-gen".into()
         }
     );
@@ -210,6 +217,29 @@ fn the_helper_serves_a_session() {
         Reply::RateSet { kbps: 5_000 },
         "what the encoder reads back that it runs"
     );
+}
+
+/// The helper says whether its session holds its cap: a capped one runs constant bitrate,
+/// an uncapped one constant QP.
+#[test]
+fn the_helper_says_whether_its_session_holds_its_cap() {
+    for (max_kbps, holds) in [(2000, true), (0, false)] {
+        let (fake, _) = Fake::new(Codec::H264);
+        let mut o = open(Codec::H264, 640, 480);
+        o.rate.max_kbps = max_kbps;
+        let mut out = Vec::new();
+        let input = Request::Open(o).bytes();
+        serve(
+            input.as_slice(),
+            &mut out,
+            |o| Ok(grey(o)),
+            session_on(fake),
+        );
+        match Reply::parse(&bodies(&out)[0]).unwrap() {
+            Reply::Opened { holds_cap, .. } => assert_eq!(holds_cap, holds, "{max_kbps}"),
+            r => panic!("{r:?}"),
+        }
+    }
 }
 
 #[test]
@@ -359,6 +389,46 @@ fn stats_say_why_quick_sync_is_off_as_it_stands_now() {
     assert!(turned_off().is_empty(), "no Quick Sync on this platform");
 }
 
+/// After a give-up, a codec whose Quick Sync offer no stream used is not listed as using
+/// it: only the H.264 stream failed over to software, so HEVC's offer stayed in the
+/// snapshot.
+#[test]
+fn stats_list_no_backend_that_is_off_as_chosen() {
+    use crate::encoder::{with_live, Backend, Codec, SOFTWARE_H264};
+    use crate::negotiate::{chosen, Candidate};
+    let qsv = |codec| Candidate {
+        codec,
+        backend: Backend::Qsv,
+        hardware: true,
+    };
+    let sw = Candidate {
+        codec: Codec::H264,
+        backend: SOFTWARE_H264,
+        hardware: false,
+    };
+    let live = [qsv(Codec::Hevc), sw];
+    let snapshot = serde_json::json!({
+        "mode": "qsv",
+        "chosen": chosen(&live),
+        "failed": [{"codec": "h264", "backend": "qsv", "reason": "keeps failing"}],
+    });
+    let why = "qsv given up: a second helper failed (helper 7 closed its stdout)";
+    let off = [(Backend::Qsv, why.to_string())];
+    let e = with_live(&snapshot, &off);
+    assert_eq!(e["chosen"], serde_json::json!(chosen(&[sw])), "{e}");
+    assert_eq!(e["failed"][0]["reason"], why);
+    assert_eq!(e["off"][0]["backend"], serde_json::json!(Backend::Qsv));
+    assert_eq!(with_live(&snapshot, &[])["chosen"], snapshot["chosen"]);
+
+    let only =
+        serde_json::json!({"mode": "qsv", "chosen": chosen(&[qsv(Codec::Hevc)]), "failed": []});
+    assert_eq!(
+        with_live(&only, &off)["chosen"],
+        serde_json::json!([]),
+        "a codec whose only candidate is off has no chosen entry"
+    );
+}
+
 #[cfg(unix)]
 mod remote {
     use super::super::probe::{self, luid_of, Verified};
@@ -395,8 +465,14 @@ mod remote {
     }
 
     fn opened() -> String {
+        opened_holding(true)
+    }
+
+    /// A helper's open, its session holding its cap or not.
+    fn opened_holding(holds_cap: bool) -> String {
         let opened = says(&Reply::Opened {
             low_power: true,
+            holds_cap,
             name: "fake-gen".into(),
         });
         format!("{}; {opened}", super::super::r1_tests::READS_OPEN)
@@ -494,6 +570,7 @@ mod remote {
     fn open_line(low_power: bool) -> (u32, String) {
         let opened = says(&Reply::Opened {
             low_power,
+            holds_cap: true,
             name: "fake-gen".into(),
         });
         let reads = super::super::r1_tests::READS_OPEN;
@@ -868,5 +945,17 @@ mod remote {
             why.starts_with("qsv given up: the probe: ") && why.contains("MFX_ERR_GPU_HANG"),
             "{e}"
         );
+    }
+
+    /// The helper's encoder holds its cap as the helper's session said when it opened.
+    #[test]
+    fn the_helpers_encoder_holds_its_cap_as_its_session_does() {
+        for holds in [true, false] {
+            let enc = start(
+                policy(QUICK),
+                format!("{}; sleep 30", opened_holding(holds)),
+            );
+            assert_eq!(enc.holds_cap(), holds);
+        }
     }
 }

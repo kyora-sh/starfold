@@ -120,6 +120,7 @@ pub fn serve(
             }
             let opened = Reply::Opened {
                 low_power: s.low_power,
+                holds_cap: s.holds_cap(),
                 name,
             };
             if !reply(&mut output, &opened) {

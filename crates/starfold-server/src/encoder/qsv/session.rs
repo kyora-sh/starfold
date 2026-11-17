@@ -123,10 +123,11 @@ fn signal(c: ColorInfo) -> ExtVideoSignalInfo {
 }
 
 /// The most kbit/s a Reset may put in TargetKbps for a stream capped at `cap_kbps` and
-/// coded at `fps`: a first keyframe's boost of the largest share one stripe gets, held to
-/// its budget per picture at the slowest rate the stream budgets for.
+/// coded at `fps`: a first keyframe's boost of the largest share one stripe can get (an
+/// encoder that doesn't hold its cap; one that does gets less), held to its budget per
+/// picture at the slowest rate the stream budgets for.
 fn ceiling_kbps(cap_kbps: u32, fps: u32) -> u64 {
-    let share = crate::video::stripe_share(cap_kbps, 1);
+    let share = crate::video::stripe_share(cap_kbps, 1, false);
     let boost = crate::video::keyframe_rate(0.0, share, fps).max_kbps as u64;
     boost * fps.max(1) as u64 / crate::video::FPS_FLOOR.min(fps.max(1)) as u64
 }
@@ -632,5 +633,9 @@ impl VideoEncoder for Session {
 
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
+    }
+
+    fn holds_cap(&self) -> bool {
+        self.rc.cbr
     }
 }
