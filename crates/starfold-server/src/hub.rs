@@ -449,7 +449,8 @@ pub struct Hub {
     /// `--encoder` and the encoder each codec streams from, for /stats.
     pub encoder: Mutex<serde_json::Value>,
     /// The backends turned off for this process and why ([`crate::encoder::turned_off`]; a
-    /// fake in tests). The video thread reads it each time it routes viewers.
+    /// fake in tests). Read when a hello is built and each time the video thread routes
+    /// viewers.
     pub off: Mutex<Off>,
 }
 
@@ -563,8 +564,17 @@ impl Hub {
     }
 
     /// The `hello` message: current geometry plus the server's settings, and for
-    /// protocol 2 clients the codecs on offer. `stripes` is the H.264 stream's layout.
+    /// protocol 2 clients the codecs on offer, without the backends that are off as it is
+    /// built. `stripes` is the H.264 stream's layout.
     pub fn hello(&self) -> String {
+        let off: Vec<crate::encoder::Backend> = self.off().into_iter().map(|(b, _)| b).collect();
+        let offers: Vec<Offer> = self
+            .offers
+            .lock()
+            .iter()
+            .filter(|o| !off.contains(&o.cand.backend))
+            .cloned()
+            .collect();
         let mut m = self.hello_extra.lock().clone();
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
@@ -575,7 +585,7 @@ impl Hub {
             "offer".into(),
             self.offer_gen.load(Ordering::Relaxed).into(),
         );
-        m.insert("videoOffers".into(), serde_json::json!(*self.offers.lock()));
+        m.insert("videoOffers".into(), serde_json::json!(offers));
         serde_json::Value::Object(m).to_string()
     }
 

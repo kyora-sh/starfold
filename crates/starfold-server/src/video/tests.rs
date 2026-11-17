@@ -880,10 +880,28 @@ fn a_backend_that_is_off_is_not_offered() {
     );
 }
 
-/// A backend turned off while a viewer streams from it: every connected viewer gets a new
-/// hello without it, and the viewer moves to the next codec.
+/// What a hello built now offers.
+fn hello_offers(hub: &Hub) -> serde_json::Value {
+    let h: serde_json::Value = serde_json::from_str(&hub.hello()).unwrap();
+    h["videoOffers"].clone()
+}
+
+/// The offers of `cands` at this size, as a hello carries them (it does not name the
+/// backend, so they are told apart by the offer itself).
+fn offers_of(hub: &Hub, cands: &[Candidate]) -> serde_json::Value {
+    let all = hub.offers.lock().clone();
+    let v: Vec<_> = cands
+        .iter()
+        .filter_map(|c| all.iter().find(|o| o.cand == *c))
+        .collect();
+    serde_json::json!(v)
+}
+
+/// A backend turned off while a viewer streams from it: the next hello built leaves it out
+/// at once, the plan moves the viewer to the next codec, and no viewer is sent a new
+/// hello for it (connected viewers keep the offers they had).
 #[test]
-fn a_backend_turned_off_is_taken_out_of_every_viewers_offers() {
+fn a_backend_turned_off_is_left_out_of_the_next_hello() {
     let hub = Hub::new();
     let off = fake_off(&hub);
     let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
@@ -896,28 +914,58 @@ fn a_backend_turned_off_is_taken_out_of_every_viewers_offers() {
     off.lock()
         .unwrap()
         .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
     hub.replan();
     push(&mut eng);
-    let m = drain(&mut rx);
-    let h = hellos(&m);
-    assert_eq!(h.len(), 1, "one new hello");
-    let codecs: Vec<&str> = h[0]["videoOffers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|o| o["codec"].as_str())
-        .collect();
-    assert_eq!(codecs, vec!["h264"]);
-    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen + 1);
+    assert!(hellos(&drain(&mut rx)).is_empty(), "no new hello");
+    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen);
     assert_eq!(eng.failed, vec![HEVC]);
     assert!(eng.why.contains(&(HEVC, GIVEN_UP.to_string())));
-    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
-    push(&mut eng);
     assert_eq!(route_codec(&c), Some(Codec::H264));
-    // Nothing changed since: no further hello.
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+}
+
+/// The H.264 stream's own backend turned off: a hello built before the engine routes again
+/// already offers the H.264 encoder it falls back to, never the one that is off.
+#[test]
+fn a_hello_never_offers_an_h264_encoder_that_is_off() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let mut eng = engine(&hub, &[H264_HW, H264], Opts::default());
+    assert_eq!(eng.h264, H264_HW);
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264_HW, H264]));
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
     hub.replan();
     push(&mut eng);
-    assert!(hellos(&drain(&mut rx)).is_empty());
+    assert_eq!(eng.h264, H264);
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+}
+
+/// A backend that goes off while the engine is being built (one of its own sample encodes
+/// gives it up) is left out of every hello from the start.
+#[test]
+fn a_backend_that_goes_off_while_the_engine_starts_is_not_offered() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let base = fakes(Opts::default());
+    let flip = off.clone();
+    let open: Open = Arc::new(move |c: &EncoderConfig| {
+        if c.codec == Codec::H264 && c.backend == Backend::VideoToolbox {
+            flip.lock()
+                .unwrap()
+                .push((Backend::VideoToolbox, GIVEN_UP.into()));
+        }
+        base(c)
+    });
+    let mut eng = Engine::new(config(), hub.clone(), W, H, &[HEVC, H264_HW, H264], open).unwrap();
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+    hub.replan();
+    push(&mut eng);
+    assert_eq!(eng.h264, H264);
+    assert!(eng.failed.contains(&HEVC) && eng.failed.contains(&H264_HW));
 }
 
 #[test]
