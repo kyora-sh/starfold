@@ -6,6 +6,7 @@
 use super::probe::{Probe as Prober, Verified};
 use super::proc::{self, NotStarted, Pipes, Proc, Ready};
 use super::proto::{Reply, Unit};
+use super::r1_tests::READS_OPEN;
 use super::remote::{Policy, Remote, Timing};
 use super::tests::bitstream;
 use crate::encoder::caps::{Acceleration, EncoderCapability, ProbeProvider, ProbeStatus};
@@ -46,10 +47,11 @@ fn says(r: &Reply) -> String {
 }
 
 fn opened() -> String {
-    says(&Reply::Opened {
+    let opened = says(&Reply::Opened {
         low_power: true,
         name: "fake-gen".into(),
-    })
+    });
+    format!("{READS_OPEN}; {opened}")
 }
 
 fn done() -> String {

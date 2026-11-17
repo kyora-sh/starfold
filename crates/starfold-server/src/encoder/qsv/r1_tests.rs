@@ -35,11 +35,21 @@ fn says(r: &Reply) -> String {
     format!("printf '{octal}'")
 }
 
+/// A shell line that reads the server's Open request (its four-byte length, read as the
+/// host's little-endian u32, then that many bytes) a byte at a time. A fake helper that
+/// starts with it can't exit, crash or close its stdin before that write has landed, which
+/// would fail the open with a broken pipe.
+pub(super) const READS_OPEN: &str = concat!(
+    "n=$(( $(dd bs=1 count=4 2>/dev/null | od -An -tu4) )); ",
+    "dd bs=1 count=$n of=/dev/null 2>/dev/null"
+);
+
 fn opened() -> String {
-    says(&Reply::Opened {
+    let opened = says(&Reply::Opened {
         low_power: true,
         name: "fake-gen".into(),
-    })
+    });
+    format!("{READS_OPEN}; {opened}")
 }
 
 fn done(slot: u8, key: bool) -> String {
