@@ -464,7 +464,11 @@ impl Remote {
         } else {
             "LowPower off"
         };
-        format!("qsv helper {}: opened {}, {mode}", self.proc.id(), self.name)
+        format!(
+            "qsv helper {}: opened {}, {mode}",
+            self.proc.id(),
+            self.name
+        )
     }
 
     /// The helper's process id.

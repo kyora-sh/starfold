@@ -19,10 +19,10 @@ mod helper;
 mod helper_tests;
 #[cfg(windows)]
 mod locate;
-#[cfg(all(test, unix))]
-mod mode_tests;
 #[cfg(test)]
 mod low_power_tests;
+#[cfg(all(test, unix))]
+mod mode_tests;
 mod probe;
 mod proc;
 mod proto;
