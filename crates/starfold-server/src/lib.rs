@@ -443,10 +443,15 @@ async fn serve(a: HashMap<String, String>) {
         mic,
         resize: resize_on,
         read_only,
-        // GET /screenshot, /record; --max-record-seconds caps a recording's length.
+        // GET /screenshot; /record* with --enable-recording (off by default), spooled to
+        // --recording-dir; --max-record-seconds caps a recording's length.
         recorder: record::Recorder::new(
             hub.clone(),
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
+            truthy(a.get("enable-recording"), false),
+            a.get("recording-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(record::default_dir),
         ),
         // --title: the browser tab's title.
         index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),

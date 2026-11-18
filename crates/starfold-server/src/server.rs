@@ -711,7 +711,12 @@ mod tests {
             mic,
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            recorder: crate::record::Recorder::new(
+                hub.clone(),
+                Duration::from_secs(1),
+                true,
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
