@@ -387,9 +387,9 @@ binary". Its `--version` says so too, its `--help` doesn't offer `--openh264-lib
     system's dynamic loader loads those from the usual library paths, as it does starfold's own
     libraries, and starfold doesn't hash them.
 - **Other platforms:** not yet. On macOS, Windows, Linux with musl (static or not), x32 and
-  big-endian arm64 (`aarch64_be`), `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the startup
-  log say "OpenH264 (Cisco) is not available on this platform yet", in the starfold binary and
-  in a program that embeds the library alike. `--help` doesn't offer `--openh264-lib` there,
+  big-endian arm64 (`aarch64_be`), `openh264-cisco` builds, and OpenH264 is unavailable.
+  `--version`, `--help` and the startup log say "OpenH264 (Cisco) is not available on this
+  platform yet", in the starfold binary and in a program that embeds the library alike. `--help` doesn't offer `--openh264-lib` there,
   and its `--crf` entry doesn't name openh264.
   - `/stats` says so too when another encoder serves H.264 and starfold starts.
   - Without one, as in a build without x264 and with no usable hardware H.264 encoder, starfold
