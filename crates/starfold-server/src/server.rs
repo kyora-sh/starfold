@@ -729,7 +729,12 @@ mod tests {
             mic,
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1), true),
+            recorder: crate::record::Recorder::new(
+                hub.clone(),
+                Duration::from_secs(1),
+                true,
+                crate::record::default_dir(),
+            ),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
@@ -997,7 +1002,12 @@ mod tests {
         hub.width.store(64, Ordering::Relaxed);
         hub.height.store(32, Ordering::Relaxed);
         let mut s = app(&hub, false, None);
-        s.recorder = crate::record::Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        s.recorder = crate::record::Recorder::new(
+            hub.clone(),
+            Duration::from_secs(30),
+            true,
+            crate::record::default_dir(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });

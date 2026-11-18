@@ -2,13 +2,27 @@
 //! encode thread hands each frame of the cohort being recorded to every tap as it hands it
 //! to the viewers, with the size its encoder was opened at. A tap is not a hub client:
 //! flow control, the cohort's display rate, its bitrate and `deliver` never see it.
+//!
+//! A frame waiting for a recording's disk is the stream's own buffer, shared with the
+//! viewers, and counts against the recording's queue until written: at most [`QUEUE`]
+//! bytes, or one frame of up to [`LARGEST_FRAME`] into an empty queue. A frame that does
+//! not fit ends the recording; it is never queued.
 
 use super::End;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
+
+/// The most a recording's queue holds while the disk catches up. A keyframe at the
+/// default 8 Mbit/s cap is budgeted at about 1 MiB (4x the cap, at 30 fps); deltas are a few
+/// tens of KiB.
+pub const QUEUE: usize = 4 << 20;
+/// The largest frame a recording takes, and only into an empty queue.
+pub const LARGEST_FRAME: usize = 8 << 20;
+/// What a queued frame costs besides its bytes (its message and the channel's slot).
+pub const OVERHEAD: usize = 256;
 
 /// One encoded frame as a recording gets it.
 pub struct Tapped {
@@ -18,6 +32,8 @@ pub struct Tapped {
     pub captured_at: Instant,
     /// The protocol 1 message, header included (Annex-B from byte 16 on).
     pub data: Bytes,
+    /// What it counts against the queue until [`Tap::release`]d.
+    pub charge: usize,
 }
 
 pub enum Msg {
@@ -31,12 +47,51 @@ pub struct Tap {
     tx: mpsc::Sender<Msg>,
     /// Has had a keyframe from the cohort it records now.
     started: AtomicBool,
+    /// Bytes handed over and not yet written.
+    queued: AtomicUsize,
+    /// Takes no more frames.
+    closed: AtomicBool,
 }
 
 impl Tap {
     /// Ends the recording: frames handed over before this are recorded, none after.
     pub fn end(&self, why: End) {
         let _ = self.tx.send(Msg::End(why));
+    }
+
+    /// A frame's bytes were written (or dropped).
+    pub fn release(&self, charge: usize) {
+        self.queued.fetch_sub(charge, Ordering::AcqRel);
+    }
+
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Takes no more frames; true the first time.
+    pub fn close(&self) -> bool {
+        !self.closed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Hands over one frame if it fits the queue; else ends the recording.
+    fn admit(&self, f: Tapped) {
+        let q = self.queued();
+        if q + f.charge > QUEUE && !(q == 0 && f.charge <= LARGEST_FRAME) {
+            if self.close() {
+                self.end(match f.charge > LARGEST_FRAME {
+                    true => End::LargeFrame,
+                    false => End::DiskSlow,
+                });
+            }
+            return;
+        }
+        self.queued.fetch_add(f.charge, Ordering::AcqRel);
+        let _ = self.tx.send(Msg::Frame(f));
     }
 }
 
@@ -95,6 +150,8 @@ impl Taps {
             id: self.next.fetch_add(1, Ordering::Relaxed),
             tx,
             started: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
         });
         self.list.lock().push(tap.clone());
         self.key.store(true, Ordering::Release);
@@ -125,6 +182,9 @@ impl Taps {
             self.key.store(false, Ordering::Release);
         }
         for t in list.iter() {
+            if t.closed.load(Ordering::Acquire) {
+                continue;
+            }
             if !t.started.load(Ordering::Acquire) {
                 if !all_key {
                     continue;
@@ -133,15 +193,18 @@ impl Taps {
             }
             let [data] = msgs else {
                 // A recording is one picture per frame; this stream no longer is.
-                t.end(End::Closed);
+                if t.close() {
+                    t.end(End::Closed);
+                }
                 continue;
             };
-            let _ = t.tx.send(Msg::Frame(Tapped {
+            t.admit(Tapped {
                 size,
                 key: all_key,
                 captured_at,
                 data: data.clone(),
-            }));
+                charge: data.len() + OVERHEAD,
+            });
         }
     }
 }

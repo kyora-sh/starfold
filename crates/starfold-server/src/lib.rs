@@ -15,6 +15,8 @@ mod compat;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
+#[cfg(test)]
+mod counting;
 #[cfg(target_os = "linux")]
 mod desktop;
 pub mod encoder;
@@ -40,6 +42,10 @@ mod wait;
 mod win;
 #[cfg(any(windows, test))]
 mod winlib;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: counting::Counting = counting::Counting;
 
 // The macOS and Windows backends provide the same modules with the same interfaces.
 #[cfg(target_os = "macos")]
@@ -153,7 +159,8 @@ fn files_from_args(a: &HashMap<String, String>, read_only: bool) -> Result<files
 }
 
 /// The recorder `serve` uses: GET /screenshot; /record* only with --enable-recording (off
-/// by default); --max-record-seconds caps a recording's length.
+/// by default); --max-record-seconds caps a recording's length; recordings spool in
+/// --recording-dir.
 fn recorder_from_args(
     a: &HashMap<String, String>,
     hub: &std::sync::Arc<hub::Hub>,
@@ -162,7 +169,27 @@ fn recorder_from_args(
         hub.clone(),
         std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
         record::enabled(a),
+        a.get("recording-dir")
+            .map_or_else(record::default_dir, std::path::PathBuf::from),
     )
+}
+
+/// With --enable-recording, recordings may not spool inside --files-root, where the shared
+/// folder would list and serve them.
+fn recording_dir_allowed(a: &HashMap<String, String>) -> Result<(), String> {
+    let (Some(root), true) = (a.get("files-root"), record::enabled(a)) else {
+        return Ok(());
+    };
+    let dir = a
+        .get("recording-dir")
+        .map_or_else(record::default_dir, std::path::PathBuf::from);
+    match record::spool::inside(&dir, std::path::Path::new(root)) {
+        true => Err(format!(
+            "--recording-dir {} is inside --files-root {root}; recordings would be shared there",
+            dir.display()
+        )),
+        false => Ok(()),
+    }
 }
 
 async fn serve(a: HashMap<String, String>) {
@@ -411,6 +438,10 @@ async fn serve(a: HashMap<String, String>) {
             if files.download { "on" } else { "off" },
         ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
+    }
+    if let Err(e) = recording_dir_allowed(&a) {
+        log::error!("{e}");
+        std::process::exit(2);
     }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
