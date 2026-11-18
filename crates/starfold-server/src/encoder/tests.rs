@@ -1177,12 +1177,7 @@ const REFINE_NOISE_DB: f64 = 0.01;
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
-    for (threads, max_bytes) in [
-        (1, None),
-        (1, Some(60_000)),
-        (4, None),
-        (4, Some(60_000)),
-    ] {
+    for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, None), (4, Some(60_000))] {
         let noise = if threads > 1 { REFINE_NOISE_DB } else { 0.0 };
         let mut s = Refining::on(Backend::X264, threads, 30);
         s.enc.set_rate(RateConfig::new(24.0, 3000, 30)).unwrap();
