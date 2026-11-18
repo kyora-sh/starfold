@@ -122,9 +122,11 @@ pub unsafe fn install(handoff: Result<Handoff, String>) -> Result<(), String> {
         from: h.from,
         _keep: Some((h.library, h.memfd)),
     });
-    LIBRARY
-        .set(loaded)
-        .map_err(|_| "OpenH264: a library was already handed over, or the encoders already looked".into())?;
+    if LIBRARY.set(loaded).is_err() {
+        return Err(
+            "OpenH264: a library was already handed over, or the encoders already looked".into(),
+        );
+    }
     HANDED_OVER.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
@@ -224,8 +226,7 @@ fn not_installed() -> Result<Loaded, String> {
     };
     #[cfg(openh264_cisco_loadable)]
     {
-        let o =
-            cisco_load::open_checked(&path, &platform_pins(), platform_file().unwrap(), || {})?;
+        let o = cisco_load::open_checked(&path, &platform_pins(), platform_file().unwrap(), || {})?;
         Ok(Loaded {
             api: Api {
                 create: o.create,

@@ -20,24 +20,26 @@ fn load_openh264() {
     }
     let handoff = match cisco::lib_path(&args) {
         None => Err(cisco::no_library()),
-        Some(path) => {
-            cisco_load::load_alone(&path, &cisco::platform_pins(), cisco::platform_file().unwrap())
-                .map(|o| {
-                    let threads = match o.threads {
-                        Some(1) => "with one thread".to_string(),
-                        n => format!("with an unchecked thread count ({n:?})"),
-                    };
-                    cisco::Handoff {
-                        what: format!("{} ({}, sha256 {})", cisco::ATTRIBUTION, o.file, o.sha256),
-                        from: format!("{}, loaded as {} {threads}", path.display(), o.name),
-                        library: o.library,
-                        memfd: o.memfd,
-                        create: o.create,
-                        destroy: o.destroy,
-                        version: o.version,
-                    }
-                })
-        }
+        Some(path) => cisco_load::load_alone(
+            &path,
+            &cisco::platform_pins(),
+            cisco::platform_file().unwrap(),
+        )
+        .map(|o| {
+            let threads = match o.threads {
+                Some(1) => "with one thread".to_string(),
+                n => format!("with an unchecked thread count ({n:?})"),
+            };
+            cisco::Handoff {
+                what: format!("{} ({}, sha256 {})", cisco::ATTRIBUTION, o.file, o.sha256),
+                from: format!("{}, loaded as {} {threads}", path.display(), o.name),
+                library: o.library,
+                memfd: o.memfd,
+                create: o.create,
+                destroy: o.destroy,
+                version: o.version,
+            }
+        }),
     };
     // SAFETY: this is the starfold binary's main, before anything else; the pointers are the
     // loaded library's own entry points, and the library and its memfd go with them.

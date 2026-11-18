@@ -453,7 +453,10 @@ mod tests {
         #[cfg(feature = "openh264-cisco")]
         crate::encoder::cisco::pretend_handed_over(false);
         let labels = software_encoder_labels().join(", ");
-        assert!(!labels.contains("Cisco's binary, loaded at run time"), "{labels}");
+        assert!(
+            !labels.contains("Cisco's binary, loaded at run time"),
+            "{labels}"
+        );
         assert_eq!(
             labels.contains(&format!("openh264 [{CISCO_BINARY_ONLY}]")),
             loadable,
