@@ -9,4 +9,8 @@ c0f1ac06a61f998345ca0d4e4acc4f28fd8937fc ported in #46 (2e9ae4472f2a49bb031821e7
 b963394c2fde0d4a3c3dcc8664ad5b5df9bebed7 formatting only (oxfmt on the README's macOS flags table)
 3eda62874b2b3f160bc0b2e1ea20c434e0de5325 Selkies bench setup; ideas reviewed separately
 b00f3b8b8c156b14e0c75abdfcf5cae9a14a865f until --base-path and the unix listener settle; revisit
+2ea4f8f0e491d570e38abad49b813550f1570385 hand port queued (conflicts with our client/build)
+e2acdb1757790e26fcc53b73cb3ac514b5b2b939 hand port queued (conflicts with our client/build)
+b70f56e4422d5503c8d4745cd9d21cf58113c0ca hand port queued (conflicts with our client/build)
 c0ea9f4a1ca51cda3a9f761aaff1388eee8dcf89 release version bump (0.3.5); versions here are set independently
+93ad2d4839a3d1a9086a07307bfe66baa75f2504 hand port queued (conflicts with our client/build)
