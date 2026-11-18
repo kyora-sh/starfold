@@ -438,6 +438,66 @@ fn short_or_wrapping_planes_are_rejected() {
     }
 }
 
+/// A plane with a stride wider than the picture that ends right after the last row's
+/// pixels is refused before any encoder sees it: OpenH264 and x264's C copy step their
+/// pointer a stride past every row, the last one too, which would point beyond its end.
+/// With every row's stride there, it encodes.
+#[test]
+fn a_padded_plane_must_hold_its_last_rows_stride() {
+    let (w, h, pad) = (64usize, 48usize, 16usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let (sy, suv) = (w + pad, cw + pad / 2);
+    let p = Picture::new(w, h);
+    let padded = |src: &[u8], rows: usize, cols: usize, stride: usize| {
+        let mut out = vec![0u8; rows * stride];
+        for r in 0..rows {
+            out[r * stride..][..cols].copy_from_slice(&src[r * cols..][..cols]);
+        }
+        out
+    };
+    let (y, u, v) = (
+        padded(&p.y, h, w, sy),
+        padded(&p.u, ch, cw, suv),
+        padded(&p.v, ch, cw, suv),
+    );
+    let ends_at_last_pixel = |len: usize, rows: usize, cols: usize, stride: usize| {
+        assert_eq!(len, rows * stride);
+        (rows - 1) * stride + cols
+    };
+    let short = FrameView {
+        width: w as u32,
+        height: h as u32,
+        y: &y[..ends_at_last_pixel(y.len(), h, w, sy)],
+        u: &u[..ends_at_last_pixel(u.len(), ch, cw, suv)],
+        v: &v[..ends_at_last_pixel(v.len(), ch, cw, suv)],
+        stride_y: sy,
+        stride_uv: suv,
+    };
+    assert!(short.check().is_err());
+    let full = FrameView {
+        y: &y,
+        u: &u,
+        v: &v,
+        ..short
+    };
+    assert!(full.check().is_ok());
+    for b in backends() {
+        let mut enc = open(&config(b, w as u32, h as u32, 4000)).unwrap();
+        let e = enc.encode(&short, EncodeOptions::default()).unwrap_err();
+        assert!(e.0.contains("don't hold a 64x48 picture"), "{b:?}: {e}");
+        let only_luma = FrameView {
+            y: short.y,
+            ..full
+        };
+        assert!(
+            enc.encode(&only_luma, EncodeOptions::default()).is_err(),
+            "{b:?}: luma alone"
+        );
+        let aus = enc.encode(&full, EncodeOptions::default()).unwrap();
+        assert!(!aus.is_empty(), "{b:?}");
+    }
+}
+
 #[test]
 fn idr_missing_parameter_sets_gets_cached_ones() {
     let nal = |t: u8, body: &[u8]| [&[0, 0, 0, 1, t][..], body].concat();

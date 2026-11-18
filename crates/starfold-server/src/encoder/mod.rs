@@ -123,7 +123,9 @@ pub struct FrameView<'a> {
 }
 
 impl FrameView<'_> {
-    /// Fails unless every plane holds the picture at its stride, and strides fit a C int.
+    /// Fails unless every plane holds all its rows at its stride, the last one too, and
+    /// strides fit a C int. An encoder that steps its pointer a stride past each row then
+    /// never points beyond the plane's end.
     pub fn check(&self) -> Result<(), EncodeError> {
         let bad = || {
             EncodeError(format!(
@@ -133,7 +135,7 @@ impl FrameView<'_> {
         };
         let (w, h) = (self.width as usize, self.height as usize);
         let plane = |len: usize, stride: usize, w: usize, h: usize| {
-            let need = (h.max(1) - 1).checked_mul(stride)?.checked_add(w)?;
+            let need = h.max(1).checked_mul(stride)?;
             (w > 0 && stride >= w && stride <= i32::MAX as usize && len >= need).then_some(())
         };
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
