@@ -6,12 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "pw";
 
-/// What `serve` composes, with handlers that answer the path they were asked for: the
-/// routes, then the login and the host check as layers.
-fn app() -> Router {
+/// Routes standing in for the server's, each answering the path it was asked for.
+fn routes() -> Router {
     let echo = |uri: Uri| async move { format!("path {}", uri.path()) };
-    let login = Arc::new(crate::login::Login::new(None, PASSWORD.into()));
-    let access = Arc::new(crate::access::Access::new(None, None));
     Router::new()
         .route("/", get(echo))
         .route("/healthz", get(echo))
@@ -21,14 +18,13 @@ fn app() -> Router {
             "/ws",
             get(|ws: WebSocketUpgrade| async move { ws.on_upgrade(|_| async {}) }),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            login,
-            crate::login::check,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            access,
-            crate::access::check,
-        ))
+}
+
+/// What `serve` serves: the routes with the login on and the host check, under `base`.
+fn app(base: Option<&str>) -> Router {
+    let login = Arc::new(crate::login::Login::new(None, PASSWORD.into()));
+    let access = Arc::new(crate::access::Access::new(None, None));
+    compose(routes(), base, Some(login), access)
 }
 
 /// Serves `router` on a loopback port and returns the port.
@@ -39,16 +35,52 @@ async fn serve(router: Router) -> u16 {
     port
 }
 
-/// The status and the rest of the response to a GET of `target` with these extra headers.
-async fn get_from(port: u16, target: &str, extra: &str) -> (u16, String) {
+/// A request's extra headers.
+#[derive(Clone, Copy, Debug)]
+enum Asking {
+    /// The password, from this machine.
+    Signed,
+    /// No password.
+    Anonymous,
+    /// The password, for a host name starfold doesn't answer to.
+    OtherHost,
+    /// The password, from another site's page.
+    OtherSite,
+}
+
+const ASKING: [Asking; 4] = [
+    Asking::Signed,
+    Asking::Anonymous,
+    Asking::OtherHost,
+    Asking::OtherSite,
+];
+
+/// The status and the whole response to a GET of `target`.
+async fn get_from(port: u16, target: &str, asking: Asking, extra: &str) -> (u16, String) {
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    let own = format!("127.0.0.1:{port}");
+    let (host, more) = match asking {
+        Asking::Signed => (
+            own.as_str(),
+            format!("Authorization: Bearer {PASSWORD}\r\n"),
+        ),
+        Asking::Anonymous => (own.as_str(), String::new()),
+        Asking::OtherHost => (
+            "starfold.example",
+            format!("Authorization: Bearer {PASSWORD}\r\n"),
+        ),
+        Asking::OtherSite => (
+            own.as_str(),
+            format!("Authorization: Bearer {PASSWORD}\r\nOrigin: https://other.example\r\n"),
+        ),
+    };
     let close = match extra.contains("Connection:") {
         true => "",
         false => "Connection: close\r\n",
     };
-    let req = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{close}{extra}\r\n");
+    let req = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{more}{close}{extra}\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -67,43 +99,95 @@ async fn get_from(port: u16, target: &str, extra: &str) -> (u16, String) {
     (status, text)
 }
 
-fn bearer() -> String {
-    format!("Authorization: Bearer {PASSWORD}\r\n")
-}
-
 #[test]
-fn prefixes_are_parsed_and_checked() {
-    assert_eq!(parse(None), Ok(None));
-    assert_eq!(parse(Some("")), Ok(None));
-    assert_eq!(parse(Some("/")), Ok(None));
-    assert_eq!(parse(Some("/desk")), Ok(Some("/desk".into())));
-    assert_eq!(parse(Some("/desk/")), Ok(Some("/desk".into())));
-    assert_eq!(
-        parse(Some("/a/b-c_d.e~f/9")),
-        Ok(Some("/a/b-c_d.e~f/9".into()))
-    );
-    for bad in [
-        "desk", "//desk", "/a//b", "/./a", "/a/..", "/a b", "/a?b", "/a%2F", "/ä", "/a#b",
+fn every_prefix_shape_has_one_normal_form_or_is_refused() {
+    let accepted: &[(Option<&str>, Option<&str>)] = &[
+        (None, None),
+        (Some(""), None),
+        (Some("/"), None),
+        (Some("/desk"), Some("/desk")),
+        (Some("/desk/"), Some("/desk")),
+        (Some("/a/b-c_d.e~f/9"), Some("/a/b-c_d.e~f/9")),
+        (Some("/a/b/"), Some("/a/b")),
+    ];
+    for &(given, normal) in accepted {
+        assert_eq!(parse(given), Ok(normal.map(String::from)), "{given:?}");
+    }
+    for refused in [
+        "desk", "desk/", "//", "///", "/desk//", "//desk", "/a//b", "/a/b//", "/%2F", "/a%2Fb",
+        "/%2e", "/.", "/..", "/a/./b", "/a/../b", "/a/.", "/a b", "/a?b", "/a#b", "/ä", "/a\\b",
     ] {
-        assert!(parse(Some(bad)).is_err(), "{bad}");
+        assert!(
+            parse(Some(refused)).is_err(),
+            "{refused:?}: {:?}",
+            parse(Some(refused))
+        );
     }
 }
 
 #[tokio::test]
-async fn requests_under_the_prefix_reach_the_routes_as_they_are_without_one() {
-    let port = serve(under("/p/q", app())).await;
-    let (status, body) = get_from(port, "/p/q/", &bearer()).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.ends_with("path /"), "{body}");
-    let (status, body) = get_from(port, "/p/q/stats?x=1", &bearer()).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.ends_with("path /stats"), "{body}");
+async fn a_prefix_serves_nothing_outside_itself() {
+    for prefix in ["/desk", "/a/b-c_d.e~f/9"] {
+        let port = serve(app(Some(prefix))).await;
+        let inside = format!("{prefix}/healthz");
+        assert_eq!(
+            get_from(port, &inside, Asking::Signed, "").await.0,
+            200,
+            "{inside}"
+        );
+        let longer = format!("{prefix}top/healthz");
+        for outside in [
+            "/healthz",
+            "/",
+            "/stats",
+            longer.as_str(),
+            "/desk/../healthz",
+        ] {
+            let (status, body) = get_from(port, outside, Asking::Signed, "").await;
+            assert_eq!(status, 404, "{prefix}: {outside}: {body}");
+        }
+    }
 }
 
 #[tokio::test]
-async fn the_prefix_itself_is_sent_on_to_its_slash() {
-    let port = serve(under("/p", app())).await;
-    let (status, head) = get_from(port, "/p?token=pw", "").await;
+async fn under_the_prefix_every_route_answers_as_without_one() {
+    let plain = serve(app(None)).await;
+    let prefixed = serve(app(Some("/p"))).await;
+    for path in [
+        "/",
+        "/healthz",
+        "/client.js",
+        "/stats",
+        "/stats?x=1",
+        "/nothing",
+    ] {
+        for asking in ASKING {
+            let (want, want_body) = get_from(plain, path, asking, "").await;
+            let target = format!("/p{path}");
+            let (got, got_body) = get_from(prefixed, &target, asking, "").await;
+            assert_eq!(
+                got, want,
+                "{target} {asking:?}: {got_body}\nwithout: {want_body}"
+            );
+            if want == 200 {
+                assert!(got_body.ends_with(&format!("path {}", path.split('?').next().unwrap())));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_bare_prefix_is_checked_before_it_is_sent_on() {
+    let port = serve(app(Some("/p"))).await;
+    for asking in [Asking::Anonymous, Asking::OtherHost, Asking::OtherSite] {
+        let (want, want_body) = get_from(port, "/p/", asking, "").await;
+        let (got, got_body) = get_from(port, "/p", asking, "").await;
+        assert_ne!(want, 200, "{asking:?}: {want_body}");
+        assert_eq!(got, want, "{asking:?}: {got_body}\n/p/: {want_body}");
+    }
+    let (status, _) = get_from(port, "/p", Asking::Anonymous, "").await;
+    assert_eq!(status, 401);
+    let (status, head) = get_from(port, "/p?token=pw", Asking::Anonymous, "").await;
     assert_eq!(status, 308, "{head}");
     assert!(
         head.to_ascii_lowercase()
@@ -113,42 +197,44 @@ async fn the_prefix_itself_is_sent_on_to_its_slash() {
 }
 
 #[tokio::test]
-async fn nothing_outside_the_prefix_is_served() {
-    let port = serve(under("/p", app())).await;
-    for target in ["/", "/healthz", "/stats", "/px/healthz", "/pp", "/ws"] {
-        let (status, body) = get_from(port, target, &bearer()).await;
-        assert_eq!(status, 404, "{target}: {body}");
-    }
-}
-
-#[tokio::test]
-async fn the_login_works_under_the_prefix_as_without_one() {
-    let port = serve(under("/p", app())).await;
-    for public in ["/p/healthz", "/p/client.js"] {
-        let (status, body) = get_from(port, public, "").await;
-        assert_eq!(status, 200, "{public}: {body}");
-    }
-    for private in ["/p/", "/p/stats", "/p/stats?token=wrong"] {
-        let (status, body) = get_from(port, private, "").await;
-        assert_eq!(status, 401, "{private}: {body}");
-    }
-    let (status, body) = get_from(port, "/p/stats?token=pw", "").await;
-    assert_eq!(status, 200, "{body}");
-}
-
-#[tokio::test]
 async fn the_websocket_upgrades_under_the_prefix() {
-    let port = serve(under("/p", app())).await;
+    let port = serve(app(Some("/p"))).await;
     let upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\n\
                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
-    let (status, head) = get_from(port, "/p/ws?token=pw", upgrade).await;
+    let (status, head) = get_from(port, "/p/ws", Asking::Signed, upgrade).await;
     assert_eq!(status, 101, "{head}");
 }
 
 #[tokio::test]
 async fn without_a_prefix_nothing_changes() {
-    let port = serve(app()).await;
-    let (status, body) = get_from(port, "/healthz", "").await;
+    let port = serve(app(None)).await;
+    let (status, body) = get_from(port, "/healthz", Asking::Anonymous, "").await;
     assert_eq!(status, 200, "{body}");
     assert!(body.ends_with("path /healthz"), "{body}");
+    assert_eq!(
+        get_from(port, "/p/healthz", Asking::Signed, "").await.0,
+        404
+    );
+}
+
+#[test]
+fn the_startup_lines_carry_the_prefix_and_are_unchanged_without_one() {
+    assert_eq!(
+        listening("0.0.0.0", 6901, None),
+        "listening on http://0.0.0.0:6901"
+    );
+    assert_eq!(listening("::1", 80, None), "listening on http://::1:80");
+    assert_eq!(
+        listening("0.0.0.0", 6901, Some("/d")),
+        "listening on http://0.0.0.0:6901/d/"
+    );
+    assert_eq!(page("0.0.0.0", 6901, None), "http://localhost:6901/");
+    assert_eq!(page("::", 6901, None), "http://localhost:6901/");
+    assert_eq!(page("::1", 6901, None), "http://[::1]:6901/");
+    assert_eq!(page("10.0.0.2", 6901, None), "http://10.0.0.2:6901/");
+    assert_eq!(
+        page("0.0.0.0", 6901, Some("/d")),
+        "http://localhost:6901/d/"
+    );
+    assert_eq!(page("::1", 6901, Some("/d")), "http://[::1]:6901/d/");
 }

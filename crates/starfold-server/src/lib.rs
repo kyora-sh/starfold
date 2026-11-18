@@ -472,31 +472,17 @@ async fn serve(a: HashMap<String, String>) {
     // --enable-basic-auth=false.
     let login =
         login::Login::from_args(&a).map(|(l, generated)| (std::sync::Arc::new(l), generated));
-    let mut app = server::router(state);
-    if let Some((l, _)) = &login {
-        app = app.layer(axum::middleware::from_fn_with_state(
-            l.clone(),
-            login::check,
-        ));
-    }
-    // Added last, so it runs first: a request for the wrong host or from another site's
-    // page is turned away before the login is asked for.
-    let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
-    let prefix = base.as_deref().unwrap_or("");
-    let app = match base.as_deref() {
-        Some(p) => base_path::under(p, app),
-        None => app,
-    };
+    let app = base_path::compose(
+        server::router(state),
+        base.as_deref(),
+        login.as_ref().map(|(l, _)| l.clone()),
+        access,
+    );
     let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
         .await
         .expect("bind");
-    log::info!("listening on http://{addr}:{port}{prefix}/");
-    // Where to point a browser on this machine.
-    let page = match addr.as_str() {
-        "0.0.0.0" | "::" => format!("http://localhost:{port}{prefix}/"),
-        a if a.contains(':') => format!("http://[{a}]:{port}{prefix}/"),
-        a => format!("http://{a}:{port}{prefix}/"),
-    };
+    log::info!("{}", base_path::listening(&addr, port, base.as_deref()));
+    let page = base_path::page(&addr, port, base.as_deref());
     match &login {
         Some((l, true)) => log::info!(
             "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",

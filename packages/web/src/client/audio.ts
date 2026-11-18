@@ -2,44 +2,60 @@
 // over a MessageChannel, so audio never waits on the main thread.
 import type { App } from './app';
 
-export function createAudio(app: App) {
-	let started = false;
-	let enabled = false;
-	let ac: AudioContext | null = null;
+/** What playback follows: the server's hello on this connection, and the connection's state. */
+export type AudioCue =
+	| { t: 'hello'; audio?: boolean }
+	| { t: 'status'; s: string };
 
-	/** Starts (or resumes) playback; browsers only allow it after a user gesture. Nothing
-	 * happens until the server's hello says it streams audio. */
-	async function start() {
-		if (!enabled) return;
-		if (ac && ac.state === 'suspended') {
-			ac.resume().catch(() => {});
-			return;
-		}
-		if (started || typeof AudioDecoder === 'undefined') return;
-		started = true;
+export function createAudio(app: App) {
+	/** Whether the last hello on the live connection said the server streams audio. */
+	let on = false;
+	let ac: AudioContext | null = null;
+	/** The worklet being set up on `ac`, true once it is wired. */
+	let wiring: Promise<boolean> | null = null;
+
+	async function wire(ctx: AudioContext): Promise<boolean> {
 		try {
-			ac = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
-			await ac.audioWorklet.addModule('audio.js');
-			const node = new AudioWorkletNode(ac, 'pcm-player', {
+			await ctx.audioWorklet.addModule('audio.js');
+			const node = new AudioWorkletNode(ctx, 'pcm-player', {
 				outputChannelCount: [2],
 			});
-			node.connect(ac.destination);
+			node.connect(ctx.destination);
 			const ch = new MessageChannel();
 			node.port.postMessage({ port: ch.port2 }, [ch.port2]);
 			app.post({ t: 'audioPort', port: ch.port1 }, [ch.port1]);
-			if (ac.state !== 'running') ac.resume().catch(() => {});
+			return true;
 		} catch (err) {
 			console.warn('[starfold] audio unavailable', err);
+			return false;
 		}
 	}
 
-	/** What a hello says (one per connection): with audio, playback starts right away if
-	 * the browser allows it (autoplay, or a gesture seen before), else at the next gesture;
-	 * without, nothing is loaded and audio already playing is suspended. */
-	function setEnabled(on: boolean) {
-		enabled = on;
-		if (on) void start();
-		else if (ac && ac.state === 'running') ac.suspend().catch(() => {});
+	/** Starts (or resumes) playback if the last hello has audio; browsers only let it run
+	 * after a user gesture, so a gesture calls this again. */
+	async function start() {
+		if (!on || typeof AudioDecoder === 'undefined') return;
+		if (!ac) {
+			ac = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+			wiring = wire(ac);
+		}
+		const ctx = ac;
+		const wired = await wiring;
+		if (wired && on && ctx.state !== 'running') ctx.resume().catch(() => {});
 	}
-	return { start, setEnabled };
+
+	function stop() {
+		if (ac && ac.state === 'running') ac.suspend().catch(() => {});
+	}
+
+	/** A hello sets playback to what it says (a new connection sends one, and a screen
+	 * resize another); a closed connection stops it until the next hello. */
+	function follow(m: AudioCue) {
+		if (m.t === 'hello') on = !!m.audio;
+		else if (m.s === 'closed') on = false;
+		else return;
+		if (on) void start();
+		else stop();
+	}
+	return { start, follow };
 }

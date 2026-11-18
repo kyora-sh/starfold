@@ -168,7 +168,7 @@ function main() {
 				files.setup(m.files);
 				mic.setup(!!m.mic && !app.readOnly);
 				resize.setup(m.resize);
-				audio.setEnabled(!!m.audio);
+				audio.follow(m);
 				statusEl.style.display = 'none';
 				break;
 			case 'codec':
@@ -185,6 +185,7 @@ function main() {
 				}
 				break;
 			case 'status':
+				audio.follow(m);
 				if (m.s === 'closed') {
 					mic.stop();
 					statusEl.style.display = '';

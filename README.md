@@ -161,9 +161,13 @@ Programs that aren't browsers (curl, scripts, agents) send no `Origin` and conne
 usual. A refused request gets a 403 that names the flag to add.
 
 A proxy that serves starfold under a path, such as `https://example.com/desktop/`, and
-forwards the path unchanged needs `--base-path=/desktop`: starfold then answers under
-`/desktop/` only, sends `/desktop` on to `/desktop/`, and prints its link with the prefix.
-A proxy that strips the prefix before forwarding needs no flag.
+forwards the path unchanged needs `--base-path=/desktop`. starfold then serves its pages
+under `/desktop/` only and prints its link with the prefix. Every request, `/desktop`
+itself included, goes through the same host, origin and password checks as without a
+prefix; once they pass, `/desktop` is sent on to `/desktop/` and paths outside the prefix
+are not found. A proxy that strips the prefix before forwarding needs no flag, but has to
+send `/desktop` on to `/desktop/` itself: the page's URLs are relative, so from
+`/desktop` they would resolve at the site's root.
 
 ### For agents and scripts
 
