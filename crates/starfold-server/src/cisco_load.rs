@@ -295,6 +295,17 @@ fn linked(lib: libloading::Library) -> (libloading::Library, Result<[usize; 2], 
 /// then lie in that mapping too.
 fn load_memfd(fd: OwnedFd, file: &'static str, sha256: String) -> Result<Opened, String> {
     let name = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    load_as(name, fd, file, sha256)
+}
+
+/// Loads `name`, which must hand back the library in `fd`'s mapping: the link map is checked
+/// against `fd` before any symbol lookup.
+fn load_as(
+    name: String,
+    fd: OwnedFd,
+    file: &'static str,
+    sha256: String,
+) -> Result<Opened, String> {
     let ours = file_id(&fd).map_err(|e| format!("{name}: {e}"))?;
     let in_ours = |addr: usize| -> Result<bool, String> {
         let found = mapping_of(addr).map_err(|e| format!("/proc/self/maps: {e}"))?;
@@ -302,7 +313,7 @@ fn load_memfd(fd: OwnedFd, file: &'static str, sha256: String) -> Result<Opened,
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "Linux only: a /proc/self/fd path to a sealed memfd, with no search"
+        reason = "Linux only: the loader's path is /proc/self/fd/N of a sealed memfd, no search"
     )]
     let lib = unsafe { libloading::Library::new(&name) }.map_err(|e| format!("{name}: {e}"))?;
     let (lib, at) = linked(lib);
@@ -529,6 +540,18 @@ mod tests {
         assert_eq!(mapping_of(m as usize).unwrap(), Some(want));
         unsafe { libc::munmap(m, 4096) };
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A name that hands back an object other than the sealed copy, here the C library this
+    /// process already runs, is refused by the link-map check, before any symbol is looked up.
+    #[test]
+    fn a_handle_that_is_not_the_sealed_copy_is_refused_before_any_symbol_lookup() {
+        let bytes = b"never loaded";
+        let fd = sealed_memfd(bytes, &sha256_hex(bytes)).unwrap();
+        let e = load_as("libc.so.6".into(), fd, "lib.so", sha256_hex(bytes))
+            .err()
+            .unwrap();
+        assert!(e.contains("refused before looking up any symbol"), "{e}");
     }
 
     /// With Cisco's real file: after the check, the given file is replaced, in place and then

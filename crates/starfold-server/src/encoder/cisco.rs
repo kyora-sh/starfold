@@ -96,22 +96,82 @@ struct Loaded {
 static LIBRARY: OnceLock<Result<Loaded, String>> = OnceLock::new();
 static HANDED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The seals a hand-over's memfd must carry: nothing can write to it, grow it, shrink it or
+/// change its seals any more.
+#[cfg(openh264_cisco_loadable)]
+const SEALS: c_int =
+    libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+
+/// Refuses a descriptor that does not carry every one of [`SEALS`]. Only a memfd created with
+/// `MFD_ALLOW_SEALING` (or `MFD_NOEXEC_SEAL`, which implies it) can: the kernel answers
+/// `F_GET_SEALS` only for a tmpfs or hugetlbfs file, and every other such file has `F_SEAL_SEAL`
+/// from its creation, so it can never take `F_SEAL_WRITE`. With `F_SEAL_SEAL` among them the
+/// seals are final, and with `F_SEAL_WRITE` no writable shared mapping of the file exists.
+#[cfg(openh264_cisco_loadable)]
+fn sealed(memfd: &std::os::fd::OwnedFd) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let seals = unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(format!(
+            "OpenH264: the hand-over's descriptor is not a sealable memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if seals & SEALS != SEALS {
+        return Err(format!(
+            "OpenH264: the hand-over's memfd is not sealed against writing, growing, shrinking \
+             and further sealing (its seals: {seals:#x})"
+        ));
+    }
+    Ok(())
+}
+
 /// The starfold binary's hand-over: what its `main` loaded, or why nothing was. The library and
 /// memfd move into a static here and are never unloaded or closed.
 ///
 /// # Safety
 ///
 /// Only the `starfold` binary's `main` calls this, once, first thing, before any encoder
-/// exists. In `Ok(h)`, `h.create`, `h.destroy` and `h.version` are `WelsCreateSVCEncoder`,
-/// `WelsDestroySVCEncoder` and `WelsGetCodecVersion` of `h.library`, and `h.library` is Cisco's
-/// OpenH264 2.6, loaded from `h.memfd`, whose encoders have the vtable openh264-sys2 0.9.9 binds.
-/// The encoders call these pointers and that vtable with no further check.
+/// exists. In `Ok(h)`:
 ///
-/// A second call, or one after the encoders have looked, is refused: nothing is installed and
-/// the `Handoff` given is dropped.
+/// - `h.library` is Cisco's OpenH264 2.6 for this target, loaded from the contents of
+///   `h.memfd`, and no code outside this function closes a reference to it. `install` checks
+///   that `h.memfd` carries `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL` and
+///   refuses it otherwise, so the mapped code can't change while the library is installed.
+/// - `h.create`, `h.destroy` and `h.version` are that library's own entry points, which
+///   starfold calls with these C signatures:
+///   - `int WelsCreateSVCEncoder(ISVCEncoder** ppEncoder)`
+///   - `void WelsDestroySVCEncoder(ISVCEncoder* pEncoder)`
+///   - `OpenH264Version WelsGetCodecVersion(void)`
+/// - The encoder `WelsCreateSVCEncoder` creates is a C++ `ISVCEncoder` (`codec_api.h`). starfold
+///   calls the methods of its vtable as C functions taking the encoder first, under the
+///   Itanium C++ ABI's virtual calls (its AArch64 variant on arm64), by vtable slot counted from 0:
+///   - 1 `int InitializeExt(ISVCEncoder*, const SEncParamExt*)`
+///   - 2 `int GetDefaultParams(ISVCEncoder*, SEncParamExt*)`
+///   - 3 `int Uninitialize(ISVCEncoder*)`
+///   - 4 `int EncodeFrame(ISVCEncoder*, const SSourcePicture*, SFrameBSInfo*)`
+///   - 6 `int ForceIntraFrame(ISVCEncoder*, bool bIDR, int iLayerId)`, the three-argument C++
+///     method, called through a pointer of that type with `bIDR` true and `iLayerId` -1, not
+///     through openh264-sys2's two-argument `ForceIntraFrame` type for the slot;
+///   - 7 `int SetOption(ISVCEncoder*, ENCODER_OPTION, void*)`, with `TRACE_LEVEL`,
+///     `DATAFORMAT` and `RC_MODE` on an `int`, `FRAME_RATE` on a `float`, `BITRATE` and
+///     `MAX_BITRATE` on an `SBitrateInfo`, and `SVC_ENCODE_PARAM_EXT` on an `SEncParamExt`;
+///   - 8 `int GetOption(ISVCEncoder*, ENCODER_OPTION, void*)`, with `SVC_ENCODE_PARAM_EXT` on an
+///     `SEncParamExt` and `GET_STATISTICS` on an `SEncoderStatistics`.
+/// - Each structure and constant above has the layout and value openh264-sys2 0.9.9's bindings
+///   give it, and the buffers `EncodeFrame` reports in `SFrameBSInfo` stay valid until that
+///   encoder's next `EncodeFrame` or `Uninitialize`.
+///
+/// The encoders make these calls from one thread at a time per encoder, with no further check.
+///
+/// A descriptor without those seals, a second call, or one after the encoders have looked, is
+/// refused: nothing is installed and the `Handoff` given is dropped.
 #[cfg(openh264_cisco_loadable)]
 #[doc(hidden)]
 pub unsafe fn install(handoff: Result<Handoff, String>) -> Result<(), String> {
+    if let Ok(h) = &handoff {
+        sealed(&h.memfd)?;
+    }
     let loaded = handoff.map(|h| Loaded {
         api: Api {
             create: h.create,
@@ -362,5 +422,78 @@ mod tests {
             Some(PathBuf::from("/b/lib.so"))
         );
         assert_eq!(lib_path(&args(&["--openh264-lib="])), None);
+    }
+
+    /// A memfd holding a byte, with `seals` added.
+    #[cfg(openh264_cisco_loadable)]
+    fn memfd_with(seals: c_int) -> std::os::fd::OwnedFd {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe {
+            libc::memfd_create(
+                c"sf-handoff".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        f.write_all(b"x").unwrap();
+        if seals != 0 {
+            assert_eq!(
+                unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+                0
+            );
+        }
+        f.into()
+    }
+
+    /// A hand-over of `memfd`, with this process's own handle and the tests' entry points.
+    #[cfg(openh264_cisco_loadable)]
+    fn handoff(memfd: std::os::fd::OwnedFd) -> Handoff {
+        let api = super::super::openh264::SOURCE;
+        Handoff {
+            library: libloading::os::unix::Library::this().into(),
+            memfd,
+            create: api.create,
+            destroy: api.destroy,
+            version: api.version,
+            what: "a test".into(),
+            from: "a test".into(),
+        }
+    }
+
+    /// `install` refuses a memfd that lacks any one of the four seals, an unsealed one and a
+    /// descriptor that is no memfd, before it installs anything.
+    #[cfg(openh264_cisco_loadable)]
+    #[test]
+    fn a_hand_over_without_every_seal_is_refused() {
+        let all = SEALS;
+        let mut cases: Vec<(String, std::os::fd::OwnedFd)> = [
+            ("WRITE", libc::F_SEAL_WRITE),
+            ("GROW", libc::F_SEAL_GROW),
+            ("SHRINK", libc::F_SEAL_SHRINK),
+            ("SEAL", libc::F_SEAL_SEAL),
+        ]
+        .into_iter()
+        .map(|(name, s)| (format!("without F_SEAL_{name}"), memfd_with(all & !s)))
+        .collect();
+        cases.push(("unsealed".into(), memfd_with(0)));
+        let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml")
+            .unwrap();
+        cases.push(("a regular file".into(), file.into()));
+        for (what, fd) in cases {
+            let e = unsafe { install(Ok(handoff(fd))) }.unwrap_err();
+            assert!(e.contains("the hand-over's"), "{what}: {e}");
+        }
+    }
+
+    /// The memfd the binary's loader seals passes the same check.
+    #[cfg(openh264_cisco_loadable)]
+    #[test]
+    fn the_loaders_own_sealed_memfd_is_accepted() {
+        let bytes = b"sealed by the loader";
+        let fd = cisco_load::sealed_memfd(bytes, &cisco_load::sha256_hex(bytes)).unwrap();
+        sealed(&fd).unwrap();
+        sealed(&memfd_with(SEALS)).unwrap();
     }
 }

@@ -30,6 +30,46 @@ fn a_probe_child_loads_no_openh264() {
     assert!(!err.contains("must not have Cisco's OpenH264"), "{err}");
 }
 
+/// Whether running `cmd` opened `path`, as inotify on it saw.
+#[cfg(target_os = "linux")]
+fn opens(path: &std::path::Path, mut cmd: Command) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let ino = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(ino >= 0, "{}", std::io::Error::last_os_error());
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert!(unsafe { libc::inotify_add_watch(ino, c.as_ptr(), libc::IN_OPEN) } >= 0);
+    let out = cmd.output().unwrap();
+    let mut buf = [0u8; 4096];
+    let n = unsafe { libc::read(ino, buf.as_mut_ptr().cast(), buf.len()) };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(ino) };
+    assert!(
+        n > 0 || err.kind() == std::io::ErrorKind::WouldBlock,
+        "{err}; {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    n > 0
+}
+
+/// A probe child never opens the library path it is given, so it can't load the library, not
+/// even to discard it before a hand-over. The control: the same binary not as a probe child
+/// opens it, where it loads Cisco's binary.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_probe_child_never_opens_the_library_it_is_given() {
+    let dir = std::env::temp_dir().join(format!("sf-probe-lib-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("libopenh264.so");
+    std::fs::write(&lib, b"not a library").unwrap();
+    let mut child = starfold();
+    child.args([FLAG, "bogus"]).env("STARFOLD_OPENH264_LIB", &lib);
+    assert!(!opens(&lib, child), "a probe child opened the library");
+    let mut server = starfold();
+    server.arg("--version").env("STARFOLD_OPENH264_LIB", &lib);
+    assert_eq!(opens(&lib, server), cfg!(openh264_cisco_loadable));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn experimental_probe_is_refused_without_the_flag() {
     let s = starfold().args([FLAG, "nvenc"]).output().unwrap();

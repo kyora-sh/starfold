@@ -345,13 +345,16 @@ the encoders a binary includes and its licence.
 On 64-bit Linux, x86-64 and arm64, with glibc,
 `cargo build --release --no-default-features --features openh264-cisco` builds a binary with no
 H.264 encoder of its own. It encodes H.264 with Cisco's OpenH264 2.6.0 binary, which starfold
-neither contains nor downloads. The binary stays under starfold's MIT licence.
+neither contains nor downloads. That binary stays under starfold's MIT licence. With the
+default `x264` feature as well (`--features openh264-cisco` alone), the binary links x264 and is
+GPL-2.0-or-later, as `--version` says.
 
 Cisco's OpenH264 is a property of the `starfold` binary, not of the crate. The binary loads it
-first thing in its `main`, before starfold starts its logger, its panic hook or any thread. A
-program that embeds starfold's library with this feature doesn't load it: OpenH264 is then
-unavailable there, with "OpenH264 (Cisco) is available only in the starfold binary". Its
-`--version` says so too, and its `--help` doesn't offer `--openh264-lib`.
+first thing in its `main`, before starfold starts its logger, its panic hook or any thread. On
+those targets, a program that embeds starfold's library with this feature doesn't load it:
+OpenH264 is then unavailable there, with "OpenH264 (Cisco) is available only in the starfold
+binary". Its `--version` says so too, its `--help` doesn't offer `--openh264-lib`, and its
+`--crf` help doesn't name openh264.
 
 - **Loading it:** pass the file's path with `--openh264-lib PATH` or `STARFOLD_OPENH264_LIB`.
   - Cisco publishes the file at `https://ciscobinary.openh264.org/<file>.bz2`;
@@ -382,7 +385,9 @@ unavailable there, with "OpenH264 (Cisco) is available only in the starfold bina
     libraries, and starfold doesn't hash them.
 - **Other platforms:** not yet. On macOS, Windows, Linux with musl (static or not) and x32,
   `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the startup
-  log say "OpenH264 (Cisco) is not available on this platform yet".
+  log say "OpenH264 (Cisco) is not available on this platform yet", in the starfold binary and
+  in a program that embeds the library alike. `--help` doesn't offer `--openh264-lib` there,
+  and its `--crf` entry doesn't name openh264.
   - `/stats` says so too when another encoder serves H.264 and starfold starts.
   - Without one, as in a build without x264 and with no usable hardware H.264 encoder, starfold
     exits 2 at startup with that reason, and there is no `/stats`; `--help` says so.

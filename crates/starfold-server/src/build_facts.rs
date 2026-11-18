@@ -328,9 +328,11 @@ pub fn reads(encoder: &str, flag: &str, uncapped: bool) -> bool {
         .any(|e| e.name == encoder && meaning(e, flag).is_some() && (uncapped || !e.uncapped_only))
 }
 
-/// This build's encoders that read `flag`, each with what the flag is to it.
+/// This build's encoders that read `flag`, each with what the flag is to it; one that can't run
+/// here ([`unavailable_note`]) reads nothing.
 pub fn readers(flag: &str) -> Vec<(&'static str, &'static str)> {
     built()
+        .filter(|e| unavailable_note(e.name).is_none())
         .filter_map(|e| meaning(e, flag).map(|m| (e.name, m)))
         .collect()
 }

@@ -241,25 +241,11 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
-    // In a program that embeds the library nothing was handed over, and the flag does nothing.
     #[cfg(feature = "openh264-cisco")]
-    let openh264 = {
-        use crate::encoder::cisco;
-        match cisco::platform_file() {
-            Some(_) if !cisco::handed_over() => String::new(),
-            Some(f) => entry(
-                "--openh264-lib",
-                &format!(
-                    "Cisco's OpenH264 binary ({f}), loaded by the starfold binary at startup \
-                     only if its sha256 is the build starfold pins (default ${}); without it \
-                     there is no OpenH264. {}",
-                    cisco::LIB_ENV,
-                    cisco::ATTRIBUTION
-                ),
-            ),
-            None => entry("--openh264-lib", &format!("{}.", cisco::NOT_AVAILABLE)),
-        }
-    };
+    let openh264 = openh264_entry(
+        crate::encoder::cisco::platform_file(),
+        crate::encoder::cisco::handed_over(),
+    );
     #[cfg(not(feature = "openh264-cisco"))]
     let openh264 = String::new();
     usage
@@ -268,6 +254,28 @@ fn encoder_entries(usage: &str) -> String {
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
         .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
         .replace("PAINTOVER_ENTRY\n", &entry(paintover_flags, &paintover))
+}
+
+/// `--openh264-lib`'s entry, given Cisco's file for this target (none where starfold doesn't
+/// load it) and whether the starfold binary handed a library or its reason over. Only that
+/// binary, on a target it loads the file on, reads the flag; elsewhere `--encoder` gives the
+/// reason OpenH264 is unavailable.
+#[cfg(feature = "openh264-cisco")]
+fn openh264_entry(file: Option<&str>, handed_over: bool) -> String {
+    use crate::encoder::cisco;
+    match file {
+        Some(f) if handed_over => entry(
+            "--openh264-lib",
+            &format!(
+                "Cisco's OpenH264 binary ({f}), loaded by the starfold binary at startup only if \
+                 its sha256 is the build starfold pins (default ${}); without it there is no \
+                 OpenH264. {}",
+                cisco::LIB_ENV,
+                cisco::ATTRIBUTION
+            ),
+        ),
+        _ => String::new(),
+    }
 }
 
 /// `--help`'s text, with `addr` as the default listen address.
@@ -393,7 +401,7 @@ mod tests {
         let loadable = cfg!(openh264_cisco_loadable);
         assert_eq!(words.contains(attribution), loadable, "{words}");
         assert_eq!(words.contains(not_yet), cisco && !loadable, "{words}");
-        assert_eq!(words.contains("--openh264-lib"), cisco, "{words}");
+        assert_eq!(words.contains("--openh264-lib"), loadable, "{words}");
         assert_eq!(
             words.contains("starfold exits at startup"),
             cisco && !loadable && !cfg!(feature = "x264"),
@@ -411,18 +419,44 @@ mod tests {
         crate::encoder::cisco::pretend_handed_over(false);
         let words = help_words();
         let loadable = cfg!(openh264_cisco_loadable);
-        if loadable {
-            assert!(!words.contains("--openh264-lib"), "{words}");
-            assert!(
-                !words.contains("OpenH264 Video Codec provided by Cisco Systems, Inc."),
-                "{words}"
-            );
-        }
+        assert!(!words.contains("--openh264-lib"), "{words}");
+        assert!(
+            !words.contains("OpenH264 Video Codec provided by Cisco Systems, Inc."),
+            "{words}"
+        );
         assert_eq!(
             words.contains("OpenH264 (Cisco) is available only in the starfold binary"),
             loadable,
             "{words}"
         );
+    }
+
+    /// `--crf` names openh264 as a reader only where it can run: in a build with OpenH264 from
+    /// source, or in the starfold binary on a target it loads Cisco's binary on.
+    #[test]
+    fn crf_names_openh264_only_where_it_can_run() {
+        let crf = |handed_over: bool| {
+            #[cfg(feature = "openh264-cisco")]
+            crate::encoder::cisco::pretend_handed_over(handed_over);
+            let _ = handed_over;
+            help_words().contains("openh264's lowest QP in motion;")
+        };
+        let source = cfg!(feature = "openh264");
+        let loadable = cfg!(openh264_cisco_loadable);
+        assert_eq!(crf(true), source || loadable);
+        assert_eq!(crf(false), source);
+    }
+
+    /// `--openh264-lib` is offered by the starfold binary on a target it loads Cisco's file on,
+    /// and nowhere else: not in a program that embeds the library, not on another target.
+    #[cfg(feature = "openh264-cisco")]
+    #[test]
+    fn only_the_binary_where_it_loads_offers_the_library_flag() {
+        let f = Some("libopenh264-2.6.0-linux64.8.so");
+        assert!(openh264_entry(f, true).contains("--openh264-lib"));
+        for (file, handed_over) in [(f, false), (None, true), (None, false)] {
+            assert_eq!(openh264_entry(file, handed_over), "", "{file:?} {handed_over}");
+        }
     }
 
     #[test]
