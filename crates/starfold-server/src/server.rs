@@ -398,9 +398,16 @@ pub fn bind_unix_std(
 /// Binds and listens on `s` in `dir`, with permissions `mode`, without a path: with `dir`
 /// as the working directory and the umask that gives `mode`, `bind("s")`. The socket's
 /// identity goes on record (`socket_id`) right after the bind, so the cleanup finds it
-/// whatever fails next; then the mode is read back and the socket listens. The working
-/// directory and the umask are restored before it returns, on every path. Both are the
-/// process's, so nothing else may run meanwhile: no other thread exists.
+/// whatever fails next; then the mode is read back and the socket listens. If that first
+/// look at the socket fails (an EIO, say), there is no identity to record, so `s` is
+/// unlinked by name in `dir` as held open: a directory this process made, mode 0700 at
+/// that moment, where only this uid or root can have put another entry.
+///
+/// The umask is restored, and then the working directory (`fchdir` to the one held open
+/// at the start), on every path. Both are the process's, so nothing else may run
+/// meanwhile: no other thread exists. The return `fchdir` can fail (EACCES once search
+/// permission on that directory is gone): that is an error of its own, whatever happened
+/// before it, and the message names both; the binary then exits.
 #[cfg(target_os = "linux")]
 pub fn bind_in(
     dir: &std::os::fd::OwnedFd,
@@ -428,7 +435,18 @@ pub fn bind_in(
                 len as libc::socklen_t,
             )
         })?;
-        let st = stat_at(dir, SOCKET)?;
+        let st = match fail_at("stat").and_then(|()| stat_at(dir, SOCKET)) {
+            Ok(st) => st,
+            Err(e) => {
+                return Err(match unlink_at(dir, SOCKET, 0) {
+                    Ok(()) => e,
+                    Err(u) => std::io::Error::new(
+                        e.kind(),
+                        format!("{e}; and the socket could not be removed: {u}"),
+                    ),
+                })
+            }
+        };
         if !is_socket(&st) {
             return Err(std::io::Error::other(
                 "what was bound in the directory is no socket",
@@ -447,10 +465,19 @@ pub fn bind_in(
         Ok(std::os::unix::net::UnixListener::from(sock))
     })();
     unsafe { libc::umask(umask) };
-    let back = cvt(unsafe { libc::fchdir(saved.as_raw_fd()) });
-    let bound = bound?;
-    back?;
-    Ok(bound)
+    let back = fail_at("return").and_then(|()| cvt(unsafe { libc::fchdir(saved.as_raw_fd()) }));
+    match (bound, back) {
+        (bound, Ok(_)) => bound,
+        (bound, Err(e)) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not return to the working directory it started in: {e}{}",
+                bound
+                    .err()
+                    .map_or(String::new(), |b| format!("; before that: {b}"))
+            ),
+        )),
+    }
 }
 
 /// The bound listener of [`bind_unix_std`], registered with tokio; on a failure the socket
@@ -498,6 +525,33 @@ pub fn remove_at_exit(file: SocketFile) -> &'static SocketFile {
 #[cfg(target_os = "linux")]
 const OVERFLOW_UID: u32 = 65534;
 
+/// Where the kernel says which uid an unmapped user reads as (the overflow uid, settable).
+#[cfg(target_os = "linux")]
+pub const OVERFLOW_UID_FILE: &str = "/proc/sys/kernel/overflowuid";
+
+/// Why --listen-unix is refused when [`provably_not_the_overflow_uid`] can't say yes.
+#[cfg(target_os = "linux")]
+pub const OVERFLOW_UID_REFUSAL: &str = "--listen-unix: cannot prove this process's uid differs \
+     from the kernel's overflow uid; refusing";
+
+/// Whether `own` is shown not to be the overflow uid by `read`, the contents of
+/// [`OVERFLOW_UID_FILE`] as read once at start: a peer the kernel can't map into this
+/// process's user namespace reads as that uid, so a server running as it would take such a
+/// peer for itself. Only a value that parses (decimal, as the kernel writes it) and differs
+/// from `own` is a yes; a read that failed, anything else in the file, or `own` itself is a
+/// no, and the unix listener is not started.
+#[cfg(target_os = "linux")]
+pub fn provably_not_the_overflow_uid(read: std::io::Result<String>, own: u32) -> bool {
+    read.ok()
+        .and_then(|s| {
+            let v = s.strip_suffix('\n').unwrap_or(&s);
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u32>().ok())
+                .flatten()
+        })
+        .is_some_and(|overflow| overflow != own)
+}
+
 /// Whether a peer whose uid is `peer` may talk to a server running as `own`: the same
 /// user only, and never the overflow uid, which stands for anyone the kernel can't name
 /// here.
@@ -509,9 +563,19 @@ pub fn admits(peer: u32, own: u32) -> bool {
 /// The unix listener with the check that keeps other users out: every accepted
 /// connection's peer credentials (SO_PEERCRED, recorded by the kernel at the peer's
 /// `connect`) are read before a byte is read or written, and a connection from any uid
-/// but the server's own is closed there.
+/// but the server's own is closed there. Made only by [`unix_server`].
 #[cfg(target_os = "linux")]
-pub struct PeerChecked(pub tokio::net::UnixListener);
+pub struct PeerChecked(tokio::net::UnixListener);
+
+/// What the server serves for --listen-unix: the bound listener of [`bind_unix_std`],
+/// registered with tokio ([`register`]) and behind the peer check ([`PeerChecked`]).
+#[cfg(target_os = "linux")]
+pub fn unix_server(
+    listener: std::os::unix::net::UnixListener,
+    file: &SocketFile,
+) -> std::io::Result<PeerChecked> {
+    register(listener, file).map(PeerChecked)
+}
 
 #[cfg(target_os = "linux")]
 impl axum::serve::Listener for PeerChecked {
@@ -545,19 +609,28 @@ thread_local! {
     /// The next `bind_unix` on this thread fails to register its listener with tokio (as
     /// an exhausted epoll watch limit makes it), once.
     pub static REGISTRATION_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The step of `bind_in` that fails next on this thread, once: "bind" or "listen".
-    pub static FAIL_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// The steps of `bind_in` that fail next on this thread, each once: "bind", "stat" (the
+    /// first look at the bound socket), "listen" or "return" (the `fchdir` back).
+    pub static FAIL_AT: std::cell::Cell<Vec<&'static str>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
 #[cfg(all(target_os = "linux", test))]
 fn fail_at(step: &'static str) -> std::io::Result<()> {
-    match FAIL_AT.with(|f| f.get()) == Some(step) {
-        true => {
-            FAIL_AT.with(|f| f.set(None));
-            Err(std::io::Error::other(format!("injected: {step} failed")))
-        }
-        false => Ok(()),
+    let mut steps = FAIL_AT.with(|f| f.take());
+    let hit = steps
+        .iter()
+        .position(|s| *s == step)
+        .map(|i| steps.remove(i));
+    FAIL_AT.with(|f| f.set(steps));
+    match hit {
+        Some(_) => Err(std::io::Error::other(format!("injected: {step} failed"))),
+        None => Ok(()),
     }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn fail_at(_step: &'static str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// [`bind_unix_std`] and [`register`] for tests, which run on many threads: the bind runs
@@ -2383,8 +2456,11 @@ mod tests {
 
         /// The bind sets the working directory and the umask for a moment; afterwards both
         /// are what they were (the directory by identity), whether it succeeded or failed
-        /// at the bind or at the listen. A failure leaves nothing behind. Run on a thread
-        /// with its own working directory and umask, as the binary's bind runs alone.
+        /// at the bind, at the first look at the socket or at the listen. A failure leaves
+        /// nothing behind, and the path takes the next start. When the `fchdir` back fails,
+        /// that is the error, named even after an earlier failure; the umask is restored
+        /// all the same. Run on a thread with its own working directory and umask, as the
+        /// binary's bind runs alone.
         #[test]
         fn the_bind_restores_the_working_directory_and_umask_on_every_path() {
             let d = dir("restore");
@@ -2404,24 +2480,51 @@ mod tests {
                     u
                 };
                 let before = (here(), umask());
-                for (i, fail) in [None, Some("bind"), Some("listen")].into_iter().enumerate() {
+                let cases: [&[&'static str]; 7] = [
+                    &[],
+                    &["bind"],
+                    &["stat"],
+                    &["listen"],
+                    &["return"],
+                    &["bind", "return"],
+                    &["listen", "return"],
+                ];
+                for (i, fail) in cases.into_iter().enumerate() {
                     let at = base.join(format!("r{i}"));
-                    FAIL_AT.with(|f| f.set(fail));
+                    FAIL_AT.with(|f| f.set(fail.to_vec()));
                     let r = bind_unix_std(&at, 0o600);
-                    assert_eq!((here(), umask()), before, "{fail:?}");
+                    let returned = !fail.contains(&"return");
+                    assert_eq!(umask(), before.1, "{fail:?}");
+                    assert_eq!(
+                        here() == before.0,
+                        returned,
+                        "{fail:?}: the working directory"
+                    );
                     match fail {
-                        None => {
+                        [] => {
                             let (l, file) = r.unwrap();
                             assert!(at.join("s").exists());
                             drop(l);
                             remove_unix(&file);
                         }
-                        Some(step) => {
-                            let e = r.unwrap_err();
-                            assert!(e.to_string().contains(step), "{e}");
+                        steps => {
+                            let e = r.unwrap_err().to_string();
+                            for step in steps.iter().filter(|s| **s != "return") {
+                                assert!(e.contains(&format!("injected: {step} failed")), "{e}");
+                            }
+                            assert_eq!(
+                                e.contains("could not return to the working directory"),
+                                !returned,
+                                "{e}"
+                            );
                         }
                     }
+                    std::env::set_current_dir(&base).unwrap();
                     assert!(!at.exists(), "{fail:?}: {} left behind", at.display());
+                    let (l, file) = bind_unix_std(&at, 0o600).expect("the next start");
+                    drop(l);
+                    remove_unix(&file);
+                    assert_eq!((here(), umask()), before, "{fail:?}: the next start");
                 }
             })
             .join()
@@ -2441,73 +2544,53 @@ mod tests {
             assert!(!admits(OVERFLOW_UID, OVERFLOW_UID));
         }
 
-        /// A client running as another user (nobody, through `sudo -n`) reaches the socket
-        /// (mode 0666) and gets nothing: the connection closes before a byte either way.
-        /// Skipped where `sudo -n` or python3 isn't there.
-        #[tokio::test]
-        async fn another_user_gets_nothing_through_the_socket() {
-            let ok = |c: &mut std::process::Command| c.output().is_ok_and(|o| o.status.success());
-            if !ok(std::process::Command::new("sudo")
-                .args(["-n", "-u", "nobody", "python3", "-c", ""]))
-            {
-                eprintln!("skipped: no `sudo -n -u nobody python3` here");
-                return;
+        /// The unix listener starts only on proof that this process's uid is not the
+        /// kernel's overflow uid: a file that can't be read, anything but the decimal uid
+        /// the kernel writes, or this process's own uid there, and it does not.
+        #[test]
+        fn the_unix_listener_needs_proof_it_is_not_the_overflow_uid() {
+            let read = |s: &str| Ok(s.to_string());
+            let unreadable = || Err(std::io::Error::from_raw_os_error(libc::EACCES));
+            assert!(provably_not_the_overflow_uid(read("65534\n"), 1000));
+            assert!(provably_not_the_overflow_uid(read("1000\n"), 1001));
+            assert!(provably_not_the_overflow_uid(read("0"), 1000));
+            assert!(!provably_not_the_overflow_uid(unreadable(), 1000));
+            for garbage in [
+                "",
+                "\n",
+                "nobody\n",
+                "-1\n",
+                "+65534\n",
+                " 65534\n",
+                "65534 \n",
+                "65534\n\n",
+                "99999999999\n",
+            ] {
+                assert!(
+                    !provably_not_the_overflow_uid(read(garbage), 1000),
+                    "{garbage:?}"
+                );
             }
-            let (hub, _input) = wired();
-            let d = dir("other-user");
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o711)).unwrap();
-            let path = d.join("sf");
-            let (l, file) = bind_unix(&path, 0o666).unwrap();
-            let server = tokio::spawn(
-                axum::serve(PeerChecked(l), router(app(&hub, false, None))).into_future(),
-            );
-            // The server closes with the request unread, so the read ends with EOF or a reset:
-            // either way, what counts is the bytes that came before it.
-            let client = "import socket, sys\n\
-                s = socket.socket(socket.AF_UNIX)\n\
-                s.connect(sys.argv[1])\n\
-                s.settimeout(5)\n\
-                data = b''\n\
-                try:\n    s.sendall(b'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')\n    \
-                while True:\n        b = s.recv(100)\n        if not b:\n            break\n        \
-                data += b\n\
-                except (ConnectionResetError, BrokenPipeError):\n    pass\n\
-                print(len(data))\n";
-            let socket = unix_socket_path(&path);
-            let to = socket.clone();
-            let out = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("sudo")
-                    .args(["-n", "-u", "nobody", "python3", "-c", client])
-                    .arg(&to)
-                    .output()
-            })
-            .await
-            .unwrap()
-            .unwrap();
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(said.trim(), "0", "the other user read {said} bytes");
-            assert!(hub.clients.lock().is_empty());
-            // The server's own user still gets in.
-            let mut own = tokio::net::UnixStream::connect(&socket).await.unwrap();
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            own.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            let mut reply = Vec::new();
-            own.read_to_end(&mut reply).await.unwrap();
-            assert!(
-                reply.starts_with(b"HTTP/1.1 200"),
-                "{}",
-                String::from_utf8_lossy(&reply)
-            );
-            server.abort();
-            drop(file);
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!provably_not_the_overflow_uid(read("1000\n"), 1000));
+            assert!(!provably_not_the_overflow_uid(read("65534\n"), 65534));
+        }
+
+        /// The first look at the socket after the bind fails (as an EIO would make it):
+        /// with no identity on record, the socket is unlinked by name in the directory held
+        /// open, the directory goes too, and the path takes the next start.
+        #[test]
+        fn a_stat_failure_right_after_the_bind_leaves_nothing_behind() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("stat");
+            let at = d.join("sf");
+            FAIL_AT.with(|f| f.set(vec!["stat"]));
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert!(e.to_string().contains("injected: stat failed"), "{e}");
+            assert!(!at.exists(), "{} left behind", at.display());
+            let (l, file) = bind_unix(&at, 0o600).expect("a start after it");
+            drop(l);
+            remove_unix(&file);
             std::fs::remove_dir_all(&d).unwrap();
         }
     }

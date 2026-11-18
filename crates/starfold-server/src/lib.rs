@@ -137,20 +137,24 @@ pub fn main() {
     run_with(args, prebound);
 }
 
-/// The socket --listen-unix binds before the server starts, and what removes it.
+/// The socket --listen-unix binds before the server starts, what removes it, and which of
+/// SIGTERM and SIGINT were blocked for it (the ones that weren't blocked already).
 #[cfg(target_os = "linux")]
-type Prebound = (
-    std::os::unix::net::UnixListener,
-    &'static server::SocketFile,
-);
+struct Prebound {
+    listener: std::os::unix::net::UnixListener,
+    file: &'static server::SocketFile,
+    blocked: libc::sigset_t,
+}
 #[cfg(not(target_os = "linux"))]
 type Prebound = std::convert::Infallible;
 
 /// --listen-unix's socket, bound first thing, while this is the process's only thread:
 /// the bind changes the process's working directory and umask for a moment (see
-/// [`server::bind_in`]). SIGTERM and SIGINT wait (blocked) from here until the server
-/// takes them, so one that comes meanwhile still removes the socket. A bad flag, or a
-/// bind that fails, ends the process here, before any desktop is touched.
+/// [`server::bind_in`]). It is bound only if this process's uid is provably not the
+/// kernel's overflow uid ([`server::provably_not_the_overflow_uid`]). SIGTERM and SIGINT
+/// wait (blocked) from just before the bind until the server's handlers take them, first
+/// thing in [`serve`], so one that comes meanwhile still removes the socket. A bad flag,
+/// a refusal or a bind that fails ends the process here, before any desktop is touched.
 fn prebind(args: &[String]) -> Option<Prebound> {
     if help::asked(args) {
         return None;
@@ -174,9 +178,19 @@ fn prebind(args: &[String]) -> Option<Prebound> {
             );
             std::process::exit(1);
         }
-        shutdown_signals(libc::SIG_BLOCK);
+        let own = unsafe { libc::geteuid() };
+        let overflow = std::fs::read_to_string(server::OVERFLOW_UID_FILE);
+        if !server::provably_not_the_overflow_uid(overflow, own) {
+            eprintln!("{}", server::OVERFLOW_UID_REFUSAL);
+            std::process::exit(1);
+        }
+        let blocked = block_shutdown_signals();
         return match server::bind_unix_std(&path, mode) {
-            Ok((l, file)) => Some((l, server::remove_at_exit(file))),
+            Ok((listener, file)) => Some(Prebound {
+                listener,
+                file: server::remove_at_exit(file),
+                blocked,
+            }),
             Err(e) => {
                 eprintln!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
@@ -188,16 +202,34 @@ fn prebind(args: &[String]) -> Option<Prebound> {
     None
 }
 
-/// Blocks or unblocks SIGTERM and SIGINT on the calling thread (and the threads it starts).
+/// Blocks SIGTERM and SIGINT on the calling thread (and the threads it starts), and returns
+/// those of the two that weren't blocked before: what [`unblock_shutdown_signals`] gives
+/// back, so a caller's own mask comes out as it was.
 #[cfg(target_os = "linux")]
-fn shutdown_signals(how: libc::c_int) {
+fn block_shutdown_signals() -> libc::sigset_t {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        let mut ours: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+        libc::sigemptyset(&mut ours);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut before);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            if libc::sigismember(&before, sig) == 0 {
+                libc::sigaddset(&mut ours, sig);
+            }
+        }
+        ours
     }
+}
+
+/// Unblocks on the calling thread what [`block_shutdown_signals`] blocked, and nothing else.
+#[cfg(target_os = "linux")]
+fn unblock_shutdown_signals(blocked: &libc::sigset_t) {
+    unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, blocked, std::ptr::null_mut()) };
 }
 
 /// Runs the server with these command-line flags (without the program name) until it's
@@ -255,6 +287,41 @@ fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
 }
 
 async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Prebound>) {
+    let hub = hub::Hub::new();
+    // SIGTERM and SIGINT lead to the shutdown below (which removes the unix socket) from
+    // here on, before anything that can block; one that came since the socket was bound
+    // (blocked until now) is taken now. Only what prebind blocked is unblocked.
+    #[cfg(target_os = "linux")]
+    let socket_file = prebound.as_ref().map(|p| p.file);
+    #[cfg(unix)]
+    let (mut term, mut int) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate()).unwrap(),
+            signal(SignalKind::interrupt()).unwrap(),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(p) = &prebound {
+        unblock_shutdown_signals(&p.blocked);
+    }
+    let shutdown_hub = hub.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        #[cfg(windows)]
+        let _ = tokio::signal::ctrl_c().await;
+        log::info!("shutting down");
+        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
+            let _ = tx.send(input::InputEvent::Shutdown);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(file) = socket_file {
+            server::remove_unix(file);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
     let display = std::env::var("DISPLAY")
@@ -369,7 +436,6 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     };
     let audio_on = truthy(a.get("audio-enabled"), true);
 
-    let hub = hub::Hub::new();
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.
@@ -593,30 +659,22 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     // Added last, so it runs first: a request for the wrong host or from another site's
     // page is turned away before the login is asked for.
     let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
+    // A port that can't be had ends the process through `exit`, which removes the unix
+    // socket bound before it.
     let tcp = match listen.tcp {
-        true => Some(
-            tokio::net::TcpListener::bind((addr.as_str(), port))
-                .await
-                .expect("bind"),
-        ),
+        true => match tokio::net::TcpListener::bind((addr.as_str(), port)).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                log::error!("listening on {addr}:{port}: {e}");
+                std::process::exit(1);
+            }
+        },
         false => None,
     };
-    // From here SIGTERM and SIGINT lead to the shutdown below, which removes the unix socket;
-    // one that came since the socket was bound (blocked until now) is taken now.
-    #[cfg(unix)]
-    let (mut term, mut int) = {
-        use tokio::signal::unix::{signal, SignalKind};
-        (
-            signal(SignalKind::terminate()).unwrap(),
-            signal(SignalKind::interrupt()).unwrap(),
-        )
-    };
     #[cfg(target_os = "linux")]
-    shutdown_signals(libc::SIG_UNBLOCK);
-    #[cfg(target_os = "linux")]
-    let (unix, socket_file) = match (prebound, &listen.unix) {
-        (Some((l, file)), Some((path, mode))) => {
-            let l = server::register(l, file).unwrap_or_else(|e| {
+    let unix = match (prebound, &listen.unix) {
+        (Some(p), Some((path, mode))) => {
+            let l = server::unix_server(p.listener, p.file).unwrap_or_else(|e| {
                 log::error!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
             });
@@ -625,9 +683,9 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
                 server::unix_socket_path(path).display(),
                 unsafe { libc::geteuid() }
             );
-            (Some(server::PeerChecked(l)), Some(file))
+            Some(l)
         }
-        _ => (None, None),
+        _ => None,
     };
     #[cfg(not(target_os = "linux"))]
     let _ = prebound;
@@ -654,23 +712,6 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     if framed {
         log::info!("--framed: every WebSocket message is binary with a kind byte");
     }
-    let shutdown_hub = hub.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-        #[cfg(windows)]
-        let _ = tokio::signal::ctrl_c().await;
-        log::info!("shutting down");
-        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(input::InputEvent::Shutdown);
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(file) = &socket_file {
-            server::remove_unix(file);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::process::exit(0);
-    });
     let mut servers = tokio::task::JoinSet::new();
     #[cfg(target_os = "linux")]
     if let Some(l) = unix {

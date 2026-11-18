@@ -18,9 +18,11 @@ Server:
                                 it; removes both on exit; the host and origin
                                 checks still apply. Only a peer with this
                                 process's uid is let in (SO_PEERCRED); the same
-                                uid is not separated. Its parent must not let
-                                other users rename entries: e.g. /tmp (sticky)
-                                or a directory only you can write
+                                uid is not separated. Refused unless this uid is
+                                shown to differ from the kernel's overflow uid
+                                (/proc/sys/kernel/overflowuid). Its parent must
+                                not let other users rename entries: e.g. /tmp
+                                (sticky) or a directory only you can write
   --listen-unix-mode            the socket's permissions (default 0600); group
                                 or other write access also lets that class
                                 search the directory
