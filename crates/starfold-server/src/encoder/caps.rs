@@ -398,7 +398,10 @@ pub fn host_providers(
 
 /// The whole startup probe, for a stream that is `capped` or not.
 pub fn host_probe(hardware: bool, experimental: bool, capped: bool) -> Registry {
-    Registry::probe(host_providers(hardware, experimental, capped), PROBE_TIMEOUT)
+    Registry::probe(
+        host_providers(hardware, experimental, capped),
+        PROBE_TIMEOUT,
+    )
 }
 
 /// This platform's hardware probes, run in-process: the experimental ones only with

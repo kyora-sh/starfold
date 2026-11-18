@@ -200,7 +200,8 @@ pub fn serve(
                 }
             }
         };
-        let stopped = matches!(r, Reply::Error { stopped: true, .. }) || session.stopped().is_some();
+        let stopped =
+            matches!(r, Reply::Error { stopped: true, .. }) || session.stopped().is_some();
         let sent = reply(&mut output, &r);
         // A stopped session frees nothing, whether or not the reply got out: a picture still
         // on the GPU can reach its output buffer and descriptors.

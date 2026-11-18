@@ -1867,12 +1867,20 @@ fn a_reopen_closes_the_old_encoder_before_opening_the_new_one() {
         open: open.clone(),
     };
     assert_eq!(live.load(Ordering::SeqCst), 1);
-    assert_eq!(reopen(&mut s, 4), None, "the one slot, which the old encoder held");
+    assert_eq!(
+        reopen(&mut s, 4),
+        None,
+        "the one slot, which the old encoder held"
+    );
     assert_eq!(live.load(Ordering::SeqCst), 1);
     assert_eq!(s.applied_kbps, None, "the new encoder gets its rate");
     let why = reopen(&mut s, 1).expect("the backend opens no more sessions");
     assert!(why.contains("no more sessions"), "{why}");
-    assert_eq!(live.load(Ordering::SeqCst), 0, "the old one is closed all the same");
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "the old one is closed all the same"
+    );
 }
 
 /// Only an encoder that codes with a thread count gets the governor: a hardware one would
