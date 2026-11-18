@@ -176,14 +176,29 @@ fn encoder_entries(usage: &str) -> String {
             arms.join(", ")
         ),
     };
+    let not_here = |name: &str| build_facts::not_on_this_platform(name);
+    let fallback = match not_here(sw) {
+        true => format!(
+            "{sw}, which is not available on this platform yet, so without a usable hardware \
+             H.264 encoder starfold exits at startup"
+        ),
+        false => sw.to_string(),
+    };
+    let pinnable: Vec<String> = build_facts::h264_encoders()
+        .into_iter()
+        .map(|name| match not_here(name) {
+            true => format!("{name} ({})", build_facts::CISCO_NOT_YET),
+            false => name.to_string(),
+        })
+        .collect();
     let encoder = format!(
-        "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
+        "auto: each codec from its hardware encoder, H.264 from {fallback} where there is none \
          (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
          nvenc (Linux, Windows), mediafoundation (Windows) or qsv (64-bit Windows, Intel Quick \
          Sync){arms}; \
          vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
-         and auto never picks them; /stats shows what the probe found",
-        build_facts::h264_encoders().join(", ")
+         and auto never picks them; /stats shows what the probe found once starfold runs",
+        pinnable.join(", ")
     );
     let crf: Vec<String> = build_facts::readers("crf")
         .into_iter()
@@ -347,13 +362,12 @@ mod tests {
         }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
         assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
-        assert!(
-            words.contains(&format!(
-                "H.264 from {} where there is none",
-                build_facts::software_h264()
-            )),
-            "{text}"
-        );
+        let sw = build_facts::software_h264();
+        let fallback = match build_facts::not_on_this_platform(sw) {
+            true => format!("H.264 from {sw}, which is not available on this platform yet,"),
+            false => format!("H.264 from {sw} where there is none"),
+        };
+        assert!(words.contains(&fallback), "{text}");
         assert!(!text.contains("_ENTRY"), "{text}");
     }
 
@@ -373,6 +387,11 @@ mod tests {
         assert_eq!(words.contains(attribution), loadable, "{words}");
         assert_eq!(words.contains(not_yet), cisco && !loadable, "{words}");
         assert_eq!(words.contains("--openh264-lib"), cisco, "{words}");
+        assert_eq!(
+            words.contains("starfold exits at startup"),
+            cisco && !loadable && !cfg!(feature = "x264"),
+            "{words}"
+        );
         #[cfg(feature = "openh264-cisco")]
         assert_eq!(crate::encoder::cisco::ATTRIBUTION, attribution);
     }

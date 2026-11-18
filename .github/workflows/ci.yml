@@ -225,7 +225,20 @@ jobs:
           [ -s "$RUNNER_TEMP/embed.rel" ] || { echo "::error::objdump -R printed nothing"; exit 1; }
           awk -f referrers.awk "$RUNNER_TEMP/embed.rel" "$RUNNER_TEMP/embed.dis" > "$RUNNER_TEMP/embed-refs.txt"
           grep -q own_encoder "$RUNNER_TEMP/embed-refs.txt" || { echo "::error::the check does not see the application's own call"; exit 1; }
-          if grep -E '[^0-9]8starfold|\$LT\$starfold\.\.' "$RUNNER_TEMP/embed-refs.txt"; then
+          # starfold's own functions, and generics instantiated with a starfold type, legacy
+          # (`starfold..` after `$LT$`, `$C$`, `$RF$` and the like) or v0 (`8starfold`).
+          starfold_re='[^0-9]8starfold|(^|[^A-Za-z0-9_])starfold\.\.'
+          for s in '_ZN8starfold7encoder8openh2648OpenH2643new17h0123456789abcdefE' \
+            '_ZN4core3ptr58drop_in_place$LT$starfold..encoder..openh264..OpenH264$GT$17h0123456789abcdefE' \
+            '_ZN4core3ptr85drop_in_place$LT$$LP$u8$C$starfold..encoder..openh264..OpenH264$RP$$GT$17h0123456789abcdefE' \
+            '_RNvCs1234abcd_8starfold4main'; do
+            grep -Eq "$starfold_re" <<< "$s" || { echo "::error::the starfold pattern misses $s"; exit 1; }
+          done
+          for s in '_ZN12embed_source11own_encoder17h0123456789abcdefE' \
+            '_ZN13openh264_sys26source9APILoader20WelsCreateSVCEncoder17h0123456789abcdefE'; do
+            if grep -Eq "$starfold_re" <<< "$s"; then echo "::error::the starfold pattern matches $s"; exit 1; fi
+          done
+          if grep -E "$starfold_re" "$RUNNER_TEMP/embed-refs.txt"; then
             echo "::error::starfold refers to OpenH264 compiled from source"; exit 1
           fi
           "$bin" --own-encoder

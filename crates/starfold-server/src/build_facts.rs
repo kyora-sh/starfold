@@ -231,6 +231,12 @@ pub fn h264_encoders() -> Vec<&'static str> {
     software().filter(|e| e.h264).map(|e| e.name).collect()
 }
 
+/// Whether the encoder named `name` is built in but can't run on this platform: Cisco's
+/// OpenH264 where starfold doesn't load it yet.
+pub fn not_on_this_platform(name: &str) -> bool {
+    software().any(|e| e.name == name && e.library == Library::CiscoNotOnThisPlatform)
+}
+
 /// The bench arms `--encoder` can name.
 pub fn bench_arms() -> Vec<&'static str> {
     #[cfg(feature = "sw-arm")]

@@ -14,16 +14,19 @@ fn main() {
         nasm_check();
     }
     // `openh264_any`: the OpenH264 backend is built in, compiled from source or Cisco's binary.
-    // `openh264_cisco_loadable`: starfold loads Cisco's binary on this target (Linux x86-64 and
-    // arm64 with glibc); on any other, `openh264-cisco` builds and OpenH264 is unavailable.
+    // `openh264_cisco_loadable`: starfold loads Cisco's binary on this target (64-bit Linux,
+    // x86-64 and arm64, with glibc; not x32); on any other, `openh264-cisco` builds and
+    // OpenH264 is unavailable.
     println!("cargo::rustc-check-cfg=cfg(openh264_any, openh264_cisco_loadable)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let wide = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default() == "64";
     let cisco = cfg!(feature = "openh264-cisco");
     if cfg!(feature = "openh264") || cisco {
         println!("cargo::rustc-cfg=openh264_any");
     }
-    if cisco && target == "linux" && env == "gnu" && matches!(arch.as_str(), "x86_64" | "aarch64") {
+    let loadable = target == "linux" && env == "gnu" && wide;
+    if cisco && loadable && matches!(arch.as_str(), "x86_64" | "aarch64") {
         println!("cargo::rustc-cfg=openh264_cisco_loadable");
     }
     let triple = std::env::var("TARGET").unwrap_or_default();

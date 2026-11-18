@@ -1,12 +1,13 @@
 //! Cisco's OpenH264 binary, loaded at run time (the `openh264-cisco` feature). starfold neither
-//! contains nor downloads it, and loads it only on Linux x86-64 and arm64 with glibc; on any
-//! other target the feature builds, and OpenH264 is unavailable with [`NOT_AVAILABLE`].
+//! contains nor downloads it, and loads it only on 64-bit Linux, x86-64 and arm64, with glibc;
+//! on any other target the feature builds, and OpenH264 is unavailable with [`NOT_AVAILABLE`].
 //!
 //! The file from `--openh264-lib` or `$STARFOLD_OPENH264_LIB` is read once into memory (a
 //! regular file of at most 16 MiB, opened without blocking), and its sha256 must be the pinned
 //! Cisco build. Those bytes go into a memfd sealed against writing, growing and shrinking,
 //! which is read back and hashed again, and the library is loaded from `/proc/self/fd/N`, a
-//! name no loaded object already has. Its entry points must lie in that memfd's own mapping.
+//! name no loaded object already has. Before any symbol lookup, the object glibc returned must
+//! be that memfd's own mapping, and so must each entry point.
 //! The memfd stays open for the life of the process; nothing is written to disk. starfold
 //! calls the library only through the entry points held here, never through openh264-sys2's
 //! `DynamicAPI`, so a build in which a dependent enables OpenH264's source build still never
@@ -37,17 +38,20 @@ pub const ATTRIBUTION: &str = "OpenH264 Video Codec provided by Cisco Systems, I
 
 /// Why a build of the feature for any other target has no OpenH264.
 pub const NOT_AVAILABLE: &str = "OpenH264 (Cisco) is not available on this platform yet: \
-     starfold loads Cisco's binary only on Linux x86-64 and arm64 with glibc";
+     starfold loads Cisco's binary only on 64-bit Linux, x86-64 and arm64, with glibc";
+
+/// Cisco's file name for a target architecture starfold loads it on.
+fn file_for(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("libopenh264-2.6.0-linux64.8.so"),
+        "aarch64" => Some("libopenh264-2.6.0-linux-arm64.8.so"),
+        _ => None,
+    }
+}
 
 /// Cisco's file name for this target, where starfold loads it.
 pub fn platform_file() -> Option<&'static str> {
-    if !cfg!(openh264_cisco_loadable) {
-        None
-    } else if cfg!(target_arch = "x86_64") {
-        Some("libopenh264-2.6.0-linux64.8.so")
-    } else {
-        Some("libopenh264-2.6.0-linux-arm64.8.so")
-    }
+    file_for(std::env::consts::ARCH).filter(|_| cfg!(openh264_cisco_loadable))
 }
 
 struct Loaded {
@@ -245,14 +249,21 @@ mod linux {
     pub(super) fn sealed_memfd(bytes: &[u8], sha256: &str) -> std::io::Result<OwnedFd> {
         let name = c"starfold-openh264";
         let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
-        // MFD_EXEC keeps it executable where vm.memfd_noexec would make it not; kernels
-        // before 6.3 don't know the flag.
+        // MFD_EXEC keeps it executable under vm.memfd_noexec = 1; kernels before 6.3 don't
+        // know the flag. Under vm.memfd_noexec = 2 the kernel refuses an executable memfd,
+        // and so starfold can't load the library at all.
         let mut fd = unsafe { libc::memfd_create(name.as_ptr(), flags | libc::MFD_EXEC) };
         if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
             fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
         }
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(libc::EACCES) => std::io::Error::other(format!(
+                    "the kernel refuses an executable memfd ({e}), as vm.memfd_noexec = 2 does"
+                )),
+                _ => e,
+            });
         }
         let mut f = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
         f.write_all(bytes)?;
@@ -334,60 +345,107 @@ mod linux {
 
     /// The file mapped at `addr` in this process, from `/proc/self/maps`.
     pub(super) fn mapping_of(addr: usize) -> std::io::Result<Option<FileId>> {
-        let maps = std::fs::read_to_string("/proc/self/maps")?;
-        Ok(maps.lines().find_map(|l| {
-            let mut w = l.split_whitespace();
-            let (lo, hi) = w.next()?.split_once('-')?;
+        Ok(mapping_in(&std::fs::read("/proc/self/maps")?, addr))
+    }
+
+    /// The file mapped at `addr`, from the text of a maps file. Only the numeric fields are
+    /// read: a path may hold any bytes.
+    pub(super) fn mapping_in(maps: &[u8], addr: usize) -> Option<FileId> {
+        maps.split(|&b| b == b'\n').find_map(|l| {
+            let mut w = l
+                .split(|&b| b == b' ')
+                .filter(|f| !f.is_empty())
+                .map(std::str::from_utf8);
+            let (lo, hi) = w.next()?.ok()?.split_once('-')?;
             let lo = usize::from_str_radix(lo, 16).ok()?;
             let hi = usize::from_str_radix(hi, 16).ok()?;
             if !(lo..hi).contains(&addr) {
                 return None;
             }
-            let (major, minor) = w.nth(2)?.split_once(':')?;
+            let (major, minor) = w.nth(2)?.ok()?.split_once(':')?;
             Some((
                 u32::from_str_radix(major, 16).ok()?,
                 u32::from_str_radix(minor, 16).ok()?,
-                w.next()?.parse().ok()?,
+                w.next()?.ok()?.parse().ok()?,
             ))
-        }))
+        })
+    }
+
+    /// The public head of glibc's `struct link_map` (`<link.h>`).
+    #[repr(C)]
+    struct LinkMap {
+        l_addr: usize,
+        _l_name: *const std::ffi::c_char,
+        l_ld: *const c_void,
+    }
+
+    /// The object glibc handed back for `lib`, by its load address and its dynamic section,
+    /// each with the file mapped there.
+    fn linked(lib: libloading::Library) -> (libloading::Library, Result<[usize; 2], String>) {
+        let raw = libloading::os::unix::Library::from(lib).into_raw();
+        let mut map: *mut LinkMap = std::ptr::null_mut();
+        let r = unsafe { libc::dlinfo(raw, libc::RTLD_DI_LINKMAP, (&raw mut map).cast()) };
+        let lib =
+            libloading::Library::from(unsafe { libloading::os::unix::Library::from_raw(raw) });
+        let at = if r != 0 || map.is_null() {
+            Err("dlinfo found no link map".to_string())
+        } else {
+            let m = unsafe { &*map };
+            Ok([m.l_addr, m.l_ld as usize])
+        };
+        (lib, at)
     }
 
     /// Loads the library in the sealed memfd `fd` from `/proc/self/fd/N`, under a number no
-    /// loaded object is named by, and makes sure each entry point lies in that memfd's own
-    /// mapping, not in an object loaded earlier.
+    /// loaded object is named by. Before it looks up any symbol, the object glibc returned
+    /// must be the memfd's own mapping, so nothing of an object loaded earlier under that
+    /// name runs; each entry point must then lie in that mapping too.
     pub(super) fn load_memfd(fd: OwnedFd) -> Result<(Api, Held), String> {
         let fd = unused_name(fd).map_err(|e| format!("choosing its descriptor: {e}"))?;
         let name = proc_name(fd.as_raw_fd());
+        let ours = file_id(&fd).map_err(|e| format!("{name}: {e}"))?;
+        let in_ours = |addr: usize| -> Result<bool, String> {
+            let found = mapping_of(addr).map_err(|e| format!("/proc/self/maps: {e}"))?;
+            Ok(found == Some(ours))
+        };
         #[allow(
             clippy::disallowed_methods,
             reason = "Linux only: a /proc/self/fd path to a sealed memfd, with no search"
         )]
         let lib = unsafe { libloading::Library::new(&name) }.map_err(|e| format!("{name}: {e}"))?;
-        unsafe fn entry<T: Copy>(lib: &libloading::Library, sym: &str) -> Result<T, String> {
-            let s = unsafe { lib.get::<T>(sym.as_bytes()) }.map_err(|e| format!("{sym}: {e}"))?;
-            Ok(*s)
-        }
-        let api = unsafe {
-            Api {
-                create: entry(&lib, "WelsCreateSVCEncoder")?,
-                destroy: entry(&lib, "WelsDestroySVCEncoder")?,
-                version: entry(&lib, "WelsGetCodecVersion")?,
-            }
-        };
-        let ours = file_id(&fd).map_err(|e| format!("{name}: {e}"))?;
-        for (sym, addr) in [
-            ("WelsCreateSVCEncoder", api.create as usize),
-            ("WelsDestroySVCEncoder", api.destroy as usize),
-            ("WelsGetCodecVersion", api.version as usize),
-        ] {
-            let found = mapping_of(addr).map_err(|e| format!("/proc/self/maps: {e}"))?;
-            if found != Some(ours) {
+        let (lib, at) = linked(lib);
+        for addr in at.map_err(|e| format!("{name}: {e}"))? {
+            if !in_ours(addr)? {
                 return Err(format!(
-                    "{name}: {sym} is not in the sealed copy ({found:?}, not {ours:?}): another \
-                     object was loaded under that name"
+                    "{name}: the object loaded under that name is not the sealed copy (its link \
+                     map lies outside it); refused before looking up any symbol"
                 ));
             }
         }
+        let entry = |sym: &str| -> Result<*mut c_void, String> {
+            let p = *unsafe { lib.get::<*mut c_void>(sym.as_bytes()) }
+                .map_err(|e| format!("{sym}: {e}"))?;
+            if p.is_null() {
+                return Err(format!("{sym}: null"));
+            }
+            if !in_ours(p as usize)? {
+                return Err(format!("{name}: {sym} is not in the sealed copy"));
+            }
+            Ok(p)
+        };
+        type Enc = *mut openh264_sys2::ISVCEncoder;
+        type Create = unsafe extern "C" fn(*mut Enc) -> c_int;
+        type Destroy = unsafe extern "C" fn(Enc);
+        type Version = unsafe extern "C" fn() -> openh264_sys2::OpenH264Version;
+        let api = unsafe {
+            Api {
+                create: std::mem::transmute::<*mut c_void, Create>(entry("WelsCreateSVCEncoder")?),
+                destroy: std::mem::transmute::<*mut c_void, Destroy>(entry(
+                    "WelsDestroySVCEncoder",
+                )?),
+                version: std::mem::transmute::<*mut c_void, Version>(entry("WelsGetCodecVersion")?),
+            }
+        };
         Ok((
             api,
             Held {
@@ -462,13 +520,24 @@ mod tests {
         assert_eq!((v.uMajor, v.uMinor), want);
     }
 
+    /// Each architecture starfold loads Cisco's binary on has exactly one pin.
     #[test]
-    fn only_linux_gnu_x86_64_and_arm64_load_it() {
+    fn both_architectures_have_their_pin() {
+        for arch in ["x86_64", "aarch64"] {
+            let f = file_for(arch).unwrap();
+            assert_eq!(PINS.iter().filter(|p| p.1 == f).count(), 1, "{arch}: {f}");
+        }
+        assert_eq!(PINS.len(), 2);
+    }
+
+    #[test]
+    fn only_64_bit_linux_gnu_x86_64_and_arm64_load_it() {
         assert_eq!(
             platform_file().is_some(),
             cfg!(all(
                 target_os = "linux",
                 target_env = "gnu",
+                target_pointer_width = "64",
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))
         );
@@ -480,7 +549,16 @@ mod tests {
 mod linux_tests {
     use super::linux::*;
     use super::*;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::sync::Mutex;
+
+    /// Held by every test that loads a library or relies on which `/proc/self/fd` names are
+    /// loaded, so that none of them sees another's descriptor numbers change under it.
+    static LOADS: Mutex<()> = Mutex::new(());
+
+    fn loads() -> std::sync::MutexGuard<'static, ()> {
+        LOADS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let mut r = [0u8; 12];
@@ -611,6 +689,7 @@ mod linux_tests {
     /// A descriptor no loaded object is named after keeps its number.
     #[test]
     fn a_free_name_is_kept() {
+        let _g = loads();
         let fd = sealed_memfd(b"x", &sha256_hex(b"x")).unwrap();
         let n = fd.as_raw_fd();
         assert!(!loaded_fd_names().contains(&n));
@@ -622,6 +701,7 @@ mod linux_tests {
     /// `open()` loads is still Cisco's OpenH264 2.6, from the memfd, not from the given file.
     #[test]
     fn ciscos_bytes_load_after_the_given_file_is_replaced() {
+        let _g = loads();
         let Some(real) = real_lib() else { return };
         let dir = scratch("swap");
         let given = dir.join(platform_file().unwrap());
@@ -653,6 +733,7 @@ mod linux_tests {
     /// memfd under another number, and its entry points are in that memfd's mapping.
     #[test]
     fn an_object_already_loaded_under_the_name_is_not_what_loads() {
+        let _g = loads();
         let Some(real) = real_lib() else { return };
         let bytes = std::fs::read(&real).unwrap();
         let sha = sha256_hex(&bytes);
@@ -678,5 +759,81 @@ mod linux_tests {
         assert_eq!((v.uMajor, v.uMinor), (2, 6));
         drop(held);
         drop(dummy);
+    }
+
+    /// With Cisco's real file as the earlier object: an embedding process loads it by its
+    /// path, then opens the same inode as `/proc/self/fd/N`, which glibc records as another
+    /// name of that object, and gives N up while keeping the object. `dl_iterate_phdr` reports
+    /// only the path, so starfold's memfd keeps N, and glibc hands back the earlier object for
+    /// that name. starfold refuses it from its link map, before it looks up any symbol.
+    #[test]
+    fn an_alias_of_an_earlier_object_is_refused_before_any_symbol_lookup() {
+        let _g = loads();
+        let Some(real) = real_lib() else { return };
+        let dir = scratch("alias");
+        let path = dir.join(platform_file().unwrap());
+        std::fs::copy(&real, &path).unwrap();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "a test's earlier object, by its path"
+        )]
+        let first = unsafe { libloading::Library::new(&path) }.unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let n = file.as_raw_fd();
+        let alias = proc_name(n);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the same inode by its descriptor's name"
+        )]
+        let again = unsafe { libloading::Library::new(&alias) }.unwrap();
+        drop(again);
+        assert!(!loaded_fd_names().contains(&n));
+        let bytes = std::fs::read(&real).unwrap();
+        let ours = sealed_memfd(&bytes, &sha256_hex(&bytes)).unwrap();
+        // n is this test's own descriptor: it now refers to the sealed memfd.
+        assert_eq!(unsafe { libc::dup2(ours.as_raw_fd(), n) }, n);
+        drop(ours);
+        let handed: OwnedFd = file.into();
+        let c = std::ffi::CString::new(alias.clone()).unwrap();
+        let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+        assert!(
+            !h.is_null(),
+            "glibc kept no second name for the earlier object"
+        );
+        unsafe { libc::dlclose(h) };
+        let e = load_memfd(handed)
+            .err()
+            .expect("the earlier object was accepted");
+        assert!(e.contains("before looking up any symbol"), "{e}");
+        drop(first);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A mapped file whose path is not UTF-8 leaves the maps check working.
+    #[test]
+    fn a_path_that_is_not_utf8_does_not_stop_the_maps_check() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("maps");
+        let p = dir.join(std::ffi::OsStr::from_bytes(b"map-\xff.bin"));
+        std::fs::write(&p, [0u8; 4096]).unwrap();
+        let f = std::fs::File::open(&p).unwrap();
+        let m = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(m, libc::MAP_FAILED);
+        assert!(std::str::from_utf8(&std::fs::read("/proc/self/maps").unwrap()).is_err());
+        let meta = std::fs::metadata(&p).unwrap();
+        let want = (libc::major(meta.dev()), libc::minor(meta.dev()), meta.ino());
+        assert_eq!(mapping_of(m as usize).unwrap(), Some(want));
+        unsafe { libc::munmap(m, 4096) };
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

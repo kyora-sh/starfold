@@ -42,7 +42,7 @@ Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esb
 toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
-On Linux (x86-64 and arm64, glibc), `--no-default-features --features openh264-cisco` builds
+On 64-bit Linux (x86-64 and arm64, glibc), `--no-default-features --features openh264-cisco` builds
 without either and encodes H.264 with Cisco's OpenH264 binary, loaded at run time (see
 [OpenH264 from Cisco](#openh264-from-cisco)).
 
@@ -342,7 +342,7 @@ the encoders a binary includes and its licence.
 
 ### OpenH264 from Cisco
 
-On Linux x86-64 and arm64 with glibc,
+On 64-bit Linux, x86-64 and arm64, with glibc,
 `cargo build --release --no-default-features --features openh264-cisco` builds a binary with no
 H.264 encoder of its own. It encodes H.264 with Cisco's OpenH264 2.6.0 binary, which starfold
 neither contains nor downloads. The binary stays under starfold's MIT licence.
@@ -356,18 +356,25 @@ neither contains nor downloads. The binary stays under starfold's MIT licence.
   - It reads the given file once into memory. The file must be a regular file of at most 16 MiB,
     opened without blocking, and its sha256 must be the pinned build for this architecture.
   - It writes those bytes to a memfd, seals it so that nothing can write to it, grow it or shrink
-    it any more, reads it back and hashes it again.
+    it any more, reads it back and hashes it again. The memfd is executable: under
+    `vm.memfd_noexec = 2` the kernel refuses that, and OpenH264 is unavailable with that reason.
   - It loads the library from `/proc/self/fd/N`, and keeps the memfd open for the life of the
     process. If an object is already loaded under that name (glibc would hand that object back),
     starfold uses a duplicate of the memfd numbered above every such name.
-  - Each entry point it takes from the library must lie in the memfd's own mapping, and the
-    library must report version 2.6.
+  - Before it looks up any symbol, the object glibc returned must be the memfd's own mapping (its
+    link map's load address and dynamic section). So no code of an object loaded earlier under
+    another name for that descriptor runs, and the load is refused with the reason.
+  - Each entry point it takes from the library must lie in that mapping too, and the library must
+    report version 2.6.
 - **What this protects against:** an attacker who can replace the file at the given path, before
   or after the check, is in scope. One who controls starfold's environment (`LD_PRELOAD`, for
   one) or its process is not.
-- **Other platforms:** not yet. On macOS, Windows, musl (static or not) and any other target,
-  `openh264-cisco` builds, and OpenH264 is unavailable: `--version`, `--help`, the startup log
-  and `/stats` say "OpenH264 (Cisco) is not available on this platform yet".
+- **Other platforms:** not yet. On macOS, Windows, musl (static or not), x32 and any other
+  target, `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the
+  startup log say "OpenH264 (Cisco) is not available on this platform yet".
+  - `/stats` says so too when another encoder serves H.264 and starfold starts.
+  - Without one, as in a build without x264 and with no usable hardware H.264 encoder, starfold
+    exits 2 at startup with that reason, and there is no `/stats`; `--help` says so.
 - **Without the library, or with any other file:** OpenH264 is unavailable, and the startup log
   says why.
   - `--encoder auto` takes x264 in a build that has it. It never takes VA-API or NVENC, which
