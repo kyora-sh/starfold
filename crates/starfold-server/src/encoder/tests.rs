@@ -1160,9 +1160,18 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
-/// x264 under VBV, as it streams: no pass leaves the picture worse and the ladder ends far
-/// sharper than motion left it, with or without a byte budget, at one thread or sliced. A
-/// budgeted first step may change nothing: motion counts as QP 51 until a pass proves better.
+/// How far a refining pass may come out below the one before and still count as no worse: at
+/// one thread x264 gives the same PSNR on every run, but sliced threads under VBV code rows by
+/// timing. Alone, 200 runs of the test below gave 200 different motion PSNRs (33.62 to 35.61
+/// dB); under the full suite's load its first budgeted step came out 6e-5 dB lower, twice. The
+/// smallest real step measured is +3.35 dB.
+#[cfg(feature = "x264")]
+const REFINE_NOISE_DB: f64 = 0.01;
+
+/// x264 under VBV, as it streams: no pass leaves the picture worse (by more than
+/// [`REFINE_NOISE_DB`]) and the ladder ends far sharper than motion left it, with or without a
+/// byte budget, at one thread or sliced. A budgeted first step may change nothing: motion counts
+/// as QP 51 until a pass proves better.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
@@ -1177,7 +1186,11 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             let at = format!("t{threads} {max_bytes:?} qp {qp}");
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
             assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
-            assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
+            assert!(
+                s.last_psnr >= prev - REFINE_NOISE_DB,
+                "{at}: {} after {prev}",
+                s.last_psnr
+            );
             prev = s.last_psnr;
         }
         assert!(
