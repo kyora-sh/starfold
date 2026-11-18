@@ -67,12 +67,28 @@ function recorder() {
 	return { r, h };
 }
 
-async function until(f: () => boolean, ms = 2000) {
+function until(f: () => boolean, ms = 2000): Promise<void> {
 	const end = Date.now() + ms;
-	while (!f()) {
-		if (Date.now() > end) throw new Error('timed out');
-		await sleep(5);
-	}
+	return new Promise((resolve, reject) => {
+		const check = () => {
+			if (f()) return resolve();
+			if (Date.now() > end) return reject(new Error('timed out'));
+			setTimeout(check, 5);
+		};
+		check();
+	});
+}
+
+/** What `answerPreamble` posts to the worker and reports for `p`. */
+async function answer(p: Parameters<typeof answerPreamble>[0]) {
+	const posted: ToWorker[] = [];
+	const failed: unknown[] = [];
+	await answerPreamble(
+		p,
+		(m) => posted.push(m),
+		(e) => failed.push(e)
+	);
+	return { posted, failed };
 }
 
 let stop: (() => void) | null = null;
@@ -199,39 +215,30 @@ describe("the served page's link is unchanged", () => {
 });
 
 describe('answerPreamble', () => {
-	const run = async (p: Parameters<typeof answerPreamble>[0]) => {
-		const posted: ToWorker[] = [];
-		const failed: unknown[] = [];
-		await answerPreamble(
-			p,
-			(m) => posted.push(m),
-			(e) => failed.push(e)
-		);
-		return { posted, failed };
-	};
-
 	test('posts the messages a sync or async preamble gives', async () => {
-		expect((await run(() => ['a', 'b'])).posted).toEqual([
+		expect((await answer(() => ['a', 'b'])).posted).toEqual([
 			{ t: 'preamble', msgs: ['a', 'b'] },
 		]);
-		expect((await run(async () => 'ticket')).posted).toEqual([
+		expect((await answer(async () => 'ticket')).posted).toEqual([
 			{ t: 'preamble', msgs: ['ticket'] },
 		]);
-		expect((await run(undefined)).posted).toEqual([
+		expect((await answer(undefined)).posted).toEqual([
 			{ t: 'preamble', msgs: [] },
 		]);
 	});
 
 	test('a throwing, rejecting or non-text preamble opens nothing and reports', async () => {
 		const boom = new Error('no ticket');
-		for (const p of [
-			() => {
-				throw boom;
-			},
-			() => Promise.reject(boom),
-			() => [1] as unknown as string[],
-		]) {
-			const { posted, failed } = await run(p);
+		const results = await Promise.all(
+			[
+				() => {
+					throw boom;
+				},
+				() => Promise.reject(boom),
+				() => [1] as unknown as string[],
+			].map(answer)
+		);
+		for (const { posted, failed } of results) {
 			expect(posted).toEqual([{ t: 'preambleFailed' }]);
 			expect(failed.length).toBe(1);
 		}
