@@ -618,23 +618,28 @@ mod tests {
             unix: None,
         };
         assert_eq!(listen(&[]), Ok(tcp_only));
-        assert_eq!(
-            listen(&["--listen-unix", "/run/sf.sock"]),
-            Ok(Listen {
+        // Unix sockets need Linux or macOS; elsewhere asking for one is an error.
+        let unix = |args: &[&str], want: Listen| match cfg!(unix) {
+            true => assert_eq!(listen(args), Ok(want)),
+            false => assert!(listen(args).is_err_and(|e| e.contains("Linux or macOS"))),
+        };
+        unix(
+            &["--listen-unix", "/run/sf.sock"],
+            Listen {
                 tcp: true,
                 unix: Some(("/run/sf.sock".into(), 0o600)),
-            })
+            },
         );
-        assert_eq!(
-            listen(&[
+        unix(
+            &[
                 "--listen-unix=/run/sf.sock",
                 "--listen-tcp=false",
-                "--listen-unix-mode=0660"
-            ]),
-            Ok(Listen {
+                "--listen-unix-mode=0660",
+            ],
+            Listen {
                 tcp: false,
                 unix: Some(("/run/sf.sock".into(), 0o660)),
-            })
+            },
         );
     }
 

@@ -611,8 +611,13 @@ async fn stats(State(s): State<AppState>) -> Response {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
-    ws.max_message_size(frame::MAX_MESSAGE)
-        .on_upgrade(move |socket| handle_socket(socket, s))
+    let ws = ws.max_message_size(frame::MAX_MESSAGE);
+    // Framed, a message up to the cap may come as one frame as well as in several.
+    let ws = match s.framed {
+        true => ws.max_frame_size(frame::MAX_MESSAGE),
+        false => ws,
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, s))
 }
 
 async fn handle_socket(socket: WebSocket, s: AppState) {
@@ -696,8 +701,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                if framed && oversized(e) {
-                    refused = Some(FrameError::Oversized);
+                if framed {
+                    refused = refused_by_websocket(e);
                 }
                 break;
             }
@@ -758,12 +763,15 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     log::info!("client {} disconnected", client.id);
 }
 
-/// Whether the WebSocket refused a message for its size (more than `frame::MAX_MESSAGE`,
-/// however it was fragmented).
-fn oversized(e: axum::Error) -> bool {
-    e.into_inner()
-        .downcast_ref::<tungstenite::Error>()
-        .is_some_and(|e| matches!(e, tungstenite::Error::Capacity(_)))
+/// What a framed socket closes with for a message the WebSocket itself refused: one over
+/// `frame::MAX_MESSAGE` however it was fragmented (1009), or a text message that isn't
+/// UTF-8 (1007; a text message has no place there in any case). None: no close frame.
+fn refused_by_websocket(e: axum::Error) -> Option<FrameError> {
+    match e.into_inner().downcast_ref::<tungstenite::Error>()? {
+        tungstenite::Error::Capacity(_) => Some(FrameError::Oversized),
+        tungstenite::Error::Utf8(_) => Some(FrameError::BadUtf8),
+        _ => None,
+    }
 }
 
 /// A framed message (--framed) as the message plain WebSockets would have carried.
@@ -1499,6 +1507,70 @@ mod tests {
             gone(&hub).await;
             server.abort();
             drop(file);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A framed server, and a viewer of it connected over its unix socket in a
+        /// directory named for `name`.
+        async fn framed_viewer(
+            hub: &Arc<Hub>,
+            name: &str,
+        ) -> (
+            WebSocketStream<tokio::net::UnixStream>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+            std::path::PathBuf,
+        ) {
+            let mut s = app(hub, false, None);
+            s.framed = true;
+            let d = dir(name);
+            let path = d.join("sf");
+            let (l, _) = bind_unix(&path, 0o600).unwrap();
+            let server = tokio::spawn(axum::serve(l, router(s)).into_future());
+            let sock = tokio::net::UnixStream::connect(unix_socket_path(&path))
+                .await
+                .unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", sock)
+                .await
+                .unwrap();
+            next(&mut ws, true).await;
+            (ws, server, d)
+        }
+
+        /// An outer text message that isn't even UTF-8, which the WebSocket refuses before
+        /// it can be unframed, still gets a close code (1007), not a bare disconnect.
+        #[tokio::test]
+        async fn a_framed_socket_closes_on_outer_text_that_is_not_utf8() {
+            use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+            use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+            let (hub, _input) = wired();
+            let (mut ws, server, d) = framed_viewer(&hub, "outer-utf8").await;
+            let bad = Frame::message(
+                Bytes::from_static(&[0xff, 0xfe]),
+                OpCode::Data(Data::Text),
+                true,
+            );
+            ws.send(Ws::Frame(bad)).await.unwrap();
+            assert_eq!(close_code(&mut ws).await, 1007);
+            gone(&hub).await;
+            server.abort();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A 20 MiB framed message in one WebSocket frame is taken like the same message in
+        /// several: the session goes on.
+        #[tokio::test]
+        async fn a_framed_message_under_the_cap_in_one_frame_is_taken() {
+            let (hub, input) = wired();
+            let (mut ws, server, d) = framed_viewer(&hub, "one-frame").await;
+            let big = frame::encode_binary(&vec![0u8; 20 << 20]).unwrap();
+            ws.send(Ws::Binary(big)).await.unwrap();
+            ws.send(Ws::Binary(frame::encode_text("k,65,1").unwrap()))
+                .await
+                .unwrap();
+            let (typed, _input) = key(input).await;
+            assert!(typed, "the session ended at the 20 MiB frame");
+            assert_eq!(hub.clients.lock().len(), 1);
+            server.abort();
             std::fs::remove_dir_all(&d).unwrap();
         }
 
