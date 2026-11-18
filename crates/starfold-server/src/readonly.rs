@@ -104,14 +104,16 @@ pub fn binary(_first: Option<u8>) -> Kind {
     Act
 }
 
-/// The layer on every route: under `--read-only`, a route that acts, or one with no
-/// decision, is refused before its handler runs.
+/// The layer on every route and on the fallback: under `--read-only`, a route that acts,
+/// or one with no decision, is refused before its handler runs, and a request no route
+/// matched gets a plain 404 here, so no fallback handler runs for it either.
 pub async fn check(State(read_only): State<bool>, req: Request, next: Next) -> Response {
     if read_only {
-        if let Some(path) = req.extensions().get::<MatchedPath>() {
-            if route(req.method(), path.as_str()) != Some(Watch) {
-                return refused(req.method(), path.as_str());
-            }
+        let Some(path) = req.extensions().get::<MatchedPath>() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if route(req.method(), path.as_str()) != Some(Watch) {
+            return refused(req.method(), path.as_str());
         }
     }
     next.run(req).await

@@ -3,7 +3,6 @@
 //! the next one (variable frame rate).
 
 /// One encoded frame: time since the recording started (ms), keyframe, Annex-B data.
-#[cfg(test)]
 pub struct Frame {
     pub ms: u64,
     pub key: bool,
@@ -63,34 +62,15 @@ fn u32s(v: &[u32]) -> Vec<u8> {
 /// Identity transformation matrix of movie and track headers.
 const MATRIX: [u32; 9] = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000];
 
-/// What the MP4's index keeps of one frame: when it was captured (ms), whether it is a
-/// keyframe, and the size of its sample.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Sample {
-    pub ms: u64,
-    pub key: bool,
-    pub size: u32,
-}
-
-/// A frame as an MP4 sample: its NAL units length-prefixed, parameter sets and
-/// delimiters left out.
-pub fn sample(data: &[u8]) -> Vec<u8> {
-    let units: Vec<&[u8]> = nals(data)
-        .into_iter()
-        .filter(|n| !matches!(n[0] & 0x1f, 7..=9))
-        .collect();
-    let mut out = Vec::with_capacity(units.iter().map(|n| n.len() + 4).sum());
-    for n in units {
-        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-        out.extend_from_slice(n);
+/// Writes `frames` (the first must be a keyframe) as an MP4 of `width`x`height`
+/// lasting until `end_ms`.
+pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<Vec<u8>, String> {
+    let first = frames.first().ok_or("no frames were recorded")?;
+    if !first.key {
+        return Err("recording doesn't start with a keyframe".into());
     }
-    out
-}
-
-/// A keyframe's first SPS and PPS.
-pub fn parameter_sets(keyframe: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (mut sps, mut pps) = (None, None);
-    for n in nals(keyframe) {
+    for n in nals(&first.data) {
         match n[0] & 0x1f {
             7 if sps.is_none() => sps = Some(n.to_vec()),
             8 if pps.is_none() => pps = Some(n.to_vec()),
@@ -104,54 +84,19 @@ pub fn parameter_sets(keyframe: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     if sps.len() < 4 {
         return Err("bad SPS".into());
     }
-    Ok((sps, pps))
-}
 
-/// Writes `frames` (the first must be a keyframe) as an MP4 of `width`x`height`
-/// lasting until `end_ms`: [`header`], then every frame's [`sample`]. Recordings write
-/// the two parts apart (the samples go to disk as they come); this is the whole file.
-#[cfg(test)]
-pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<Vec<u8>, String> {
-    let first = frames.first().ok_or("no frames were recorded")?;
-    if !first.key {
-        return Err("recording doesn't start with a keyframe".into());
-    }
-    let (sps, pps) = parameter_sets(&first.data)?;
-    let bodies: Vec<Vec<u8>> = frames.iter().map(|f| sample(&f.data)).collect();
-    let index: Vec<Sample> = frames
-        .iter()
-        .zip(&bodies)
-        .map(|(f, b)| Sample {
-            ms: f.ms,
-            key: f.key,
-            size: b.len() as u32,
-        })
-        .collect();
-    let mut out = header(&index, &sps, &pps, width, height, end_ms)?;
-    for b in bodies {
-        out.extend_from_slice(&b);
-    }
-    Ok(out)
-}
-
-/// Everything of the MP4 before the samples (ftyp, moov, mdat's header) for the samples
-/// `index` describes (the first must be a keyframe), whose bytes follow it in order.
-pub fn header(
-    index: &[Sample],
-    sps: &[u8],
-    pps: &[u8],
-    width: u32,
-    height: u32,
-    end_ms: u64,
-) -> Result<Vec<u8>, String> {
-    let first = index.first().ok_or("no frames were recorded")?;
-    if !first.key {
-        return Err("recording doesn't start with a keyframe".into());
-    }
+    // Samples: length-prefixed NAL units, parameter sets and delimiters left out. They
+    // are only sized here and copied once, straight into the output, at the end.
+    let mut samples: Vec<Vec<&[u8]>> = Vec::with_capacity(frames.len());
     let (mut sizes, mut durations, mut sync) = (Vec::new(), Vec::new(), Vec::new());
-    for (i, f) in index.iter().enumerate() {
-        sizes.push(f.size);
-        let next = index
+    for (i, f) in frames.iter().enumerate() {
+        let units: Vec<&[u8]> = nals(&f.data)
+            .into_iter()
+            .filter(|n| !matches!(n[0] & 0x1f, 7..=9))
+            .collect();
+        sizes.push(units.iter().map(|n| n.len() as u32 + 4).sum::<u32>());
+        samples.push(units);
+        let next = frames
             .get(i + 1)
             .map(|n| n.ms)
             .unwrap_or(end_ms.max(f.ms + LAST_FRAME_MS));
@@ -161,7 +106,7 @@ pub fn header(
         }
     }
     let total: u64 = durations.iter().map(|&d| d as u64).sum();
-    let n = index.len() as u32;
+    let n = frames.len() as u32;
     let mdat_len: u64 = sizes.iter().map(|&s| s as u64).sum();
 
     let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
@@ -173,10 +118,10 @@ pub fn header(
 
     let mut avcc = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
     avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    avcc.extend_from_slice(sps);
+    avcc.extend_from_slice(&sps);
     avcc.push(1);
     avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    avcc.extend_from_slice(pps);
+    avcc.extend_from_slice(&pps);
     if matches!(sps[1], 100 | 110 | 122 | 144) {
         // 4:2:0, 8-bit, no SPS extensions.
         avcc.extend_from_slice(&[0xfd, 0xf8, 0xf8, 0]);
@@ -256,11 +201,15 @@ pub fn header(
     let offset = (ftyp.len() + moov.len() + 8) as u32;
     let at = moov.len() - 4;
     moov[at..].copy_from_slice(&offset.to_be_bytes());
-    let mut out = Vec::with_capacity(offset as usize);
+    let mut out = Vec::with_capacity(offset as usize + mdat_len as usize);
     out.extend_from_slice(&ftyp);
     out.extend_from_slice(&moov);
     out.extend_from_slice(&(mdat_len as u32 + 8).to_be_bytes());
     out.extend_from_slice(b"mdat");
+    for n in samples.iter().flatten() {
+        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+        out.extend_from_slice(n);
+    }
     Ok(out)
 }
 

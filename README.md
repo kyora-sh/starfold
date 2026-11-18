@@ -101,15 +101,14 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--stripes`                                                    | `1`                                                                   | encode the screen as N independent horizontal streams (experimental)                                                                                                                                      |
 | `--scroll-px-per-notch`                                        | `180`                                                                 | desktop pixels one wheel notch scrolls (calibrates smooth scrolling)                                                                                                                                      |
 | `--file-transfers`                                             | `upload,download`                                                     | `upload`, `download`, both, or `none`                                                                                                                                                                     |
-| `--read-only`                                                  | `false`                                                               | viewers only watch: input, clipboard writes, the microphone, uploads, recordings and resizing are refused, and downloads unless `--file-transfers` names `download`                                       |
+| `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, files or recordings (downloads only with `--file-transfers=download`); watching still influences delivery as any viewer does                                          |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
-| `--enable-recording`                                           | `false`                                                               | allow `/record` (see [For agents and scripts](#for-agents-and-scripts)): at most 2 at once, 2 GiB each, on disk in `--recording-dir` (up to 4 GiB)                                                        |
-| `--recording-dir`                                              | `/var/tmp` on Linux, else the temp folder                             | where recordings are written while they run; refused if it is in memory (tmpfs, ramfs)                                                                                                                    |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; clips are held in memory and are not yet bounded: do not enable it for viewers you do not trust                                                                                          |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
 ### File transfer
@@ -187,26 +186,9 @@ the three `/record` routes answer 403 (`"recording": false`). A recording's id i
 32-character string, and only that id stops it and gets the clip: scripts need `jq -r .id`
 where they had `jq .id`.
 
-While a recording runs, its video goes to a file in `--recording-dir` that has no name (it is
-gone when the recording ends, or if starfold stops). The default is `/var/tmp` on Linux, which
-is kept on disk where `/tmp` often isn't, and the temporary folder elsewhere; a directory in
-memory (tmpfs, ramfs) is refused, as is one that can't be written (both 503). Limits, all fixed:
-
-- At most 2 recordings at once, `/record` and `/record/start` alike; a started one that is
-  never stopped keeps its place until `--max-record-seconds` and another 60 s have passed.
-  Another gets 429.
-- At most 2 GiB of video each: about 9.5 minutes at the default 30 Mbit/s `--max-kbps` ceiling
-  and 2.4 hours at the 2 Mbit/s `--min-kbps` floor, so with the default 300 s length it only
-  matters above about 57 Mbit/s or with `--max-kbps 0`.
-- The disk keeps the smaller of 1 GiB and a tenth of its size free: a recording doesn't start
-  below that (507), and ends once a check (one every 64 MiB written) finds it below.
-- So recordings take at most 4 GiB of disk at once (2 × 2 GiB, an unclaimed one included), and
-  about 10 MiB of memory each: an 8 MiB queue to the disk, a 256 KiB write buffer and the
-  index of its frames.
-
-A recording that reaches one of these ends there and returns what it has, with its end reason:
-`size_limit`, `disk_space`, `disk_slow` (the disk fell more than the queue behind; recording
-never slows the stream or other viewers down) or `disk_error` (a write failed).
+With `--enable-recording` the recorder is as it was before the flag: clips are held in memory
+and are not yet bounded; do not enable it for viewers you do not trust. Under `--read-only`
+the three routes are refused even with it.
 
 A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
 encoding with any viewers taking H.264, and with none it starts an H.264 encoding of its
@@ -219,7 +201,7 @@ software one, say), the recording continues in a new MP4, up to 16 of them. Add 
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
-`segment_lost`, `closed`, `size_limit`, `disk_space`, `disk_slow` or `disk_error`). Without it you get the first MP4, with `x-starfold-segments` and
+`segment_lost` or `closed`). Without it you get the first MP4, with `x-starfold-segments` and
 `x-starfold-record-end` headers when there were more.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
@@ -249,6 +231,10 @@ ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polli
 `POST /input` drives the mouse and keyboard with JSON actions (one, or an array applied in
 order) and answers with the `seq` from before them, so `/wait?change&since=` sees what they
 did. A `--read-only` server refuses it with 403. `python/starfold` wraps all of this.
+
+With `--read-only` a viewer cannot change the desktop, files or recordings: every route and
+message is decided in one table, and anything not in it is refused. Watching still influences
+delivery as any viewer does (keyframe requests, its refresh rate, its acknowledgements).
 
 ```sh
 curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \

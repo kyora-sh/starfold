@@ -717,12 +717,7 @@ mod tests {
             mic,
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(
-                hub.clone(),
-                Duration::from_secs(1),
-                true,
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            ),
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1), true),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
@@ -947,12 +942,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_more_than_two_recordings_run_at_once() {
-        let port = served(false).await;
-        assert_eq!(ask(port, "POST", "/record/start", "").await.0, 200);
-        assert_eq!(ask(port, "POST", "/record/start", "").await.0, 200);
-        let (status, text) = ask(port, "POST", "/record/start", "").await;
-        assert_eq!(status, 429, "{text}");
+    async fn without_the_flag_no_recording_starts() {
+        let hub = Hub::new();
+        let mut s = app(&hub, false, None);
+        let flags = crate::parse_args(["--port".to_string(), "6901".to_string()]);
+        s.recorder = crate::record::Recorder::new(
+            hub.clone(),
+            Duration::from_secs(1),
+            crate::record::enabled(&flags),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
+        for (method, target) in [
+            ("POST", "/record/start"),
+            ("GET", "/record?seconds=1"),
+            ("POST", "/record/stop?id=1"),
+        ] {
+            let (status, text) = ask(port, method, target, "").await;
+            assert_eq!(status, 403, "{method} {target}: {text}");
+            assert!(text.contains("\"recording\":false"), "{text}");
+        }
+        assert!(hub.clients.lock().is_empty(), "nothing joined the stream");
     }
 
     #[tokio::test]

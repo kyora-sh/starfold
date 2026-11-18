@@ -6,39 +6,106 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SERVER: &str = include_str!("../server.rs");
 
-/// Every `.route("PATH", ...)` in server.rs with its method: post( and put( as written,
-/// everything else (get, the bundled! and asset! routes) GET.
+/// The method-routing functions a route can be registered with, and the method each means.
+const METHODS: &[(&str, &str)] = &[
+    ("routing::post(", "POST"),
+    ("routing::put(", "PUT"),
+    ("routing::patch(", "PATCH"),
+    ("routing::delete(", "DELETE"),
+    ("routing::any(", "ANY"),
+    ("routing::on(", "ANY"),
+];
+
+/// Every `.route(` in server.rs, however its arguments are laid out over lines: its path
+/// (the first string literal after it) and its method (from the method-routing call before
+/// the next `.route(`; get, the bundled! and asset! routes are GET).
 fn routes_in_server() -> BTreeSet<(String, String)> {
-    SERVER
-        .lines()
-        .filter_map(|l| {
-            let rest = l.trim().strip_prefix(".route(\"")?;
-            let (path, tail) = rest.split_once('"')?;
-            let method = if tail.contains("routing::post(") {
-                "POST"
-            } else if tail.contains("routing::put(") {
-                "PUT"
-            } else {
-                "GET"
-            };
-            Some((method.to_string(), path.to_string()))
-        })
-        .collect()
+    let mut out = BTreeSet::new();
+    let mut rest = SERVER;
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        let open = rest.find('"').expect("a path literal");
+        let (path, after) = rest[open + 1..].split_once('"').expect("its end");
+        let call = &after[..after.find(".route(").unwrap_or(after.len())];
+        let call = &call[..call.find("\n    }").unwrap_or(call.len())];
+        let method = METHODS
+            .iter()
+            .find(|(f, _)| call.contains(f))
+            .map_or("GET", |m| m.1);
+        out.insert((method.to_string(), path.to_string()));
+    }
+    out
 }
 
-/// Every command `handle_text` matches on (`"cmd" =>` or `"cmd" if ... =>`).
+/// Every command `handle_text` matches on: each literal of an arm's pattern (`"a" =>`,
+/// `"a" | "b" =>`, `"a" if ... =>`).
 fn commands_in_server() -> BTreeSet<String> {
     let start = SERVER.find("fn handle_text(").expect("handle_text");
     let body = &SERVER[start..];
     let body = &body[..body.find("\n}\n").expect("its end")];
-    body.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            let rest = l.strip_prefix('"')?;
-            let (cmd, tail) = rest.split_once('"')?;
-            tail.contains("=>").then(|| cmd.to_string())
-        })
-        .collect()
+    let mut out = BTreeSet::new();
+    for l in body.lines().map(str::trim) {
+        if !l.starts_with('"') {
+            continue;
+        }
+        let Some((pattern, _)) = l.split_once("=>") else {
+            continue;
+        };
+        let pattern = pattern.split(" if ").next().unwrap_or(pattern);
+        for alt in pattern.split('|') {
+            if let Some(cmd) = alt
+                .trim()
+                .strip_prefix('"')
+                .and_then(|a| a.strip_suffix('"'))
+            {
+                out.insert(cmd.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Every source file of the crate but its tests, as (path, text).
+fn sources() -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("tests.rs") {
+                out.push((p.clone(), std::fs::read_to_string(&p).unwrap()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn routes_are_only_registered_where_the_table_is_checked() {
+    for (path, text) in sources() {
+        if path.ends_with("server.rs") {
+            for f in [
+                ".fallback(",
+                ".fallback_service(",
+                ".nest(",
+                ".nest_service(",
+                ".route_service(",
+            ] {
+                assert!(
+                    !text.contains(f),
+                    "server.rs uses {f}: decide what it serves under --read-only in readonly.rs"
+                );
+            }
+            continue;
+        }
+        assert!(
+            !text.contains(".route(\"") && !text.contains("Router::new()"),
+            "{} builds routes; they need decisions in readonly.rs",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -109,7 +176,8 @@ fn stub(read_only: bool) -> Router {
         let filter = MethodFilter::try_from(Method::from_bytes(m.as_bytes()).unwrap()).unwrap();
         r = r.route(p, on(filter, || async { "ran" }));
     }
-    r.layer(axum::middleware::from_fn_with_state(read_only, check))
+    r.fallback(|| async { "fallback ran" })
+        .layer(axum::middleware::from_fn_with_state(read_only, check))
 }
 
 async fn serve(router: Router) -> u16 {
@@ -154,6 +222,11 @@ async fn a_read_only_server_refuses_every_acting_route_and_no_watching_one() {
     }
     let (status, _) = ask(port, "POST", "/healthz").await;
     assert_eq!(status, 403, "a method with no decision is refused too");
+    for method in ["GET", "POST"] {
+        let (status, text) = ask(port, method, "/no-such-route").await;
+        assert_eq!(status, 404, "{method}: {text}");
+        assert!(!text.contains("fallback ran"), "{method}: the fallback ran");
+    }
 }
 
 #[tokio::test]
