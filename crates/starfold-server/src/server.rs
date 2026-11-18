@@ -752,10 +752,11 @@ mod tests {
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
         let binary = [&[0x11u8, 0x89, b'P'][..], &[0x12, 1, 2], &[0x13, 1, 2]];
-        let messages = ALL
-            .iter()
-            .map(|c| Message::Text((*c).into()))
-            .chain(binary.iter().map(|b| Message::Binary(Bytes::copy_from_slice(b))));
+        let messages = ALL.iter().map(|c| Message::Text((*c).into())).chain(
+            binary
+                .iter()
+                .map(|b| Message::Binary(Bytes::copy_from_slice(b))),
+        );
         for m in messages {
             assert!(handle_message(&s, &client, m, &mut rtts));
         }
