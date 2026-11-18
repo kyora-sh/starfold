@@ -47,6 +47,11 @@ afterEach(() => {
 
 const embed: LinkMode = { embed: true };
 
+/** A WebSocket constructor that throws, as one does for a bad URL. */
+function Throws(): never {
+	throw new SyntaxError('bad url ws://x/?token=secret');
+}
+
 describe('embedded link', () => {
 	test('nothing opens until the preamble comes, even well after it was asked for', async () => {
 		const s = server();
@@ -143,9 +148,6 @@ describe('embedded link', () => {
 
 	test('a socket that cannot be made reports connect-failed, keeps nothing, and the next attempt can go', () => {
 		const { r, h } = recorder();
-		function Throws(): never {
-			throw new SyntaxError('bad url ws://x/?token=secret');
-		}
 		const link = new Link(
 			'ws://x/#frag',
 			embed,
