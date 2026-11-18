@@ -3888,16 +3888,23 @@ fn skipped_damage_is_caught_up_once_the_cap_allows() {
     // skips one.
     let skipped = (0..8).any(|_| run_captures(&mut eng, &mut t, 1, viewers).0 == vec![1, 0]);
     assert!(skipped, "OpenH264 never skipped a capture");
+    // At the skipped capture's own time OpenH264 still may not take a frame; a capture for
+    // its skipped damage is due all the same, and it takes one once its cap allows.
     let views = eng.views();
-    let turn = eng.turn(&views, 1000.0 / 120.0, t - Duration::from_millis(5));
+    let skipped_at = t - Duration::from_micros(1_000_000 / 120);
+    let k = eng
+        .cohorts
+        .iter()
+        .position(|c| c.shared.cand == H264)
+        .unwrap();
+    let turn = eng.turn(&views, 1000.0 / 120.0, skipped_at);
     assert!(turn.catch_up, "a capture is due for the skipped damage");
-    assert!(
-        !turn.takes[eng
-            .cohorts
-            .iter()
-            .position(|c| c.shared.cand == H264)
-            .unwrap()]
-    );
+    assert!(!turn.takes[k]);
+    let free = skipped_at
+        + eng.cohorts[k]
+            .take
+            .wait(skipped_at, frame_interval(eng.cohorts[k].fps()));
+    assert!(eng.turn(&views, 1000.0 / 120.0, free).takes[k]);
 }
 
 #[test]
