@@ -353,3 +353,58 @@ fn a_reset_starts_from_what_the_encoder_runs_with() {
     );
     assert_eq!(kbps(&l.reset[0]), 12_000);
 }
+
+/// A frame rate the runtime leaves undefined (FrameRateExtD 0, or FrameRateExtN 0) is not
+/// made into a number: the rate in force is unknown, and a rate change, which would have to
+/// scale by it, takes the encoder out of use.
+#[test]
+fn an_undefined_frame_rate_leaves_the_rate_unknown() {
+    for (n, d) in [(30_000, 0), (0, 1)] {
+        let (mut fake, log) = Fake::new(Codec::H264);
+        fake.frame_rate = Some((n, d));
+        let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+        assert_eq!(s.rate_in_force(), RateInForce::Unknown, "{n}/{d}");
+        let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
+        assert!(e.0.contains("no defined frame rate"), "{n}/{d}: {e}");
+        assert!(log.lock().unwrap().reset.is_empty(), "no Reset scaled by it");
+        assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+        assert!(frame(&mut s, false).is_err(), "out of use");
+    }
+}
+
+/// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: the runtime took the call and changed what it asked.
+const WRN_INCOMPATIBLE_VIDEO_PARAM: i32 = 5;
+
+/// A constant-bitrate Init the runtime takes but leaves HRD conformance on (it corrected
+/// it back, answering MFX_WRN_INCOMPATIBLE_VIDEO_PARAM), or doesn't say, is not a session
+/// to keep: its bitrate could not change through Reset. Constant QP needs no Reset of the
+/// bitrate, so it opens either way.
+#[test]
+fn an_init_that_leaves_hrd_conformance_on_opens_no_session() {
+    for (hrd, says) in [(ffi::CODINGOPTION_ON, "on"), (0, "unconfirmed")] {
+        let (mut fake, _) = Fake::new(Codec::H264);
+        fake.init = VecDeque::from([WRN_INCOMPATIBLE_VIDEO_PARAM]);
+        fake.hrd_report = Some(hrd);
+        let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
+        assert!(e.0.contains(&format!("HRD conformance {says}")), "{e}");
+    }
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.hrd_report = Some(ffi::CODINGOPTION_ON);
+    let s = Session::new(Box::new(fake), &cfg(0)).unwrap();
+    assert_eq!(s.rate_in_force(), RateInForce::NotRead, "constant QP");
+}
+
+/// A Reset the runtime takes but that leaves HRD conformance reading back on takes the
+/// encoder out of use: its rate is unknown, and the next change would be refused.
+#[test]
+fn a_reset_that_leaves_hrd_conformance_on_takes_the_encoder_out_of_use() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.hrd_after_reset = Some(ffi::CODINGOPTION_ON);
+    let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    assert_eq!(s.rate_in_force(), RateInForce::Known(at(30_000)));
+    let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
+    assert!(e.0.contains("HRD conformance on"), "{e}");
+    assert_eq!(log.lock().unwrap().reset.len(), 1, "the Reset went through");
+    assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+    assert!(frame(&mut s, false).is_err(), "out of use");
+}

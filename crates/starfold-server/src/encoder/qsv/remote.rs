@@ -337,15 +337,17 @@ pub struct Remote {
     section: Section,
     size: (u32, u32),
     rate: Rate,
-    /// The bitrate the helper's encoder runs at, as it read it back after the last rate
-    /// change; unknown after a change that failed.
+    /// The bitrate the helper's encoder runs at, exactly as the helper said it: what its
+    /// session read back after Init (in `Opened`), then after each rate change (in
+    /// `RateSet`); unknown after a change that failed.
     in_force: RateInForce,
     stream: hw::Stream,
     /// Why this helper is no longer used.
     gone: Option<String>,
-    /// The implementation the helper opened, and whether it runs LowPower.
+    /// The implementation the helper opened, and whether it runs LowPower, as its session
+    /// read it back (None: the runtime didn't say).
     pub name: String,
-    pub low_power: bool,
+    pub low_power: Option<bool>,
     /// Whether the helper's session holds its cap, as it said when it opened.
     holds_cap: bool,
     /// Every frame request sent: pts, IDR asked.
@@ -424,7 +426,7 @@ impl Remote {
             in_force: RateInForce::NotRead,
             gone: None,
             name: String::new(),
-            low_power: false,
+            low_power: None,
             holds_cap: false,
             #[cfg(test)]
             sent: Vec::new(),
@@ -447,6 +449,7 @@ impl Remote {
             Reply::Opened {
                 low_power,
                 holds_cap,
+                rate,
                 name,
             } => {
                 let codec = if cfg.codec == Codec::Hevc {
@@ -454,7 +457,11 @@ impl Remote {
                 } else {
                     "H.264"
                 };
-                let mode = if low_power { "on" } else { "off" };
+                let mode = match low_power {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unknown",
+                };
                 let line = format!(
                     "qsv helper {}: opened {name} for {codec}, LowPower {mode}",
                     r.proc.id()
@@ -467,6 +474,7 @@ impl Remote {
                 r.name = name;
                 r.low_power = low_power;
                 r.holds_cap = holds_cap;
+                r.in_force = rate;
                 Ok(r)
             }
             Reply::Error { stopped, reason } => {
@@ -607,18 +615,21 @@ impl Remote {
             return Ok(());
         }
         match self.request(&Request::Rate(r), "a rate change", self.policy.timing.frame)? {
-            Reply::RateSet { kbps } => {
+            Reply::RateSet { rate } => {
                 self.rate = r;
-                self.in_force = match kbps {
-                    0 => RateInForce::NotRead,
-                    k => RateInForce::Known(k),
-                };
-                if let RateInForce::Known(k) = self.in_force {
-                    log::info!(
+                self.in_force = rate;
+                match rate {
+                    RateInForce::Known(k) => log::info!(
                         "qsv helper {}: rate asked {} kbps, in force {k} kbps",
                         self.proc.id(),
                         r.max_kbps
-                    );
+                    ),
+                    RateInForce::Unknown => log::info!(
+                        "qsv helper {}: rate asked {} kbps, in force unknown",
+                        self.proc.id(),
+                        r.max_kbps
+                    ),
+                    RateInForce::NotRead => {}
                 }
                 Ok(())
             }

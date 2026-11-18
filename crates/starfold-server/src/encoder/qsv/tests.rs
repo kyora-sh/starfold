@@ -303,6 +303,10 @@ pub(super) struct Fake {
     pub(super) normalize: bool,
     /// Its Init turned NalHrdConformance off.
     hrd_off: bool,
+    /// What GetVideoParam reads back as NalHrdConformance, over what Init set.
+    pub(super) hrd_report: Option<u16>,
+    /// A Reset it takes leaves NalHrdConformance reading back as this.
+    pub(super) hrd_after_reset: Option<u16>,
     /// IDRs after the first come without parameter sets.
     sets_once: bool,
     idrs: usize,
@@ -331,6 +335,8 @@ impl Fake {
                 video_param: VecDeque::new(),
                 normalize: false,
                 hrd_off: false,
+                hrd_report: None,
+                hrd_after_reset: None,
                 sets_once: false,
                 idrs: 0,
             },
@@ -410,6 +416,9 @@ impl Runtime for Fake {
             runs.mfx.max_kbps = c;
         }
         self.running = Some(runs);
+        if let Some(v) = self.hrd_after_reset {
+            self.hrd_report = Some(v);
+        }
         if corrected.is_some() {
             WRN_INCOMPATIBLE_VIDEO_PARAM
         } else {
@@ -417,11 +426,25 @@ impl Runtime for Fake {
         }
     }
 
+    /// Fills what the encoder runs with into `par`, and NalHrdConformance into a coding
+    /// option attached to it, as the runtime does.
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
         drop(self.call());
         let r = self.video_param.pop_front().unwrap_or(0);
         if r < 0 {
             return r;
+        }
+        let (ext, n) = (par.ext_param, par.num_ext_param);
+        let hrd = self.hrd_report.unwrap_or(if self.hrd_off {
+            ffi::CODINGOPTION_OFF
+        } else {
+            ffi::CODINGOPTION_ON
+        });
+        for i in 0..n as usize {
+            let b = unsafe { *ext.add(i) };
+            if unsafe { (*b).buffer_id } == CODING_OPTION {
+                unsafe { *((b as *mut u8).add(NAL_HRD_CONFORMANCE) as *mut u16) = hrd };
+            }
         }
         *par = self.got.or(self.running).unwrap_or_default();
         if self.normalize && par.mfx.rate_control_method == ffi::RATECONTROL_CBR {

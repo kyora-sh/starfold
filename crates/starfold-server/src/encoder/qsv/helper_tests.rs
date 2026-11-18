@@ -7,7 +7,7 @@ use super::proto::{Decoder, Open, Rate, Reply, Request, Unit, MAX_MESSAGE, MAX_U
 use super::remote::slot_size;
 use super::session::Session;
 use super::tests::{bitstream, Fake};
-use crate::encoder::{Codec, EncodeError, EncoderConfig};
+use crate::encoder::{Codec, EncodeError, EncoderConfig, RateInForce};
 use std::collections::VecDeque;
 
 fn rate() -> Rate {
@@ -62,13 +62,21 @@ fn requests_and_replies_round_trip() {
     }
     let replies = [
         Reply::Opened {
-            low_power: true,
+            low_power: Some(true),
             holds_cap: false,
+            rate: RateInForce::NotRead,
             name: "mfx-gen".into(),
         },
         Reply::Opened {
-            low_power: false,
+            low_power: Some(false),
             holds_cap: true,
+            rate: RateInForce::Known(7_990),
+            name: "mfx-gen".into(),
+        },
+        Reply::Opened {
+            low_power: None,
+            holds_cap: true,
+            rate: RateInForce::Unknown,
             name: "mfx-gen".into(),
         },
         Reply::Done {
@@ -82,7 +90,15 @@ fn requests_and_replies_round_trip() {
             slot: 1,
             units: Vec::new(),
         },
-        Reply::RateSet { kbps: 7_990 },
+        Reply::RateSet {
+            rate: RateInForce::Known(7_990),
+        },
+        Reply::RateSet {
+            rate: RateInForce::NotRead,
+        },
+        Reply::RateSet {
+            rate: RateInForce::Unknown,
+        },
         Reply::Error {
             stopped: true,
             reason: "Quick Sync stopped: x".into(),
@@ -196,10 +212,12 @@ fn the_helper_serves_a_session() {
     assert_eq!(
         replies[0],
         Reply::Opened {
-            low_power: false,
+            low_power: Some(false),
             holds_cap: true,
+            rate: RateInForce::Known(2_000),
             name: "fake-gen".into()
-        }
+        },
+        "Init's read-back goes with Opened"
     );
     let keys: Vec<(u8, bool)> = replies[1..4]
         .iter()
@@ -214,7 +232,9 @@ fn the_helper_serves_a_session() {
     }
     assert_eq!(
         replies[4],
-        Reply::RateSet { kbps: 5_000 },
+        Reply::RateSet {
+            rate: RateInForce::Known(5_000)
+        },
         "what the encoder reads back that it runs"
     );
 }
@@ -470,9 +490,15 @@ mod remote {
 
     /// A helper's open, its session holding its cap or not.
     fn opened_holding(holds_cap: bool) -> String {
+        opened_at(holds_cap, RateInForce::NotRead)
+    }
+
+    /// A helper's open, its session saying `rate` about what Init left it running at.
+    fn opened_at(holds_cap: bool, rate: RateInForce) -> String {
         let opened = says(&Reply::Opened {
-            low_power: true,
+            low_power: Some(true),
             holds_cap,
+            rate,
             name: "fake-gen".into(),
         });
         format!("{}; {opened}", super::super::r1_tests::READS_OPEN)
@@ -567,10 +593,11 @@ mod remote {
     }
 
     /// The line logged when a helper with `low_power` opens its session.
-    fn open_line(low_power: bool) -> (u32, String) {
+    fn open_line(low_power: Option<bool>) -> (u32, String) {
         let opened = says(&Reply::Opened {
             low_power,
             holds_cap: true,
+            rate: RateInForce::NotRead,
             name: "fake-gen".into(),
         });
         let reads = super::super::r1_tests::READS_OPEN;
@@ -580,7 +607,7 @@ mod remote {
 
     #[test]
     fn the_open_line_says_low_power_off() {
-        let (pid, line) = open_line(false);
+        let (pid, line) = open_line(Some(false));
         assert_eq!(
             line,
             format!("qsv helper {pid}: opened fake-gen for H.264, LowPower off")
@@ -589,10 +616,21 @@ mod remote {
 
     #[test]
     fn the_open_line_says_low_power_on() {
-        let (pid, line) = open_line(true);
+        let (pid, line) = open_line(Some(true));
         assert_eq!(
             line,
             format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on")
+        );
+    }
+
+    /// A runtime that doesn't read LowPower back leaves it unknown in the line, not the mode
+    /// the session asked for.
+    #[test]
+    fn the_open_line_says_low_power_unknown_when_not_read_back() {
+        let (pid, line) = open_line(None);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower unknown")
         );
     }
 
@@ -601,22 +639,52 @@ mod remote {
     #[test]
     fn a_failed_rate_change_makes_the_helpers_rate_unknown() {
         let p = policy(QUICK);
-        let set = says(&Reply::RateSet { kbps: 5_000 });
+        let set = says(&Reply::RateSet {
+            rate: RateInForce::Known(5_000),
+        });
         let refused = says(&Reply::Error {
             stopped: false,
             reason: "MFXVideoENCODE_Reset failed".into(),
         });
-        let mut enc = start(p, format!("{}; {set}; {refused}; sleep 30", opened()));
+        let opened = opened_at(true, RateInForce::Known(2_000));
+        let mut enc = start(p, format!("{opened}; {set}; {refused}; sleep 30"));
         assert_eq!(
             enc.rate_in_force(),
-            RateInForce::NotRead,
-            "nothing read yet"
+            RateInForce::Known(2_000),
+            "what Init read back"
         );
         enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
         assert_eq!(enc.rate_in_force(), RateInForce::Known(5_000));
         assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
         assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
         assert!(p.off().is_none(), "an ordinary failure");
+    }
+
+    /// A fresh helper (one that replaces an encoder whose rate change was refused) says at
+    /// once what its Init left it running at: the server never stands its target in for it.
+    #[test]
+    fn a_replacement_reports_its_inits_rate_before_any_change() {
+        for rate in [
+            RateInForce::Known(30_000),
+            RateInForce::Unknown,
+            RateInForce::NotRead,
+        ] {
+            let enc = start(policy(QUICK), format!("{}; sleep 30", opened_at(true, rate)));
+            assert_eq!(enc.rate_in_force(), rate);
+        }
+    }
+
+    /// A rate change the helper took but could read no rate back from stays unknown at the
+    /// server: not 'not read' (where the target would stand), and not the rate asked.
+    #[test]
+    fn a_rate_set_with_no_rate_read_back_stays_unknown() {
+        let set = says(&Reply::RateSet {
+            rate: RateInForce::Unknown,
+        });
+        let opened = opened_at(true, RateInForce::Known(2_000));
+        let mut enc = start(policy(QUICK), format!("{opened}; {set}; sleep 30"));
+        enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
+        assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
     }
 
     #[test]

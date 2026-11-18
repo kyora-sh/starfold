@@ -13,7 +13,8 @@ use crate::encoder::caps::{Acceleration, EncoderCapability, ProbeProvider, Probe
 use crate::encoder::hw::sample_config;
 use crate::encoder::isolate::{Report, VERSION};
 use crate::encoder::{
-    Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder,
+    Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig, RateInForce,
+    VideoEncoder,
 };
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -48,8 +49,9 @@ fn says(r: &Reply) -> String {
 
 fn opened() -> String {
     let opened = says(&Reply::Opened {
-        low_power: true,
+        low_power: Some(true),
         holds_cap: true,
+        rate: RateInForce::NotRead,
         name: "fake-gen".into(),
     });
     format!("{READS_OPEN}; {opened}")

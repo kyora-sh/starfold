@@ -12,7 +12,7 @@ use crate::encoder::hw::sample_config;
 use crate::encoder::isolate::{Report, VERSION};
 use crate::encoder::{
     AccessUnit, Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    VideoEncoder,
+    RateInForce, VideoEncoder,
 };
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -46,8 +46,9 @@ pub(super) const READS_OPEN: &str = concat!(
 
 fn opened() -> String {
     let opened = says(&Reply::Opened {
-        low_power: true,
+        low_power: Some(true),
         holds_cap: true,
+        rate: RateInForce::NotRead,
         name: "fake-gen".into(),
     });
     format!("{READS_OPEN}; {opened}")

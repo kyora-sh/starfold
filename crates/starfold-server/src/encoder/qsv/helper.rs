@@ -7,9 +7,7 @@ use super::driver::STOPPED;
 use super::proto::{Open, Reply, Request, Unit};
 use super::session::Session;
 use crate::encoder::hw::sample_config;
-use crate::encoder::{
-    Backend, EncodeError, EncodeOptions, FrameView, RateConfig, RateInForce, VideoEncoder,
-};
+use crate::encoder::{Backend, EncodeError, EncodeOptions, FrameView, RateConfig, VideoEncoder};
 use std::io::{Read, Write};
 
 /// The most a request may be: they carry fields, never pictures.
@@ -119,8 +117,9 @@ pub fn serve(
                 eprintln!("LowPower on: the runtime refused the full encoder ({why})");
             }
             let opened = Reply::Opened {
-                low_power: s.low_power,
+                low_power: s.low_power_read,
                 holds_cap: s.holds_cap(),
+                rate: s.rate_in_force(),
                 name,
             };
             if !reply(&mut output, &opened) {
@@ -198,10 +197,7 @@ pub fn serve(
                 };
                 match session.set_rate(rate) {
                     Ok(()) => Reply::RateSet {
-                        kbps: match session.rate_in_force() {
-                            RateInForce::Known(k) => k,
-                            _ => 0,
-                        },
+                        rate: session.rate_in_force(),
                     },
                     Err(e) => error(&e, session.stopped().is_some()),
                 }
