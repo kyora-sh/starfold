@@ -426,79 +426,44 @@ struct Cohort {
     viewers: Vec<u64>,
     refine: Refinement,
     pace: Pace,
-    /// When this cohort's next frame is due at its cap.
-    take: Schedule,
-}
-
-/// How far ahead of an even schedule at the rate captures may run, in frame intervals (the
-/// tolerance of [`Schedule`]): a source whose frames never run more than this ahead loses
-/// none to the gate, and no burst gets more than this.
-const TOLERANCE: f64 = 1.5;
-
-/// The frame interval at `fps`.
-fn frame_interval(fps: u32) -> Duration {
-    Duration::from_secs_f64(1.0 / fps.max(1) as f64)
-}
-
-/// A capture rate as a GCRA (a token bucket): `due` is when the next capture would come on
-/// an even schedule at the rate, and a capture may come once `now` is no more than
-/// `TOLERANCE` intervals before it. Each capture moves `due` on by an interval from itself
-/// or from `due`, whichever is later, so unused time isn't banked past the tolerance.
-///
-/// Over any window of length `w`, at most `(w + TOLERANCE × interval) / interval + 1`
-/// captures come: at most two more than the rate in a window of whole intervals, three
-/// within one interval at most. A rate change starts the schedule again at the new rate
-/// from the last capture, and the bound holds from there at the new rate.
-#[derive(Clone, Copy, Debug, Default)]
-struct Schedule {
-    due: Option<Instant>,
-    /// The interval `due` was set at, and the capture that set it.
-    interval: Option<Duration>,
-    last: Option<Instant>,
-}
-
-impl Schedule {
-    /// `due` at `interval`: as it stands, or from the last capture at a changed rate.
-    fn due_at(&self, interval: Duration) -> Option<Instant> {
-        match self.interval == Some(interval) {
-            true => self.due,
-            false => self.last.map(|l| l + interval),
-        }
-    }
-
-    /// How long until a capture at `interval` may come, from `now` (zero: it may).
-    fn wait(&self, now: Instant, interval: Duration) -> Duration {
-        self.due_at(interval).map_or(Duration::ZERO, |d| {
-            d.saturating_duration_since(now)
-                .saturating_sub(interval.mul_f64(TOLERANCE))
-        })
-    }
-
-    /// A capture at `interval` came at `at`.
-    fn took(&mut self, at: Instant, interval: Duration) {
-        let from = self.due_at(interval).map_or(at, |d| d.max(at));
-        self.due = Some(from + interval);
-        self.interval = Some(interval);
-        self.last = Some(at);
-    }
-}
-
-/// A wait in whole milliseconds, as the capture loop sleeps it: rounded up from whole
-/// microseconds.
-fn wait_ms(d: Duration) -> i32 {
-    (d.as_micros().min(i32::MAX as u128 - 999) as i32 + 999) / 1000
+    /// The capture this cohort last took a frame from.
+    last_take: Option<Instant>,
 }
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
 /// second's worth of the cap.
 const FPS_FLOOR: u32 = 10;
 
-/// How often a cohort takes a frame while the picture moves. Flow control and a busy encoder
-/// skip frames, and an encoder that budgets for every capture would starve the ones that go out.
+/// How many of the last gaps between motion frames a raise of the budgeted rate looks at.
+const UP_GAPS: usize = 3;
+
+/// How far above the budgeted rate frames have to come before it is raised.
+const UP_SHARE: f64 = 0.05;
+
+/// A gap between motion frames this long or longer is a pause, not a rate.
+const PAUSE_MS: f64 = 1000.0;
+
+/// The rate a cohort's encoder budgets each picture for: the rate frames are delivered to
+/// it while the picture moves, so the stream spends its target on average, neither more
+/// (frames delivered faster than budgeted, each sized for the slower rate) nor much less.
+///
+/// - Measured: a moving average of the gaps between motion frames (each new gap weighs
+///   0.2, about the last five frames). A gap of a second or more is a pause and isn't
+///   counted.
+/// - Raised at once when the last three gaps run 5% or more faster than the budgeted rate,
+///   to their mean rate, at most twice the cap: frames delivered faster than budgeted
+///   would each spend a slower rate's share.
+/// - Lowered (flow control and a busy encoder skip frames, and an encoder that budgets for
+///   every capture would starve the ones that go out) only by a quarter or more, at most
+///   once a second, and never below the floor.
+/// - Back to the cap after a pause and at the start, so the first pictures after either are
+///   budgeted for the full rate, not for the slow trickle before.
 struct Pace {
     last: Option<Instant>,
-    /// Smoothed interval between frames taken in motion (ms); pauses of a second or more are stills.
+    /// Smoothed interval between frames taken in motion (ms), since the last pause.
     interval_ms: Option<f64>,
+    /// The last [`UP_GAPS`] gaps (ms), since the last pause.
+    recent: std::collections::VecDeque<f64>,
     fps: u32,
     changed: Instant,
 }
@@ -508,35 +473,63 @@ impl Pace {
         Pace {
             last: None,
             interval_ms: None,
+            recent: std::collections::VecDeque::with_capacity(UP_GAPS),
             fps,
             changed: Instant::now(),
         }
     }
 
-    /// A motion frame went to the encoder at `now`. Changes the budgeted rate at most once a
-    /// second, and only by a quarter or more.
+    fn set(&mut self, fps: u32, now: Instant, cohort: u64, why: &str) {
+        log::info!("cohort {cohort}: encoder rate {} -> {fps} fps ({why})", self.fps);
+        self.fps = fps;
+        self.changed = now;
+    }
+
+    /// A motion frame went to the encoder at `now`, the cohort capped at `max` fps.
     fn took(&mut self, now: Instant, max: u32, cohort: u64) {
-        if let Some(gap) = self
+        let top = max.saturating_mul(2).max(1);
+        let gap = self
             .last
-            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0)
-        {
-            if gap < 1000.0 {
-                self.interval_ms = Some(self.interval_ms.map_or(gap, |i| i * 0.8 + gap * 0.2));
+            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0);
+        self.last = Some(now);
+        if self.fps > top {
+            self.set(top, now, cohort, "the cap went down");
+        }
+        match gap {
+            Some(g) if g < PAUSE_MS => {
+                self.interval_ms = Some(self.interval_ms.map_or(g, |i| i * 0.8 + g * 0.2));
+                if self.recent.len() == UP_GAPS {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(g);
+            }
+            Some(_) => {
+                self.interval_ms = None;
+                self.recent.clear();
+                if self.fps != max {
+                    self.set(max, now, cohort, "after a pause");
+                }
+                return;
+            }
+            None => return,
+        }
+        if self.recent.len() == UP_GAPS {
+            let mean = self.recent.iter().sum::<f64>() / UP_GAPS as f64;
+            let up = ((1000.0 / mean.max(1.0)).round() as u32).min(top);
+            if up as f64 >= self.fps as f64 * (1.0 + UP_SHARE) {
+                let why = format!("frames every {mean:.0} ms");
+                self.set(up, now, cohort, &why);
+                return;
             }
         }
-        self.last = Some(now);
         let Some(interval) = self.interval_ms else {
             return;
         };
-        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), max);
+        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), top);
         let step = (want as f64 - self.fps as f64).abs() >= self.fps as f64 * 0.25;
         if step && now.saturating_duration_since(self.changed) >= Duration::from_secs(1) {
-            log::info!(
-                "cohort {cohort}: encoder rate {} -> {want} fps (a frame every {interval:.0} ms)",
-                self.fps
-            );
-            self.fps = want;
-            self.changed = now;
+            let why = format!("a frame every {interval:.0} ms");
+            self.set(want, now, cohort, &why);
         }
     }
 }
@@ -1108,7 +1101,7 @@ impl Engine {
                 self.h,
             ),
             pace: Pace::new(fps),
-            take: Schedule::default(),
+            last_take: None,
         })
     }
 
@@ -1441,7 +1434,7 @@ impl Engine {
             .collect()
     }
 
-    /// Cohorts capped below the capture rate whose next frame isn't due yet at their cap
+    /// Cohorts capped below the capture rate whose last frame is too recent for their cap
     /// (with the capture's early allowance).
     fn early(&self, views: &[View], now: Instant) -> Vec<bool> {
         let capture = self.arrival_fps(views);
@@ -1449,7 +1442,10 @@ impl Engine {
             .iter()
             .map(|c| {
                 let fps = c.fps();
-                fps < capture && !c.take.wait(now, frame_interval(fps)).is_zero()
+                fps < capture
+                    && c.last_take.is_some_and(|t| {
+                        now.saturating_duration_since(t).as_secs_f64() < 0.85 / fps.max(1) as f64
+                    })
             })
             .collect()
     }
@@ -1509,24 +1505,6 @@ impl Engine {
             })
             .min()
             .unwrap_or(100)
-    }
-
-    /// How long the capture loop may sleep with nothing to do: until a cohort's pass can come
-    /// due, and no later than the earliest a cohort holding skipped damage may take a frame,
-    /// so that damage reaches its viewers at their cap, not a fixed wait later. (One that
-    /// may already take it and doesn't waits on its viewers, whose acks wake the loop.)
-    fn idle_wait_ms(&self, views: &[View], now: Instant) -> i32 {
-        let skipped = self
-            .cohorts
-            .iter()
-            .zip(views)
-            .filter(|(c, v)| !v.clients.is_empty() && c.skipped.is_some())
-            .map(|(c, _)| c.take.wait(now, frame_interval(c.fps())))
-            .filter(|w| !w.is_zero())
-            .map(wait_ms)
-            .min();
-        let refine = self.refine_wait_ms(views, now);
-        skipped.map_or(refine, |s| refine.min(s))
     }
 
     /// What changed in this capture, for the cohorts with viewers (None: everything).
@@ -1607,13 +1585,13 @@ impl Engine {
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
                 fps: if typing {
-                    max_fps
+                    max_fps.max(c.pace.fps)
                 } else {
-                    c.pace.fps.min(max_fps)
+                    c.pace.fps
                 },
             }) {
                 Ok(()) => {
-                    c.take.took(turn.at, frame_interval(max_fps));
+                    c.last_take = Some(turn.at);
                     if motion {
                         c.pace.took(now, max_fps, c.shared.id);
                     }
@@ -2379,7 +2357,6 @@ fn capture_loop(
     let mut pool = Pool::new(w, h, cap.full());
     let mut fps = cfg.fps;
     let mut last_capture = Instant::now() - Duration::from_secs(1);
-    let mut schedule = Schedule::default();
     let mut had_clients = false;
     let mut full_next = true;
     let debug_marker = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
@@ -2434,20 +2411,26 @@ fn capture_loop(
             log::info!("capture {fps} -> {want} fps");
             fps = want;
         }
-        let interval = frame_interval(fps);
+        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        // Allow slight early capture so source jitter doesn't alias into dropped frames.
+        let min_interval = interval.mul_f64(0.85);
         let interval_ms = interval.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let turn = eng.turn(&views, interval_ms, now);
         if !cap.damaged && !turn.work() {
             wait_any(
                 &[cap.fd(), hub.waker.waitable()],
-                eng.idle_wait_ms(&views, now),
+                eng.refine_wait_ms(&views, now),
             );
             continue;
         }
-        let rem = schedule.wait(Instant::now(), interval);
-        if !rem.is_zero() {
-            wait_any(&[hub.waker.waitable()], wait_ms(rem));
+        let since = last_capture.elapsed();
+        if since < min_interval {
+            let rem = min_interval - since;
+            wait_any(
+                &[hub.waker.waitable()],
+                (rem.as_micros() as i32 + 999) / 1000,
+            );
             continue;
         }
         // Apps present a frame as a burst of puts; give the burst a moment to land so
@@ -2522,7 +2505,6 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         last_capture = t0;
-        schedule.took(t0, interval);
         eng.dispatch(
             &Frame {
                 buf,
