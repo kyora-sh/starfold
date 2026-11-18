@@ -48,7 +48,7 @@ type ForceIntraFrame = unsafe extern "C" fn(*mut sys::ISVCEncoder, bool, c_int) 
 /// The same slot as openh264-sys2 binds it.
 type AsBound = unsafe extern "C" fn(*mut sys::ISVCEncoder, bool) -> c_int;
 
-/// Asks `enc` for an IDR on every spatial layer (`iLayerId` -1) of the next frame.
+/// Calls `enc`'s `ForceIntraFrame` slot with `bIDR` true and `iLayerId` -1.
 ///
 /// # Safety
 /// `enc` is a live encoder from `WelsCreateSVCEncoder`.
@@ -58,8 +58,8 @@ unsafe fn force_intra_frame(enc: *mut sys::ISVCEncoder) -> c_int {
     // but it holds the C++ method declared at codec_api.h:323 and defined at
     // welsEncoderExt.cpp:491,
     //   virtual int EXTAPI ForceIntraFrame (bool bIDR, int iLayerId = -1) = 0;
-    // whose default argument only a C++ caller supplies. Called with the method's own
-    // parameters, the callee reads the layer id passed here.
+    // whose default argument only a C++ caller supplies. This passes the layer id in the
+    // argument position the method takes.
     unsafe {
         let slot = (**enc).ForceIntraFrame.unwrap();
         let f = std::mem::transmute::<AsBound, ForceIntraFrame>(slot);
@@ -374,7 +374,7 @@ mod tests {
         0
     }
 
-    /// The slot gets the IDR flag and the layer id the C++ method reads: -1, every layer.
+    /// The slot receives `bIDR` true and `iLayerId` -1, in the method's argument positions.
     #[test]
     fn a_forced_keyframe_names_every_layer() {
         let vt = sys::ISVCEncoderVtbl {
