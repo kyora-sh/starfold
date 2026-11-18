@@ -4079,9 +4079,14 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         .passes(&views, &p.eng.takes(&views, 33.0), later)
         .contains(&true));
     p.eng.cfg.source_fps = 120;
+    // Each cohort has just used its tolerance up: its next frame is two intervals off.
     for c in &mut p.eng.cohorts {
-        let due = later - Duration::from_millis(5) + frame_interval(c.fps());
-        c.take = Schedule { due: Some(due) };
+        let interval = frame_interval(c.fps());
+        c.take = Schedule {
+            due: Some(later + interval * 2),
+            interval: Some(interval),
+            last: Some(later - Duration::from_millis(5)),
+        };
     }
     let turn = p.eng.turn(&views, 33.0, later);
     assert!(!turn.passes.contains(&true), "too soon for a 30 fps cap");
@@ -4231,8 +4236,8 @@ fn no_software_encoders_share_moves() {
 }
 
 /// Captures as the capture loop takes them while damage never stops: as soon as the schedule
-/// allows, the wait rounded up to whole milliseconds, plus the loop's own `overhead`. Returns
-/// when each capture came, over `secs` seconds at `fps`.
+/// allows, after the loop's own wait (`wait_ms`, as it sleeps), plus the loop's own
+/// `overhead`. Returns when each capture came, over `secs` seconds at `fps`.
 fn continuous(fps: u32, secs: u64, overhead: Duration) -> Vec<Duration> {
     let start = Instant::now();
     let interval = frame_interval(fps);
@@ -4242,7 +4247,7 @@ fn continuous(fps: u32, secs: u64, overhead: Duration) -> Vec<Duration> {
     while now < start + Duration::from_secs(secs) {
         let rem = s.wait(now, interval);
         if !rem.is_zero() {
-            now += Duration::from_millis(rem.as_nanos().div_ceil(1_000_000) as u64);
+            now += Duration::from_millis(wait_ms(rem) as u64).max(rem);
             continue;
         }
         s.took(now, interval);
@@ -4300,81 +4305,123 @@ fn captures_offered_on_any_grid_up_to_the_interval_come_at_the_rate() {
     }
 }
 
-/// The cost of keeping a late capture's lateness: at most two captures over the rate in any
-/// second, and a capture right after a late one; never three within an interval, and none
-/// right after a pause.
+/// The most captures in `at` within any window of length `w` (starting at a capture).
+fn most_in(at: &[Duration], w: Duration) -> usize {
+    (0..at.len())
+        .map(|i| at[i..].iter().take_while(|&&b| b < at[i] + w).count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The bound the schedule promises for a window of length `w`:
+/// `(w + TOLERANCE × interval) / interval + 1`, rounded down.
+fn bound(w: Duration, interval: Duration) -> usize {
+    ((w.as_secs_f64() + TOLERANCE * interval.as_secs_f64()) / interval.as_secs_f64()) as usize
+        + 1
+}
+
+/// However captures are offered, no window holds more than the bound: at most two over the
+/// rate in a second, three within one interval at most.
 #[test]
-fn no_more_than_two_captures_over_the_rate_in_any_second() {
-    let fps = 30;
-    let interval = frame_interval(fps);
-    let bound = fps as usize + 2;
-    let runs = [
-        continuous(fps, 10, Duration::from_micros(300)),
-        continuous(fps, 10, Duration::ZERO),
-        on_a_grid(fps, interval.mul_f64(0.9), 10),
-        on_a_grid(fps, interval.mul_f64(0.7), 10),
-        on_a_grid(fps, interval.mul_f64(0.5), 10),
-    ];
-    for at in &runs {
-        for (i, &a) in at.iter().enumerate() {
-            let n = at[i..]
-                .iter()
-                .take_while(|&&b| b < a + Duration::from_secs(1))
-                .count();
-            assert!(n <= bound, "{n} captures in the second from {a:?}");
-            let close = at[i..].iter().take_while(|&&b| b < a + interval).count();
-            assert!(close <= 2, "{close} captures within an interval from {a:?}");
+fn no_window_holds_more_than_the_bound() {
+    for fps in [20, 30, 60, 120] {
+        let interval = frame_interval(fps);
+        let runs = [
+            continuous(fps, 10, Duration::from_micros(300)),
+            continuous(fps, 10, Duration::ZERO),
+            on_a_grid(fps, interval.mul_f64(0.9), 10),
+            on_a_grid(fps, interval.mul_f64(0.7), 10),
+            on_a_grid(fps, interval.mul_f64(0.5), 10),
+            on_a_grid(fps, Duration::from_micros(100), 10),
+        ];
+        for at in &runs {
+            for w in [interval, interval * 2, Duration::from_secs(1)] {
+                let n = most_in(at, w);
+                assert!(n <= bound(w, interval), "{n} captures in {w:?} at {fps} fps");
+            }
+            assert!(most_in(at, Duration::from_secs(1)) <= fps as usize + 2);
+            assert!(most_in(at, interval) <= 3);
         }
     }
-    let mut s = Schedule {
-        due: Some(Instant::now()),
-    };
-    let late = s.due.unwrap() + interval.mul_f64(1.0 - EARLY_SHARE);
-    s.took(late, interval);
-    assert!(
-        s.wait(late, interval) <= Duration::from_micros(1),
-        "a late capture can be followed at once"
-    );
-    s.took(late, interval);
-    assert!(!s.wait(late, interval).is_zero(), "but not by a third");
-    let paused = s.due.unwrap() + interval;
-    s.took(paused, interval);
-    assert!(
-        s.wait(paused, interval) >= interval.mul_f64(1.0 - EARLY_SHARE) - Duration::from_micros(1),
-        "after a pause the schedule starts afresh"
-    );
+    // After a pause, a burst gets two at once and no more.
+    let interval = frame_interval(30);
     let mut s = Schedule::default();
     let t = Instant::now();
     s.took(t, interval);
-    assert!(
-        !s.wait(t, interval).is_zero(),
-        "nor after the first capture"
-    );
+    assert!(s.wait(t, interval).is_zero(), "the tolerance lets a second come at once");
+    s.took(t, interval);
+    assert!(!s.wait(t, interval).is_zero(), "but not a third");
 }
 
+/// Sol's bursty source at --framerate 20: ten updates 43 ms apart every 520 ms (19.2 fps
+/// on average). Each burst runs ahead of an even schedule at 20 fps by up to 63 ms, within
+/// the tolerance (75 ms), so every update is captured. The schedule before this one, which
+/// let a capture come only 15% early, merged the last two of each burst.
 #[test]
-fn an_early_capture_borrows_from_the_next() {
-    let interval = frame_interval(30);
+fn a_bursty_source_below_the_rate_loses_no_frame() {
+    let interval = frame_interval(20);
+    let mut s = Schedule::default();
+    let start = Instant::now();
+    for cycle in 0..20u64 {
+        for k in 0..10u64 {
+            let t = start + Duration::from_millis(cycle * 520 + k * 43);
+            assert_eq!(
+                s.wait(t, interval),
+                Duration::ZERO,
+                "update {k} of burst {cycle} held back"
+            );
+            s.took(t, interval);
+        }
+    }
+}
+
+/// A rate change starts the schedule again at the new rate from the last capture, in both
+/// directions (Sol's cases): raised from 60 to 240 fps right after a capture, the next may
+/// come at once at the new rate, not 16 ms later; lowered from 120 to 60, the bound holds at
+/// the new rate from the change on.
+#[test]
+fn a_rate_change_starts_the_schedule_again_at_the_new_rate() {
+    let (i60, i240, i120) = (frame_interval(60), frame_interval(240), frame_interval(120));
     let t = Instant::now();
-    let mut s = Schedule {
-        due: Some(t + interval),
-    };
-    let early = t + interval.mul_f64(1.0 - EARLY_SHARE);
-    assert!(s.wait(early, interval).is_zero(), "early by the allowance");
-    s.took(early, interval);
-    let again = early + interval.mul_f64(1.0 - EARLY_SHARE);
-    assert!(
-        s.wait(again, interval) >= interval.mul_f64(EARLY_SHARE) - Duration::from_micros(1),
-        "not another early capture right after the first"
-    );
-    assert!(
-        s.wait(
-            t + interval.mul_f64(2.0 - EARLY_SHARE) + Duration::from_micros(1),
-            interval
-        )
-        .is_zero(),
-        "the next is due a whole interval after the one the early capture was due for"
-    );
+    let mut s = Schedule::default();
+    s.took(t, i60);
+    s.took(t + Duration::from_millis(1), i60);
+    assert!(!s.wait(t + Duration::from_millis(2), i60).is_zero(), "held at 60");
+    let up = t + Duration::from_micros(4_167);
+    assert_eq!(s.wait(up, i240), Duration::ZERO, "free at 240 once raised");
+
+    let mut s = Schedule::default();
+    let start = Instant::now();
+    let mut at = Vec::new();
+    let mut now = start;
+    while now < start + Duration::from_secs(2) {
+        let interval = if now < start + Duration::from_secs(1) { i120 } else { frame_interval(60) };
+        if s.wait(now, interval).is_zero() {
+            s.took(now, interval);
+            at.push(now - start);
+        }
+        now += Duration::from_micros(250);
+    }
+    let after: Vec<Duration> = at
+        .iter()
+        .copied()
+        .filter(|&a| a >= Duration::from_secs(1))
+        .collect();
+    let i60 = frame_interval(60);
+    for w in [i60, i60 * 2, Duration::from_millis(500)] {
+        assert!(most_in(&after, w) <= bound(w, i60), "after the change, in {w:?}");
+    }
+}
+
+/// The capture loop's timer: the wait it sleeps is the schedule's, in whole microseconds
+/// rounded up to whole milliseconds (so a 999 ns rest is a zero-time poll and a 1,000,001 ns
+/// rest a 1 ms sleep).
+#[test]
+fn the_loop_sleeps_the_schedules_wait_in_milliseconds() {
+    assert_eq!(wait_ms(Duration::from_nanos(999)), 0);
+    assert_eq!(wait_ms(Duration::from_nanos(1_000_001)), 1);
+    assert_eq!(wait_ms(Duration::from_micros(1_001)), 2);
+    assert_eq!(wait_ms(Duration::from_millis(33)), 33);
 }
 
 #[test]
@@ -4451,9 +4498,10 @@ fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     join_legacy(&hub, &c);
     let grid = Duration::from_millis(15);
     let got = frames_on_a_grid(&mut eng, (&c, &mut rx), H264, grid, (120, 60));
+    let most = bound(Duration::from_secs(2), frame_interval(60));
     assert!(
-        got.abs_diff(120) <= 1,
-        "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms"
+        (119..=most).contains(&got),
+        "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms (at most {most})"
     );
 }
 
@@ -4482,8 +4530,41 @@ fn a_100_fps_cohort_on_a_120_fps_capture_takes_100_frames_a_second() {
         Duration::from_nanos(1_000_000_000 / 120),
         (120, 100),
     );
+    let most = bound(Duration::from_secs(2), frame_interval(100));
     assert!(
-        got.abs_diff(200) <= 1,
-        "{got} frames in 2 s at a 100 fps cap from a 120 fps capture"
+        (199..=most).contains(&got),
+        "{got} frames in 2 s at a 100 fps cap from a 120 fps capture (at most {most})"
+    );
+}
+
+/// Sol's stall: a cohort that skipped damage because its next frame wasn't due yet must not
+/// sleep the loop's idle timeout: the loop wakes no later than when that cohort may take a
+/// frame. Here the H.264 cohort (30 fps) skipped one 5 ms after its last frame; with nothing
+/// else to do, the loop sleeps at most the rest of its wait, not 100 ms.
+#[test]
+fn skipped_damage_wakes_the_loop_when_its_cohort_may_take_it() {
+    let mut p = pair();
+    p.still();
+    p.ack_hevc();
+    p.ack_h264();
+    let now = p.t + Duration::from_secs(60);
+    let views = p.eng.views();
+    let k = p.eng.cohorts.iter().position(|c| c.shared.cand == H264).unwrap();
+    let interval = frame_interval(p.eng.cohorts[k].fps());
+    p.eng.cohorts[k].take = Schedule {
+        due: Some(now + interval * 2),
+        interval: Some(interval),
+        last: Some(now - Duration::from_millis(5)),
+    };
+    p.eng.cohorts[k].skipped = Some(Skipped {
+        band: None,
+        mb: None,
+    });
+    let rest = p.eng.cohorts[k].take.wait(now, interval);
+    assert!(!rest.is_zero());
+    let ms = p.eng.idle_wait_ms(&views, now);
+    assert!(
+        ms <= wait_ms(rest),
+        "the loop sleeps {ms} ms though the skipped damage may go in {rest:?}"
     );
 }

@@ -430,44 +430,63 @@ struct Cohort {
     take: Schedule,
 }
 
-/// How early a capture may come before it is due, as a share of the frame interval, so
-/// source jitter doesn't alias into dropped frames.
-const EARLY_SHARE: f64 = 0.15;
+/// How far ahead of an even schedule at the rate captures may run, in frame intervals (the
+/// tolerance of [`Schedule`]): a source whose frames never run more than this ahead loses
+/// none to the gate, and no burst gets more than this.
+const TOLERANCE: f64 = 1.5;
 
 /// The frame interval at `fps`.
 fn frame_interval(fps: u32) -> Duration {
     Duration::from_secs_f64(1.0 / fps.max(1) as f64)
 }
 
-/// When the next capture at a rate is due. An early capture moves the due time on from
-/// the one it came early for, so the next gives the time back. So does a late one, up to
-/// the rest of an interval late: captures offered on a grid that doesn't divide the
-/// interval still come at the rate on average. Later than that is a pause, and the
-/// schedule starts afresh. Never above the rate on average, and in any window at most two
-/// more than the rate allows (the second right after a late one).
+/// A capture rate as a GCRA (a token bucket): `due` is when the next capture would come on
+/// an even schedule at the rate, and a capture may come once `now` is no more than
+/// `TOLERANCE` intervals before it. Each capture moves `due` on by an interval from itself
+/// or from `due`, whichever is later, so unused time isn't banked past the tolerance.
+///
+/// Over any window of length `w`, at most `(w + TOLERANCE × interval) / interval + 1`
+/// captures come: at most two more than the rate in a window of whole intervals, three
+/// within one interval at most. A rate change starts the schedule again at the new rate
+/// from the last capture, and the bound holds from there at the new rate.
 #[derive(Clone, Copy, Debug, Default)]
 struct Schedule {
     due: Option<Instant>,
+    /// The interval `due` was set at, and the capture that set it.
+    interval: Option<Duration>,
+    last: Option<Instant>,
 }
 
 impl Schedule {
+    /// `due` at `interval`: as it stands, or from the last capture at a changed rate.
+    fn due_at(&self, interval: Duration) -> Option<Instant> {
+        match self.interval == Some(interval) {
+            true => self.due,
+            false => self.last.map(|l| l + interval),
+        }
+    }
+
     /// How long until a capture at `interval` may come, from `now` (zero: it may).
     fn wait(&self, now: Instant, interval: Duration) -> Duration {
-        self.due.map_or(Duration::ZERO, |d| {
+        self.due_at(interval).map_or(Duration::ZERO, |d| {
             d.saturating_duration_since(now)
-                .saturating_sub(interval.mul_f64(EARLY_SHARE))
+                .saturating_sub(interval.mul_f64(TOLERANCE))
         })
     }
 
     /// A capture at `interval` came at `at`.
     fn took(&mut self, at: Instant, interval: Duration) {
-        let late = interval.mul_f64(1.0 - EARLY_SHARE);
-        let from = match self.due {
-            Some(d) if at <= d + late => d,
-            _ => at,
-        };
+        let from = self.due_at(interval).map_or(at, |d| d.max(at));
         self.due = Some(from + interval);
+        self.interval = Some(interval);
+        self.last = Some(at);
     }
+}
+
+/// A wait in whole milliseconds, as the capture loop sleeps it: rounded up from whole
+/// microseconds.
+fn wait_ms(d: Duration) -> i32 {
+    (d.as_micros().min(i32::MAX as u128 - 999) as i32 + 999) / 1000
 }
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
@@ -1492,6 +1511,24 @@ impl Engine {
             .unwrap_or(100)
     }
 
+    /// How long the capture loop may sleep with nothing to do: until a cohort's pass can come
+    /// due, and no later than the earliest a cohort holding skipped damage may take a frame,
+    /// so that damage reaches its viewers at their cap, not a fixed wait later. (One that
+    /// may already take it and doesn't waits on its viewers, whose acks wake the loop.)
+    fn idle_wait_ms(&self, views: &[View], now: Instant) -> i32 {
+        let skipped = self
+            .cohorts
+            .iter()
+            .zip(views)
+            .filter(|(c, v)| !v.clients.is_empty() && c.skipped.is_some())
+            .map(|(c, _)| c.take.wait(now, frame_interval(c.fps())))
+            .filter(|w| !w.is_zero())
+            .map(wait_ms)
+            .min();
+        let refine = self.refine_wait_ms(views, now);
+        skipped.map_or(refine, |s| refine.min(s))
+    }
+
     /// What changed in this capture, for the cohorts with viewers (None: everything).
     fn mark(&mut self, views: &[View], dirty: Option<&[u8]>) {
         for (c, v) in self.cohorts.iter_mut().zip(views) {
@@ -2402,18 +2439,12 @@ fn capture_loop(
         let now = Instant::now();
         let turn = eng.turn(&views, interval_ms, now);
         if !cap.damaged && !turn.work() {
-            wait_any(
-                &[cap.fd(), hub.waker.waitable()],
-                eng.refine_wait_ms(&views, now),
-            );
+            wait_any(&[cap.fd(), hub.waker.waitable()], eng.idle_wait_ms(&views, now));
             continue;
         }
         let rem = schedule.wait(Instant::now(), interval);
         if !rem.is_zero() {
-            wait_any(
-                &[hub.waker.waitable()],
-                (rem.as_micros() as i32 + 999) / 1000,
-            );
+            wait_any(&[hub.waker.waitable()], wait_ms(rem));
             continue;
         }
         // Apps present a frame as a burst of puts; give the burst a moment to land so
