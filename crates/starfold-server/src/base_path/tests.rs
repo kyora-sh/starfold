@@ -6,9 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "pw";
 
-/// Routes standing in for the server's, each answering the path it was asked for.
+/// Routes standing in for the server's, each answering the path and query it was asked for.
 fn routes() -> Router {
-    let echo = |uri: Uri| async move { format!("path {}", uri.path()) };
+    let echo = |uri: Uri| async move {
+        format!("path {}", uri.path_and_query().map_or("", |p| p.as_str()))
+    };
     Router::new()
         .route("/", get(echo))
         .route("/healthz", get(echo))
@@ -57,6 +59,11 @@ const ASKING: [Asking; 4] = [
 
 /// The status and the whole response to a GET of `target`.
 async fn get_from(port: u16, target: &str, asking: Asking, extra: &str) -> (u16, String) {
+    ask(port, "GET", target, asking, extra).await
+}
+
+/// The status and the whole response to a `method` request for `target`.
+async fn ask(port: u16, method: &str, target: &str, asking: Asking, extra: &str) -> (u16, String) {
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
@@ -80,7 +87,9 @@ async fn get_from(port: u16, target: &str, asking: Asking, extra: &str) -> (u16,
         true => "",
         false => "Connection: close\r\n",
     };
-    let req = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{more}{close}{extra}\r\n");
+    let req = format!(
+        "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{more}{close}Content-Length: 0\r\n{extra}\r\n"
+    );
     s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -113,6 +122,14 @@ fn every_prefix_shape_has_one_normal_form_or_is_refused() {
     for &(given, normal) in accepted {
         assert_eq!(parse(given), Ok(normal.map(String::from)), "{given:?}");
     }
+    let longest = format!("/{}", "a".repeat(MAX_LEN - 1));
+    assert_eq!(parse(Some(&longest)), Ok(Some(longest.clone())));
+    assert_eq!(
+        parse(Some(&format!("{longest}/"))),
+        Ok(Some(longest.clone()))
+    );
+    assert!(parse(Some(&format!("{longest}a"))).is_err());
+    assert!(parse(Some(&format!("/{}", "a".repeat(65_533)))).is_err());
     for refused in [
         "desk", "desk/", "//", "///", "/desk//", "//desk", "/a//b", "/a/b//", "/%2F", "/a%2Fb",
         "/%2e", "/.", "/..", "/a/./b", "/a/../b", "/a/.", "/a b", "/a?b", "/a#b", "/ä", "/a\\b",
@@ -170,7 +187,7 @@ async fn under_the_prefix_every_route_answers_as_without_one() {
                 "{target} {asking:?}: {got_body}\nwithout: {want_body}"
             );
             if want == 200 {
-                assert!(got_body.ends_with(&format!("path {}", path.split('?').next().unwrap())));
+                assert!(got_body.ends_with(&format!("path {path}")), "{got_body}");
             }
         }
     }
@@ -214,6 +231,112 @@ async fn without_a_prefix_nothing_changes() {
     assert_eq!(
         get_from(port, "/p/healthz", Asking::Signed, "").await.0,
         404
+    );
+}
+
+#[tokio::test]
+async fn outside_paths_get_the_checks_first() {
+    let plain = serve(app(None)).await;
+    let prefixed = serve(app(Some("/p"))).await;
+    for path in [
+        "/",
+        "/healthz",
+        "/client.js",
+        "/stats",
+        "/nothing",
+        "/pq/stats",
+    ] {
+        for asking in ASKING {
+            let (without, _) = get_from(plain, path, asking, "").await;
+            let (got, body) = get_from(prefixed, path, asking, "").await;
+            let want = match without {
+                401 | 403 => without,
+                _ => 404,
+            };
+            assert_eq!(got, want, "{path} {asking:?}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_outside_path_is_a_plain_not_found_whatever_the_method() {
+    let plain = serve(app(None)).await;
+    let prefixed = serve(app(Some("/p"))).await;
+    for (method, path) in [
+        ("POST", "/healthz"),
+        ("PUT", "/stats"),
+        ("DELETE", "/"),
+        ("POST", "/nothing"),
+    ] {
+        let (status, head) = ask(prefixed, method, path, Asking::Signed, "").await;
+        assert_eq!(status, 404, "{method} {path}: {head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("\r\nallow:"),
+            "{method} {path}: {head}"
+        );
+        let (want, want_head) = ask(plain, method, path, Asking::Signed, "").await;
+        let inside = format!("/p{path}");
+        let (got, got_head) = ask(prefixed, method, &inside, Asking::Signed, "").await;
+        assert_eq!(got, want, "{method} {inside}: {got_head}");
+        assert_eq!(
+            got_head.to_ascii_lowercase().contains("\r\nallow:"),
+            want_head.to_ascii_lowercase().contains("\r\nallow:"),
+            "{method} {inside}: {got_head}\nwithout: {want_head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_query_reaches_the_route_under_the_prefix() {
+    let port = serve(app(Some("/p"))).await;
+    let (status, body) = get_from(port, "/p/stats?token=pw", Asking::Anonymous, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.ends_with("path /stats?token=pw"), "{body}");
+    let (status, body) = get_from(port, "/p/stats?x=1&y=%2F", Asking::Signed, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.ends_with("path /stats?x=1&y=%2F"), "{body}");
+    let upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+    let (status, head) = get_from(port, "/p/ws?token=pw", Asking::Anonymous, upgrade).await;
+    assert_eq!(status, 101, "{head}");
+}
+
+#[test]
+fn the_flag_reaches_the_prefix_as_the_server_reads_it() {
+    let read = |v: &[&str]| from_args(&crate::parse_args(v.iter().map(|s| s.to_string())));
+    assert_eq!(read(&[]), Ok(None));
+    assert_eq!(read(&["--base-path", "/d"]), Ok(Some("/d".into())));
+    assert_eq!(read(&["--base-path=/d/"]), Ok(Some("/d".into())));
+    assert_eq!(read(&["--base_path", "/d"]), Ok(Some("/d".into())));
+    assert_eq!(
+        read(&["--port", "6901", "--base-path", "/a/b", "--read-only"]),
+        Ok(Some("/a/b".into()))
+    );
+    for refused in [
+        &["--base-path"][..],
+        &["--base-path", "-h"],
+        &["--base-path", "desk"],
+        &["--base-path=//"],
+    ] {
+        assert!(read(refused).is_err(), "{refused:?}: {:?}", read(refused));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_argument_that_is_not_utf8_is_refused_not_a_panic() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let bad = vec![
+        OsString::from("--base-path"),
+        OsString::from_vec(b"/d\xff".to_vec()),
+    ];
+    let got = std::panic::catch_unwind(|| crate::utf8_args(bad));
+    let err = got.expect("no panic").expect_err("refused");
+    assert!(err.contains("argument 2"), "{err}");
+    assert_eq!(
+        crate::utf8_args(vec![OsString::from("--base-path"), OsString::from("/d")]),
+        Ok(vec!["--base-path".to_string(), "/d".to_string()])
     );
 }
 

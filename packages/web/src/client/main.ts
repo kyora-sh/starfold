@@ -168,7 +168,6 @@ function main() {
 				files.setup(m.files);
 				mic.setup(!!m.mic && !app.readOnly);
 				resize.setup(m.resize);
-				audio.follow(m);
 				statusEl.style.display = 'none';
 				break;
 			case 'codec':
@@ -185,7 +184,6 @@ function main() {
 				}
 				break;
 			case 'status':
-				audio.follow(m);
 				if (m.s === 'closed') {
 					mic.stop();
 					statusEl.style.display = '';
@@ -224,6 +222,9 @@ function main() {
 				break;
 		}
 	});
+
+	// Autoplay may be allowed (iframe allow="autoplay"); try right away.
+	audio.start();
 }
 
 main();

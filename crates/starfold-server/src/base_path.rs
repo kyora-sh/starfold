@@ -10,14 +10,26 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::Router;
 use std::sync::Arc;
 
+/// The longest prefix taken, in bytes. A prefix is part of every URL the page asks for, and
+/// this leaves those far inside what an HTTP/1.1 request line may hold (the server's parser
+/// takes 64 KiB; proxies often less), so `PREFIX/` and what follows it stay reachable.
+pub const MAX_LEN: usize = 1024;
+
 /// The prefix `--base-path` gives, in its one normal form: `/` and parts of letters, digits,
-/// `.`, `_`, `~` or `-` between single slashes, none `.` or `..`, and no trailing slash (one
-/// is dropped). Nothing, `""` or `/` is none; every other shape is refused.
+/// `.`, `_`, `~` or `-` between single slashes, none `.` or `..`, no trailing slash (one is
+/// dropped), at most [`MAX_LEN`] bytes. Nothing, `""` or `/` is none; every other shape is
+/// refused.
 pub fn parse(value: Option<&str>) -> Result<Option<String>, String> {
     let Some(v) = value.filter(|v| !v.is_empty() && *v != "/") else {
         return Ok(None);
     };
     let normal = v.strip_suffix('/').unwrap_or(v);
+    if normal.len() > MAX_LEN {
+        return Err(format!(
+            "{} bytes is longer than the {MAX_LEN} a prefix may be",
+            normal.len()
+        ));
+    }
     let part_ok = |p: &str| {
         !p.is_empty()
             && p != "."
@@ -34,18 +46,29 @@ pub fn parse(value: Option<&str>) -> Result<Option<String>, String> {
     }
 }
 
+/// The prefix the server's flags ask for (`--base-path`, or `--base_path`, as the flag parser
+/// spells it after normalising).
+pub fn from_args(a: &std::collections::HashMap<String, String>) -> Result<Option<String>, String> {
+    parse(a.get("base-path").map(|s| s.as_str()))
+}
+
 /// What the server serves: `routes` behind the login (if on) and the host and origin check,
 /// as without a prefix. Under `base`, `PREFIX/rest` reaches them as `/rest`; `PREFIX` itself
 /// goes through the same checks as `PREFIX/` and is then sent on to it, so the page's
-/// relative URLs resolve under the prefix; any other path goes through them and is not found.
+/// relative URLs resolve under the prefix; any other path goes through them and is then not
+/// found, before any route sees it.
 pub fn compose(
     routes: Router,
     base: Option<&str>,
     login: Option<Arc<Login>>,
     access: Arc<Access>,
 ) -> Router {
+    // Under a prefix the routes sit behind one service, so `settle` answers before routing
+    // (a route would add its own headers, such as `Allow`, to an answer for an outside path).
     let mut app = match base {
-        Some(_) => routes.layer(from_fn(settle)),
+        Some(_) => Router::new()
+            .fallback_service(routes)
+            .layer(from_fn(settle)),
         None => routes,
     };
     if let Some(l) = login {
@@ -56,9 +79,7 @@ pub fn compose(
     let app = app.layer(from_fn_with_state(access, access::check));
     match base {
         None => app,
-        Some(p) => Router::new()
-            .fallback_service(app)
-            .layer(from_fn_with_state(Arc::<str>::from(p), mark)),
+        Some(p) => app.layer(from_fn_with_state(Arc::<str>::from(p), mark)),
     }
 }
 

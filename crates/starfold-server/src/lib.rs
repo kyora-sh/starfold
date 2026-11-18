@@ -73,6 +73,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> HashMap<String, String>
     m
 }
 
+/// The arguments as text; one that isn't UTF-8 is refused (no flag starfold reads can hold
+/// it) instead of panicking.
+fn utf8_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            a.into_string().map_err(|a| {
+                format!(
+                    "argument {} ({:?}) is not UTF-8",
+                    i + 1,
+                    a.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
+
 /// Selkies ranges look like "60-60"; take the upper bound.
 fn range_max(v: Option<&String>, default: f64) -> f64 {
     v.and_then(|s| s.rsplit('-').next()?.trim().parse().ok())
@@ -88,7 +105,13 @@ pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
 /// hardware encoders in child processes that run this executable again. A program that
 /// embeds the server can call it from its own `main` to get the same isolation.
 pub fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("starfold: {e}");
+            std::process::exit(2);
+        }
+    };
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
@@ -163,7 +186,7 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| default_addr.into());
     let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
-    let base = match base_path::parse(a.get("base-path").map(|s| s.as_str())) {
+    let base = match base_path::from_args(&a) {
         Ok(b) => b,
         Err(e) => {
             log::error!("--base-path: {e}");
