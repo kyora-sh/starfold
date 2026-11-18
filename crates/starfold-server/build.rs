@@ -1,3 +1,6 @@
+#[path = "src/encoder/cisco_target.rs"]
+mod cisco_target;
+
 fn main() {
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -14,25 +17,30 @@ fn main() {
         nasm_check();
     }
     // `openh264_any`: the OpenH264 backend is built in, compiled from source or Cisco's binary.
-    // `openh264_cisco_loadable`: starfold loads Cisco's binary on this target (64-bit Linux,
-    // x86-64 and arm64, with glibc; not x32); on any other, `openh264-cisco` builds and
-    // OpenH264 is unavailable.
+    // `openh264_cisco_loadable`: starfold loads Cisco's binary on this target (64-bit
+    // little-endian Linux, x86-64 and arm64, with glibc; not x32, not aarch64_be); on any
+    // other, `openh264-cisco` builds and OpenH264 is unavailable.
     println!("cargo::rustc-check-cfg=cfg(openh264_any, openh264_cisco_loadable)");
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let wide = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default() == "64";
+    let cfg = |k: &str| std::env::var(format!("CARGO_CFG_TARGET_{k}")).unwrap_or_default();
     let cisco = cfg!(feature = "openh264-cisco");
     if cfg!(feature = "openh264") || cisco {
         println!("cargo::rustc-cfg=openh264_any");
     }
-    let loadable = target == "linux" && env == "gnu" && wide;
-    if cisco && loadable && matches!(arch.as_str(), "x86_64" | "aarch64") {
+    let loadable = cisco_target::cisco_loadable(
+        &target,
+        &cfg("ENV"),
+        &cfg("POINTER_WIDTH"),
+        &cfg("ARCH"),
+        &cfg("ENDIAN"),
+    );
+    if cisco && loadable {
         println!("cargo::rustc-cfg=openh264_cisco_loadable");
     }
     let triple = std::env::var("TARGET").unwrap_or_default();
     println!("cargo::rustc-env=STARFOLD_TARGET={triple}");
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/encoder/cisco_target.rs");
 }
 
 /// x264's include paths, with the `x264` feature.

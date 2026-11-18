@@ -51,25 +51,57 @@ fn opens(path: &std::path::Path, mut cmd: Command) -> bool {
     n > 0
 }
 
-/// A probe child never opens the library path it is given, so it can't load the library, not
-/// even to discard it before a hand-over. The control: the same binary not as a probe child
-/// opens it, where it loads Cisco's binary.
+/// A child run with `args` after [`FLAG`] never opens the library path it is given, so it
+/// can't load the library, not even to discard it before a hand-over. The control: the same
+/// binary not as a probe child opens it, where it loads Cisco's binary.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_probe_child_never_opens_the_library_it_is_given() {
-    let dir = std::env::temp_dir().join(format!("sf-probe-lib-{}", std::process::id()));
+fn never_opens_the_library(name: &str, args: &[&str]) {
+    let dir = std::env::temp_dir().join(format!("sf-probe-lib-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let lib = dir.join("libopenh264.so");
     std::fs::write(&lib, b"not a library").unwrap();
     let mut child = starfold();
     child
-        .args([FLAG, "bogus"])
+        .arg(FLAG)
+        .args(args)
         .env("STARFOLD_OPENH264_LIB", &lib);
-    assert!(!opens(&lib, child), "a probe child opened the library");
+    assert!(
+        !opens(&lib, child),
+        "{args:?}: the child opened the library"
+    );
     let mut server = starfold();
     server.arg("--version").env("STARFOLD_OPENH264_LIB", &lib);
     assert_eq!(opens(&lib, server), cfg!(openh264_cisco_loadable));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A probe child for a backend that doesn't exist.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_probe_child_never_opens_the_library_it_is_given() {
+    never_opens_the_library("bogus", &["bogus"]);
+}
+
+/// A probe child for a real hardware backend, which probes it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_recognised_probe_child_never_opens_the_library_it_is_given() {
+    never_opens_the_library("nvenc", &["nvenc", "--experimental-hw-probes"]);
+}
+
+/// A session child, which opens one encoding session on a hardware backend (as the server
+/// asks for one: codec, size and rate, rate control, and the render node).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_child_never_opens_the_library_it_is_given() {
+    never_opens_the_library(
+        "session",
+        &[
+            "vaapi",
+            starfold::encoder::isolate::SESSION,
+            "h264:640x480@30,8000,8000,30,24,/dev/dri/renderD128",
+        ],
+    );
 }
 
 #[test]

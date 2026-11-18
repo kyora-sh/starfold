@@ -176,7 +176,7 @@ fn encoder_entries(usage: &str) -> String {
             arms.join(", ")
         ),
     };
-    let fallback = match build_facts::unavailable_note(sw) {
+    let fallback = match build_facts::not_usable_note(sw) {
         Some(why) => format!(
             "{sw} ({why}), so without a usable hardware H.264 encoder starfold exits at startup"
         ),
@@ -184,7 +184,7 @@ fn encoder_entries(usage: &str) -> String {
     };
     let pinnable: Vec<String> = build_facts::h264_encoders()
         .into_iter()
-        .map(|name| match build_facts::unavailable_note(name) {
+        .map(|name| match build_facts::not_usable_note(name) {
             Some(why) => format!("{name} ({why})"),
             None => name.to_string(),
         })
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
         assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
         let sw = build_facts::software_h264();
-        let fallback = match build_facts::unavailable_note(sw) {
+        let fallback = match build_facts::not_usable_note(sw) {
             Some(why) => format!("H.264 from {sw} ({why}), so without"),
             None => format!("H.264 from {sw} where there is none"),
         };
@@ -432,19 +432,47 @@ mod tests {
     }
 
     /// `--crf` names openh264 as a reader only where it can run: in a build with OpenH264 from
-    /// source, or in the starfold binary on a target it loads Cisco's binary on.
+    /// source, or in the starfold binary on a target it loads Cisco's binary on, after a load
+    /// that succeeded. After a failed load (no library, or one refused) `--help` gives the
+    /// reason instead, and so it does in `--encoder`.
     #[test]
     fn crf_names_openh264_only_where_it_can_run() {
-        let crf = |handed_over: bool| {
+        #[derive(Clone, Copy, Debug)]
+        enum HandOver {
+            Loaded,
+            Failed,
+            Nothing,
+        }
+        let help = |h: HandOver| {
             #[cfg(feature = "openh264-cisco")]
-            crate::encoder::cisco::pretend_handed_over(handed_over);
-            let _ = handed_over;
-            help_words().contains("openh264's lowest QP in motion;")
+            match h {
+                HandOver::Loaded => crate::encoder::cisco::pretend_handed_over(true),
+                HandOver::Failed => crate::encoder::cisco::pretend_failed_load(),
+                HandOver::Nothing => crate::encoder::cisco::pretend_handed_over(false),
+            }
+            let _ = h;
+            help_words()
         };
         let source = cfg!(feature = "openh264");
         let loadable = cfg!(openh264_cisco_loadable);
-        assert_eq!(crf(true), source || loadable);
-        assert_eq!(crf(false), source);
+        let not_loaded = build_facts::CISCO_NOT_LOADED;
+        for (h, reads) in [
+            (HandOver::Loaded, source || loadable),
+            (HandOver::Failed, source),
+            (HandOver::Nothing, source),
+        ] {
+            let words = help(h);
+            assert_eq!(
+                words.contains("openh264's lowest QP in motion;"),
+                reads,
+                "{h:?}: {words}"
+            );
+            assert_eq!(
+                words.contains(&format!("openh264 ({not_loaded})")),
+                loadable && matches!(h, HandOver::Failed),
+                "{h:?}: {words}"
+            );
+        }
     }
 
     /// `--openh264-lib` is offered by the starfold binary on a target it loads Cisco's file on,

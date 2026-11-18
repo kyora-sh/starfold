@@ -3,7 +3,7 @@
 //!
 //! The library never loads it. Only the `starfold` binary does, in `cisco_load.rs`, first thing
 //! in its `main`, before starfold starts its logger, its panic hook or any thread, and only on
-//! 64-bit Linux, x86-64 and arm64, with glibc. It hands the outcome here through [`install`];
+//! 64-bit little-endian Linux, x86-64 and arm64, with glibc. It hands the outcome here through [`install`];
 //! the encoders read it from [`api`]. A program that embeds the library gets "available only
 //! in the starfold binary" instead, and any other target gets [`NOT_AVAILABLE`]. starfold calls
 //! the library only through the entry points installed here, never through openh264-sys2's
@@ -35,7 +35,8 @@ pub const ATTRIBUTION: &str = "OpenH264 Video Codec provided by Cisco Systems, I
 
 /// Why a build of the feature for any other target has no OpenH264.
 pub const NOT_AVAILABLE: &str = "OpenH264 (Cisco) is not available on this platform yet: \
-     starfold loads Cisco's binary only on 64-bit Linux, x86-64 and arm64, with glibc";
+     starfold loads Cisco's binary only on 64-bit little-endian Linux, x86-64 and arm64, with \
+     glibc";
 
 /// Why a program that embeds starfold's library has no Cisco OpenH264.
 pub const BINARY_ONLY: &str = "OpenH264 (Cisco) is available only in the starfold binary: \
@@ -95,6 +96,7 @@ struct Loaded {
 
 static LIBRARY: OnceLock<Result<Loaded, String>> = OnceLock::new();
 static HANDED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The seals a hand-over's memfd must carry: nothing can write to it, grow it, shrink it or
 /// change its seals any more.
@@ -182,11 +184,13 @@ pub unsafe fn install(handoff: Result<Handoff, String>) -> Result<(), String> {
         from: h.from,
         _keep: Some((h.library, h.memfd)),
     });
+    let usable = loaded.is_ok();
     if LIBRARY.set(loaded).is_err() {
         return Err(
             "OpenH264: a library was already handed over, or the encoders already looked".into(),
         );
     }
+    LOADED.store(usable, std::sync::atomic::Ordering::Release);
     HANDED_OVER.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
@@ -196,21 +200,38 @@ pub unsafe fn install(handoff: Result<Handoff, String>) -> Result<(), String> {
 /// Cisco's OpenH264.
 pub fn handed_over() -> bool {
     #[cfg(test)]
-    if let Some(v) = PRETEND.with(std::cell::Cell::get) {
+    if let Some((v, _)) = PRETEND.with(std::cell::Cell::get) {
         return v;
     }
     HANDED_OVER.load(std::sync::atomic::Ordering::Acquire)
 }
 
-#[cfg(test)]
-thread_local! {
-    static PRETEND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+/// Whether what the starfold binary's `main` handed over is a loaded library, not the reason
+/// it has none (no library given, or one that did not load): only then can OpenH264 run.
+pub fn loaded() -> bool {
+    #[cfg(test)]
+    if let Some((_, v)) = PRETEND.with(std::cell::Cell::get) {
+        return v;
+    }
+    LOADED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// For this test thread, what [`handed_over`] says.
+#[cfg(test)]
+thread_local! {
+    static PRETEND: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// For this test thread, what [`handed_over`] and [`loaded`] say: a loaded library handed over,
+/// or nothing handed over.
 #[cfg(test)]
 pub(crate) fn pretend_handed_over(v: bool) {
-    PRETEND.with(|p| p.set(Some(v)));
+    PRETEND.with(|p| p.set(Some((v, v))));
+}
+
+/// For this test thread: the reason handed over, not a library (as when the load failed).
+#[cfg(test)]
+pub(crate) fn pretend_failed_load() {
+    PRETEND.with(|p| p.set(Some((true, false))));
 }
 
 fn library() -> &'static Result<Loaded, String> {
@@ -309,6 +330,11 @@ fn not_installed() -> Result<Loaded, String> {
 #[path = "../cisco_load.rs"]
 mod cisco_load;
 
+/// build.rs's classification of targets, for its test.
+#[cfg(test)]
+#[path = "cisco_target.rs"]
+mod cisco_target;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,16 +418,89 @@ mod tests {
         assert_eq!(PINS.len(), 2);
     }
 
+    /// The build gate's classification of named targets, each with its `cfg` values as rustc
+    /// gives them (`rustc --print cfg --target <tuple>`): only the two little-endian 64-bit
+    /// glibc Linux targets load Cisco's binary.
     #[test]
-    fn only_64_bit_linux_gnu_x86_64_and_arm64_load_it() {
+    fn the_build_gate_classifies_named_targets() {
+        let targets = [
+            (
+                "x86_64-unknown-linux-gnu",
+                ["linux", "gnu", "64", "x86_64", "little"],
+                true,
+            ),
+            (
+                "aarch64-unknown-linux-gnu",
+                ["linux", "gnu", "64", "aarch64", "little"],
+                true,
+            ),
+            (
+                "aarch64_be-unknown-linux-gnu",
+                ["linux", "gnu", "64", "aarch64", "big"],
+                false,
+            ),
+            (
+                "x86_64-unknown-linux-gnux32",
+                ["linux", "gnu", "32", "x86_64", "little"],
+                false,
+            ),
+            (
+                "x86_64-unknown-linux-musl",
+                ["linux", "musl", "64", "x86_64", "little"],
+                false,
+            ),
+            (
+                "aarch64-unknown-linux-musl",
+                ["linux", "musl", "64", "aarch64", "little"],
+                false,
+            ),
+            (
+                "i686-unknown-linux-gnu",
+                ["linux", "gnu", "32", "x86", "little"],
+                false,
+            ),
+            (
+                "riscv64gc-unknown-linux-gnu",
+                ["linux", "gnu", "64", "riscv64", "little"],
+                false,
+            ),
+            (
+                "powerpc64-unknown-linux-gnu",
+                ["linux", "gnu", "64", "powerpc64", "big"],
+                false,
+            ),
+            (
+                "aarch64-apple-darwin",
+                ["macos", "", "64", "aarch64", "little"],
+                false,
+            ),
+            (
+                "x86_64-pc-windows-gnu",
+                ["windows", "gnu", "64", "x86_64", "little"],
+                false,
+            ),
+        ];
+        for (tuple, [os, env, width, arch, endian], loads) in targets {
+            assert_eq!(
+                super::cisco_target::cisco_loadable(os, env, width, arch, endian),
+                loads,
+                "{tuple}"
+            );
+        }
+    }
+
+    /// What the build saw: the target it was built for (`TARGET`, through build.rs) loads
+    /// Cisco's binary exactly when it is one of the two targets starfold pins a file for.
+    #[test]
+    fn this_build_loads_it_only_on_the_two_pinned_targets() {
+        let target = env!("STARFOLD_TARGET");
         assert_eq!(
             platform_file().is_some(),
-            cfg!(all(
-                target_os = "linux",
-                target_env = "gnu",
-                target_pointer_width = "64",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))
+            matches!(
+                target,
+                "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+            ),
+            "{target}"
         );
         assert!(NOT_AVAILABLE.starts_with("OpenH264 (Cisco) is not available on this platform yet"));
         assert!(

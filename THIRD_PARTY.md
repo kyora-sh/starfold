@@ -18,7 +18,7 @@
   `--no-default-features --features openh264` builds without x264, and that binary stays under
   starfold's MIT licence.
 - **Cisco's OpenH264 binary** (BSD-2-Clause, with Cisco's AVC/H.264 patent licence conditions): not
-  bundled. On 64-bit Linux, x86-64 and arm64, with glibc, the `starfold` binary built with the
+  bundled. On 64-bit little-endian Linux, x86-64 and arm64, with glibc, the `starfold` binary built with the
   `openh264-cisco` feature loads it at startup from a path the user gives: it checks the file
   against the pinned sha256 and loads the checked bytes from a sealed memfd. A program that embeds
   the library, and any other target, loads nothing and has no Cisco OpenH264. starfold neither contains nor downloads it. Licence, verbatim from Cisco:

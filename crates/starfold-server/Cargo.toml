@@ -29,9 +29,11 @@ x264 = ["dep:bindgen"]
 # the software H.264 encoder of a build without x264 (`--no-default-features --features openh264`).
 openh264 = ["dep:openh264-sys2", "openh264-sys2/source"]
 # Cisco's OpenH264 binary (BSD-2-Clause, with Cisco's patent licence conditions), loaded at
-# run time from --openh264-lib and refused unless its sha256 is a pinned Cisco build; the
-# binary contains no H.264 encoder of its own. Linux x86-64 and arm64 with glibc only; on other
-# targets it builds and OpenH264 is unavailable. Not with `openh264` (see the README).
+# run time from --openh264-lib and refused unless its sha256 is a pinned Cisco build. Without
+# default features the binary has neither x264 nor OpenH264 (CI checks for OpenH264's symbols);
+# with them, x264 stays. Little-endian
+# 64-bit Linux, x86-64 and arm64, with glibc only; on other targets it builds and OpenH264 is
+# unavailable. Not with `openh264` (see the README).
 openh264-cisco = ["dep:openh264-sys2", "dep:sha2"]
 # Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
 sw-arm = ["dep:bindgen"]

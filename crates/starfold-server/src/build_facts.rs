@@ -55,11 +55,28 @@ pub const CISCO_NOT_YET: &str = "OpenH264 (Cisco) is not available on this platf
 /// the starfold binary loads it.
 pub const CISCO_BINARY_ONLY: &str = "OpenH264 (Cisco) is available only in the starfold binary";
 
+/// What `--help` says of Cisco's OpenH264 in the starfold binary when its load failed (no
+/// library given, or one that did not load).
+pub const CISCO_NOT_LOADED: &str =
+    "OpenH264 (Cisco) is not loaded: no library given, or it did not load";
+
 /// Whether the starfold binary handed a Cisco library over (or the reason it has none).
 fn cisco_handed_over() -> bool {
     #[cfg(feature = "openh264-cisco")]
     {
         crate::encoder::cisco::handed_over()
+    }
+    #[cfg(not(feature = "openh264-cisco"))]
+    {
+        false
+    }
+}
+
+/// Whether what the starfold binary handed over is a loaded Cisco library.
+fn cisco_loaded() -> bool {
+    #[cfg(feature = "openh264-cisco")]
+    {
+        crate::encoder::cisco::loaded()
     }
     #[cfg(not(feature = "openh264-cisco"))]
     {
@@ -262,6 +279,19 @@ pub fn unavailable_note(name: &str) -> Option<&'static str> {
         })
 }
 
+/// Why the encoder named `name` can't run in this process: [`unavailable_note`]'s reasons, and
+/// Cisco's OpenH264 in the starfold binary when what was handed over is the reason the load
+/// failed, not a library. `--version` names the build's encoders whatever loaded; `--help`'s
+/// `--crf` and `--encoder` entries go by this.
+pub fn not_usable_note(name: &str) -> Option<&'static str> {
+    unavailable_note(name).or_else(|| {
+        software()
+            .find(|e| e.name == name)
+            .filter(|e| e.library == Library::CiscoBinary && !cisco_loaded())
+            .map(|_| CISCO_NOT_LOADED)
+    })
+}
+
 /// The bench arms `--encoder` can name.
 pub fn bench_arms() -> Vec<&'static str> {
     #[cfg(feature = "sw-arm")]
@@ -329,10 +359,10 @@ pub fn reads(encoder: &str, flag: &str, uncapped: bool) -> bool {
 }
 
 /// This build's encoders that read `flag`, each with what the flag is to it; one that can't run
-/// here ([`unavailable_note`]) reads nothing.
+/// in this process ([`not_usable_note`]) reads nothing.
 pub fn readers(flag: &str) -> Vec<(&'static str, &'static str)> {
     built()
-        .filter(|e| unavailable_note(e.name).is_none())
+        .filter(|e| not_usable_note(e.name).is_none())
         .filter_map(|e| meaning(e, flag).map(|m| (e.name, m)))
         .collect()
 }
@@ -411,8 +441,8 @@ mod tests {
         }
     }
 
-    /// Only a build with `openh264-cisco` loads Cisco's binary, on Linux x86-64 and arm64 with
-    /// glibc, and it says so in `--version`; for any other target it says the binary is not
+    /// Only a build with `openh264-cisco` loads Cisco's binary, on little-endian Linux x86-64
+    /// and arm64 with glibc, and it says so in `--version`; for any other target it says the binary is not
     /// available there yet.
     #[test]
     fn cisco_binary_only_with_its_feature() {

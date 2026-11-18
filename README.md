@@ -42,9 +42,10 @@ Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esb
 toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
-On 64-bit Linux (x86-64 and arm64, glibc), `--no-default-features --features openh264-cisco` builds
-without either and encodes H.264 with Cisco's OpenH264 binary, loaded at run time (see
-[OpenH264 from Cisco](#openh264-from-cisco)).
+On 64-bit little-endian Linux (x86-64 and arm64, glibc),
+`--no-default-features --features openh264-cisco` builds without either; that binary encodes
+H.264 with Cisco's OpenH264 binary, loaded at run time, and without a valid one it exits before
+serving (see [OpenH264 from Cisco](#openh264-from-cisco)).
 
 ```sh
 nix-shell --arg withRust true
@@ -319,8 +320,10 @@ Phones and tablets get touch input and an on-screen keyboard.
 
 **Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
-**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
-(OpenH264 in a build without x264).
+**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264, or
+with OpenH264 in a build with `--no-default-features --features openh264`. A build with
+`--no-default-features --features openh264-cisco` has no H.264 encoder of its own (see
+[OpenH264 from Cisco](#openh264-from-cisco)).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
 macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, 64-bit Windows) encoders are
 experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,
@@ -342,7 +345,7 @@ the encoders a binary includes and its licence.
 
 ### OpenH264 from Cisco
 
-On 64-bit Linux, x86-64 and arm64, with glibc,
+On 64-bit little-endian Linux, x86-64 and arm64, with glibc,
 `cargo build --release --no-default-features --features openh264-cisco` builds a binary with no
 H.264 encoder of its own. It encodes H.264 with Cisco's OpenH264 2.6.0 binary, which starfold
 neither contains nor downloads. That binary stays under starfold's MIT licence. With the
@@ -383,8 +386,8 @@ binary". Its `--version` says so too, its `--help` doesn't offer `--openh264-lib
   - the system libraries Cisco's file needs (`libstdc++`, `libm`, `libgcc_s`, `libc`). The
     system's dynamic loader loads those from the usual library paths, as it does starfold's own
     libraries, and starfold doesn't hash them.
-- **Other platforms:** not yet. On macOS, Windows, Linux with musl (static or not) and x32,
-  `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the startup
+- **Other platforms:** not yet. On macOS, Windows, Linux with musl (static or not), x32 and
+  big-endian arm64 (`aarch64_be`), `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the startup
   log say "OpenH264 (Cisco) is not available on this platform yet", in the starfold binary and
   in a program that embeds the library alike. `--help` doesn't offer `--openh264-lib` there,
   and its `--crf` entry doesn't name openh264.
