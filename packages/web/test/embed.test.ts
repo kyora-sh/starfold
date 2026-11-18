@@ -235,6 +235,24 @@ describe('the lifecycle through the page and worker ports', () => {
 		expect(s.conns[0].got).toEqual(['ticket-2', 'client-first']);
 	});
 
+	test("attempt 1's preamble, resolving first after attempt 2 began, doesn't stop attempt 2", async () => {
+		const answers = [deferred<string>(), deferred<string>()];
+		let n = 0;
+		const { s, page, seen } = setup({ preamble: () => answers[n++].promise });
+		page.connect();
+		await until(() => n === 1);
+		page.connect();
+		await until(() => n === 2);
+		answers[0].resolve('ticket-1');
+		await sleep(100);
+		answers[1].resolve('ticket-2');
+		await until(() => (s.conns[0]?.got.length ?? 0) >= 2);
+		await until(() => statuses(seen).includes('open'));
+		await sleep(100);
+		expect(s.conns.length).toBe(1);
+		expect(s.conns[0].got).toEqual(['ticket-2', 'client-first']);
+	});
+
 	test('unmount reports UNMOUNTED at once, the socket closes, and the late worker close is dropped', async () => {
 		const { s, page, seen } = setup({ preamble: () => 'ticket' });
 		page.connect();
