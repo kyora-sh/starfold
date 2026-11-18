@@ -240,6 +240,12 @@ compile_error!(
     "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
 );
 
+#[cfg(all(feature = "x264", any(target_arch = "mips", target_arch = "mips64")))]
+compile_error!(
+    "the `x264` feature is not built for MIPS: x264's MSA chroma copy reads past the end of \
+     a frame plane; build with `--no-default-features --features openh264`"
+);
+
 /// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
 const MAX_MBS: usize = 36864;
 
