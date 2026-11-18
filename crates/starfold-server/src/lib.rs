@@ -29,6 +29,7 @@ mod mac;
 mod mic;
 mod mp4;
 mod negotiate;
+mod readonly;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -371,15 +372,12 @@ async fn serve(a: HashMap<String, String>) {
         audio::spawn(dev, br, hub.clone());
     }
 
-    // --file-transfers=upload,download (as in selkies); "none" turns both off.
-    let transfers = a
-        .get("file-transfers")
-        .cloned()
-        .unwrap_or_else(|| "upload,download".into());
+    // --file-transfers=upload,download (as in selkies); "none" turns both off. Whether it
+    // was given matters under --read-only (files.rs).
     // No --files-root, no file transfer: there is no default folder to share.
     let files = files::Files::new(
         a.get("files-root").map(String::as_str),
-        &transfers,
+        a.get("file-transfers").map(String::as_str),
         read_only,
         a.get("upload-dir").map_or("Downloads", String::as_str),
         (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
@@ -390,7 +388,12 @@ async fn serve(a: HashMap<String, String>) {
     });
     let files = std::sync::Arc::new(files);
     match &files.root {
-        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        Some(root) => log::info!(
+            "file transfer under {}: upload {}, download {}",
+            root.path().display(),
+            if files.upload { "on" } else { "off" },
+            if files.download { "on" } else { "off" },
+        ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
     }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a

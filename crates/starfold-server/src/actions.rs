@@ -399,12 +399,7 @@ async fn synced(tx: &std::sync::mpsc::Sender<InputEvent>) -> Option<()> {
 }
 
 pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if s.read_only {
-        return reply(
-            StatusCode::FORBIDDEN,
-            json!({ "error": "this server is read-only (--read-only): input is refused", "read_only": true }),
-        );
-    }
+    // --read-only refuses this route before it gets here (readonly.rs).
     // A JSON body also means a browser on another site can't send this without a CORS
     // preflight, which starfold never answers.
     let is_json = headers
@@ -701,15 +696,6 @@ mod tests {
         assert!(s.hub.key_at.lock().is_some(), "a key went unnoted");
     }
 
-    #[tokio::test]
-    async fn read_only_servers_refuse_input() {
-        let (s, seen) = state(true, Duration::ZERO);
-        let (code, body) = post(&s, "application/json", CLICK).await;
-        assert_eq!(code, StatusCode::FORBIDDEN);
-        assert!(body["error"].as_str().unwrap().contains("read-only"));
-        assert_eq!(body["read_only"], true);
-        assert!(seen.lock().is_empty());
-    }
 
     #[tokio::test]
     async fn answers_once_the_input_is_done_with_the_seq_before_it() {
