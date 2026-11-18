@@ -348,7 +348,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             // --read-only decides binary messages in readonly.rs (all of them act).
             Message::Binary(b)
                 if s.read_only
-                    && crate::readonly::binary(b.first().copied()) != crate::readonly::Kind::Watch => {}
+                    && crate::readonly::binary(b.first().copied())
+                        != crate::readonly::Kind::Watch => {}
             // 0x11: clipboard image (PNG) pasted on the client.
             Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
                 if let Some(tx) = s.hub.input.lock().as_ref() {
@@ -918,7 +919,10 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or(0);
-        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_string();
+        let body = text
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, b)| b)
+            .to_string();
         (status, body)
     }
 
@@ -934,7 +938,10 @@ mod tests {
         ] {
             let (status, text) = ask(port, method, target, body).await;
             assert_eq!(status, 403, "{method} {target}: {text}");
-            assert!(text.contains("\"read_only\":true"), "{method} {target}: {text}");
+            assert!(
+                text.contains("\"read_only\":true"),
+                "{method} {target}: {text}"
+            );
         }
         assert_eq!(ask(port, "GET", "/healthz", "").await.0, 200);
     }

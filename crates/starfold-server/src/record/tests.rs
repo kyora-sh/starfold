@@ -65,7 +65,14 @@ async fn record_units(units: &[Option<(u8, u8)>], limits: spool::Limits) -> Resu
     let mut writer = spool::Writer::spawn(file, dir(), limits).unwrap();
     let (parts, end) = tokio::time::timeout(
         Duration::from_secs(5),
-        collect(&hub, &client, rx, stop, Duration::from_secs(30), &mut writer),
+        collect(
+            &hub,
+            &client,
+            rx,
+            stop,
+            Duration::from_secs(30),
+            &mut writer,
+        ),
     )
     .await
     .expect("the recording ended");
@@ -197,8 +204,17 @@ async fn a_keyframe_that_cant_start_a_segment_ends_the_recording() {
     b.resize(16, 0);
     b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
     tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
-    let mut writer = spool::Writer::spawn(spool::anonymous(&dir()).unwrap(), dir(), limits()).unwrap();
-    let (parts, end) = collect(&hub, &client, rx, stop, Duration::from_secs(30), &mut writer).await;
+    let mut writer =
+        spool::Writer::spawn(spool::anonymous(&dir()).unwrap(), dir(), limits()).unwrap();
+    let (parts, end) = collect(
+        &hub,
+        &client,
+        rx,
+        stop,
+        Duration::from_secs(30),
+        &mut writer,
+    )
+    .await;
     let done = tokio::task::spawn_blocking(move || writer.finish())
         .await
         .unwrap()
@@ -271,7 +287,11 @@ fn a_segment_that_cant_be_written_leaves_the_others() {
     let c = Clip::build(parts, End::Stopped, done(file, 2), a_place()).unwrap();
     assert_eq!(c.end, End::SegmentLost);
     assert_eq!(c.segments.len(), 2);
-    assert_eq!(check(&mp4_of(&c, 1)).0, 1, "the second keyframe's own bytes");
+    assert_eq!(
+        check(&mp4_of(&c, 1)).0,
+        1,
+        "the second keyframe's own bytes"
+    );
 }
 
 #[tokio::test]
@@ -420,7 +440,10 @@ fn query(pairs: &[(&str, &str)]) -> Query<HashMap<String, String>> {
 async fn a_bad_format_leaves_the_recording_running() {
     let r = recorder(true, limits());
     let started = start(State(r.clone())).await;
-    let id = json(&body(started).await)["id"].as_str().unwrap().to_string();
+    let id = json(&body(started).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let bad = stop(State(r.clone()), query(&[("id", &id), ("format", "avi")])).await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     assert!(r.active.lock().contains_key(&id));
@@ -440,10 +463,7 @@ async fn recording_is_off_unless_enabled() {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
         let j = json(&body(res).await);
         assert_eq!(j["recording"], false);
-        assert!(j["error"]
-            .as_str()
-            .unwrap()
-            .contains("--enable-recording"));
+        assert!(j["error"].as_str().unwrap().contains("--enable-recording"));
     }
     assert!(r.hub.clients.lock().is_empty());
     assert_eq!(r.running.load(Ordering::Acquire), 0);
@@ -460,11 +480,19 @@ async fn at_most_two_recordings_run_at_once() {
     assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
     let fourth = record(State(r.clone()), query(&[("seconds", "1")])).await;
     assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(r.hub.clients.lock().len(), 2, "nothing started for the refused");
+    assert_eq!(
+        r.hub.clients.lock().len(),
+        2,
+        "nothing started for the refused"
+    );
     let id = a["id"].as_str().unwrap();
     let _ = body(stop(State(r.clone()), query(&[("id", id)])).await).await;
     let again = start(State(r.clone())).await;
-    assert_eq!(again.status(), StatusCode::OK, "a stopped recording gives its place back");
+    assert_eq!(
+        again.status(),
+        StatusCode::OK,
+        "a stopped recording gives its place back"
+    );
 }
 
 #[tokio::test]
@@ -478,7 +506,13 @@ async fn only_the_id_a_recording_was_started_with_stops_it() {
     assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
     let mut other = id.clone().into_bytes();
     other[31] = if other[31] == b'0' { b'1' } else { b'0' };
-    for wrong in ["1", "0", "", &id[..31], std::str::from_utf8(&other).unwrap()] {
+    for wrong in [
+        "1",
+        "0",
+        "",
+        &id[..31],
+        std::str::from_utf8(&other).unwrap(),
+    ] {
         let res = stop(State(r.clone()), query(&[("id", wrong)])).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "{wrong:?}");
     }
@@ -538,7 +572,14 @@ async fn a_disk_that_falls_behind_ends_the_recording_not_the_stream() {
     let t = Instant::now();
     let (parts, end) = tokio::time::timeout(
         Duration::from_secs(2),
-        collect(&hub, &client, rx, stop, Duration::from_secs(30), &mut writer),
+        collect(
+            &hub,
+            &client,
+            rx,
+            stop,
+            Duration::from_secs(30),
+            &mut writer,
+        ),
     )
     .await
     .expect("the stream never waited on the disk");
@@ -581,6 +622,7 @@ async fn a_write_error_ends_the_recording_cleanly() {
 
 #[tokio::test]
 async fn a_spool_that_cant_be_used_refuses_the_recording_and_holds_nothing() {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut cases: Vec<(PathBuf, spool::Limits, StatusCode, &str)> = vec![
         (
             dir().join("no-such-directory"),
@@ -647,7 +689,11 @@ fn a_spool_leaves_nothing_in_its_directory() {
     let mut f = spool::anonymous(&d).unwrap();
     f.write_all(b"video").unwrap();
     #[cfg(unix)]
-    assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "no name while open");
+    assert_eq!(
+        std::fs::read_dir(&d).unwrap().count(),
+        0,
+        "no name while open"
+    );
     drop(f);
     assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
     std::fs::remove_dir(&d).unwrap();

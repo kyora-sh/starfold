@@ -71,11 +71,7 @@ fn every_command_the_server_takes_is_decided_once() {
 
 #[test]
 fn what_acts_is_what_changes_something() {
-    let acting: BTreeSet<&str> = ROUTES
-        .iter()
-        .filter(|r| r.2 == Act)
-        .map(|r| r.1)
-        .collect();
+    let acting: BTreeSet<&str> = ROUTES.iter().filter(|r| r.2 == Act).map(|r| r.1).collect();
     assert_eq!(
         acting,
         BTreeSet::from([
@@ -94,7 +90,11 @@ fn what_acts_is_what_changes_something() {
     for c in ["a", "v", "au", "kf", "po"] {
         assert_eq!(command(c), Some(Watch), "{c}");
     }
-    assert_eq!(command("new"), None, "no decision: refused under --read-only");
+    assert_eq!(
+        command("new"),
+        None,
+        "no decision: refused under --read-only"
+    );
     for first in [None, Some(0x11), Some(0x12), Some(0x13), Some(0xff)] {
         assert_eq!(binary(first), Act);
     }

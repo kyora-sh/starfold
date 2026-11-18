@@ -286,7 +286,8 @@ impl Clip {
         let opts = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
             .large_file(false);
-        z.start_file("manifest.json", opts).map_err(io::Error::other)?;
+        z.start_file("manifest.json", opts)
+            .map_err(io::Error::other)?;
         z.write_all(self.manifest().to_string().as_bytes())?;
         for (i, s) in self.segments.iter().enumerate() {
             z.start_file(segment_name(i), opts)
@@ -837,10 +838,7 @@ pub async fn stop(
     let id = q.get("id").map_or("", String::as_str);
     let found = {
         let mut active = r.active.lock();
-        let key = active
-            .keys()
-            .find(|k| crate::login::same(k, id))
-            .cloned();
+        let key = active.keys().find(|k| crate::login::same(k, id)).cloned();
         key.and_then(|k| active.remove(&k))
     };
     let Some(a) = found else {

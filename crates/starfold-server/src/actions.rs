@@ -696,7 +696,6 @@ mod tests {
         assert!(s.hub.key_at.lock().is_some(), "a key went unnoted");
     }
 
-
     #[tokio::test]
     async fn answers_once_the_input_is_done_with_the_seq_before_it() {
         let (s, seen) = state(false, Duration::from_millis(20));

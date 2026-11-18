@@ -349,7 +349,14 @@ fn the_command_line_decides_whether_files_are_shared() {
     assert_eq!(off.hello()["download"], false);
     let t = Tmp::new();
     let root = t.root();
-    let on = Files::new(root.to_str(), Some("upload,download"), false, "/Downloads/", 0).unwrap();
+    let on = Files::new(
+        root.to_str(),
+        Some("upload,download"),
+        false,
+        "/Downloads/",
+        0,
+    )
+    .unwrap();
     assert_eq!(on.hello()["upload"], true);
     assert_eq!(on.hello()["download"], true);
     assert_eq!(on.hello()["dir"], "Downloads");
@@ -382,7 +389,11 @@ async fn read_only_shares_files_only_when_download_is_named() {
         assert_eq!(f.hello()["download"], download, "{what}");
         let f = Arc::new(f);
         let listed = get_list(&f, "").await.0;
-        assert_eq!(listed == StatusCode::FORBIDDEN, !upload && !download, "{what}");
+        assert_eq!(
+            listed == StatusCode::FORBIDDEN,
+            !upload && !download,
+            "{what}"
+        );
         let fetched = get_file(&f, "nothing").await.0;
         assert_eq!(fetched == StatusCode::FORBIDDEN, !download, "{what}");
         let uploaded = put(&f, &[("name", "a")], "x").await.0;

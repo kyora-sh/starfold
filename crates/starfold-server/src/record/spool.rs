@@ -107,7 +107,8 @@ fn in_memory(dir: &Path) -> io::Result<bool> {
     if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(matches!(st.f_type as u64 as u32, TMPFS | RAMFS))
+    // f_type is 64 bits wide (signed on glibc, unsigned on musl); the magic numbers are 32.
+    Ok(matches!(st.f_type as u32, TMPFS | RAMFS))
 }
 
 #[cfg(target_os = "macos")]
@@ -283,7 +284,8 @@ fn write_all(
         if buf.is_empty() {
             return Ok(());
         }
-        file.write_all(buf).map_err(|e| Stop::Error(e.to_string()))?;
+        file.write_all(buf)
+            .map_err(|e| Stop::Error(e.to_string()))?;
         *bytes += buf.len() as u64;
         since_check += buf.len() as u64;
         *samples += std::mem::take(pending);
