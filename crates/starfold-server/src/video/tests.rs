@@ -1846,6 +1846,51 @@ fn a_failed_session_is_closed_when_no_replacement_opens() {
     );
 }
 
+/// A reopen, the governor's (another thread count) as a failed session's, closes the old
+/// encoder before it opens the new one: on a backend with one slot the new one opens. If none
+/// opens, the stripe holds no session.
+#[test]
+fn a_reopen_closes_the_old_encoder_before_opening_the_new_one() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let open = slotted(fakes(Opts::default()), 1, 2, live.clone());
+    let cfg = encoder_config(&config(), H264, W, H, 1);
+    let enc = open(&cfg).unwrap();
+    let mut s = Stripe {
+        y: 0,
+        h: H as usize,
+        enc,
+        cfg,
+        max_threads: 4,
+        applied_kbps: Some(1000),
+        applied_crf: -1.0,
+        applied_fps: 0,
+        open: open.clone(),
+    };
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    assert_eq!(reopen(&mut s, 4), None, "the one slot, which the old encoder held");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    assert_eq!(s.applied_kbps, None, "the new encoder gets its rate");
+    let why = reopen(&mut s, 1).expect("the backend opens no more sessions");
+    assert!(why.contains("no more sessions"), "{why}");
+    assert_eq!(live.load(Ordering::SeqCst), 0, "the old one is closed all the same");
+}
+
+/// Only an encoder that codes with a thread count gets the governor: a hardware one would
+/// be reopened, at a keyframe's cost, for a thread count it never receives.
+#[test]
+fn only_an_encoder_that_takes_a_thread_count_adapts_it() {
+    assert!(Backend::OpenH264.takes_threads());
+    for b in [
+        Backend::VideoToolbox,
+        Backend::Vaapi,
+        Backend::Nvenc,
+        Backend::MediaFoundation,
+        Backend::Qsv,
+    ] {
+        assert!(!b.takes_threads(), "{b:?}");
+    }
+}
+
 #[test]
 fn announcements_carry_the_cohorts_current_configuration() {
     let hub = Hub::new();
@@ -2548,7 +2593,7 @@ fn hevc_nal_types(d: &[u8]) -> Vec<u8> {
 #[test]
 fn videotoolbox_hevc_negotiated() {
     use crate::encoder::caps::{host_providers, Registry, PROBE_TIMEOUT};
-    let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let reg = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     let cands = negotiate::candidates(&reg, encoder::SOFTWARE_H264);
     if !cands.iter().any(|c| c.codec == Codec::Hevc) {
         assert!(

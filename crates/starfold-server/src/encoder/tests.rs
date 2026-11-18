@@ -517,7 +517,7 @@ fn backends_without_the_codec_refuse_to_open() {
 #[test]
 fn videotoolbox_probe() {
     use super::caps::{host_providers, Registry, PROBE_TIMEOUT};
-    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let r = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     println!("{}", serde_json::to_string_pretty(&r).unwrap());
     for codec in [Codec::H264, Codec::Hevc] {
         let c = r.check(Backend::VideoToolbox, codec).unwrap();
@@ -542,7 +542,7 @@ fn vt(codec: Codec, w: u32, h: u32, kbps: u32) -> Box<dyn VideoEncoder> {
 #[cfg(target_os = "macos")]
 fn vt_hardware(codec: Codec) -> bool {
     use super::caps::{host_providers, Acceleration, Registry, PROBE_TIMEOUT};
-    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let r = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     let hw = r
         .check(Backend::VideoToolbox, codec)
         .is_ok_and(|c| c.acceleration == Acceleration::Hardware);

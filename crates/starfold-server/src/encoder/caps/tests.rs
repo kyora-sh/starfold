@@ -252,7 +252,7 @@ fn hung_probes_become_diagnostics() {
 
 #[test]
 fn software_only_probes_load_no_hardware_backend() {
-    let backends: Vec<Backend> = host_providers(false, true)
+    let backends: Vec<Backend> = host_providers(false, true, true)
         .iter()
         .map(|p| p.backend())
         .collect();
@@ -269,7 +269,7 @@ fn software_only_probes_load_no_hardware_backend() {
 #[test]
 fn experimental_probes_are_off_by_default() {
     let r = Registry::probe(
-        host_providers(true, false)
+        host_providers(true, false, true)
             .into_iter()
             .filter(|p| p.backend() != Backend::VideoToolbox)
             .collect(),

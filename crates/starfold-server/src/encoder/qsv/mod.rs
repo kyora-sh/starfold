@@ -286,19 +286,37 @@ fn sample_on(
     r
 }
 
+/// The side of the picture a probe encodes: the smallest `open` codes.
+#[cfg(any(windows, test))]
+const SAMPLE_SIDE: u32 = 160;
+
+/// What the probe helper is told after `--probe` when the stream runs uncapped.
+pub const PROBE_UNCAPPED: &str = "--uncapped";
+
+/// The probe's sample session for `codec`, in the stream's own mode: constant bitrate when
+/// the stream is `capped` (`--max-kbps` above 0), constant QP when it isn't. A probe then
+/// passes or fails on what the stream will ask of the runtime, and an uncapped stream's
+/// probe asks nothing about HRD conformance (see [`session`]).
+#[cfg(any(windows, test))]
+fn probe_config(codec: Codec, capped: bool) -> super::EncoderConfig {
+    let mut cfg = super::hw::sample_config(Backend::Qsv, codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
+    if !capped {
+        cfg.rate.max_kbps = 0;
+    }
+    cfg
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::super::caps::{Probe as Found, ProbeProvider, ProbeStatus};
-    use super::super::{hw, isolate, Backend, EncodeError, EncoderConfig, VideoEncoder};
+    use super::super::{isolate, Backend, EncodeError, EncoderConfig, VideoEncoder};
     use super::driver::{MfxRuntime, STOPPED};
     use super::probe::{self, VERIFIED};
     use super::remote::{Remote, POLICY};
     use super::session::Session;
     use super::{caps, ffi, locate, pick, proc, read_impl, runtime_path, Adapter, ImplInfo};
+    use super::{probe_config, PROBE_UNCAPPED, SAMPLE_SIDE};
     use std::time::Duration;
-
-    /// The side of the picture a probe encodes: the smallest `open` codes.
-    const SAMPLE_SIDE: u32 = 160;
     /// More implementations than one runtime has.
     const MAX_IMPLS: u32 = 16;
 
@@ -367,19 +385,26 @@ mod windows_impl {
         )
     }
 
-    /// The server's Quick Sync probe: run in a helper, or not at all.
-    pub fn provider(timeout: Duration) -> Box<dyn ProbeProvider> {
+    /// The server's Quick Sync probe: run in a helper, or not at all; in the stream's mode,
+    /// constant bitrate if `capped`, else constant QP ([`probe_config`]).
+    pub fn provider(timeout: Duration, capped: bool) -> Box<dyn ProbeProvider> {
+        let args: &'static [&'static str] = if capped {
+            &["--probe"]
+        } else {
+            &["--probe", PROBE_UNCAPPED]
+        };
         Box::new(probe::Probe {
             helpers: isolate::self_exec(),
-            spawn: Box::new(|| proc::spawn_helper(&["--probe"])),
+            spawn: Box::new(move || proc::spawn_helper(args)),
             policy: &POLICY,
             verified: &VERIFIED,
             timeout,
         })
     }
 
-    /// The probe itself, in this process: only a helper runs it.
-    pub fn probe_here() -> Found {
+    /// The probe itself, in this process: only a helper runs it. Its sample sessions run at
+    /// constant bitrate if `capped`, else at constant QP.
+    pub fn probe_here(capped: bool) -> Found {
         let adapters = match locate::intel_adapters() {
             Ok(a) => a,
             Err(e) => return Found::failed(Backend::Qsv, e),
@@ -411,7 +436,7 @@ mod windows_impl {
                 .iter_mut()
                 .filter(|c| c.status == ProbeStatus::Discovered)
             {
-                stopped = verify(c, a.luid, &mut kept);
+                stopped = verify(c, a.luid, capped, &mut kept);
                 if stopped.is_some() {
                     break;
                 }
@@ -436,12 +461,13 @@ mod windows_impl {
     fn verify(
         c: &mut super::EncoderCapability,
         luid: u64,
+        capped: bool,
         kept: &mut Vec<Session>,
     ) -> Option<String> {
         if !Backend::Qsv.implements(c.codec) {
             return None;
         }
-        let cfg = hw::sample_config(Backend::Qsv, c.codec, SAMPLE_SIDE, SAMPLE_SIDE, 30);
+        let cfg = probe_config(c.codec, capped);
         let r = open_session(&cfg, luid).and_then(|(s, _)| super::sample_on(s, SAMPLE_SIDE, kept));
         match r {
             Ok(()) => {

@@ -429,6 +429,19 @@ impl Backend {
         )
     }
 
+    /// Codes with as many threads as `EncoderConfig::threads` says; a hardware encoder takes
+    /// no thread count.
+    pub fn takes_threads(self) -> bool {
+        !matches!(
+            self,
+            Backend::VideoToolbox
+                | Backend::Vaapi
+                | Backend::Nvenc
+                | Backend::MediaFoundation
+                | Backend::Qsv
+        )
+    }
+
     /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
     pub fn refines_by_qp(self) -> bool {
         match self {

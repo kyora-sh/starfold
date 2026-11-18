@@ -701,7 +701,7 @@ fn video_v2_layout() {
 #[test]
 fn auto_on_this_host() {
     use crate::encoder::caps::{host_providers, PROBE_TIMEOUT};
-    let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let reg = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     let h264 = h264_backend(&reg, Selection::Auto).unwrap();
     let got: Vec<(Codec, Backend, bool)> = chosen(&candidates(&reg, h264))
         .iter()

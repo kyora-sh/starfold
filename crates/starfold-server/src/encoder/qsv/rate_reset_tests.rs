@@ -362,8 +362,9 @@ const WRN_INCOMPATIBLE_VIDEO_PARAM: i32 = 5;
 
 /// A constant-bitrate Init the runtime takes but leaves HRD conformance on (it corrected
 /// it back, answering MFX_WRN_INCOMPATIBLE_VIDEO_PARAM), or doesn't say, is not a session
-/// to keep: its bitrate could not change through Reset. Constant QP needs no Reset of the
-/// bitrate, so it opens either way.
+/// to keep: its bitrate could not change through Reset. Constant QP never changes a bitrate:
+/// it neither asks for HRD conformance off nor reads it back, and opens whatever the runtime
+/// would say, unfilled included.
 #[test]
 fn an_init_that_leaves_hrd_conformance_on_opens_no_session() {
     for (hrd, says) in [(ffi::CODINGOPTION_ON, "on"), (0, "unconfirmed")] {
@@ -373,10 +374,43 @@ fn an_init_that_leaves_hrd_conformance_on_opens_no_session() {
         let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
         assert!(e.0.contains(&format!("HRD conformance {says}")), "{e}");
     }
-    let (mut fake, _) = Fake::new(Codec::H264);
-    fake.hrd_report = Some(ffi::CODINGOPTION_ON);
-    let s = Session::new(Box::new(fake), &cfg(0)).unwrap();
-    assert!(!s.holds_cap(), "constant QP");
+    for hrd in [ffi::CODINGOPTION_ON, 0] {
+        let (mut fake, log) = Fake::new(Codec::H264);
+        fake.hrd_report = Some(hrd);
+        let mut s = Session::new(Box::new(fake), &cfg(0)).unwrap();
+        assert!(!s.holds_cap(), "constant QP");
+        s.set_rate(RateConfig::new(30.0, 0, 30)).unwrap();
+        assert!(frame(&mut s, false).unwrap()[0].keyframe);
+        let l = log.lock().unwrap();
+        assert_eq!(l.hrd, vec![None], "Init asks nothing about HRD");
+        assert_eq!(l.reset.len(), 1, "the QP changed through Reset");
+        assert!(l.reset.iter().all(|p| p.num_ext_param == 1), "colour only");
+        assert!(l.read_with.iter().all(|&n| n == 0), "{:?}", l.read_with);
+    }
+}
+
+/// The startup probe's sample runs in the stream's own mode: for a capped stream at constant
+/// bitrate, which needs HRD conformance read back off; for an uncapped one at constant QP,
+/// which asks nothing about it. A runtime that leaves the field unfilled then fails only a
+/// capped stream's probe, as it would fail that stream's own sessions.
+#[test]
+fn the_probe_runs_in_the_streams_mode() {
+    for capped in [true, false] {
+        let cfg = super::probe_config(Codec::H264, capped);
+        let (mut fake, log) = Fake::new(Codec::H264);
+        fake.hrd_report = Some(0);
+        let r = Session::new(Box::new(fake), &cfg);
+        assert_eq!(r.is_err(), capped, "capped {capped}");
+        let l = log.lock().unwrap();
+        let method = l.inited[0].mfx.rate_control_method;
+        let want = if capped {
+            ffi::RATECONTROL_CBR
+        } else {
+            ffi::RATECONTROL_CQP
+        };
+        assert_eq!(method, want, "capped {capped}");
+        assert_eq!(l.hrd[0].is_some(), capped, "capped {capped}");
+    }
 }
 
 /// A Reset the runtime takes but that leaves HRD conformance reading back on takes the

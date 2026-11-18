@@ -3,15 +3,18 @@
 //! through the runtime's own system-memory NV12 surfaces. It opens on the full encoder
 //! (LowPower off), and on the low-power one (VDEnc) only if the runtime refuses that.
 //!
-//! The stream is not held to HRD conformance (NalHrdConformance off, no NAL HRD parameters
-//! in its VUI): oneVPL lets a constant-bitrate encoder change its bitrate through Reset only
-//! then (the spec's "Dynamic Bitrate Change"), and every rate change goes through Reset. A
+//! A constant-bitrate session (a capped stream's) asks for no HRD conformance
+//! (NalHrdConformance off, and VuiNalHrdParameters off, which is asked but not read back):
+//! oneVPL lets a constant-bitrate encoder change its bitrate through Reset only then (the
+//! spec's "Dynamic Bitrate Change"), and every rate change goes through Reset. A constant-QP
+//! session (an uncapped stream's) never changes a bitrate and asks nothing about HRD. A
 //! Reset is built from what the encoder reads back (GetVideoParam) with TargetKbps (and
 //! MaxKbps with it) changed, held to the one ceiling the session was sized for and its
 //! BRCParamMultiplier can hold; a raise is no IDR. An encoder that doesn't read back the
 //! rate control method, codec, picture size and format asked for, and at constant bitrate
 //! HRD conformance off, is not used: Init fails, and before or after a Reset it is out of
-//! use. So is one that reads back no defined frame rate when a rate change needs it, and
+//! use. The colour signalling asked for is not read back: the stream's own description of
+//! its colour says what was asked, and viewers take colour from the bitstream. So is one that reads back no defined frame rate when a rate change needs it, and
 //! one whose Reset the runtime refuses: it takes no more pictures and the stream opens a
 //! fresh one. The session reports no bitrate; the server's figure is what it asked for.
 //!
@@ -171,7 +174,8 @@ fn sized(mut p: VideoParam, ceiling: u64) -> VideoParam {
     p
 }
 
-/// No HRD conformance and no NAL HRD parameters, so a bitrate change can go through Reset.
+/// No HRD conformance and no NAL HRD parameters asked for, so a bitrate change can go through
+/// Reset (only NalHrdConformance is read back).
 fn coding_option() -> ExtCodingOption {
     ExtCodingOption {
         header: ExtBuffer {
@@ -397,14 +401,16 @@ impl Session {
         self.stopped.as_deref()
     }
 
-    /// `p` with the session's extension buffers: its colour signalling, and no HRD.
+    /// `p` with the session's extension buffers: its colour signalling and, at constant
+    /// bitrate (whose rate changes go through Reset), no HRD. A constant-QP session never
+    /// changes a bitrate and asks nothing about HRD.
     fn with_ext(&mut self, mut p: VideoParam) -> VideoParam {
         *self.signal = signal(self.color);
         *self.coding = coding_option();
         self.ext[0] = &mut *self.signal as *mut ExtVideoSignalInfo as *mut ExtBuffer;
         self.ext[1] = &mut *self.coding as *mut ExtCodingOption as *mut ExtBuffer;
         p.ext_param = self.ext.as_mut_ptr();
-        p.num_ext_param = 2;
+        p.num_ext_param = if self.rc.cbr { 2 } else { 1 };
         p
     }
 
@@ -419,9 +425,9 @@ impl Session {
         EncodeError(why)
     }
 
-    /// What the encoder runs with now (GetVideoParam): its parameters, and NalHrdConformance
-    /// as the runtime fills it into the coding option attached to the call (0 if it doesn't
-    /// say).
+    /// What the encoder runs with now (GetVideoParam): its parameters and, at constant
+    /// bitrate, NalHrdConformance as the runtime fills it into the coding option attached to
+    /// the call (0 if it doesn't say). A constant-QP session attaches none.
     fn working(&mut self) -> Result<Working, EncodeError> {
         *self.readback = ExtCodingOption {
             header: ExtBuffer {
@@ -433,7 +439,7 @@ impl Session {
         self.readback_ext[0] = &mut *self.readback as *mut ExtCodingOption as *mut ExtBuffer;
         let mut par = VideoParam {
             ext_param: self.readback_ext.as_mut_ptr(),
-            num_ext_param: 1,
+            num_ext_param: self.rc.cbr as u16,
             ..Default::default()
         };
         let r = self.rt.video_param(&mut par);

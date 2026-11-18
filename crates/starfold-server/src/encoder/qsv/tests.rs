@@ -263,6 +263,8 @@ pub(super) struct Log {
     pub(super) reset: Vec<VideoParam>,
     /// Each Init's NalHrdConformance and VuiNalHrdParameters, if it set them.
     pub(super) hrd: Vec<Option<(u16, u16)>>,
+    /// How many extension buffers each GetVideoParam call carried.
+    pub(super) read_with: Vec<u16>,
     /// The frame type asked of each encode call, if it asked for one.
     pub(super) frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
@@ -435,7 +437,7 @@ impl Runtime for Fake {
     /// Fills what the encoder runs with into `par`, and NalHrdConformance into a coding
     /// option attached to it, as the runtime does.
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
-        drop(self.call());
+        self.call().read_with.push(par.num_ext_param);
         self.video_params += 1;
         let r = self.video_param.pop_front().unwrap_or(0);
         if r < 0 {

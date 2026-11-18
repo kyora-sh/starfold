@@ -977,12 +977,12 @@ impl Engine {
                 y: s.y as usize,
                 h: s.h as usize,
                 enc: (self.open)(&ecfg)?,
-                cfg: ecfg,
-                max_threads: if self.cfg.adaptive_threads {
+                max_threads: if self.cfg.adaptive_threads && ecfg.backend.takes_threads() {
                     (self.cfg.threads / n as u32).max(1)
                 } else {
                     1
                 },
+                cfg: ecfg,
                 applied_kbps: None,
                 applied_crf: -1.0,
                 applied_fps: 0,
@@ -2685,6 +2685,24 @@ impl ThreadGovernor {
     }
 }
 
+/// Replaces a stripe's encoder with a fresh one at `threads`. The old one is closed first, so
+/// it holds nothing the fresh one needs, and is gone even if that can't open: the stripe then
+/// has none ([`Retired`]) until a later picture opens one. The reason if it can't.
+fn reopen(s: &mut Stripe, threads: u32) -> Option<String> {
+    s.enc = Box::new(Retired);
+    match (s.open)(&EncoderConfig {
+        threads,
+        ..s.cfg.clone()
+    }) {
+        Ok(e) => {
+            s.enc = e;
+            s.applied_kbps = None;
+            None
+        }
+        Err(e) => Some(e.0),
+    }
+}
+
 fn stripe_worker(
     i: usize,
     mut s: Stripe,
@@ -2795,61 +2813,46 @@ fn stripe_worker(
                 out.as_ref().map_or(0, |o| o.1.len())
             );
         }
-        if s.max_threads > 1 {
-            // Changed macroblocks in this stripe (all of them without a damage map).
-            let changed = info
-                .as_ref()
-                .map_or((s.h.div_ceil(16) * job.mb_cols) as f64, |m| {
-                    m.iter().filter(|&&c| c == 0).count() as f64
-                });
-            if let Some(t) = gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads) {
-                match (s.open)(&EncoderConfig {
-                    threads: t,
-                    ..s.cfg.clone()
-                }) {
-                    Ok(e) => {
-                        log::info!(
-                            "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
-                            gov.ewma_ms
-                        );
-                        // A fresh encoder opens with an IDR on its next frame.
-                        s.enc = e;
-                        s.applied_kbps = None;
-                        gov.threads = t;
-                        gov.heavy = 0;
-                        gov.light_since = None;
-                    }
-                    Err(e) => log::error!("encoder reopen failed: {e}"),
-                }
-            }
-        }
+        // The thread count the governor wants, for an encoder that takes one.
+        let want = (s.max_threads > 1)
+            .then(|| {
+                // Changed macroblocks in this stripe (all of them without a damage map).
+                let changed = info
+                    .as_ref()
+                    .map_or((s.h.div_ceil(16) * job.mb_cols) as f64, |m| {
+                        m.iter().filter(|&&c| c == 0).count() as f64
+                    });
+                gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads)
+            })
+            .flatten();
         let failed = out.is_err();
         let error = out.as_ref().err().map(|e| e.0.clone());
+        if let Err(e) = &out {
+            log::error!("stripe {i}: {e}");
+        }
+        // A session that failed may stay broken, and the governor may want another thread
+        // count: either way the next picture gets a fresh one (which starts with an IDR).
+        if failed || want.is_some() {
+            let threads = want.unwrap_or(if s.max_threads > 1 {
+                gov.threads
+            } else {
+                s.cfg.threads
+            });
+            if let Some(why) = reopen(&mut s, threads) {
+                log::error!("stripe {i}: encoder reopen failed: {why}");
+            } else if let Some(t) = want {
+                log::info!(
+                    "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
+                    gov.ewma_ms
+                );
+                gov.threads = t;
+                gov.heavy = 0;
+                gov.light_since = None;
+            }
+        }
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
-            Ok(_) => None,
-            Err(e) => {
-                log::error!("stripe {i}: {e}");
-                // A session that failed may stay broken: the next picture gets a fresh
-                // one (which starts with an IDR). The failed one is closed first, so it
-                // holds nothing the fresh one needs, and is gone even if that can't open.
-                s.enc = Box::new(Retired);
-                match (s.open)(&EncoderConfig {
-                    threads: if s.max_threads > 1 {
-                        gov.threads
-                    } else {
-                        s.cfg.threads
-                    },
-                    ..s.cfg.clone()
-                }) {
-                    Ok(e) => {
-                        s.enc = e;
-                        s.applied_kbps = None;
-                    }
-                    Err(e) => log::error!("stripe {i}: encoder reopen failed: {e}"),
-                }
-                None
-            }
+            _ => None,
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);

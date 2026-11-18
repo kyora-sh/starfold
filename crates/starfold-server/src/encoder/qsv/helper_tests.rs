@@ -286,6 +286,60 @@ fn a_stopped_device_is_reported_and_the_helper_leaves_without_closing_it() {
     assert_eq!(l.live, 1, "nor the frame's surface released");
 }
 
+/// Output that takes `left` writes, then fails: the server's end of the pipe closed.
+struct ClosesAfter {
+    left: usize,
+    out: Vec<u8>,
+}
+
+impl std::io::Write for ClosesAfter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.left -= 1;
+        self.out.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stopped device whose report can't get out leaves the helper as a reported one does:
+/// the stopped exit (the session forgotten, freeing nothing), not the ordinary one.
+#[test]
+fn a_stopped_device_whose_report_fails_still_frees_nothing() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.sync = VecDeque::from([ffi_in_execution()]);
+    let o = open(Codec::H264, 640, 480);
+    let mut input = Request::Open(o).bytes();
+    input.extend(
+        Request::Frame {
+            slot: 0,
+            pts: 0,
+            key: false,
+        }
+        .bytes(),
+    );
+    let mut out = ClosesAfter {
+        left: 1,
+        out: Vec::new(),
+    };
+    let code = serve(
+        input.as_slice(),
+        &mut out,
+        |o| Ok(grey(o)),
+        session_on(fake),
+    );
+    assert_eq!(bodies(&out.out).len(), 1, "only Opened got out");
+    assert_eq!(code, STOPPED_EXIT);
+    let l = log.lock().unwrap();
+    assert!(!l.dropped, "the runtime is not closed");
+    assert_eq!(l.live, 1, "nor the frame's surface released");
+}
+
 fn ffi_in_execution() -> i32 {
     super::ffi::WRN_IN_EXECUTION
 }
