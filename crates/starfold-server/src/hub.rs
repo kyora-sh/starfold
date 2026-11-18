@@ -464,6 +464,8 @@ pub struct Hub {
     /// fake in tests). Read when a hello is built and each time the video thread routes
     /// viewers.
     pub off: Mutex<Off>,
+    /// Recordings, beside the viewers: the encode thread hands them the H.264 cohort's frames.
+    pub taps: crate::record::Taps,
 }
 
 /// Where the video thread reads which backends are turned off.
@@ -499,6 +501,7 @@ impl Hub {
             cohorts: Mutex::new(serde_json::Value::Array(Vec::new())),
             encoder: Mutex::new(serde_json::Value::Null),
             off: Mutex::new(Arc::new(crate::encoder::turned_off)),
+            taps: Default::default(),
         })
     }
 

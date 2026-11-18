@@ -517,10 +517,19 @@ impl Drop for Cohort {
     }
 }
 
-/// A cohort's viewers that get frames now, and whether one is waiting for a keyframe.
+/// A cohort's viewers that get frames now, whether a recording takes its frames, and
+/// whether one of them is waiting for a keyframe.
 struct View {
     clients: Vec<Arc<Client>>,
+    recorded: bool,
     want_key: bool,
+}
+
+impl View {
+    /// Whether anyone takes this cohort's frames: its viewers or a recording.
+    fn watched(&self) -> bool {
+        !self.clients.is_empty() || self.recorded
+    }
 }
 
 fn encoder_config(
@@ -814,6 +823,7 @@ impl Engine {
             .map(|s| (s.y, s.h))
             .collect();
         eng.cohorts.push(c);
+        eng.name_recorded();
         eng.publish_offers();
         // Under the lock a connecting viewer's first-hello check also takes
         // (Hub::send_first_hello_with), released before the restart hellos below.
@@ -1165,6 +1175,7 @@ impl Engine {
         let (h264, best) = (self.h264, self.best);
         self.cohorts
             .retain(|c| c.shared.cand == h264 || Some(c.shared.cand) == best);
+        self.name_recorded();
         self.publish();
     }
 
@@ -1286,19 +1297,34 @@ impl Engine {
     }
 
     fn views(&self) -> Vec<View> {
+        let taps = &self.hub.taps;
+        let recording = taps.any();
         self.cohorts
             .iter()
             .map(|c| {
                 let clients = self.hub.cohort_clients(c.shared.id);
                 let sh = &c.shared;
+                let recorded = recording && taps.cohort() == sh.id;
                 let want_key = !sh.idr_inflight.load(Ordering::Acquire)
                     && (!sh.degraded() || sh.last_key.lock().elapsed() >= RETRY_EVERY)
-                    && clients
+                    && (clients
                         .iter()
-                        .any(|x| x.needs_keyframe.load(Ordering::Relaxed));
-                View { clients, want_key }
+                        .any(|x| x.needs_keyframe.load(Ordering::Relaxed))
+                        || (recorded && taps.wants_key()));
+                View {
+                    clients,
+                    recorded,
+                    want_key,
+                }
             })
             .collect()
+    }
+
+    /// Recordings take the H.264 cohort a protocol 1 viewer gets.
+    fn name_recorded(&self) {
+        if let Some(c) = self.cohorts.iter().find(|c| c.shared.cand == self.h264) {
+            self.hub.taps.set_cohort(c.shared.id);
+        }
     }
 
     /// Each cohort's bitrate from its own viewers; a cohort that lost them all starts over.
@@ -1329,11 +1355,13 @@ impl Engine {
             }
             c.viewers.clear();
             c.viewers.extend(v.clients.iter().map(|x| x.id));
+            // A cohort only a recording takes runs at --framerate at most (its base rate).
             let hz = v
                 .clients
                 .iter()
                 .map(|x| x.display_hz().unwrap_or(BASE_FPS))
-                .min();
+                .min()
+                .or(v.recorded.then_some(c.shared.base_fps));
             c.shared.hz.store(hz.unwrap_or(u32::MAX), Ordering::Release);
             c.shared.target.store(c.rc.target as u32, Ordering::Relaxed);
             if c.active {
@@ -1356,7 +1384,7 @@ impl Engine {
         self.cohorts
             .iter()
             .zip(views)
-            .filter(|(_, v)| !v.clients.is_empty())
+            .filter(|(_, v)| v.watched())
             .map(|(c, _)| c.fps())
             .max()
             .unwrap_or(self.cfg.fps)
@@ -1375,7 +1403,7 @@ impl Engine {
                     true => 1000.0 / c.fps().max(1) as f64,
                     false => interval_ms,
                 };
-                !v.clients.is_empty()
+                v.watched()
                     && c.shared.busy.load(Ordering::Acquire) < 2
                     && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, ms))
             })
@@ -1423,7 +1451,7 @@ impl Engine {
         let capped = self.cfg.max_kbps != 0;
         let input_at = *self.hub.input_at.lock();
         for (c, v) in self.cohorts.iter_mut().zip(views) {
-            if !v.clients.is_empty() {
+            if v.watched() {
                 // --max-kbps 0: the controller's floor applies after congestion, the budget doesn't.
                 let kbps = if capped { c.rc.target as u32 } else { 0 };
                 c.refine.update(&c.shared, kbps, now, input_at);
@@ -1446,7 +1474,7 @@ impl Engine {
         self.cohorts
             .iter()
             .zip(views)
-            .filter(|(_, v)| !v.clients.is_empty())
+            .filter(|(_, v)| v.watched())
             .map(|(c, _)| match c.refine.burst.due(now) {
                 true => 100,
                 false => c.refine.burst.wait_ms(now),
@@ -1458,7 +1486,7 @@ impl Engine {
     /// What changed in this capture, for the cohorts with viewers (None: everything).
     fn mark(&mut self, views: &[View], dirty: Option<&[u8]>) {
         for (c, v) in self.cohorts.iter_mut().zip(views) {
-            if !v.clients.is_empty() {
+            if v.watched() {
                 match dirty {
                     Some(m) => c.refine.refiner.mark(m),
                     None => c.refine.refiner.mark_all(),
@@ -1470,7 +1498,7 @@ impl Engine {
     /// The picture moved: every watched cohort's next burst starts over.
     fn moved(&mut self, views: &[View], now: Instant) {
         for (c, v) in self.cohorts.iter_mut().zip(views) {
-            if !v.clients.is_empty() {
+            if v.watched() {
                 c.refine.burst.moved(now);
             }
         }
@@ -1502,7 +1530,7 @@ impl Engine {
         let stats = &self.hub.stats;
         let plans = turn.takes.iter().zip(&turn.passes);
         for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
-            if v.clients.is_empty() {
+            if !v.watched() {
                 continue;
             }
             if !take {
@@ -2341,7 +2369,7 @@ fn capture_loop(
         eng.replan();
         let views = eng.views();
         eng.update_rates(&views);
-        if views.iter().all(|v| v.clients.is_empty()) {
+        if !views.iter().any(View::watched) {
             had_clients = false;
             wait_any(&[cap.fd(), hub.waker.waitable()], 500);
             continue;
@@ -2991,6 +3019,9 @@ fn encode_loop(
             for c in hub.cohort_clients(sh.id) {
                 c.needs_keyframe.store(true, Ordering::Relaxed);
             }
+            if hub.taps.cohort() == sh.id {
+                hub.taps.ask_key();
+            }
             if worst >= FAIL_AFTER {
                 hub.replan();
             }
@@ -3090,6 +3121,8 @@ fn encode_loop(
             })
             .collect();
         deliver(&hub, sh.id, frame_id, all_key, total, &msgs);
+        hub.taps
+            .offer(sh.id, (sh.w, sh.h), all_key, captured_at, &msgs);
         finish(force_idr);
         hub.stats
             .send_lat_us

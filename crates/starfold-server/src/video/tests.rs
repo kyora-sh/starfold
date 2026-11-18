@@ -4300,3 +4300,55 @@ fn no_software_encoders_share_moves() {
     }
     assert!(opened > 0);
 }
+
+/// What a tap got: (size, keyframe) of each frame.
+fn tapped(rx: &std::sync::mpsc::Receiver<crate::record::tap::Msg>) -> Vec<((u32, u32), bool)> {
+    rx.try_iter()
+        .filter_map(|m| match m {
+            crate::record::tap::Msg::Frame(f) => Some((f.size, f.key)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_recording_takes_the_h264_cohorts_frames_at_its_encoders_size_without_a_viewer() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
+    let (_tap, rx) = hub.taps.add();
+    hub.replan();
+    for _ in 0..3 {
+        push(&mut eng);
+    }
+    let h264 = eng
+        .cohorts
+        .iter()
+        .find(|c| c.shared.cand == H264)
+        .unwrap()
+        .shared
+        .id;
+    assert_eq!(hub.taps.cohort(), h264);
+    let got = tapped(&rx);
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(got[0].1, "starts at a keyframe");
+    assert!(got.iter().all(|f| f.0 == (W, H)), "{got:?}");
+    assert!(hub.clients.lock().is_empty());
+    // The pipeline rebuilt at a new size: the new cohort's frames say so, whatever the hub's
+    // size is when they are read.
+    drop(eng);
+    let mut eng = Engine::new(
+        config(),
+        hub.clone(),
+        800,
+        600,
+        &[HEVC, H264],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    hub.width.store(W, Ordering::Relaxed);
+    push_at(&mut eng, 800, 600);
+    let got = tapped(&rx);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].1);
+    assert_eq!(got[0].0, (800, 600));
+}

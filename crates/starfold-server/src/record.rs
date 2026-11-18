@@ -17,14 +17,17 @@
 //! every `segment-k.mp4`; without it the response is the first segment, as an MP4, and
 //! `x-starfold-segments` and `x-starfold-record-end` say when there was more.
 //!
-//! A recording is the H.264 stream starfold already encodes, rewrapped as MP4: the recorder
-//! joins as one more viewer that acknowledges frames at once, so it costs almost no
-//! CPU and never slows real viewers down. Like the stream, it holds frames only when
-//! the screen changes, and it doesn't include the cursor (viewers draw it locally),
-//! except on macOS with `--show-cursor` or when the system cursor can't be read, where
-//! the capture carries it.
+//! A recording is the H.264 stream starfold already encodes, rewrapped as MP4. It takes the
+//! frames beside the viewers ([`tap`]), not as one of them, so it never holds the stream
+//! back. Like the stream, it holds frames only when the screen changes, and it doesn't
+//! include the cursor (viewers draw it locally), except on macOS with `--show-cursor` or
+//! when the system cursor can't be read, where the capture carries it.
 
-use crate::hub::{Client, Hub, Out};
+pub(crate) mod tap;
+
+pub use tap::Taps;
+
+use crate::hub::Hub;
 use crate::mp4;
 use axum::extract::{Query, Request, State};
 use axum::http::{header, StatusCode};
@@ -32,9 +35,10 @@ use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tap::{Msg, Tap};
+use tokio::sync::oneshot;
 
 /// How long a started recording that ran into the length limit waits for its
 /// `/record/stop` before it is discarded (the caller may have crashed or forgotten).
@@ -56,7 +60,7 @@ pub struct Recorder {
 }
 
 struct Active {
-    stop: oneshot::Sender<()>,
+    tap: Arc<Tap>,
     done: Recording,
     /// Its number in the log.
     n: u64,
@@ -96,31 +100,16 @@ fn query(req: &Request) -> Result<HashMap<String, String>, Response> {
         .map_err(IntoResponse::into_response)
 }
 
-/// Whether a text message to the recorder ends a recording of `size`: a hello for another
-/// size (an MP4 track keeps one), or one that names none. A hello for the same size (a
-/// capture rebuilt after a resize the display refused) and other broadcasts (clipboard and
-/// the like, whatever they contain) do not.
-fn resizes(t: &str, size: (u32, u32)) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
-        return false;
-    };
-    if v.get("t").and_then(|t| t.as_str()) != Some("hello") {
-        return false;
-    }
-    let dim = |k: &str| v.get(k).and_then(|d| d.as_u64());
-    (dim("w"), dim("h")) != (Some(size.0.into()), Some(size.1.into()))
-}
-
 type Recording = tokio::task::JoinHandle<Result<Clip, String>>;
 
 /// Why a recording ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum End {
+pub(crate) enum End {
     /// `/record/stop`.
     Stopped,
     /// The time asked for, or the length limit.
     TimeLimit,
-    /// A new size: an MP4 track keeps one.
+    /// A frame of another size: an MP4 track keeps one.
     Resized,
     /// Past `MAX_SEGMENTS`.
     SegmentCap,
@@ -128,7 +117,7 @@ enum End {
     BadParameterSets,
     /// A segment couldn't be written; the others are there.
     SegmentLost,
-    /// The hub went away.
+    /// The stream it recorded stopped being one picture per frame.
     Closed,
 }
 
@@ -405,114 +394,88 @@ fn wants_zip(q: &HashMap<String, String>) -> Option<bool> {
 
 const BAD_FORMAT: &str = "format must be mp4 or zip";
 
-/// Joins as a viewer and collects frames until `stop`, `max` or a geometry change.
+/// Takes a place beside the stream ([`tap`]) and records until its tap is ended, `max`, a
+/// frame of another size or a limit.
 #[allow(clippy::result_large_err)]
-fn begin(
-    r: &Arc<Recorder>,
-    stop: oneshot::Receiver<()>,
-    max: Duration,
-) -> Result<Recording, Response> {
+fn begin(r: &Arc<Recorder>, max: Duration) -> Result<(Recording, Arc<Tap>), Response> {
     if r.hub.stripes.lock().len() > 1 {
         return Err(err(
             StatusCode::CONFLICT,
             "recording needs a single-stripe stream (--stripes 1)",
         ));
     }
-    let (tx, rx) = mpsc::unbounded_channel();
-    let client = r.hub.add_client(tx);
-    // A protocol 1 viewer: the H.264 stream the MP4 writer takes.
-    client.set_video(true);
+    let (tap, rx) = r.hub.taps.add();
     r.hub.replan();
-    let hub = r.hub.clone();
-    // The size the recording starts with is the size of its MP4 track; a hello for any other
-    // ends it.
-    let size = (
-        hub.width.load(Ordering::Relaxed),
-        hub.height.load(Ordering::Relaxed),
-    );
-    Ok(tokio::spawn(async move {
-        let (parts, end) = collect(&hub, &client, rx, stop, size, max).await;
-        // Writing takes a while: nothing acknowledges frames now, so leave first.
-        hub.remove_client(client.id);
-        tokio::task::spawn_blocking(move || Clip::write(parts, end))
-            .await
-            .map_err(|e| e.to_string())?
-    }))
+    let (hub, t) = (r.hub.clone(), tap.clone());
+    let start = Instant::now();
+    let done = tokio::task::spawn_blocking(move || {
+        let (parts, end) = collect(&rx, start, max);
+        hub.taps.remove(&t);
+        hub.replan();
+        Clip::write(parts, end)
+    });
+    Ok((done, tap))
 }
 
-async fn collect(
-    hub: &Hub,
-    client: &Client,
-    mut rx: mpsc::UnboundedReceiver<Out>,
-    mut stop: oneshot::Receiver<()>,
-    size: (u32, u32),
-    max: Duration,
-) -> (Vec<Part>, End) {
-    let start = Instant::now();
-    let deadline = tokio::time::sleep(max);
-    tokio::pin!(deadline);
+/// Collects tapped frames until the tap is ended, `max` after `start`, or a frame of
+/// another size. The recording's size is its first frame's, as its encoder was opened:
+/// the size of the pictures it records, not the hub's, which a resize may already have
+/// changed.
+fn collect(rx: &mpsc::Receiver<Msg>, start: Instant, max: Duration) -> (Vec<Part>, End) {
+    let deadline = start + max;
     let mut parts: Vec<Part> = Vec::new();
     let mut frames: Vec<mp4::Frame> = Vec::new();
+    let mut size: Option<(u32, u32)> = None;
     let mut first: Option<Vec<Vec<u8>>> = None;
     let mut last_ms = None;
     let end = loop {
-        tokio::select! {
-            _ = &mut stop => break End::Stopped,
-            _ = &mut deadline => break End::TimeLimit,
-            m = rx.recv() => match m {
-                None => break End::Closed,
-                Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
-                    // Acknowledge at once, so the recorder never holds the stream back.
-                    client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
-                    hub.wake();
-                    let key = b[1] & 1 == 1;
-                    // Time the frame was captured: now, less the pipeline time in its header.
-                    let pipe = u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10;
-                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(pipe);
-                    let ms = last_ms.map_or(ms, |l: u64| ms.max(l + 1));
-                    if key {
-                        let p = params(&b[16..]);
-                        match &first {
-                            None => first = Some(p),
-                            // Another encoder took over the stream: it can't share the
-                            // track, so its keyframe starts the next segment.
-                            Some(f) if !p.is_empty() && *f != p => {
-                                if !complete(&p) {
-                                    break End::BadParameterSets;
-                                }
-                                if parts.len() + 1 == MAX_SEGMENTS {
-                                    break End::SegmentCap;
-                                }
-                                parts.push(Part {
-                                    frames: std::mem::take(&mut frames),
-                                    size,
-                                    end_ms: ms,
-                                });
-                                first = Some(p);
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                    last_ms = Some(ms);
-                    frames.push(mp4::Frame {
-                        ms,
-                        key,
-                        data: b.slice(16..),
-                    });
-                }
-                // A new size restarts the stream; an MP4 track keeps the size the recording
-                // started with, so stop. The hub's size is not read here: a frame queued
-                // before a resize can be read after the hub has the new size.
-                Some(Out::Text(t)) if resizes(&t, size) => {
-                    break End::Resized
-                }
-                _ => {}
-            },
+        let f = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Msg::Frame(f)) => f,
+            Ok(Msg::End(why)) => break why,
+            Err(mpsc::RecvTimeoutError::Timeout) => break End::TimeLimit,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break End::Closed,
+        };
+        if *size.get_or_insert(f.size) != f.size {
+            break End::Resized;
         }
+        if f.data.len() <= 16 {
+            continue;
+        }
+        let ms = f.captured_at.saturating_duration_since(start).as_millis() as u64;
+        let ms = last_ms.map_or(ms, |l: u64| ms.max(l + 1));
+        if f.key {
+            let p = params(&f.data[16..]);
+            match &first {
+                None => first = Some(p),
+                // Another encoder took over the stream: it can't share the track, so its
+                // keyframe starts the next segment.
+                Some(prev) if !p.is_empty() && *prev != p => {
+                    if !complete(&p) {
+                        break End::BadParameterSets;
+                    }
+                    if parts.len() + 1 == MAX_SEGMENTS {
+                        break End::SegmentCap;
+                    }
+                    parts.push(Part {
+                        frames: std::mem::take(&mut frames),
+                        size: f.size,
+                        end_ms: ms,
+                    });
+                    first = Some(p);
+                }
+                Some(_) => {}
+            }
+        }
+        last_ms = Some(ms);
+        frames.push(mp4::Frame {
+            ms,
+            key: f.key,
+            data: f.data.slice(16..),
+        });
     };
     parts.push(Part {
         frames,
-        size,
+        size: size.unwrap_or_default(),
         end_ms: start.elapsed().as_millis() as u64,
     });
     (parts, end)
@@ -564,9 +527,8 @@ pub async fn record(State(r): State<Arc<Recorder>>, req: Request) -> Response {
     let Some(zip) = wants_zip(&q) else {
         return err(StatusCode::BAD_REQUEST, BAD_FORMAT);
     };
-    // The deadline ends it; the stop side is never used.
-    let (_keep, stop) = oneshot::channel();
-    let done = match begin(&r, stop, len) {
+    // The deadline ends it.
+    let (done, _tap) = match begin(&r, len) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -577,21 +539,13 @@ pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
     if !r.on {
         return off();
     }
-    let (stop_tx, stop) = oneshot::channel();
-    let done = match begin(&r, stop, r.max) {
+    let (done, tap) = match begin(&r, r.max) {
         Ok(d) => d,
         Err(e) => return e,
     };
     let id = new_id();
     let n = r.next.fetch_add(1, Ordering::Relaxed);
-    r.active.lock().insert(
-        id.clone(),
-        Active {
-            stop: stop_tx,
-            done,
-            n,
-        },
-    );
+    r.active.lock().insert(id.clone(), Active { tap, done, n });
     log::info!("recording {n} started");
     // Nobody may ever stop it: once it has ended on its own, drop it after a grace period
     // instead of holding the clip in memory forever.
@@ -630,7 +584,7 @@ pub async fn stop(State(r): State<Arc<Recorder>>, req: Request) -> Response {
     let Some(a) = found else {
         return err(StatusCode::NOT_FOUND, "no such recording");
     };
-    let _ = a.stop.send(());
+    a.tap.end(End::Stopped);
     log::info!("recording {} stopped", a.n);
     respond(a.done, zip, "/record/stop", Some(a.n)).await
 }
@@ -650,7 +604,8 @@ mod tests {
         assert_eq!(record_len(f64::NAN, max), None);
     }
 
-    fn unit(key: Option<(u8, u8)>) -> Out {
+    /// A protocol 1 message: a keyframe with SPS (`profile`, `level`) and PPS, or a delta.
+    fn message(key: Option<(u8, u8)>) -> bytes::Bytes {
         let mut b = vec![0x01, key.is_some() as u8, 0, 0, 0, 1];
         b.resize(16, 0);
         match key {
@@ -660,25 +615,37 @@ mod tests {
             ]),
             None => b.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]),
         }
-        Out::Bin(bytes::Bytes::from(b))
+        bytes::Bytes::from(b)
     }
 
-    /// Queues `units` and a size change, which ends the recording in queue order.
-    async fn clip(units: &[Option<(u8, u8)>]) -> Clip {
-        let hub = Hub::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx.clone());
-        let (_keep, stop) = oneshot::channel();
-        for u in units {
-            tx.send(unit(*u)).unwrap();
+    /// A tapped frame of a 64x32 picture.
+    fn unit(key: Option<(u8, u8)>) -> Msg {
+        sized(key, (64, 32))
+    }
+
+    fn sized(key: Option<(u8, u8)>, size: (u32, u32)) -> Msg {
+        Msg::Frame(tap::Tapped {
+            size,
+            key: key.is_some(),
+            captured_at: Instant::now(),
+            data: message(key),
+        })
+    }
+
+    /// Records `msgs` in order, until one ends the recording.
+    fn collected(msgs: Vec<Msg>) -> (Vec<Part>, End) {
+        let (tx, rx) = mpsc::channel();
+        for m in msgs {
+            tx.send(m).unwrap();
         }
-        tx.send(Out::Text("{\"t\":\"hello\"}".into())).unwrap();
-        let (parts, end) = tokio::time::timeout(
-            Duration::from_secs(5),
-            collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)),
-        )
-        .await
-        .expect("the recording ended");
+        collect(&rx, Instant::now(), Duration::from_secs(30))
+    }
+
+    /// Records `units`, then a stop.
+    async fn clip(units: &[Option<(u8, u8)>]) -> Clip {
+        let mut msgs: Vec<Msg> = units.iter().map(|u| unit(*u)).collect();
+        msgs.push(Msg::End(End::Stopped));
+        let (parts, end) = collected(msgs);
         Clip::write(parts, end).unwrap()
     }
 
@@ -739,7 +706,7 @@ mod tests {
             None,
         ])
         .await;
-        assert_eq!(c.end, End::Resized);
+        assert_eq!(c.end, End::Stopped);
         assert_eq!(c.segments.len(), 2);
         let (a, b) = (&c.segments[0], &c.segments[1]);
         let (samples, total, sps, pps) = check(&a.mp4);
@@ -783,16 +750,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_keyframe_that_cant_start_a_segment_ends_the_recording() {
-        let hub = Hub::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx.clone());
-        let (_keep, stop) = oneshot::channel();
-        tx.send(unit(Some((100, 40)))).unwrap();
         let mut b = vec![0x01, 1, 0, 0, 0, 2];
         b.resize(16, 0);
         b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
-        tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
-        let (parts, end) = collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)).await;
+        let bad = Msg::Frame(tap::Tapped {
+            size: (64, 32),
+            key: true,
+            captured_at: Instant::now(),
+            data: bytes::Bytes::from(b),
+        });
+        let (parts, end) = collected(vec![unit(Some((100, 40))), bad]);
         let c = Clip::write(parts, end).unwrap();
         assert_eq!(c.end, End::BadParameterSets);
         assert_eq!(c.segments.len(), 1);
@@ -823,9 +790,7 @@ mod tests {
     }
 
     fn keyframe() -> Vec<mp4::Frame> {
-        let Out::Bin(b) = unit(Some((100, 40))) else {
-            unreachable!()
-        };
+        let b = message(Some((100, 40)));
         vec![mp4::Frame {
             ms: 0,
             key: true,
@@ -853,14 +818,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_recorder_leaves_the_hub_when_it_ends() {
+    async fn a_recording_is_beside_the_viewers_and_leaves_when_it_ends() {
         let r = Recorder::new(Hub::new(), Duration::from_secs(30), true);
-        let (stop_tx, stop) = oneshot::channel();
-        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
-        assert_eq!(r.hub.clients.lock().len(), 1);
-        stop_tx.send(()).unwrap();
+        let (done, tap) = begin(&r, Duration::from_secs(30)).ok().unwrap();
+        assert!(r.hub.taps.any());
+        assert!(r.hub.clients.lock().is_empty(), "no viewer joined");
+        tap.end(End::Stopped);
         assert!(done.await.unwrap().is_err(), "no frames were recorded");
-        assert!(r.hub.clients.lock().is_empty());
+        assert!(!r.hub.taps.any());
     }
 
     async fn body(r: Response) -> Vec<u8> {
@@ -887,7 +852,7 @@ mod tests {
         let mp4 = c.segments[0].mp4.clone();
         let r = first_segment(c);
         assert_eq!(r.headers()["x-starfold-segments"], "2");
-        assert_eq!(r.headers()["x-starfold-record-end"], "resized");
+        assert_eq!(r.headers()["x-starfold-record-end"], "stopped");
         assert_eq!(body(r).await, mp4);
     }
 
@@ -905,7 +870,7 @@ mod tests {
             v
         };
         let m: serde_json::Value = serde_json::from_slice(&read(&mut a, "manifest.json")).unwrap();
-        assert_eq!(m["end_reason"], "resized");
+        assert_eq!(m["end_reason"], "stopped");
         let segs = m["segments"].as_array().unwrap();
         assert_eq!(segs.len(), 2);
         for (i, s) in segs.iter().enumerate() {
@@ -960,6 +925,7 @@ mod tests {
             assert!(j["error"].as_str().unwrap().contains("--enable-recording"));
         }
         assert!(r.hub.clients.lock().is_empty(), "no viewer joined");
+        assert!(!r.hub.taps.any(), "nothing takes the stream");
         assert!(r.active.lock().is_empty());
     }
 
@@ -976,6 +942,13 @@ mod tests {
         assert!(read(&["--enable-recording"]));
         assert!(read(&["--enable-recording=true"]));
         assert!(read(&["--enable_recording", "1"]));
+    }
+
+    /// Cohort 1's encode thread hands out a frame of a `size` picture, as `encode_loop` does.
+    fn encoded(hub: &Hub, key: Option<(u8, u8)>, size: (u32, u32)) {
+        hub.taps.set_cohort(1);
+        hub.taps
+            .offer(1, size, key.is_some(), Instant::now(), &[message(key)]);
     }
 
     #[tokio::test]
@@ -995,11 +968,9 @@ mod tests {
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{wrong:?}");
         }
         assert!(r.active.lock().contains_key(&id), "still running");
-        let recorder = r.hub.clients.lock()[0].clone();
         for u in [Some((100, 40)), None, None] {
-            recorder.send(unit(u));
+            encoded(&r.hub, u, (64, 32));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let res = stop(State(r.clone()), with(&[("id", &id)])).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()[header::CONTENT_TYPE], "video/mp4");
@@ -1026,62 +997,71 @@ mod tests {
         }
     }
 
-    /// Records two frames of an 800x600 screen with `text` sent between them, until stopped.
-    async fn with_a_broadcast(text: &str) -> Clip {
+    #[tokio::test]
+    async fn broadcasts_do_not_reach_a_recording() {
         let hub = Hub::new();
-        hub.width.store(800, Ordering::Relaxed);
-        hub.height.store(600, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx.clone());
-        let (stop_tx, stop) = oneshot::channel();
-        tx.send(unit(Some((100, 40)))).unwrap();
-        tx.send(Out::Text(text.into())).unwrap();
-        tx.send(unit(None)).unwrap();
-        let recording = collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30));
-        let stopper = async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = stop_tx.send(());
-        };
-        let ((parts, end), ()) = tokio::join!(recording, stopper);
-        Clip::write(parts, end).unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_broadcast_that_mentions_hello_does_not_end_a_recording() {
+        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let (done, tap) = begin(&r, Duration::from_secs(30)).ok().unwrap();
+        encoded(&hub, Some((100, 40)), (800, 600));
         for text in [
-            r#"{"t":"clip","d":"\"hello\""}"#,
-            r#"{"t":"clip","d":"hello"}"#,
-            r#"{"t":"cursor","name":"hello"}"#,
-            "not json \"hello\"",
-        ] {
-            let c = with_a_broadcast(text).await;
-            assert_eq!(c.end, End::Stopped, "{text}");
-            assert_eq!(c.segments[0].frames, 2, "{text}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_new_size_ends_a_recording_whoever_asked_for_it() {
-        // A hello is what every viewer gets when the screen changes size, another viewer's
-        // resize included (--enable-resize): the MP4 track keeps one size, so it ends there.
-        for hello in [
             r#"{"t":"hello","w":1024,"h":600}"#,
-            r#"{"t":"hello","w":800,"h":768}"#,
             r#"{"t":"hello"}"#,
+            r#"{"t":"clip","d":"hello"}"#,
         ] {
-            let c = with_a_broadcast(hello).await;
-            assert_eq!(c.end, End::Resized, "{hello}");
-            assert_eq!(c.segments[0].frames, 1, "{hello}");
+            hub.broadcast(|| crate::hub::Out::Text(text.into()));
         }
-    }
-
-    #[tokio::test]
-    async fn a_hello_for_the_same_size_does_not_end_a_recording() {
-        // Another viewer's resize that the display refused still rebuilds the capture,
-        // which says hello again at the size the recording already has.
-        let c = with_a_broadcast(r#"{"t":"hello","w":800,"h":600,"offer":3}"#).await;
+        encoded(&hub, None, (800, 600));
+        tap.end(End::Stopped);
+        let c = done.await.unwrap().unwrap();
         assert_eq!(c.end, End::Stopped);
         assert_eq!(c.segments[0].frames, 2);
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_another_size_ends_a_recording() {
+        for other in [(1024, 600), (800, 768)] {
+            let (parts, end) = collected(vec![
+                sized(Some((100, 40)), (800, 600)),
+                sized(None, (800, 600)),
+                sized(Some((100, 40)), other),
+                sized(None, other),
+            ]);
+            assert_eq!(end, End::Resized, "{other:?}");
+            let c = Clip::write(parts, end).unwrap();
+            assert_eq!(c.segments.len(), 1);
+            assert_eq!(c.segments[0].frames, 2, "{other:?}");
+            assert_eq!(dims(&c.segments[0].mp4), (800, 600));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_rebuilt_at_the_same_size_keeps_recording_from_its_keyframe() {
+        // A resize the display refused rebuilds the capture at the size it had: a new cohort
+        // whose frames the recording takes from its first keyframe on.
+        let hub = Hub::new();
+        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let (done, tap) = begin(&r, Duration::from_secs(30)).ok().unwrap();
+        encoded(&hub, Some((100, 40)), (800, 600));
+        encoded(&hub, None, (800, 600));
+        hub.taps.set_cohort(2);
+        assert!(
+            hub.taps.wants_key(),
+            "the new cohort is asked for a keyframe"
+        );
+        for key in [None, Some((100, 40)), None] {
+            hub.taps.offer(
+                2,
+                (800, 600),
+                key.is_some(),
+                Instant::now(),
+                &[message(key)],
+            );
+        }
+        tap.end(End::Stopped);
+        let c = done.await.unwrap().unwrap();
+        assert_eq!(c.end, End::Stopped);
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(c.segments[0].frames, 4, "not the delta before the keyframe");
     }
 
     /// The width and height an MP4's avc1 sample entry gives its samples.
@@ -1095,56 +1075,35 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn a_frame_read_after_the_hub_has_a_new_size_keeps_the_size_the_recording_started_with() {
-        // A capture rebuild sets the hub's new size and says hello while a frame captured at
-        // the old size is still queued for the recorder.
+    /// Starts a recording while the hub says `hub_size` and the encoder still hands out
+    /// pictures of `old`, then of `new`; returns the clip.
+    async fn across_a_resize(hub_size: (u32, u32), old: (u32, u32), new: (u32, u32)) -> Clip {
         let hub = Hub::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx.clone());
-        let (_keep, stop) = oneshot::channel();
-        tx.send(unit(Some((100, 40)))).unwrap();
-        hub.width.store(1024, Ordering::Relaxed);
-        hub.height.store(768, Ordering::Relaxed);
-        tx.send(Out::Text(r#"{"t":"hello","w":1024,"h":768}"#.into()))
-            .unwrap();
-        tx.send(unit(Some((100, 40)))).unwrap();
-        let (parts, end) = tokio::time::timeout(
-            Duration::from_secs(5),
-            collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30)),
-        )
-        .await
-        .expect("the recording ended");
-        assert_eq!(end, End::Resized);
-        let c = Clip::write(parts, end).unwrap();
-        assert_eq!(c.segments.len(), 1);
-        assert_eq!(c.segments[0].frames, 1, "only the old-size frame");
-        assert_eq!(dims(&c.segments[0].mp4), (800, 600));
+        hub.width.store(hub_size.0, Ordering::Relaxed);
+        hub.height.store(hub_size.1, Ordering::Relaxed);
+        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let (done, tap) = begin(&r, Duration::from_secs(30)).ok().unwrap();
+        encoded(&hub, Some((100, 40)), old);
+        encoded(&hub, None, old);
+        encoded(&hub, Some((100, 40)), new);
+        encoded(&hub, None, new);
+        tap.end(End::Stopped);
+        done.await.unwrap().unwrap()
     }
 
     #[tokio::test]
-    async fn a_recording_takes_its_size_from_the_hub_when_it_starts() {
-        let hub = Hub::new();
-        hub.width.store(800, Ordering::Relaxed);
-        hub.height.store(600, Ordering::Relaxed);
-        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
-        let (stop_tx, stop) = oneshot::channel();
-        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
-        let recorder = hub.clients.lock()[0].clone();
-        recorder.send(unit(Some((100, 40))));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        hub.width.store(1024, Ordering::Relaxed);
-        recorder.send(Out::Text(r#"{"t":"hello","w":800,"h":600}"#.into()));
-        recorder.send(unit(None));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        stop_tx.send(()).unwrap();
-        let c = done.await.unwrap().unwrap();
-        assert_eq!(
-            c.end,
-            End::Stopped,
-            "the hello is for the size it started with"
-        );
-        assert_eq!(c.segments[0].frames, 2);
+    async fn a_resize_as_a_recording_starts_gives_it_the_size_of_the_frames_it_records() {
+        // The rebuild has set the hub's new size while the old encoder's frames still come:
+        // the clip is the old size, with only those frames, and the new size ends it.
+        let c = across_a_resize((1024, 768), (800, 600), (1024, 768)).await;
+        assert_eq!(c.end, End::Resized);
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(c.segments[0].frames, 2, "only the old-size frames");
         assert_eq!(dims(&c.segments[0].mp4), (800, 600));
+        // The hub's size not yet updated while the new encoder's frames come already.
+        let c = across_a_resize((800, 600), (1024, 768), (1024, 768)).await;
+        assert_eq!(c.end, End::Stopped);
+        assert_eq!(c.segments[0].frames, 4);
+        assert_eq!(dims(&c.segments[0].mp4), (1024, 768));
     }
 }
