@@ -285,19 +285,19 @@ impl Drop for Throwaway {
 
 /// The binary, run as the kernel's overflow uid (through `sudo -n`, reading the real
 /// /proc/sys/kernel/overflowuid at start), refuses --listen-unix before it binds: the
-/// directory is never made, though the parent would let that uid make it.
+/// directory is never made, though its parent (/tmp, root's and sticky) would take it.
 #[test]
 fn as_the_overflow_uid_the_unix_listener_is_refused() {
     sudo_works();
     let overflow = overflow_uid();
     assert_ne!(own_uid(), overflow, "this test runs as the overflow uid");
-    let d = scratch("overflow", 0o1777);
+    let d = scratch("overflow", 0o755);
     let bin = d.join("bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_starfold"), bin.join("starfold")).unwrap();
     std::fs::set_permissions(bin.join("starfold"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let at = d.join("sf");
+    let at = Path::new("/tmp").join(format!("sf-it-overflow-{}-sf", std::process::id()));
     let out = Command::new("sudo")
         .args(["-n", "-u", &format!("#{overflow}"), "--"])
         .arg(bin.join("starfold"))
@@ -333,10 +333,10 @@ fn another_user_gets_nothing_through_the_socket() {
         s.connect(sys.argv[1])\n\
         s.settimeout(5)\n\
         data = b''\n\
-        try:\n    s.sendall(b'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')\n    \
+        try:\n    s.sendall(b'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n')\n    \
         while True:\n        b = s.recv(100)\n        if not b:\n            break\n        \
         data += b\n\
-        except (ConnectionResetError, BrokenPipeError):\n    pass\n\
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):\n    pass\n\
         print(len(data))\n";
     let out = Command::new("sudo")
         .args(["-n", "-u", &user.name, "--", "python3", "-c", client])
