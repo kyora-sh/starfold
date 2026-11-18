@@ -412,9 +412,8 @@ pub fn bind_in(
     let umask = unsafe { libc::umask((0o777 & !mode) as libc::mode_t) };
     let bound = (|| {
         cvt(unsafe { libc::fchdir(dir.as_raw_fd()) })?;
-        let fd = cvt(unsafe {
-            libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
-        })?;
+        let fd =
+            cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
         let sock = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -431,7 +430,9 @@ pub fn bind_in(
         })?;
         let st = stat_at(dir, SOCKET)?;
         if !is_socket(&st) {
-            return Err(std::io::Error::other("what was bound in the directory is no socket"));
+            return Err(std::io::Error::other(
+                "what was bound in the directory is no socket",
+            ));
         }
         *socket_id = Some(id(&st));
         if st.st_mode as u32 & 0o777 != mode {
@@ -473,6 +474,24 @@ pub fn register(
         remove_unix(file);
     }
     r
+}
+
+#[cfg(target_os = "linux")]
+static AT_EXIT: std::sync::OnceLock<SocketFile> = std::sync::OnceLock::new();
+
+/// Keeps `file` for the rest of the process, and removes what it names when the process
+/// exits through `exit` (a startup error after the bind as much as a shutdown). A crash
+/// or a kill by signal leaves it, and the next start on the path is refused.
+#[cfg(target_os = "linux")]
+pub fn remove_at_exit(file: SocketFile) -> &'static SocketFile {
+    extern "C" fn remove() {
+        if let Some(file) = AT_EXIT.get() {
+            remove_unix(file);
+        }
+    }
+    let file = AT_EXIT.get_or_init(|| file);
+    unsafe { libc::atexit(remove) };
+    file
 }
 
 /// The uid an unmapped user reads as (the default overflow uid): never let in.
@@ -2428,7 +2447,9 @@ mod tests {
         #[tokio::test]
         async fn another_user_gets_nothing_through_the_socket() {
             let ok = |c: &mut std::process::Command| c.output().is_ok_and(|o| o.status.success());
-            if !ok(std::process::Command::new("sudo").args(["-n", "-u", "nobody", "python3", "-c", ""])) {
+            if !ok(std::process::Command::new("sudo")
+                .args(["-n", "-u", "nobody", "python3", "-c", ""]))
+            {
                 eprintln!("skipped: no `sudo -n -u nobody python3` here");
                 return;
             }
@@ -2459,7 +2480,11 @@ mod tests {
             .unwrap()
             .unwrap();
             let said = String::from_utf8_lossy(&out.stdout);
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             assert_eq!(said.trim(), "0", "the other user read {said} bytes");
             assert!(hub.clients.lock().is_empty());
             // The server's own user still gets in.
@@ -2470,7 +2495,11 @@ mod tests {
                 .unwrap();
             let mut reply = Vec::new();
             own.read_to_end(&mut reply).await.unwrap();
-            assert!(reply.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&reply));
+            assert!(
+                reply.starts_with(b"HTTP/1.1 200"),
+                "{}",
+                String::from_utf8_lossy(&reply)
+            );
             server.abort();
             drop(file);
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -139,7 +139,7 @@ pub fn main() {
 
 /// The socket --listen-unix binds before the server starts, and what removes it.
 #[cfg(target_os = "linux")]
-type Prebound = (std::os::unix::net::UnixListener, server::SocketFile);
+type Prebound = (std::os::unix::net::UnixListener, &'static server::SocketFile);
 #[cfg(not(target_os = "linux"))]
 type Prebound = std::convert::Infallible;
 
@@ -173,7 +173,7 @@ fn prebind(args: &[String]) -> Option<Prebound> {
         }
         shutdown_signals(libc::SIG_BLOCK);
         return match server::bind_unix_std(&path, mode) {
-            Ok(bound) => Some(bound),
+            Ok((l, file)) => Some((l, server::remove_at_exit(file))),
             Err(e) => {
                 eprintln!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
@@ -613,7 +613,7 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     #[cfg(target_os = "linux")]
     let (unix, socket_file) = match (prebound, &listen.unix) {
         (Some((l, file)), Some((path, mode))) => {
-            let l = server::register(l, &file).unwrap_or_else(|e| {
+            let l = server::register(l, file).unwrap_or_else(|e| {
                 log::error!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
             });

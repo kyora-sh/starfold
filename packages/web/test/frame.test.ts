@@ -60,9 +60,7 @@ describe('framed messages', () => {
 		expect(() => unframe(new ArrayBuffer(MAX_MESSAGE + 1))).toThrow(RangeError);
 	});
 	test('framed, the page sends up to what framing takes', () => {
-		expect(() =>
-			frameBinary(new Uint8Array(FRAMED_SEND_LIMIT))
-		).not.toThrow();
+		expect(() => frameBinary(new Uint8Array(FRAMED_SEND_LIMIT))).not.toThrow();
 		expect(() => frameBinary(new Uint8Array(FRAMED_SEND_LIMIT + 1))).toThrow(
 			RangeError
 		);
