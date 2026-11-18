@@ -893,6 +893,8 @@ struct Refining {
     last_psnr: f64,
     /// What each frame tells the encoder didn't change (x264 marks up its copy).
     map: Option<Vec<u8>>,
+    /// Every byte the encoder sent, in order.
+    stream: Vec<u8>,
 }
 
 impl Refining {
@@ -926,6 +928,7 @@ impl Refining {
             scrolled: 0,
             last_psnr: 0.0,
             map: None,
+            stream: Vec::new(),
         };
         me.step(true, None);
         me
@@ -952,6 +955,7 @@ impl Refining {
         for au in &aus {
             n += au.data.len();
             key |= au.keyframe;
+            self.stream.extend_from_slice(&au.data);
             if let Some(d) = self.dec.decode(&au.data).unwrap() {
                 self.last_psnr = luma_psnr(d.y(), d.strides().0, &self.pic);
             }
@@ -1161,12 +1165,14 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
 }
 
 /// x264 under VBV, as it streams, at one thread and sliced, each with and without a byte
-/// budget: every pass sends bytes and no IDR, and the ladder ends far sharper than motion left
-/// it. At one thread no pass leaves the picture worse either. Sliced runs don't assert the order
-/// of single steps: sliced threads under VBV code rows by timing, and under the full suite's load
-/// a first budgeted step once came out 6.06e-5 dB below the one before. A budgeted first step
-/// may change nothing: motion records its blocks at QP 52, above any QP a pass aims for, until a
-/// pass proves better.
+/// budget: every pass sends bytes and no IDR. At one thread no pass leaves the picture worse,
+/// a budget holds within twice itself, and the ladder ends far sharper than motion left it and
+/// complete. Sliced runs under VBV assert only bytes and no IDR: x264's row rate control reads
+/// the other slices' live size estimates (`ratecontrol.c` `x264_ratecontrol_mb`), so their
+/// pictures and sizes depend on thread timing; under the full suite's load a first budgeted
+/// step once came out 6.06e-5 dB below the one before. Sliced refinement is asserted rung by
+/// rung without VBV, below. A budgeted first step may change nothing: motion records its blocks
+/// at QP 52, above any QP a pass aims for, until a pass proves better.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
@@ -1180,22 +1186,61 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             let (n, key) = s.pass(qp, max_bytes);
             let at = format!("t{threads} {max_bytes:?} qp {qp}");
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
-            assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
             if threads == 1 {
+                assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
                 assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
             }
             prev = s.last_psnr;
         }
-        assert!(
-            prev > motion + 3.0,
-            "t{threads} {max_bytes:?}: {motion} -> {prev}"
-        );
+        if threads == 1 {
+            assert!(prev > motion + 3.0, "t1 {max_bytes:?}: {motion} -> {prev}");
+            assert!(!s.enc.refinable(Refine {
+                qp: 12,
+                max_bytes: None
+            }));
+        }
+        s.scroll(5);
+    }
+}
+
+/// Sliced x264 without VBV codes the same bytes whatever the threads' timing: no slice reads
+/// another's state while it encodes (row rate control returns before its cross-slice read
+/// without VBV, no deblocking across slices, slice results merged in thread order). So each
+/// rung of the ladder is strictly sharper than the one before, and a second encoder fed the
+/// same frames sends the same bytes.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_sliced_refining_without_vbv_sharpens_every_rung_the_same_every_run() {
+    let run = || {
+        let mut cfg = Refining::config(Backend::X264, 4, 30);
+        cfg.rate = RateConfig::new(24.0, 0, 30);
+        let mut s = Refining::with(open(&cfg).unwrap());
+        s.scroll(30);
+        let motion = s.last_psnr;
+        let mut prev = motion;
+        for qp in [20, 16, 12] {
+            let (n, key) = s.pass(qp, None);
+            assert!(n > 0 && !key, "qp {qp}: {n} bytes, key {key}");
+            assert!(s.last_psnr > prev, "qp {qp}: {} after {prev}", s.last_psnr);
+            prev = s.last_psnr;
+        }
+        assert!(prev > motion + 3.0, "{motion} -> {prev}");
         assert!(!s.enc.refinable(Refine {
             qp: 12,
             max_bytes: None
         }));
         s.scroll(5);
-    }
+        s.stream
+    };
+    let first = run();
+    let second = run();
+    assert!(!first.is_empty());
+    assert!(
+        first == second,
+        "two encoders sent different bytes: {} and {}",
+        first.len(),
+        second.len()
+    );
 }
 
 /// 1080p text under a 2 Mbit/s VBV, refined as the engine does it: the ladder at its planned
