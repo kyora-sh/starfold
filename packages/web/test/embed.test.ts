@@ -8,8 +8,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** A WebSocket server that records every connection's path, subprotocols and messages. */
 function fakeServer() {
-	const conns: { path: string; protocols: string | null; got: string[]; ws?: Bun.ServerWebSocket<number> }[] =
-		[];
+	const conns: {
+		path: string;
+		protocols: string | null;
+		got: string[];
+		ws?: Bun.ServerWebSocket<number>;
+	}[] = [];
 	const server = Bun.serve<number>({
 		port: 0,
 		fetch(req, srv) {
@@ -111,7 +115,11 @@ describe('embedded link', () => {
 		const s = fakeServer();
 		stop = () => s.server.stop(true);
 		const { h } = recorder();
-		const link = new Link(s.url, { embed: true, protocols: ['starfold.v1'] }, h);
+		const link = new Link(
+			s.url,
+			{ embed: true, protocols: ['starfold.v1'] },
+			h
+		);
 		link.request();
 		link.preamble([]);
 		await until(() => s.conns.length === 1 && !!s.conns[0].ws);
@@ -179,7 +187,12 @@ describe("the served page's link is unchanged", () => {
 			}
 		}
 		const { h } = recorder();
-		new Link('ws://x/ws?token=t', { embed: false }, h, Recording as unknown as typeof WebSocket).start();
+		new Link(
+			'ws://x/ws?token=t',
+			{ embed: false },
+			h,
+			Recording as unknown as typeof WebSocket
+		).start();
 		expect(made).toEqual([['ws://x/ws?token=t']]);
 		expect(RETRY_MS).toBe(1000);
 	});
@@ -189,14 +202,24 @@ describe('answerPreamble', () => {
 	const run = async (p: Parameters<typeof answerPreamble>[0]) => {
 		const posted: ToWorker[] = [];
 		const failed: unknown[] = [];
-		await answerPreamble(p, (m) => posted.push(m), (e) => failed.push(e));
+		await answerPreamble(
+			p,
+			(m) => posted.push(m),
+			(e) => failed.push(e)
+		);
 		return { posted, failed };
 	};
 
 	test('posts the messages a sync or async preamble gives', async () => {
-		expect((await run(() => ['a', 'b'])).posted).toEqual([{ t: 'preamble', msgs: ['a', 'b'] }]);
-		expect((await run(async () => 'ticket')).posted).toEqual([{ t: 'preamble', msgs: ['ticket'] }]);
-		expect((await run(undefined)).posted).toEqual([{ t: 'preamble', msgs: [] }]);
+		expect((await run(() => ['a', 'b'])).posted).toEqual([
+			{ t: 'preamble', msgs: ['a', 'b'] },
+		]);
+		expect((await run(async () => 'ticket')).posted).toEqual([
+			{ t: 'preamble', msgs: ['ticket'] },
+		]);
+		expect((await run(undefined)).posted).toEqual([
+			{ t: 'preamble', msgs: [] },
+		]);
 	});
 
 	test('a throwing, rejecting or non-text preamble opens nothing and reports', async () => {

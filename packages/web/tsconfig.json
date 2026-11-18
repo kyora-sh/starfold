@@ -3,5 +3,10 @@
 	//   tsc -p packages/web && tsc -p packages/web/tsconfig.worker.json && tsc -p packages/web/tsconfig.worklet.json
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": { "lib": ["ES2022", "DOM", "DOM.Iterable"] },
-	"include": ["src/client", "src/embed", "src/protocol.ts", "src/types/dom-extra.d.ts"]
+	"include": [
+		"src/client",
+		"src/embed",
+		"src/protocol.ts",
+		"src/types/dom-extra.d.ts"
+	]
 }

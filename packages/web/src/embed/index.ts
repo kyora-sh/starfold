@@ -51,12 +51,15 @@ export interface Handle {
 	unmount(): void;
 }
 
-const css = (e: HTMLElement, s: Partial<CSSStyleDeclaration>) => Object.assign(e.style, s);
+const css = (e: HTMLElement, s: Partial<CSSStyleDeclaration>) =>
+	Object.assign(e.style, s);
 
 /** Shows a starfold desktop in `container` and connects once; see `Handle` for the rest. */
 export function mount(container: HTMLElement, options: MountOptions): Handle {
 	if (!window.isSecureContext)
-		throw new Error('starfold: browsers only decode video on secure pages (HTTPS or localhost)');
+		throw new Error(
+			'starfold: browsers only decode video on secure pages (HTTPS or localhost)'
+		);
 	const base = new URL(options.assetBase ?? '.', import.meta.url);
 	const surface = document.createElement('div');
 	surface.tabIndex = 0;
@@ -92,7 +95,8 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	container.append(surface, kbd);
 
 	const worker = new Worker(new URL('worker.js', base));
-	const post = (m: ToWorker, transfer: Transferable[] = []) => worker.postMessage(m, transfer);
+	const post = (m: ToWorker, transfer: Transferable[] = []) =>
+		worker.postMessage(m, transfer);
 	const app: App = {
 		worker,
 		post,
@@ -128,12 +132,21 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 
 	const cursor = createCursor(app);
 	const useVideo = typeof MediaStreamTrackGenerator !== 'undefined';
-	const video = createVideo(app, canvas, useVideo, cursor.apply, () => {}, () => ({
-		w: container.clientWidth,
-		h: container.clientHeight,
-	}));
+	const video = createVideo(
+		app,
+		canvas,
+		useVideo,
+		cursor.apply,
+		() => {},
+		() => ({
+			w: container.clientWidth,
+			h: container.clientHeight,
+		})
+	);
 	const clipboard = createClipboard(app);
-	const audio = options.audio ? createAudio(app, new URL('audio.js', base)) : null;
+	const audio = options.audio
+		? createAudio(app, new URL('audio.js', base))
+		: null;
 	const onInteract = () => {
 		void audio?.start();
 		clipboard.flush();
@@ -150,7 +163,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 			url: options.connect.url,
 			presentToMain: useVideo,
 			embed: {
-				protocols: protocols === undefined ? undefined : ([] as string[]).concat(protocols),
+				protocols:
+					protocols === undefined
+						? undefined
+						: ([] as string[]).concat(protocols),
 			},
 		},
 		[offscreen]
@@ -158,7 +174,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 
 	let videoOn: boolean | null = null;
 	const updateVisibility = (force = false) => {
-		const on = !document.hidden && container.clientWidth > 0 && container.clientHeight > 0;
+		const on =
+			!document.hidden &&
+			container.clientWidth > 0 &&
+			container.clientHeight > 0;
 		if (on !== videoOn || force) {
 			videoOn = on;
 			post({ t: 'video', on });

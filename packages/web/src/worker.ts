@@ -666,7 +666,9 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			presentToMain = m.presentToMain;
 			ctx = get2dContext(canvas);
 			link = makeLink(
-				m.embed ? { embed: true, protocols: m.embed.protocols } : { embed: false }
+				m.embed
+					? { embed: true, protocols: m.embed.protocols }
+					: { embed: false }
 			);
 			link.start();
 			break;

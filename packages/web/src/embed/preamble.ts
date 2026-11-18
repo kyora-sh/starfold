@@ -20,7 +20,9 @@ export async function answerPreamble(
 		const given = preamble ? await preamble() : [];
 		msgs = typeof given === 'string' ? [given] : given;
 		if (!Array.isArray(msgs) || msgs.some((m) => typeof m !== 'string'))
-			throw new TypeError('the preamble must give a string or an array of strings');
+			throw new TypeError(
+				'the preamble must give a string or an array of strings'
+			);
 	} catch (err) {
 		post({ t: 'preambleFailed' });
 		failed(err);
