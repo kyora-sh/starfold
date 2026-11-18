@@ -162,6 +162,31 @@ describe('embedded link', () => {
 	});
 });
 
+describe('abort', () => {
+	test('closes the socket and reports the given code and reason, whatever the close echoes', async () => {
+		const s = server();
+		const { r, h } = recorder();
+		const link = new Link(s.url, embed, h);
+		link.request(1);
+		link.preamble(1, ['ticket']);
+		await until(() => r.opened.length === 1);
+		link.abort(4000, 'starfold: protocol error');
+		await until(() => r.closed.length === 1 && s.conns[0].closed);
+		expect(r.closed[0]).toEqual([1, 4000, 'starfold: protocol error']);
+	});
+
+	test('does nothing on the served page', async () => {
+		const s = server();
+		const { r, h } = recorder();
+		const link = new Link(s.url, { embed: false }, h);
+		link.start();
+		await until(() => r.opened.length === 1);
+		link.abort(4000, 'x');
+		await sleep(100);
+		expect(r.closed).toEqual([]);
+	});
+});
+
 describe("the served page's link is unchanged", () => {
 	test('it opens at once, asks for no preamble, and ignores the embedded calls', async () => {
 		const s = server();

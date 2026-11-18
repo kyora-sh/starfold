@@ -14,6 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { PROTOCOL_ERROR } from './embed/types';
 import { serveLife } from './life';
 import type { LifeUp } from './life';
 import { Link } from './link';
@@ -163,6 +164,16 @@ function up(m: LifeUp) {
 	life?.postMessage(m, []);
 }
 
+/**
+ * Something the server sent could not be handled. Embedded, the attempt ends: the socket is
+ * closed and the page hears PROTOCOL_ERROR. The served page goes on as before (the error is
+ * thrown and the stream carries on).
+ */
+function protocolFailure(e: unknown) {
+	if (!life) throw e;
+	link?.abort(PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason);
+}
+
 function makeLink(mode: LinkMode) {
 	return new Link(url, mode, {
 		opening(sock) {
@@ -194,25 +205,33 @@ function makeLink(mode: LinkMode) {
 			up({ t: 'connectFailed', id });
 		},
 		message(data) {
-			if (typeof data === 'string') return onText(data);
-			const b = new Uint8Array(data);
-			switch (b[0]) {
-				case Bin.Video:
-				case Bin.VideoV2:
-					onVideo(b);
-					break;
-				case Bin.Audio:
-					onAudio(b);
-					break;
-				case Bin.Cursor:
-					post({ t: 'cursor', buf: data }, [data]);
-					break;
-				case Bin.ClipImage:
-					post({ t: 'clipImage', buf: data }, [data]);
-					break;
+			try {
+				onMessage(data);
+			} catch (e) {
+				protocolFailure(e);
 			}
 		},
 	});
+}
+
+function onMessage(data: string | ArrayBuffer) {
+	if (typeof data === 'string') return onText(data);
+	const b = new Uint8Array(data);
+	switch (b[0]) {
+		case Bin.Video:
+		case Bin.VideoV2:
+			onVideo(b);
+			break;
+		case Bin.Audio:
+			onAudio(b);
+			break;
+		case Bin.Cursor:
+			post({ t: 'cursor', buf: data }, [data]);
+			break;
+		case Bin.ClipImage:
+			post({ t: 'clipImage', buf: data }, [data]);
+			break;
+	}
 }
 
 function onText(s: string) {
@@ -270,7 +289,7 @@ function onHello(m: Hello) {
 	// Each hello (the first, and one per new screen size) is answered with what decodes
 	// at its sizes; the last picture stays up until the server's next `codec`.
 	proto = 2;
-	void answer(conn, ++helloSeq, m.offer, m.videoOffers);
+	answer(conn, ++helloSeq, m.offer, m.videoOffers).catch(protocolFailure);
 }
 
 async function supported(c: VideoDecoderConfig): Promise<boolean> {
@@ -332,7 +351,7 @@ function onCodec(m: CodecMessage) {
 		post(m);
 		return;
 	}
-	void configure(conn, m);
+	configure(conn, m).catch(protocolFailure);
 }
 
 async function plan(m: Extract<CodecMessage, { w: number }>) {

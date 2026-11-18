@@ -220,9 +220,11 @@ export function setupKeyboard(
 
 	return {
 		releaseAll,
-		/** Removes the window listener (the rest live on elements the caller removes). */
+		/** Removes the window listener and a pending paste's timer (the rest live on elements the caller removes). */
 		dispose() {
 			window.removeEventListener('blur', releaseAll);
+			if (pendingPaste) clearTimeout(pendingPaste.timer);
+			pendingPaste = null;
 		},
 	};
 }

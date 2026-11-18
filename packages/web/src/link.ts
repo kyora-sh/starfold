@@ -30,6 +30,9 @@ export class Link {
 	private pending: number | null = null;
 	/** Embedded: the preamble's messages, from when its socket is made until they are sent. */
 	private outgoing: string[] | null = null;
+	/** Embedded: the socket abort() closed, and the close to report for it. */
+	private aborted: { sock: WebSocket; code: number; reason: string } | null =
+		null;
 
 	constructor(
 		private readonly url: string,
@@ -74,6 +77,18 @@ export class Link {
 		this.sock?.close(1000);
 	}
 
+	/**
+	 * Embedded: the client can't go on with what the server sent. The socket is closed and
+	 * its close is reported as `code` and `reason`, whatever the socket's own close says.
+	 */
+	abort(code: number, reason: string) {
+		const sock = this.sock;
+		if (!this.mode.embed || !sock) return;
+		this.aborted = { sock, code, reason };
+		this.outgoing = null;
+		sock.close(code, reason);
+	}
+
 	/** Whether preamble messages are still held, unsent. */
 	get holdsPreamble(): boolean {
 		return this.outgoing !== null;
@@ -109,7 +124,9 @@ export class Link {
 				this.sock = null;
 				this.outgoing = null;
 			}
-			this.h.closed(id, e.code, e.reason);
+			const a = this.aborted?.sock === sock ? this.aborted : null;
+			if (a) this.aborted = null;
+			this.h.closed(id, a?.code ?? e.code, a?.reason ?? e.reason);
 			if (!this.mode.embed) setTimeout(() => this.open(0, null), this.retryMs);
 		});
 		sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) =>

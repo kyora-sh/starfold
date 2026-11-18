@@ -19,10 +19,11 @@ mkdir -p "$pkg"
 	--log-level=warning --outdir="$pkg"
 bun x tsc -p tsconfig.embed.json --outDir "$work/types"
 cp "$work/types/embed/index.d.ts" "$work/types/embed/types.d.ts" "$pkg/"
-# Every relative specifier in the declarations must name a file in the package, with the .js
-# extension ESM (NodeNext) resolution requires.
+# Every relative specifier in the declarations (from '...', from "...", import("...")) must name
+# a file in the package, with the .js extension ESM (NodeNext) resolution requires.
 for d in "$pkg"/*.d.ts; do
-	for spec in $(grep -o -E "from '[^']+'" "$d" | sed -E "s/^from '(.*)'$/\1/"); do
+	for spec in $(grep -o -E "(from|import\() *['\"][^'\"]+['\"]" "$d" |
+		sed -E "s/^(from|import\() *['\"]//; s/['\"]$//"); do
 		case $spec in
 		./*.js) [ -f "$pkg/${spec#./}" ] || [ -f "$pkg/${spec%.js}.d.ts" ] || {
 			echo "pack.sh: $(basename "$d") imports $spec, which the package lacks" >&2

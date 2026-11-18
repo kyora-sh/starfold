@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { PageLife } from '../src/embed/attempts';
 import type { LifeOptions } from '../src/embed/attempts';
+import { Dispatcher } from '../src/embed/dispatch';
 import { CONNECT_FAILED, callPreamble } from '../src/embed/preamble';
 import { onStream } from '../src/embed/stream';
 import type { StreamSink } from '../src/embed/stream';
@@ -100,6 +101,11 @@ function embedded(
 		page,
 		link,
 		seen,
+		/** As mount's unmount(): the worker stops (here: its link is cancelled), then end(). */
+		unmount: () => {
+			link.cancel();
+			page.end();
+		},
 		close: () => {
 			ch.port1.close();
 			ch.port2.close();
@@ -197,10 +203,10 @@ describe('the lifecycle through the page and worker ports', () => {
 
 	test('a preamble that resolves after unmount opens nothing and reports nothing', async () => {
 		const d = deferred<string>();
-		const { s, page, seen } = setup({ preamble: () => d.promise });
+		const { s, page, seen, unmount } = setup({ preamble: () => d.promise });
 		page.connect();
 		await sleep(50);
-		page.unmount();
+		unmount();
 		d.resolve('ticket');
 		await sleep(200);
 		expect(s.conns.length).toBe(0);
@@ -210,10 +216,10 @@ describe('the lifecycle through the page and worker ports', () => {
 
 	test('a preamble that rejects after unmount reports nothing', async () => {
 		const d = deferred<string>();
-		const { page, seen } = setup({ preamble: () => d.promise });
+		const { page, seen, unmount } = setup({ preamble: () => d.promise });
 		page.connect();
 		await sleep(50);
-		page.unmount();
+		unmount();
 		d.reject(new Error(SECRET));
 		await sleep(100);
 		expect(statuses(seen)).toEqual(['connecting']);
@@ -253,16 +259,20 @@ describe('the lifecycle through the page and worker ports', () => {
 		expect(s.conns[0].got).toEqual(['ticket-2', 'client-first']);
 	});
 
-	test('unmount reports UNMOUNTED at once, the socket closes, and the late worker close is dropped', async () => {
-		const { s, page, seen } = setup({ preamble: () => 'ticket' });
+	test('unmount reports UNMOUNTED once, the socket closes, and the late worker close is dropped', async () => {
+		const { s, page, seen, unmount } = setup({ preamble: () => 'ticket' });
 		page.connect();
 		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
-		page.unmount();
+		const before = seen.status.length;
+		unmount();
+		expect(seen.closes).toEqual([]);
+		await until(() => seen.closes.length === 1);
 		expect(seen.closes).toEqual([[UNMOUNTED.code, UNMOUNTED.reason]]);
 		expect(UNMOUNTED).toEqual({ code: 1001, reason: 'unmounted' });
 		await until(() => s.conns[0].closed);
 		await sleep(200);
 		expect(seen.closes.length).toBe(1);
+		expect(seen.status.length).toBe(before);
 		page.connect();
 		await sleep(100);
 		expect(s.conns.length).toBe(1);
@@ -325,27 +335,41 @@ describe('credentials never reach a callback', () => {
 	});
 });
 
-/** A PageLife on a port the test drives by hand. */
+/** A PageLife on a port the test drives by hand; thrown callback errors go to `reported`. */
 function driven(o: LifeOptions) {
-	const sent: unknown[] = [];
+	const sent: { t: string }[] = [];
+	const reported: unknown[] = [];
 	const listeners = new Set<(e: { data: LifeUp }) => void>();
+	let closed = false;
 	const port = {
 		addEventListener: (_t: string, f: (e: { data: LifeUp }) => void) =>
 			listeners.add(f),
 		removeEventListener: (_t: string, f: (e: { data: LifeUp }) => void) =>
 			listeners.delete(f),
 		start: () => {},
-		postMessage: (m: unknown) => sent.push(m),
+		close: () => {
+			closed = true;
+		},
+		postMessage: (m: { t: string }) => {
+			if (!closed) sent.push(m);
+		},
 	};
-	const life = new PageLife(port as unknown as MessagePort, o);
+	const life = new PageLife(port as unknown as MessagePort, {
+		...o,
+		report: (e) => reported.push(e),
+	});
 	return {
 		life,
 		sent,
+		reported,
+		isClosed: () => closed,
 		deliver: (m: LifeUp) => {
 			for (const f of listeners) f({ data: m });
 		},
 	};
 }
+
+const microtasks = () => sleep(0);
 
 async function toSocket(d: ReturnType<typeof driven>) {
 	d.life.connect();
@@ -365,10 +389,11 @@ describe('the close is reported once, whatever a callback does', () => {
 			},
 		});
 		await toSocket(d);
-		expect(() =>
-			d.deliver({ t: 'closed', id: 1, code: 4401, reason: 'x' })
-		).toThrow('host bug');
+		d.deliver({ t: 'closed', id: 1, code: 4401, reason: 'x' });
+		expect(order).toEqual(['connecting']);
+		await microtasks();
 		expect(order).toEqual(['connecting', 'onClose', 'closed']);
+		expect(d.reported.map((e) => (e as Error).message)).toEqual(['host bug']);
 	});
 
 	test('a throwing onClose still gets onStatus("closed"), and the attempt is over', async () => {
@@ -382,25 +407,84 @@ describe('the close is reported once, whatever a callback does', () => {
 			onStatus: (s) => order.push(s),
 		});
 		await toSocket(d);
-		expect(() =>
-			d.deliver({ t: 'closed', id: 1, code: 1000, reason: '' })
-		).toThrow('host bug');
 		d.deliver({ t: 'closed', id: 1, code: 1000, reason: '' });
+		d.deliver({ t: 'closed', id: 1, code: 1000, reason: '' });
+		await microtasks();
 		expect(order).toEqual(['connecting', 'onClose', 'closed']);
+		expect(d.reported.length).toBe(1);
 	});
 
-	test('unmount while a socket was asked for reports UNMOUNTED once; later closes are dropped', async () => {
-		const closes: [number, string][] = [];
+	test('end() while a socket was asked for reports UNMOUNTED once, drops queued callbacks and later closes', async () => {
+		const calls: string[] = [];
 		const d = driven({
 			preamble: () => 'ticket',
-			onClose: (c, r) => closes.push([c, r]),
+			onClose: (c, r) => calls.push(`close:${c}:${r}`),
+			onStatus: (s) => calls.push(s),
 		});
 		await toSocket(d);
-		d.life.unmount();
-		d.life.unmount();
+		await microtasks();
+		d.deliver({ t: 'open', id: 1 });
+		d.life.end();
+		d.life.end();
 		d.deliver({ t: 'closed', id: 1, code: 1000, reason: '' });
-		expect(closes).toEqual([[1001, 'unmounted']]);
-		expect(d.sent.at(-1)).toEqual({ t: 'cancel' });
+		await microtasks();
+		expect(calls).toEqual(['connecting', 'close:1001:unmounted']);
+		expect(d.isClosed()).toBe(true);
+	});
+});
+
+describe('one attempt at a time on the port', () => {
+	test('once a reply is posted, connect() posts nothing until that attempt closes', async () => {
+		const d = driven({ preamble: () => 'ticket' });
+		await toSocket(d);
+		d.life.connect();
+		d.life.connect();
+		expect(d.sent.map((m) => m.t)).toEqual(['connect', 'preamble']);
+		d.deliver({ t: 'closed', id: 1, code: 1000, reason: '' });
+		d.life.connect();
+		expect(d.sent.map((m) => m.t)).toEqual(['connect', 'preamble', 'connect']);
+	});
+
+	test('a worker that fails ends the attempt with connect-failed, and nothing follows', async () => {
+		const calls: string[] = [];
+		const d = driven({
+			preamble: () => 'ticket',
+			onStatus: (s) => calls.push(s),
+		});
+		d.life.connect();
+		d.life.workerFailed();
+		d.life.connect();
+		d.deliver({ t: 'preamble', id: 1 });
+		await microtasks();
+		expect(calls).toEqual(['connecting', 'connect-failed']);
+		expect(d.sent.map((m) => m.t)).toEqual(['connect']);
+	});
+});
+
+describe('the dispatcher', () => {
+	test('queues calls after the caller returns, reports throws and carries on', async () => {
+		const reported: unknown[] = [];
+		const order: string[] = [];
+		const q = new Dispatcher((e) => reported.push(e));
+		q.call(() => order.push('a'));
+		q.call(() => {
+			throw new Error('b');
+		});
+		q.call(() => order.push('c'));
+		expect(order).toEqual([]);
+		await microtasks();
+		expect(order).toEqual(['a', 'c']);
+		expect(reported.map((e) => (e as Error).message)).toEqual(['b']);
+	});
+
+	test('seal drops what is queued and runs only the last call', async () => {
+		const order: string[] = [];
+		const q = new Dispatcher();
+		q.call(() => order.push('queued'));
+		q.seal(() => order.push('last'));
+		q.call(() => order.push('after'));
+		await microtasks();
+		expect(order).toEqual(['last']);
 	});
 });
 

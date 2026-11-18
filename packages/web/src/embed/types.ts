@@ -23,5 +23,19 @@ export type Status =
 	| 'preamble-failed'
 	| 'connect-failed';
 
-/** What onClose gets for a socket that unmount() ended: 1001, "going away". */
+/**
+ * What onClose gets when unmount() ends a connection whose socket was asked for: 1001, "going
+ * away". unmount() stops the worker at once, so the server sees the socket drop without a
+ * close frame, and a close the server sent at the same moment is reported as this.
+ */
 export const UNMOUNTED = { code: 1001, reason: 'unmounted' } as const;
+
+/**
+ * What onClose gets when the client could not handle what the server sent (a message that is
+ * not an object, a malformed offer): the client closes the socket and reports this, whatever
+ * the socket's own close says.
+ */
+export const PROTOCOL_ERROR = {
+	code: 4000,
+	reason: 'starfold: protocol error',
+} as const;

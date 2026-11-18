@@ -1,12 +1,17 @@
 // Embedded: the page's side of the connection lifecycle (life.ts). Every connect() is an
 // attempt with an id; the page answers the worker's preamble request only for the current
-// attempt and only while mounted, and decides on its own what the embedder hears:
+// attempt and only while live, and decides on its own what the embedder hears:
 // - each attempt ends in exactly one of: onClose (a socket was asked for), preamble-failed,
-//   or connect-failed; one superseded by a newer connect() or cancelled by unmount() before
-//   its socket was asked for ends silently;
-// - unmount() reports onClose(UNMOUNTED) itself for a socket it was waiting on, at once, and
-//   anything the worker says afterwards is dropped.
+//   or connect-failed; one replaced by a newer connect() or ended by end() before its socket
+//   was asked for ends silently;
+// - the page posts at most one preamble reply per attempt, only for the current one, and
+//   ignores connect() from then until that attempt's close: the port is FIFO, so a reply
+//   never follows a newer attempt's connect;
+// - every callback goes through the Dispatcher; end() seals it, so after end() the only
+//   callback is the onClose it reports for a socket it was waiting on.
 import type { LifeDown, LifeUp } from '../life';
+import { Dispatcher } from './dispatch';
+import type { Report } from './dispatch';
 import { CONNECT_FAILED, callPreamble } from './preamble';
 import { UNMOUNTED } from './types';
 import type { ConnectFailure, Preamble, Status } from './types';
@@ -15,6 +20,10 @@ export interface LifeOptions {
 	preamble?: Preamble;
 	onClose?(code: number, reason: string): void;
 	onStatus?(status: Status, detail?: ConnectFailure): void;
+	/** The client's own reaction to an open socket (not an embedder callback; run at once). */
+	opened?(): void;
+	/** Where a throwing callback's error goes (default: reportError). */
+	report?: Report;
 }
 
 export class PageLife {
@@ -22,12 +31,15 @@ export class PageLife {
 	/** asking: the current attempt waits for its preamble; socket: its socket was asked for. */
 	private phase: 'idle' | 'asking' | 'socket' = 'idle';
 	private live = true;
+	private ended = false;
+	private readonly dispatch: Dispatcher;
 	private readonly listener = (e: MessageEvent<LifeUp>) => this.onUp(e.data);
 
 	constructor(
 		private readonly port: MessagePort,
 		private readonly o: LifeOptions
 	) {
+		this.dispatch = new Dispatcher(o.report);
 		port.addEventListener('message', this.listener);
 		port.start();
 	}
@@ -38,17 +50,42 @@ export class PageLife {
 		this.id++;
 		this.phase = 'asking';
 		this.down({ t: 'connect', id: this.id });
-		this.o.onStatus?.('connecting');
+		this.status('connecting');
 	}
 
-	unmount() {
+	/**
+	 * The worker failed (it could not be loaded, or it threw at the top level): the current
+	 * attempt ends with connect-failed, and no attempt follows.
+	 */
+	workerFailed() {
 		if (!this.live) return;
-		this.live = false;
-		this.down({ t: 'cancel' });
-		this.port.removeEventListener('message', this.listener);
-		const had = this.phase === 'socket';
+		const had = this.phase !== 'idle';
 		this.phase = 'idle';
-		if (had) this.closed(UNMOUNTED.code, UNMOUNTED.reason);
+		this.live = false;
+		this.port.removeEventListener('message', this.listener);
+		this.port.close();
+		if (had) this.status('connect-failed', CONNECT_FAILED);
+	}
+
+	/**
+	 * Ends the lifecycle for good: no more messages are taken or sent, the port is closed,
+	 * every queued callback is dropped, and the one callback after this is onClose(UNMOUNTED)
+	 * if a socket was asked for. The caller stops the worker first.
+	 */
+	end() {
+		if (this.ended) return;
+		this.ended = true;
+		const had = this.live && this.phase === 'socket';
+		this.live = false;
+		this.phase = 'idle';
+		this.port.removeEventListener('message', this.listener);
+		this.port.close();
+		const onClose = this.o.onClose;
+		this.dispatch.seal(
+			had && onClose
+				? () => onClose(UNMOUNTED.code, UNMOUNTED.reason)
+				: undefined
+		);
 	}
 
 	private onUp(m: LifeUp) {
@@ -58,7 +95,9 @@ export class PageLife {
 				if (this.phase === 'asking') void this.answer(m.id);
 				break;
 			case 'open':
-				if (this.phase === 'socket') this.o.onStatus?.('open');
+				if (this.phase !== 'socket') return;
+				this.o.opened?.();
+				this.status('open');
 				break;
 			case 'closed':
 				if (this.phase !== 'socket') return;
@@ -68,7 +107,7 @@ export class PageLife {
 			case 'connectFailed':
 				if (this.phase !== 'socket') return;
 				this.phase = 'idle';
-				this.o.onStatus?.('connect-failed', CONNECT_FAILED);
+				this.status('connect-failed', CONNECT_FAILED);
 				break;
 		}
 	}
@@ -79,20 +118,23 @@ export class PageLife {
 		if (!r.ok) {
 			this.phase = 'idle';
 			this.down({ t: 'preambleFailed', id });
-			this.o.onStatus?.('preamble-failed', r.failure);
+			this.status('preamble-failed', r.failure);
 			return;
 		}
 		this.phase = 'socket';
 		this.down({ t: 'preamble', id, msgs: r.msgs });
 	}
 
-	/** onClose first; onStatus('closed') runs even if onClose throws. */
+	/** onClose, then onStatus('closed'), each queued on its own: one throwing can't skip the other. */
 	private closed(code: number, reason: string) {
-		try {
-			this.o.onClose?.(code, reason);
-		} finally {
-			this.o.onStatus?.('closed');
-		}
+		const onClose = this.o.onClose;
+		if (onClose) this.dispatch.call(() => onClose(code, reason));
+		this.status('closed');
+	}
+
+	private status(s: Status, detail?: ConnectFailure) {
+		const onStatus = this.o.onStatus;
+		if (onStatus) this.dispatch.call(() => onStatus(s, detail));
 	}
 
 	private down(m: LifeDown) {

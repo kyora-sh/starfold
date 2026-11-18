@@ -32,13 +32,14 @@ export function setupPointer(app: App, onInteract: () => void) {
 	// smooth (pixel-precise) scrolling, or wheel clicks on X servers that can't.
 	let sx = 0,
 		sy = 0,
-		queued = false;
+		queued = false,
+		frame = 0;
 	function queueScroll(dx: number, dy: number) {
 		sx += dx;
 		sy += dy;
 		if (queued) return;
 		queued = true;
-		requestAnimationFrame(() => {
+		frame = requestAnimationFrame(() => {
 			queued = false;
 			if (Math.abs(sx) < 0.5 && Math.abs(sy) < 0.5) return;
 			send(cmd.scroll(sx, sy));
@@ -98,4 +99,12 @@ export function setupPointer(app: App, onInteract: () => void) {
 		},
 		{ passive: false }
 	);
+	return {
+		/** Cancels the queued scroll and the touch timer (the listeners go with the surface). */
+		dispose() {
+			if (queued) cancelAnimationFrame(frame);
+			queued = false;
+			touch.dispose();
+		},
+	};
 }
