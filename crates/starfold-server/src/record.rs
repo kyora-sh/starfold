@@ -1009,7 +1009,11 @@ mod tests {
     async fn while_off_a_query_is_not_read() {
         let r = Recorder::new(Hub::new(), Duration::from_secs(30), false);
         for res in [
-            record(State(r.clone()), with(&[("seconds", "x"), ("format", "avi")])).await,
+            record(
+                State(r.clone()),
+                with(&[("seconds", "x"), ("format", "avi")]),
+            )
+            .await,
             stop(State(r.clone()), with(&[("id", "1"), ("format", "avi")])).await,
         ] {
             assert_eq!(res.status(), StatusCode::FORBIDDEN);

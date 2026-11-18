@@ -25,7 +25,13 @@ fn code(text: &str) -> String {
             if t.get(j) == Some(&'"') {
                 let hashes = j - i - 1;
                 let closes = |k: usize| {
-                    t[k] == '"' && t[k + 1..].iter().take(hashes).filter(|h| **h == '#').count() == hashes
+                    t[k] == '"'
+                        && t[k + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|h| **h == '#')
+                            .count()
+                            == hashes
                 };
                 let mut k = j + 1;
                 while k < t.len() && !closes(k) {
@@ -83,7 +89,8 @@ fn method_calls<'a>(code: &'a str, name: &str) -> Vec<(usize, &'a str)> {
     for (at, _) in code.match_indices(name) {
         let before = &code[..at];
         let after = &code[at + name.len()..];
-        if before.ends_with(ident) || after.starts_with(ident) || !before.trim_end().ends_with('.') {
+        if before.ends_with(ident) || after.starts_with(ident) || !before.trim_end().ends_with('.')
+        {
             continue;
         }
         if let Some(args) = after.trim_start().strip_prefix('(') {
@@ -287,7 +294,10 @@ fn the_scan_sees_the_shapes_a_route_or_command_can_take() {
     let want = ["a", "b", "c", "d", "e", "f"].map(String::from);
     assert_eq!(commands, BTreeSet::from(want));
     for (text, name) in [
-        ("r . method_not_allowed_fallback (h)", "method_not_allowed_fallback"),
+        (
+            "r . method_not_allowed_fallback (h)",
+            "method_not_allowed_fallback",
+        ),
         ("r.fallback\n(h)", "fallback"),
         ("r\n    .route(\n\"/x\", get(h))", "route"),
         ("let s = r#\"// \"#; r.merge(x)", "merge"),
@@ -328,7 +338,10 @@ fn routes_are_only_registered_where_the_table_is_checked() {
         let text = code(&text);
         if path.ends_with("server.rs") {
             seen_server = true;
-            for f in REGISTERING.iter().filter(|f| !["route", "merge"].contains(f)) {
+            for f in REGISTERING
+                .iter()
+                .filter(|f| !["route", "merge"].contains(f))
+            {
                 assert!(
                     method_calls(&text, f).is_empty(),
                     "server.rs calls .{f}(: decide what it serves under --read-only in readonly.rs"
