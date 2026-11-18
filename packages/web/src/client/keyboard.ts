@@ -214,7 +214,9 @@ export function setupKeyboard(
 		}
 		toPng(file)
 			.then((png) =>
-				app.sendBin(Bin.ClipImageUp, new Uint8Array(png)) ? flushPaste() : dropPaste()
+				app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
+					? flushPaste()
+					: dropPaste()
 			)
 			.catch((err) => {
 				console.warn('[starfold] image paste failed', err);

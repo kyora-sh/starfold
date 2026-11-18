@@ -238,8 +238,8 @@ fn check_parent(parent: &std::os::fd::OwnedFd, path: &Path) -> std::io::Result<(
     if st.st_uid != me && st.st_uid != 0 {
         return refuse(&format!("its parent belongs to user {}", st.st_uid));
     }
-    let sticky = st.st_mode as u32 & libc::S_ISVTX as u32 != 0;
-    if st.st_mode as u32 & 0o022 != 0 && !sticky {
+    let sticky = st.st_mode & libc::S_ISVTX != 0;
+    if st.st_mode & 0o022 != 0 && !sticky {
         return refuse("its parent is writable by other users and not sticky");
     }
     if acl_lets_others_write(parent)? {
@@ -2041,6 +2041,9 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("acl-parent");
+            // Sticky, so its group bits (the ACL's mask) alone don't refuse it: the ACL
+            // entry does.
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1700)).unwrap();
             let c = std::ffi::CString::new(d.as_os_str().as_bytes()).unwrap();
             // user::rwx, user:nobody:rwx, group::---, mask::rwx, other::---.
             let mut acl = 2u32.to_le_bytes().to_vec();
