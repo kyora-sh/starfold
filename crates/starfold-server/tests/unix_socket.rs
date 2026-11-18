@@ -1,7 +1,8 @@
 //! The starfold binary with --listen-unix, started as a server: who gets through the
 //! socket, what a startup that fails or is stopped leaves behind, and the signal mask.
-//! Linux only. These tests need Xvfb, python3 and passwordless `sudo -n` (to run as other
-//! uids and to make a throwaway user); without them they fail, they don't skip.
+//! Linux only. These tests need Xvfb, python3, unprivileged user namespaces (`unshare
+//! --user`) and passwordless `sudo -n` (to make a throwaway user and run as it); without
+//! them they fail, they don't skip.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
@@ -283,34 +284,41 @@ impl Drop for Throwaway {
     }
 }
 
-/// The binary, run as the kernel's overflow uid (through `sudo -n`, reading the real
-/// /proc/sys/kernel/overflowuid at start), refuses --listen-unix before it binds: the
-/// directory is never made, though its parent (/tmp, root's and sticky) would take it.
+/// In a user namespace of its own with no uid mapped (`unshare --user`), the binary's own
+/// uid reads as the kernel's overflow uid, as an unmapped peer's does: the case where
+/// "unmapped" would alias "us". It reads the real /proc/sys/kernel/overflowuid at start
+/// and refuses --listen-unix before it binds; the directory is never made.
 #[test]
 fn as_the_overflow_uid_the_unix_listener_is_refused() {
-    sudo_works();
     let overflow = overflow_uid();
     assert_ne!(own_uid(), overflow, "this test runs as the overflow uid");
-    let d = scratch("overflow", 0o755);
-    let bin = d.join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_starfold"), bin.join("starfold")).unwrap();
-    std::fs::set_permissions(bin.join("starfold"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let id = Command::new("unshare")
+        .args(["--user", "--", "id", "-u"])
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs unshare (util-linux): {e}"));
+    assert!(
+        id.status.success(),
+        "this test needs unprivileged user namespaces: {}",
+        String::from_utf8_lossy(&id.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&id.stdout).trim(),
+        overflow.to_string(),
+        "an unmapped uid reads as the overflow uid"
+    );
     let at = Path::new("/tmp").join(format!("sf-it-overflow-{}-sf", std::process::id()));
-    let out = Command::new("sudo")
-        .args(["-n", "-u", &format!("#{overflow}"), "--"])
-        .arg(bin.join("starfold"))
+    let out = Command::new("unshare")
+        .args(["--user", "--"])
+        .arg(env!("CARGO_BIN_EXE_starfold"))
         .arg(format!("--listen-unix={}", at.display()))
         .args(["--listen-tcp=false", "--enable-basic-auth=false"])
-        .current_dir("/")
+        .env_remove("DISPLAY")
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{said}");
     assert!(said.contains(REFUSAL), "{said}");
     assert!(!at.exists(), "{} was made", at.display());
-    std::fs::remove_dir_all(&d).unwrap();
 }
 
 /// A client running as a throwaway user (neither the server's uid nor the overflow uid)
