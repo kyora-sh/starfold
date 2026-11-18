@@ -242,16 +242,11 @@ compile_error!(
 
 #[cfg(all(
     feature = "x264",
-    any(
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "mips32r6",
-        target_arch = "mips64r6"
-    )
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 compile_error!(
-    "the `x264` feature is not built for MIPS: x264's MSA chroma copy reads past the end of \
-     a frame plane; build with `--no-default-features --features openh264`"
+    "the `x264` feature builds for x86_64 and aarch64 only: on others, the system's x264 may \
+     read past the end of a frame plane (its MIPS MSA and PowerPC AltiVec input copies do)"
 );
 
 /// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
