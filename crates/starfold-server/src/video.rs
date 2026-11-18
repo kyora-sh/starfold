@@ -2439,7 +2439,10 @@ fn capture_loop(
         let now = Instant::now();
         let turn = eng.turn(&views, interval_ms, now);
         if !cap.damaged && !turn.work() {
-            wait_any(&[cap.fd(), hub.waker.waitable()], eng.idle_wait_ms(&views, now));
+            wait_any(
+                &[cap.fd(), hub.waker.waitable()],
+                eng.idle_wait_ms(&views, now),
+            );
             continue;
         }
         let rem = schedule.wait(Instant::now(), interval);

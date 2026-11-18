@@ -4315,9 +4315,8 @@ fn most_in(at: &[Duration], w: Duration) -> usize {
 
 /// The bound the schedule promises for a window of length `w`:
 /// `(w + TOLERANCE × interval) / interval + 1`, rounded down.
-fn bound(w: Duration, interval: Duration) -> usize {
-    ((w.as_secs_f64() + TOLERANCE * interval.as_secs_f64()) / interval.as_secs_f64()) as usize
-        + 1
+fn window_bound(w: Duration, interval: Duration) -> usize {
+    ((w.as_secs_f64() + TOLERANCE * interval.as_secs_f64()) / interval.as_secs_f64()) as usize + 1
 }
 
 /// However captures are offered, no window holds more than the bound: at most two over the
@@ -4337,7 +4336,10 @@ fn no_window_holds_more_than_the_bound() {
         for at in &runs {
             for w in [interval, interval * 2, Duration::from_secs(1)] {
                 let n = most_in(at, w);
-                assert!(n <= bound(w, interval), "{n} captures in {w:?} at {fps} fps");
+                assert!(
+                    n <= window_bound(w, interval),
+                    "{n} captures in {w:?} at {fps} fps"
+                );
             }
             assert!(most_in(at, Duration::from_secs(1)) <= fps as usize + 2);
             assert!(most_in(at, interval) <= 3);
@@ -4348,7 +4350,10 @@ fn no_window_holds_more_than_the_bound() {
     let mut s = Schedule::default();
     let t = Instant::now();
     s.took(t, interval);
-    assert!(s.wait(t, interval).is_zero(), "the tolerance lets a second come at once");
+    assert!(
+        s.wait(t, interval).is_zero(),
+        "the tolerance lets a second come at once"
+    );
     s.took(t, interval);
     assert!(!s.wait(t, interval).is_zero(), "but not a third");
 }
@@ -4386,7 +4391,10 @@ fn a_rate_change_starts_the_schedule_again_at_the_new_rate() {
     let mut s = Schedule::default();
     s.took(t, i60);
     s.took(t + Duration::from_millis(1), i60);
-    assert!(!s.wait(t + Duration::from_millis(2), i60).is_zero(), "held at 60");
+    assert!(
+        !s.wait(t + Duration::from_millis(2), i60).is_zero(),
+        "held at 60"
+    );
     let up = t + Duration::from_micros(4_167);
     assert_eq!(s.wait(up, i240), Duration::ZERO, "free at 240 once raised");
 
@@ -4395,7 +4403,11 @@ fn a_rate_change_starts_the_schedule_again_at_the_new_rate() {
     let mut at = Vec::new();
     let mut now = start;
     while now < start + Duration::from_secs(2) {
-        let interval = if now < start + Duration::from_secs(1) { i120 } else { frame_interval(60) };
+        let interval = if now < start + Duration::from_secs(1) {
+            i120
+        } else {
+            frame_interval(60)
+        };
         if s.wait(now, interval).is_zero() {
             s.took(now, interval);
             at.push(now - start);
@@ -4409,7 +4421,10 @@ fn a_rate_change_starts_the_schedule_again_at_the_new_rate() {
         .collect();
     let i60 = frame_interval(60);
     for w in [i60, i60 * 2, Duration::from_millis(500)] {
-        assert!(most_in(&after, w) <= bound(w, i60), "after the change, in {w:?}");
+        assert!(
+            most_in(&after, w) <= window_bound(w, i60),
+            "after the change, in {w:?}"
+        );
     }
 }
 
@@ -4498,7 +4513,7 @@ fn a_cohort_capped_below_the_capture_takes_frames_at_its_cap_on_average() {
     join_legacy(&hub, &c);
     let grid = Duration::from_millis(15);
     let got = frames_on_a_grid(&mut eng, (&c, &mut rx), H264, grid, (120, 60));
-    let most = bound(Duration::from_secs(2), frame_interval(60));
+    let most = window_bound(Duration::from_secs(2), frame_interval(60));
     assert!(
         (119..=most).contains(&got),
         "{got} frames in 2 s at a 60 fps cap from a capture every 15 ms (at most {most})"
@@ -4530,7 +4545,7 @@ fn a_100_fps_cohort_on_a_120_fps_capture_takes_100_frames_a_second() {
         Duration::from_nanos(1_000_000_000 / 120),
         (120, 100),
     );
-    let most = bound(Duration::from_secs(2), frame_interval(100));
+    let most = window_bound(Duration::from_secs(2), frame_interval(100));
     assert!(
         (199..=most).contains(&got),
         "{got} frames in 2 s at a 100 fps cap from a 120 fps capture (at most {most})"
@@ -4549,7 +4564,12 @@ fn skipped_damage_wakes_the_loop_when_its_cohort_may_take_it() {
     p.ack_h264();
     let now = p.t + Duration::from_secs(60);
     let views = p.eng.views();
-    let k = p.eng.cohorts.iter().position(|c| c.shared.cand == H264).unwrap();
+    let k = p
+        .eng
+        .cohorts
+        .iter()
+        .position(|c| c.shared.cand == H264)
+        .unwrap();
     let interval = frame_interval(p.eng.cohorts[k].fps());
     p.eng.cohorts[k].take = Schedule {
         due: Some(now + interval * 2),
