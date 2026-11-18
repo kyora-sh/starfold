@@ -3884,9 +3884,10 @@ fn skipped_damage_is_caught_up_once_the_cap_allows() {
     let (mut eng, (a, mut ra), (b, mut rb)) = mixed(&hub, Opts::default());
     let mut t = Instant::now() + Duration::from_secs(1);
     let viewers = &mut [(&*a, &mut ra, true), (&*b, &mut rb, true)];
-    run_captures(&mut eng, &mut t, 1, viewers);
-    let (got, _) = run_captures(&mut eng, &mut t, 1, viewers);
-    assert_eq!(got, vec![1, 0], "OpenH264 skips the second capture");
+    // OpenH264, capped at 60, takes the 120 fps captures until its tolerance is used, then
+    // skips one.
+    let skipped = (0..8).any(|_| run_captures(&mut eng, &mut t, 1, viewers).0 == vec![1, 0]);
+    assert!(skipped, "OpenH264 never skipped a capture");
     let views = eng.views();
     let turn = eng.turn(&views, 1000.0 / 120.0, t - Duration::from_millis(5));
     assert!(turn.catch_up, "a capture is due for the skipped damage");
@@ -4297,9 +4298,10 @@ fn captures_offered_on_any_grid_up_to_the_interval_come_at_the_rate() {
         (30, 30_000),
         (30, 20_000),
     ] {
+        // Over 10 s: the rate, plus at most the two the tolerance lets through at the start.
         let n = on_a_grid(fps, Duration::from_micros(grid_us), 10).len() as f64 / 10.0;
         assert!(
-            (n - fps as f64).abs() <= 0.2,
+            (n - fps as f64).abs() <= 0.3,
             "{n}/s at {fps} fps offered every {grid_us} us"
         );
     }
