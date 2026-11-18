@@ -743,6 +743,11 @@ fn a_recording_ends_at_its_frame_cap_and_its_size_limit() {
     .unwrap();
     assert_eq!(c.end, End::SizeLimit);
     assert_eq!(c.segments[0].frames, 2);
+    let on_disk = c.file.metadata().unwrap().len();
+    assert!(
+        on_disk <= one,
+        "{on_disk} bytes written, the limit is {one}"
+    );
 }
 
 /// Runs the test `name` alone in a process of its own and asserts it passed there: what

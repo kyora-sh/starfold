@@ -211,8 +211,8 @@ answer is read back from that file:
 
 - At most 2 recordings run at once (`/record` and `/record/start` alike, each until its
   answer is sent or dropped); a third gets 429.
-- A recording holds at most 2 GiB of video (`size_limit`) and at most 120 frames a second of
-  its length (`frame_cap`).
+- A recording holds at most 2 GiB of video (`size_limit`), so recordings take at most 4 GiB
+  of `--recording-dir` together, and at most 120 frames a second of its length (`frame_cap`).
 - It starts only with at least min(1 GiB, 10 %) of the filesystem free (otherwise 507), and
   ends with `disk_space` below that; it looks again after half the room that was left, at
   most 64 MiB later.
