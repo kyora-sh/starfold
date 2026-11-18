@@ -483,12 +483,11 @@ fn a_padded_plane_must_hold_its_last_rows_stride() {
     assert!(full.check().is_ok());
     for b in backends() {
         let mut enc = open(&config(b, w as u32, h as u32, 4000)).unwrap();
-        let e = enc.encode(&short, EncodeOptions::default()).unwrap_err();
-        assert!(e.0.contains("don't hold a 64x48 picture"), "{b:?}: {e}");
-        let only_luma = FrameView {
-            y: short.y,
-            ..full
+        let Err(e) = enc.encode(&short, EncodeOptions::default()) else {
+            panic!("{b:?}: encoded a plane short of its last row's stride");
         };
+        assert!(e.0.contains("don't hold a 64x48 picture"), "{b:?}: {e}");
+        let only_luma = FrameView { y: short.y, ..full };
         assert!(
             enc.encode(&only_luma, EncodeOptions::default()).is_err(),
             "{b:?}: luma alone"
