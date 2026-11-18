@@ -2563,11 +2563,13 @@ struct StripeJob {
 }
 
 impl StripeJob {
-    /// This stripe's cap, on an encoder that does or doesn't `hold` its cap; a paint-over
-    /// gets twice it.
+    /// This stripe's cap, on an encoder that does or doesn't `hold` its cap. A paint-over
+    /// gets twice it on one that doesn't: there its finer quality sets the frame's size and
+    /// the cap only clips it. One that holds its cap spends all of it on any picture, so
+    /// twice the cap would be twice the bytes.
     fn cap(&self, holds: bool) -> u32 {
         let share = stripe_share(self.target, self.stripes, holds);
-        if self.paintover {
+        if self.paintover && !holds {
             share.saturating_mul(2)
         } else {
             share
