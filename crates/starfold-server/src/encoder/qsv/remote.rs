@@ -348,7 +348,8 @@ pub struct Remote {
     /// read it back (None: the runtime didn't say).
     pub name: String,
     pub low_power: Option<bool>,
-    /// Whether the helper's session holds its cap, as it said when it opened.
+    /// Whether the helper's session holds its cap, as it said when it opened; false once a
+    /// rate change failed (its session's rate control is then unknown).
     holds_cap: bool,
     /// Every frame request sent: pts, IDR asked.
     #[cfg(test)]
@@ -641,11 +642,12 @@ impl Remote {
 
 impl VideoEncoder for Remote {
     /// A rate change that fails, however, leaves the rate in force unknown until the helper
-    /// reads one back again.
+    /// reads one back again, and the encoder no longer said to hold its cap.
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         let r = self.change_rate(rate);
         if r.is_err() {
             self.in_force = RateInForce::Unknown;
+            self.holds_cap = false;
         }
         r
     }

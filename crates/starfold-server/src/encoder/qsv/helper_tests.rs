@@ -655,8 +655,10 @@ mod remote {
         );
         enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
         assert_eq!(enc.rate_in_force(), RateInForce::Known(5_000));
+        assert!(enc.holds_cap());
         assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
         assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
+        assert!(!enc.holds_cap(), "its rate control is unknown too");
         assert!(p.off().is_none(), "an ordinary failure");
     }
 

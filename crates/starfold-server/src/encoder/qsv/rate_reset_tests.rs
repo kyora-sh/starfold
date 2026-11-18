@@ -4,7 +4,7 @@
 //! and starts from, what the session then reports, and a Reset the runtime refuses.
 
 use super::driver::STOPPED;
-use super::ffi::{self, VideoParam};
+use super::ffi::{self, ExtVideoSignalInfo, VideoParam};
 use super::session::Session;
 use super::tests::{Fake, INCOMPATIBLE_VIDEO_PARAM};
 use crate::encoder::hw::{sample_config, Rc};
@@ -407,4 +407,72 @@ fn a_reset_that_leaves_hrd_conformance_on_takes_the_encoder_out_of_use() {
     assert_eq!(log.lock().unwrap().reset.len(), 1, "the Reset went through");
     assert_eq!(s.rate_in_force(), RateInForce::Unknown);
     assert!(frame(&mut s, false).is_err(), "out of use");
+}
+
+/// What GetVideoParam says after Init: what Init asked, with `change` applied.
+fn reads_back(change: impl FnOnce(&mut VideoParam)) -> Fake {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    let rc = Rc::new(Codec::H264, &cfg(30_000).rate, None);
+    let mut got = super::session::params(Codec::H264, (W, H), &rc, false);
+    change(&mut got);
+    fake.got = Some(got);
+    fake
+}
+
+/// An Init the runtime takes but that runs another rate control method than the one asked
+/// (constant bitrate turned into a variable one) opens no session: the stream would report a
+/// rate, or the target in its place, that the encoder doesn't run.
+#[test]
+fn an_init_that_runs_another_rate_control_method_opens_no_session() {
+    let fake = reads_back(|p| p.mfx.rate_control_method = 2);
+    let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
+    assert!(e.0.contains("rate control method 2"), "{e}");
+}
+
+/// An Init that codes another picture size or format than the one asked opens no session:
+/// the stream would report the size it asked for.
+#[test]
+fn an_init_at_another_picture_size_opens_no_session() {
+    let fake = reads_back(|p| p.mfx.frame_info.crop_h = 1088);
+    let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
+    assert!(e.0.contains("at 1920x1088, not NV12 at 1920x1080"), "{e}");
+    let fake = reads_back(|p| p.mfx.codec_id = ffi::CODEC_HEVC);
+    let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
+    assert!(e.0.contains("runs codec"), "{e}");
+}
+
+/// BT.709 full range, where BT.601 limited was asked.
+fn bt709_full() -> ExtVideoSignalInfo {
+    ExtVideoSignalInfo {
+        video_format: 5,
+        video_full_range: 1,
+        colour_description_present: 1,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
+        ..Default::default()
+    }
+}
+
+/// Colour signalling the runtime fills in otherwise than asked opens no session.
+#[test]
+fn colour_signalling_read_back_otherwise_is_refused() {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.signal_report = Some(bt709_full());
+    let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
+    assert!(e.0.contains("signals colour"), "{e}");
+    let (fake, _) = Fake::new(Codec::H264);
+    let s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    assert!(s.signal_read, "the fake reads back what Init was given");
+}
+
+/// A runtime that leaves the signal info all zero says nothing about colour: the session
+/// opens, its rate read back as usual, and its colour signalling stays unconfirmed.
+#[test]
+fn colour_signalling_not_read_back_stays_unconfirmed() {
+    let (mut fake, _) = Fake::new(Codec::H264);
+    fake.signal_report = Some(ExtVideoSignalInfo::default());
+    let s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    assert!(!s.signal_read);
+    assert_eq!(s.rate_in_force(), RateInForce::Known(at(30_000)));
 }
