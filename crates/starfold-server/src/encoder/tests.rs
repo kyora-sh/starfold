@@ -438,6 +438,29 @@ fn short_or_wrapping_planes_are_rejected() {
     }
 }
 
+/// A plane whose rows times its stride doesn't fit a C int is refused, though it holds them
+/// all; two rows fewer, it fits. The 2 GiB plane is zeroed memory nothing reads, so the
+/// system hands out no pages for it.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_plane_past_a_c_int_is_refused() {
+    let stride = 1usize << 26;
+    let y = vec![0u8; 32 * stride];
+    let uv = vec![128u8; 32 * 16];
+    let at = |height: u32| FrameView {
+        width: 64,
+        height,
+        y: &y,
+        u: &uv,
+        v: &uv,
+        stride_y: stride,
+        stride_uv: 32,
+    };
+    assert_eq!(32 * stride, i32::MAX as usize + 1);
+    assert!(at(32).check().is_err(), "32 rows at 1 << 26");
+    assert!(at(30).check().is_ok(), "30 rows at 1 << 26");
+}
+
 /// A plane with a stride wider than the picture that ends right after the last row's
 /// pixels is refused before any encoder sees it: OpenH264 and x264's C copy step their
 /// pointer a stride past every row, the last one too, which would point beyond its end.
