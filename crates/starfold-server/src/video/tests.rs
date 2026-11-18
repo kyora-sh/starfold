@@ -4270,7 +4270,10 @@ fn a_slower_delivery_lowers_the_budgeted_rate_within_about_a_second() {
     let (_, seen) = feed(&mut pace, Instant::now(), 1000.0 / 15.0, 30, 30);
     let at = seen.iter().position(|&f| f != 30).expect("lowered");
     assert!(at <= 16, "{seen:?}");
-    assert!(seen[at..].iter().all(|&f| (15..=20).contains(&f)), "{seen:?}");
+    assert!(
+        seen[at..].iter().all(|&f| (15..=20).contains(&f)),
+        "{seen:?}"
+    );
 }
 
 #[test]
@@ -4280,7 +4283,13 @@ fn a_rate_change_is_budgeted_for_at_the_new_rate() {
     let next = end + Duration::from_secs_f64(1.0 / 60.0);
     let (end, seen) = feed(&mut pace, next, 1000.0 / 60.0, 10, 60);
     assert!(seen[3..].iter().all(|&f| f == 60), "{seen:?}");
-    let (_, seen) = feed(&mut pace, end + Duration::from_millis(17), 1000.0 / 20.0, 30, 20);
+    let (_, seen) = feed(
+        &mut pace,
+        end + Duration::from_millis(17),
+        1000.0 / 20.0,
+        30,
+        20,
+    );
     assert!(seen.iter().all(|&f| f <= 40), "{seen:?}");
     assert!(seen[seen.len() - 5..].iter().all(|&f| f <= 25), "{seen:?}");
 }
@@ -4290,7 +4299,13 @@ fn a_pause_does_not_leave_the_next_frames_budgeted_for_the_trickle_before_it() {
     let mut pace = Pace::new(30);
     let (end, seen) = feed(&mut pace, Instant::now(), 200.0, 20, 30);
     assert_eq!(seen.last(), Some(&FPS_FLOOR));
-    let (_, seen) = feed(&mut pace, end + Duration::from_secs(2), 1000.0 / 30.0, 30, 30);
+    let (_, seen) = feed(
+        &mut pace,
+        end + Duration::from_secs(2),
+        1000.0 / 30.0,
+        30,
+        30,
+    );
     assert!(seen.iter().all(|&f| f == 30), "{seen:?}");
     assert!(seen.iter().all(|&f| spend(30.0, f) <= 1.0));
 }

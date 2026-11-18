@@ -480,7 +480,10 @@ impl Pace {
     }
 
     fn set(&mut self, fps: u32, now: Instant, cohort: u64, why: &str) {
-        log::info!("cohort {cohort}: encoder rate {} -> {fps} fps ({why})", self.fps);
+        log::info!(
+            "cohort {cohort}: encoder rate {} -> {fps} fps ({why})",
+            self.fps
+        );
         self.fps = fps;
         self.changed = now;
     }
