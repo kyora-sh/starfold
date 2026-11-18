@@ -324,6 +324,11 @@ async fn an_outside_path_is_a_plain_not_found_whatever_the_method() {
             !head.to_ascii_lowercase().contains("\r\nallow:"),
             "{method} {path}: {head}"
         );
+        assert_eq!(
+            head.split_once("\r\n\r\n").map(|(_, body)| body),
+            Some(""),
+            "{method} {path}: a body: {head}"
+        );
         let (want, want_head) = ask(plain, method, path, Asking::Signed, "").await;
         let inside = format!("/p{path}");
         let (got, got_head) = ask(prefixed, method, &inside, Asking::Signed, "").await;

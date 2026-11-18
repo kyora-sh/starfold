@@ -171,9 +171,10 @@ send `/desktop` on to `/desktop/` itself: the page's URLs are relative, so from
 
 Give `--base-path` once, with a prefix such as `/desktop` (letters, digits, `.`, `_`, `~`
 or `-` between single slashes, at most 1024 bytes; one trailing slash is dropped). Given
-twice, without a value, empty, `/` or in any other shape, starfold stops with exit code 2
-and says why on stderr, even beside `--help` or `--version`; leave the flag out to serve
-at the root. The prefix is part of every request line, so it counts against the length a
+twice, without a value, empty, `/` or in any other shape, the server does not start: it
+exits with code 2 and says why on stderr, even beside `--help` or `--version`; leave the
+flag out to serve at the root. (This is about starting the server; the encoder-probe child
+the server runs for itself opens no listener and ignores the flag.) The prefix is part of every request line, so it counts against the length a
 request line may have (64 KiB in starfold, often less in a proxy).
 
 ### For agents and scripts
