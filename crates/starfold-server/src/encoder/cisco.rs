@@ -478,8 +478,8 @@ mod tests {
         .map(|(name, s)| (format!("without F_SEAL_{name}"), memfd_with(all & !s)))
         .collect();
         cases.push(("unsealed".into(), memfd_with(0)));
-        let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml")
-            .unwrap();
+        let file =
+            std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml").unwrap();
         cases.push(("a regular file".into(), file.into()));
         for (what, fd) in cases {
             let e = unsafe { install(Ok(handoff(fd))) }.unwrap_err();

@@ -62,7 +62,9 @@ fn a_probe_child_never_opens_the_library_it_is_given() {
     let lib = dir.join("libopenh264.so");
     std::fs::write(&lib, b"not a library").unwrap();
     let mut child = starfold();
-    child.args([FLAG, "bogus"]).env("STARFOLD_OPENH264_LIB", &lib);
+    child
+        .args([FLAG, "bogus"])
+        .env("STARFOLD_OPENH264_LIB", &lib);
     assert!(!opens(&lib, child), "a probe child opened the library");
     let mut server = starfold();
     server.arg("--version").env("STARFOLD_OPENH264_LIB", &lib);

@@ -455,7 +455,11 @@ mod tests {
         let f = Some("libopenh264-2.6.0-linux64.8.so");
         assert!(openh264_entry(f, true).contains("--openh264-lib"));
         for (file, handed_over) in [(f, false), (None, true), (None, false)] {
-            assert_eq!(openh264_entry(file, handed_over), "", "{file:?} {handed_over}");
+            assert_eq!(
+                openh264_entry(file, handed_over),
+                "",
+                "{file:?} {handed_over}"
+            );
         }
     }
 
