@@ -100,7 +100,8 @@ class InputResult:
 
 @dataclass(frozen=True)
 class Recording:
-    """A started recording. `id` is a string the server made up; only it stops the recording."""
+    """A started recording. `id` is the string the server returned once, to this caller; any
+    holder of it can stop the recording and obtain its clip, so treat it like a secret."""
 
     id: str
     max_seconds: int

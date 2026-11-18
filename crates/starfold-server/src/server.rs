@@ -343,34 +343,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     };
     let mut rtts: std::collections::VecDeque<u32> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
-        match msg {
-            Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
-            // --read-only decides binary messages in readonly.rs (all of them act).
-            Message::Binary(b)
-                if s.read_only
-                    && crate::readonly::binary(b.first().copied())
-                        != crate::readonly::Kind::Watch => {}
-            // 0x11: clipboard image (PNG) pasted on the client.
-            Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
-                if let Some(tx) = s.hub.input.lock().as_ref() {
-                    let _ = tx.send(InputEvent::Clipboard(crate::desktop::ClipContent::Image(
-                        b[1..].to_vec(),
-                    )));
-                }
-            }
-            // 0x12: microphone Opus packet, 0x13: microphone PCM (s16le mono 48 kHz).
-            Message::Binary(b) if matches!(b.first(), Some(0x12 | 0x13)) && b.len() > 1 => {
-                if let Some(tx) = &s.mic {
-                    let data = b.slice(1..);
-                    let _ = tx.send(if b[0] == 0x12 {
-                        crate::mic::MicMsg::Opus(client.id, data)
-                    } else {
-                        crate::mic::MicMsg::Pcm(client.id, data)
-                    });
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
+        if !handle_message(&s, &client, msg, &mut rtts) {
+            break;
         }
     }
     pinger.abort();
@@ -383,6 +357,44 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     s.hub.remove_client(client.id);
     log::info!("client {} disconnected", client.id);
+}
+
+/// One message a viewer sent on /ws; false when it closes the socket.
+fn handle_message(
+    s: &AppState,
+    client: &Arc<Client>,
+    msg: Message,
+    rtts: &mut std::collections::VecDeque<u32>,
+) -> bool {
+    match msg {
+        Message::Text(t) => handle_text(s, client, t.as_str(), rtts),
+        // --read-only decides binary messages in readonly.rs (all of them act).
+        Message::Binary(b)
+            if s.read_only
+                && crate::readonly::binary(b.first().copied()) != crate::readonly::Kind::Watch => {}
+        // 0x11: clipboard image (PNG) pasted on the client.
+        Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
+            if let Some(tx) = s.hub.input.lock().as_ref() {
+                let _ = tx.send(InputEvent::Clipboard(crate::desktop::ClipContent::Image(
+                    b[1..].to_vec(),
+                )));
+            }
+        }
+        // 0x12: microphone Opus packet, 0x13: microphone PCM (s16le mono 48 kHz).
+        Message::Binary(b) if matches!(b.first(), Some(0x12 | 0x13)) && b.len() > 1 => {
+            if let Some(tx) = &s.mic {
+                let data = b.slice(1..);
+                let _ = tx.send(if b[0] == 0x12 {
+                    crate::mic::MicMsg::Opus(client.id, data)
+                } else {
+                    crate::mic::MicMsg::Pcm(client.id, data)
+                });
+            }
+        }
+        Message::Close(_) => return false,
+        _ => {}
+    }
+    true
 }
 
 fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
@@ -725,8 +737,8 @@ mod tests {
         }
     }
 
-    /// Sends every command to a server that has input, a microphone and resizing wired
-    /// up, and returns (input events, microphone messages, a resize was asked for).
+    /// Sends every command, a clipboard image and two microphone packets, as /ws messages,
+    /// to a server that has input, a microphone and resizing wired up, and returns (input events, microphone messages, a resize was asked for).
     fn drive(read_only: bool) -> (usize, usize, bool) {
         let hub = Hub::new();
         hub.width.store(1280, Ordering::Relaxed);
@@ -739,8 +751,13 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
-        for c in ALL {
-            handle_text(&s, &client, c, &mut rtts);
+        let binary = [&[0x11u8, 0x89, b'P'][..], &[0x12, 1, 2], &[0x13, 1, 2]];
+        let messages = ALL
+            .iter()
+            .map(|c| Message::Text((*c).into()))
+            .chain(binary.iter().map(|b| Message::Binary(Bytes::copy_from_slice(b))));
+        for m in messages {
+            assert!(handle_message(&s, &client, m, &mut rtts));
         }
         let resized = hub.resize_req.lock().is_some();
         (
@@ -786,8 +803,8 @@ mod tests {
         // The same commands do reach the desktop without --read-only, so the test above
         // checks the guard rather than an unwired server.
         let (input, mic, resized) = drive(false);
-        assert!(input >= 9, "{input} input events");
-        assert_eq!(mic, 1);
+        assert!(input >= 10, "{input} input events");
+        assert_eq!(mic, 3, "the mi command and two binary packets");
         assert!(resized);
     }
 
@@ -946,11 +963,7 @@ mod tests {
         let hub = Hub::new();
         let mut s = app(&hub, false, None);
         let flags = crate::parse_args(["--port".to_string(), "6901".to_string()]);
-        s.recorder = crate::record::Recorder::new(
-            hub.clone(),
-            Duration::from_secs(1),
-            crate::record::enabled(&flags),
-        );
+        s.recorder = crate::recorder_from_args(&flags, &hub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });

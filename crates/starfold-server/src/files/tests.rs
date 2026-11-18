@@ -401,6 +401,31 @@ async fn read_only_shares_files_only_when_download_is_named() {
     }
 }
 
+#[test]
+fn the_server_shares_no_files_under_read_only_unless_download_is_named() {
+    let t = Tmp::new();
+    let root = t.root();
+    let root = root.to_str().unwrap();
+    // (the command line after --files-root, read-only, upload, download)
+    for (args, read_only, upload, download) in [
+        (&[][..], true, false, false),
+        (&["--file-transfers=download"][..], true, false, true),
+        (&["--file-transfers=upload,download"][..], true, false, true),
+        (&[][..], false, true, true),
+        (&["--file-transfers=upload"][..], false, true, false),
+    ] {
+        let a = crate::parse_args(
+            ["--files-root", root]
+                .iter()
+                .chain(args)
+                .map(|s| s.to_string()),
+        );
+        let f = crate::files_from_args(&a, read_only).unwrap();
+        let what = format!("{args:?}, read-only {read_only}");
+        assert_eq!((f.upload, f.download), (upload, download), "{what}");
+    }
+}
+
 #[tokio::test]
 async fn a_path_past_the_limit_is_refused_before_anything_is_created() {
     let t = Tmp::new();

@@ -18,7 +18,8 @@ pub enum Kind {
 
 use Kind::{Act, Watch};
 
-/// Every route the server has, by method and path. HEAD is GET.
+/// Every route the server has, by method and path. HEAD is GET unless a route registers
+/// its own HEAD handler, which then needs its own entry.
 pub const ROUTES: &[(&str, &str, Kind)] = &[
     ("GET", "/", Watch),
     ("GET", "/index.html", Watch),
@@ -51,15 +52,16 @@ pub const ROUTES: &[(&str, &str, Kind)] = &[
 
 /// A route's kind; None for one not in [`ROUTES`].
 pub fn route(method: &Method, path: &str) -> Option<Kind> {
-    let m = if method == Method::HEAD {
-        "GET"
-    } else {
-        method.as_str()
+    let find = |m: &str| {
+        ROUTES
+            .iter()
+            .find(|(rm, rp, _)| *rm == m && *rp == path)
+            .map(|r| r.2)
     };
-    ROUTES
-        .iter()
-        .find(|(rm, rp, _)| *rm == m && *rp == path)
-        .map(|r| r.2)
+    match find(method.as_str()) {
+        None if method == Method::HEAD => find("GET"),
+        k => k,
+    }
 }
 
 /// Every text command on /ws (`cmd,args`).

@@ -100,8 +100,8 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--adaptive-threads`                                           | `false`                                                               | encode on one thread, fanning out only under sustained heavy motion                                                                                                                                       |
 | `--stripes`                                                    | `1`                                                                   | encode the screen as N independent horizontal streams (experimental)                                                                                                                                      |
 | `--scroll-px-per-notch`                                        | `180`                                                                 | desktop pixels one wheel notch scrolls (calibrates smooth scrolling)                                                                                                                                      |
-| `--file-transfers`                                             | `upload,download`                                                     | `upload`, `download`, both, or `none`                                                                                                                                                                     |
-| `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, files or recordings (downloads only with `--file-transfers=download`); watching still influences delivery as any viewer does                                          |
+| `--file-transfers`                                             | `upload,download`                                                     | `upload`, `download`, both, or `none`; under `--read-only` uploads stay off, and naming `download` (alone or as `upload,download`) turns on listing and downloads                                         |
+| `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, file contents or recordings; files are listed and downloaded only when `--file-transfers` names `download`; watching still influences delivery as any viewer does     |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
@@ -135,7 +135,10 @@ the limits below.
 - On Windows a path is checked and then opened by name, so a folder changed in between can
   affect what is opened.
 - With `--read-only`, uploads are refused whatever `--file-transfers` says, and the panel lists
-  and downloads files only when `--file-transfers` names `download` (`--file-transfers=download`).
+  and downloads files only when `--file-transfers` names `download` (`--file-transfers=download`,
+  or `--file-transfers=upload,download`, where uploads stay off). Viewers then cannot change a
+  file's contents, but reading one may update its access time, as any read does on a filesystem
+  mounted with `strictatime`.
   **Behaviour change:** a server started with `--read-only` and `--files-root` but no
   `--file-transfers` used to hand out files; it no longer does until `--file-transfers=download`
   is added.
@@ -183,8 +186,12 @@ curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id
 
 **Breaking change:** recording is off unless starfold runs with `--enable-recording`; without it
 the three `/record` routes answer 403 (`"recording": false`). A recording's id is now a
-32-character string, and only that id stops it and gets the clip: scripts need `jq -r .id`
-where they had `jq .id`.
+32-character string: scripts need `jq -r .id` where they had `jq .id`.
+
+Only a holder of the id that start returned can stop a recording or obtain its clip. The id
+is returned once, to the caller of start, over the same authenticated channel; it is 128 bits
+from the OS and compared in constant time. Treat the id like a secret: anyone who has it and
+can reach the server can stop the recording and take the clip.
 
 With `--enable-recording` the recorder is as it was before the flag: clips are held in memory
 and are not yet bounded; do not enable it for viewers you do not trust. Under `--read-only`
@@ -232,9 +239,10 @@ ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polli
 order) and answers with the `seq` from before them, so `/wait?change&since=` sees what they
 did. A `--read-only` server refuses it with 403. `python/starfold` wraps all of this.
 
-With `--read-only` a viewer cannot change the desktop, files or recordings: every route and
-message is decided in one table, and anything not in it is refused. Watching still influences
-delivery as any viewer does (keyframe requests, its refresh rate, its acknowledgements).
+With `--read-only` a viewer cannot change the desktop, file contents or recordings: every
+route and message is decided in one table, and anything not in it is refused. Watching still
+influences delivery as any viewer does (keyframe requests, its refresh rate, its
+acknowledgements).
 
 ```sh
 curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
