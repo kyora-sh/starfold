@@ -18,7 +18,7 @@ mod tests;
 
 /// The hidden flag, first on the child's command line.
 pub const FLAG: &str = "--probe-encoders";
-const VERSION: u32 = 1;
+pub const VERSION: u32 = 1;
 /// More than any probe prints; a child that writes more is not one of ours.
 const MAX_OUTPUT: u64 = 1 << 20;
 /// How long the child's output may stay open once it has exited or been killed.
@@ -39,6 +39,20 @@ pub fn enable() {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
     SELF_EXEC.store(true, Ordering::Relaxed);
+}
+
+/// Whether this executable answers [`FLAG`] and the encoder helpers' flag: [`enable`] was
+/// called, as `starfold::main` does.
+pub fn self_exec() -> bool {
+    SELF_EXEC.load(Ordering::Relaxed)
+}
+
+/// Prints the report of `probe`, run here, where a probe child prints it; returns the exit
+/// code.
+pub fn report_main(backend: Backend, probe: impl FnOnce() -> Probe) -> i32 {
+    let mut out = report_sink();
+    let found = probe();
+    print_report(&mut *out, backend, found)
 }
 
 /// A provider that probes `backend` in a child, if this executable takes [`FLAG`].

@@ -1,15 +1,17 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! starfold: low-latency desktop streaming (H.264, HEVC or AV1 over WebSocket) for the
+//! browser, from an X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
-//! The `voxl` binary calls [`main`]; other programs (the Tembo CLI's `tembo voxl`) embed
-//! the server by calling [`run`] with a command line, or [`main`] from their own `main`.
+//! The `starfold` binary calls [`main`]; other programs embed the server by calling
+//! [`run`] with a command line, or [`main`] from their own `main`.
 
 mod access;
 mod actions;
 #[cfg(target_os = "linux")]
 mod audio;
+mod build_facts;
 #[cfg(target_os = "linux")]
 mod capture;
+mod compat;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
@@ -36,6 +38,8 @@ mod video;
 mod wait;
 #[cfg(windows)]
 mod win;
+#[cfg(any(windows, test))]
+mod winlib;
 
 // The macOS and Windows backends provide the same modules with the same interfaces.
 #[cfg(target_os = "macos")]
@@ -76,7 +80,7 @@ fn range_max(v: Option<&String>, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn truthy(v: Option<&String>, default: bool) -> bool {
+pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
     v.map(|s| matches!(s.as_str(), "true" | "1" | "yes" | "on"))
         .unwrap_or(default)
 }
@@ -124,6 +128,10 @@ pub fn main() {
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if args.first().map(String::as_str) == Some(encoder::HELPER_FLAG) {
+        std::process::exit(encoder::helper_main(&args[1..]));
+    }
     encoder::isolate::enable();
     run(args);
 }
@@ -141,7 +149,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     let a = parse_args(args);
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
-    // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
+    // A panic on any thread ends the process, as in starfold's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
     {
@@ -219,20 +227,18 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    if encoder.name() != "x264" && !selection.is_arm() {
-        for flag in ["preset", "paintover-crf"]
-            .iter()
-            .filter(|f| a.contains_key(**f))
+    if !selection.is_arm() {
+        let uncapped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 == 0;
+        for flag in build_facts::FLAGS
+            .into_iter()
+            .filter(|f| a.contains_key(*f))
         {
-            log::warn!("--{flag} is an x264 setting; {} ignores it", encoder.name());
-        }
-        if a.contains_key("crf") {
-            if encoder == encoder::Backend::OpenH264 {
+            if flag == "crf" && encoder == encoder::Backend::OpenH264 {
                 log::warn!(
                     "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
                 );
-            } else {
-                log::warn!("--crf is an x264 setting; {} ignores it", encoder.name());
+            } else if !build_facts::reads(encoder.name(), flag, uncapped) {
+                log::warn!("{}", build_facts::flag_ignored(flag, encoder.name()));
             }
         }
     }
@@ -243,7 +249,7 @@ async fn serve(a: HashMap<String, String>) {
         preset: a
             .get("preset")
             .cloned()
-            .unwrap_or_else(|| "ultrafast".into()),
+            .unwrap_or_else(|| encoder::DEFAULT_PRESET.into()),
         // Four sliced threads: lower latency than one, and the encoders' slicing overhead
         // grows with thread count, so more threads only add CPU (x264, 2560x1600).
         threads: a
@@ -258,6 +264,11 @@ async fn serve(a: HashMap<String, String>) {
         // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
         max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
+        paintover_qp: a.contains_key("paintover-crf").then(|| {
+            range_max(a.get("paintover-crf"), 16.0)
+                .round()
+                .clamp(0.0, 51.0) as u8
+        }),
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
         min_kbps: range_max(a.get("min-kbps"), 2000.0) as u32,
@@ -319,11 +330,11 @@ async fn serve(a: HashMap<String, String>) {
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     let mut candidates = negotiate::candidates(&encoders, encoder);
-    // VOXL_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if std::env::var_os("VOXL_TEST_HOOKS").is_some() && encoder != encoder::Backend::OpenH264 {
+    // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE_H264 {
         let fallback = negotiate::Candidate {
             codec: encoder::Codec::H264,
-            backend: encoder::Backend::OpenH264,
+            backend: encoder::SOFTWARE_H264,
             hardware: false,
         };
         if !candidates.contains(&fallback) {
@@ -406,36 +417,30 @@ async fn serve(a: HashMap<String, String>) {
         .get("file-transfers")
         .cloned()
         .unwrap_or_else(|| "upload,download".into());
-    let root = a
-        .get("files-root")
-        .cloned()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .unwrap_or_else(|| "/".into());
-    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.into());
-    let files = std::sync::Arc::new(files::Files {
-        root,
-        // Uploading writes to the desktop, so a read-only viewer does not get it.
-        upload: !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
-        download: transfers.split(',').any(|t| t.trim() == "download"),
-        default_dir: a
-            .get("upload-dir")
-            .cloned()
-            .unwrap_or_else(|| "Downloads".into())
-            .trim_matches('/')
-            .to_string(),
-        max_upload_bytes: (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    // No --files-root, no file transfer: there is no default folder to share.
+    let files = files::Files::new(
+        a.get("files-root").map(String::as_str),
+        &transfers,
+        read_only,
+        a.get("upload-dir").map_or("Downloads", String::as_str),
+        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    )
+    .unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(2);
     });
-    log::info!("file transfer: {transfers} under {}", files.root.display());
+    let files = std::sync::Arc::new(files);
+    match &files.root {
+        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        None => log::info!("file transfer: off (share a folder with --files-root)"),
+    }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).
     #[cfg(target_os = "linux")]
-    let mic_sink = Some(
-        a.get("microphone-fifo")
-            .cloned()
-            .unwrap_or_else(|| "/tmp/voxl-mic.fifo".into()),
-    );
+    let mic_sink = Some(compat::mic_fifos(
+        a.get("microphone-fifo").map(String::as_str),
+    ));
     #[cfg(target_os = "macos")]
     let mic_sink = truthy(a.get("microphone-enabled"), false)
         .then(|| mac::mic::find_device(a.get("microphone-device").map(|s| s.as_str())))
@@ -457,10 +462,7 @@ async fn serve(a: HashMap<String, String>) {
         if read_only {
             extra.insert("readOnly".into(), true.into());
         }
-        extra.insert(
-            "files".into(),
-            serde_json::json!({"upload": files.upload, "download": files.download, "dir": files.default_dir}),
-        );
+        extra.insert("files".into(), files.hello());
         if resize_on {
             extra.insert(
                 "resize".into(),
@@ -468,7 +470,7 @@ async fn serve(a: HashMap<String, String>) {
             );
         }
     }
-    // --favicon: the tab's icon (default: voxl's own).
+    // --favicon: the tab's icon (default: starfold's own).
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
@@ -490,16 +492,13 @@ async fn serve(a: HashMap<String, String>) {
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
         ),
         // --title: the browser tab's title.
-        index: server::index_html(
-            a.get("title")
-                .map_or("Voxl Computer Stream", |t| t.as_str()),
-        ),
+        index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
         favicon_type,
         encoders,
         framed,
     };
-    // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
+    // --allowed-hosts and --allowed-origins: the host names and other sites starfold answers
     // besides IP addresses, localhost and its own page (see access.rs).
     let access = std::sync::Arc::new(access::Access::new(
         a.get("allowed-hosts").map(|s| s.as_str()),
@@ -554,7 +553,7 @@ async fn serve(a: HashMap<String, String>) {
     };
     match &login {
         Some((l, true)) => log::info!(
-            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or VOXL_PASSWORD)",
+            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",
             l.password()
         ),
         Some((_, false)) => log::info!(

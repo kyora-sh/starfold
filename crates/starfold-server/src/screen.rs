@@ -4,7 +4,7 @@
 //! Xvfb only offers the mode it started with, and that size is its maximum, so start
 //! it at the largest size to allow. Each new size gets a mode of its own. RandR
 //! modes belong to the client that created them and the server reverts when it
-//! disconnects, so this keeps its connection for voxl's lifetime. Xvfb keeps the
+//! disconnects, so this keeps its connection for starfold's lifetime. Xvfb keeps the
 //! same `-shmem` framebuffer (and stride) across sizes; the screen is its top-left.
 
 use x11rb::connection::Connection;
@@ -121,7 +121,7 @@ impl Screen {
         let mode = if (w, h) == self.max {
             self.initial_mode
         } else {
-            let name = format!("voxl-{w}x{h}");
+            let name = format!("starfold-{w}x{h}");
             let info = randr::ModeInfo {
                 id: 0,
                 width: w as u16,

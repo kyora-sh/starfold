@@ -1,5 +1,8 @@
 //! H.264: SPS and PPS packed before every IDR (when the driver takes packed headers),
 //! slice headers from the driver. POC type 2, so no reordering and no POC in the slice.
+//! Mesa's VA frontend also gets a packed slice header on every picture: it takes the
+//! slice's nal_ref_idc and nal_unit_type from that header alone, and writes packed
+//! headers out only next to one.
 
 use super::bits::{nal, Bits};
 use super::ffi::{self, VaId};
@@ -54,6 +57,7 @@ pub struct H264 {
     fps: u32,
     color: ColorInfo,
     packed: bool,
+    packed_slice: bool,
     pps_qp: u8,
     units: ParamSets,
 }
@@ -68,7 +72,8 @@ impl H264 {
             level: 0,
             fps: cfg.fps.max(1),
             color: ColorInfo::SRGB_BT601_LIMITED,
-            packed: choice.packed == Some(BOTH),
+            packed: choice.packed.is_some_and(|p| p & BOTH == BOTH),
+            packed_slice: choice.packed == Some(BOTH | ffi::PACKED_SLICE),
             pps_qp: rc.qp,
             units: ParamSets::default(),
         };
@@ -95,9 +100,48 @@ impl H264 {
         )
     }
 
-    /// SPS and PPS packed together or not at all.
-    pub fn packed(driver: Option<u32>) -> Option<u32> {
-        driver.map(|p| if p & BOTH == BOTH { BOTH } else { 0 })
+    /// SPS and PPS packed together or not at all, and slice headers too where `slices`
+    /// asks for them and the driver takes them.
+    pub fn packed(driver: Option<u32>, slices: bool) -> Option<u32> {
+        driver.map(|p| match p & BOTH == BOTH {
+            false => 0,
+            true if slices && p & ffi::PACKED_SLICE != 0 => BOTH | ffi::PACKED_SLICE,
+            true => BOTH,
+        })
+    }
+
+    /// Whether a driver needs a packed slice header to code a slice: Mesa's VA frontend,
+    /// whose vendor string starts this way, takes nal_ref_idc and nal_unit_type from it alone.
+    pub fn wants_slice_headers(vendor: &str) -> bool {
+        vendor.starts_with("Mesa Gallium driver")
+    }
+
+    /// The slice header the driver is given for `p` (its own takes the same values from the
+    /// parameter buffers).
+    pub fn slice_header(&self, p: &Picture, qp_delta: i32) -> Vec<u8> {
+        let mut b = Bits::new();
+        b.ue(0);
+        b.ue(if p.idr { 7 } else { 5 });
+        b.ue(0);
+        b.put(LOG2_MAX_FRAME_NUM, p.n % (1 << LOG2_MAX_FRAME_NUM));
+        if p.idr {
+            b.ue(p.idrs % 65536);
+            b.flag(false);
+            b.flag(false);
+        } else {
+            b.flag(false);
+            b.flag(false);
+            b.flag(false);
+        }
+        if self.cabac() && !p.idr {
+            b.ue(0);
+        }
+        b.se(qp_delta);
+        b.ue(0);
+        b.se(0);
+        b.se(0);
+        b.trailing();
+        nal(&[if p.idr { 0x65 } else { 0x41 }], b.bytes())
     }
 
     fn high(&self) -> bool {
@@ -275,6 +319,17 @@ impl Params for H264 {
             out.extend(Buffer::packed(ffi::PACKED_TYPE_SEQUENCE, self.sps()));
             out.extend(Buffer::packed(ffi::PACKED_TYPE_PICTURE, self.pps()));
         }
+        let qp_delta = if p.rc.mode == RcMode::Cqp {
+            p.rc.qp as i32 - self.pps_qp as i32
+        } else {
+            0
+        };
+        if self.packed_slice {
+            out.extend(Buffer::packed(
+                ffi::PACKED_TYPE_SLICE,
+                self.slice_header(p, qp_delta),
+            ));
+        }
         let sl = ffi::param(|sl: &mut ffi::VAEncSliceParameterBufferH264| {
             sl.num_macroblocks = self.mbs.0 * self.mbs.1;
             sl.macroblock_info = ffi::INVALID_ID;
@@ -286,9 +341,7 @@ impl Params for H264 {
             if let Some(r) = p.reference {
                 sl.ref_pic_list0[0] = Self::picture(r, p.n - 1);
             }
-            if p.rc.mode == RcMode::Cqp {
-                sl.slice_qp_delta = (p.rc.qp as i32 - self.pps_qp as i32) as i8;
-            }
+            sl.slice_qp_delta = qp_delta as i8;
         });
         out.push(Buffer::new(ffi::BUF_SLICE, sl));
         out

@@ -1,7 +1,7 @@
 //! Dynamic resolution on macOS: switches the captured display to the mode that best
 //! fits the viewer's window. Displays only offer fixed modes, so the desktop takes
 //! the largest one that fits rather than the exact size. The change is made for this
-//! process only: macOS restores the user's mode when voxl exits, even on a crash.
+//! process only: macOS restores the user's mode when starfold exits, even on a crash.
 
 use super::ffi::*;
 use parking_lot::Mutex;

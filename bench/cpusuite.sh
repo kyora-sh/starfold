@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cpusuite.sh : server CPU (cores) with one native client connected, per workload.
 # Counts the X server plus the streamer, since KasmVNC is both in one process (Xvnc):
-#   voxl = voxl + Xvfb on :2, kasm = Xvnc on :5, selkies = selkies + Xvfb on :2.
+#   starfold = starfold + Xvfb on :2, kasm = Xvnc on :5, selkies = selkies + Xvfb on :2.
 # Start the servers as for suite.sh; no picom. Appends JSON lines to $OUT.
 cd "$(dirname "$(readlink -f "$0")")"
 OUT=${OUT:-/tmp/cpusuite.jsonl}
@@ -13,9 +13,9 @@ cores() { # pids... : cores used over 10 s
   for p in "$@"; do b=$((b + $(awk '{print $14+$15}' /proc/$p/stat))); done
   python3 -c "print(f'{($b-$a)/100/10:.2f}')"
 }
-for srv in ${SERVERS:-voxl kasm}; do
+for srv in ${SERVERS:-starfold kasm}; do
   case $srv in
-    voxl) BD=:2; pids="$(pid_of '--port=6902') $(pid_of 'Xvfb :2 ')"; cli="nclient.py voxl localhost:6902" ;;
+    starfold) BD=:2; pids="$(pid_of '--port=6902') $(pid_of 'Xvfb :2 ')"; cli="nclient.py starfold localhost:6902" ;;
     selkies) BD=:2; pids="$(pid_of '--port=6912') $(pid_of 'Xvfb :2 ')"; cli="nclient.py selkies localhost:6912" ;;
     kasm) BD=${KASM_DISPLAY:-:5}; pids="$(pid_of "Xvnc $BD ")"; cli="kclient.py localhost:6922" ;;
   esac

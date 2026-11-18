@@ -239,7 +239,7 @@ fn copy_rects(
 /// Takes desktop images until `stop`; reopens duplication when Windows takes it away
 /// (desktop switch, UAC prompt, mode change).
 fn capture_thread(mut d: Dup, shared: Arc<Mutex<Shared>>, wake: Arc<Wake>, stop: Arc<AtomicBool>) {
-    let debug = std::env::var("VOXL_DEBUG_DAMAGE").is_ok();
+    let debug = crate::compat::is_set("STARFOLD_DEBUG_DAMAGE");
     let full = vec![(0, 0, d.width, d.height)];
     let mut first = true;
     while !stop.load(Ordering::Relaxed) {

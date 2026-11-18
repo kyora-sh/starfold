@@ -22,6 +22,10 @@ concurrency:
 
 env:
   RUST_TOOLCHAIN: '1.93.0'
+  # x264 is pinned per platform: Ubuntu 24.04's package (upstream 31e19f92, r3108) on Linux,
+  # vcpkg's port at VCPKG_BASELINE and Homebrew's formula (upstream b35605ac, r3222) elsewhere.
+  LIBX264_DEB: 'libx264-dev=2:0.164.3108+git31e19f9-1'
+  BREW_X264: 'x264 r3222'
 
 jobs:
   web:
@@ -64,17 +68,30 @@ jobs:
       - name: Test
         run: uv run --locked pytest
 
+  upstream-sync:
+    name: Upstream sync script
+    runs-on: kyora-8x16
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/scripts/upstream-sync-test.sh
+
   rust:
     name: Rust (rustfmt, clippy, test)
     runs-on: kyora-8x16
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # libyuv, Opus, PulseAudio and xcb for linking, nasm for OpenH264, esbuild for build.rs.
+      - name: x264 source hashes
+        working-directory: third_party/x264
+        run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
+      # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for x264's bindings,
+      # esbuild for build.rs.
       - name: Native libraries
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -95,17 +112,18 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  x264:
-    name: Rust with x264 (clippy, test)
+  openh264:
+    name: Rust with OpenH264 (clippy, test)
     runs-on: kyora-8x16
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # As above, plus x264 and libclang for its bindings.
+      # As above, plus nasm for OpenH264.
       - name: Native libraries
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx264-dev libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -116,12 +134,114 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-openh264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-openh264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      # Both encoders, then the build without x264 (BSD-licensed dependencies only).
       - name: Clippy
-        run: cargo clippy --features x264 --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --features openh264 --all-targets --locked -- -D warnings
+          cargo clippy --no-default-features --features openh264 --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --features x264 --locked
+        run: |
+          cargo test --features openh264 --locked
+          cargo test --no-default-features --features openh264 --locked
+
+  bench-arms:
+    name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The Rust job's libraries, plus the arms' build tools, x265 as bench/arms/libs.sh takes it
+      # (Ubuntu's package) and Xvfb for the startup check.
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm pkg-config libx265-dev xvfb; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - id: svt-av1
+        uses: actions/cache@v4
+        with:
+          path: ~/arm-libs
+          key: arm-libs-svt-av1-${{ runner.os }}-${{ hashFiles('bench/arms/libs.sh') }}
+      # libs.sh's pinned release, checked against its tag's commit.
+      - name: SVT-AV1
+        if: steps.svt-av1.outputs.cache-hit != 'true'
+        run: bash bench/arms/libs.sh svt-av1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-bench-arms-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-bench-arms-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo clippy --features svt-av1,x265 --all-targets --locked -- -D warnings
+      - name: Test
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo test --features svt-av1,x265 --locked
+      # Each arm with a preset of its own must open its encoder and reach "listening on".
+      - name: Startup on Xvfb
+        run: |
+          source <(bash bench/arms/libs.sh --env)
+          cargo build --features svt-av1,x265 --locked
+          BENCH_DISPLAY=:99 bench/env/xvfb.sh >/dev/null 2>&1 &
+          for _ in $(seq 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done
+          for arm in svt-av1:12 x265:ultrafast; do
+            enc=${arm%%:*} preset=${arm#*:} log=$RUNNER_TEMP/$enc.log
+            DISPLAY=:99 RUST_LOG=info target/debug/starfold --encoder="$enc" --preset="$preset" --port=6901 --enable-basic-auth=false --audio-enabled=false > "$log" 2>&1 &
+            pid=$!
+            up() { grep -q 'listening on' "$log" && grep -q "offering .* from $enc:" "$log"; }
+            for _ in $(seq 60); do up && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+            sleep 3
+            grep -v '^Svt' "$log" | cut -c1-240 || true
+            ok=1
+            up && kill -0 $pid 2>/dev/null || ok=0
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+            [ $ok = 1 ] || { echo "::error::--encoder=$enc --preset=$preset did not start"; exit 1; }
+          done
+
+  musl:
+    name: Linux musl (clippy)
+    runs-on: kyora-8x16
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # Checked, not linked: musl-gcc for the C dependencies, the host g++ for OpenH264's C++,
+      # x264's headers and libclang for its bindings.
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-musl-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        env:
+          PKG_CONFIG_ALLOW_CROSS: '1'
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CXX_x86_64_unknown_linux_musl: g++
+        run: cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --all-targets --locked -- -D warnings
 
   windows:
     name: Windows (clippy, cross-compiled on Linux)
@@ -137,23 +257,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: MinGW, NASM and vcpkg's build tools
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-x64-mingw-static-${{ env.VCPKG_BASELINE }}-libyuv-opus-v1
+          key: vcpkg-x64-mingw-static-${{ env.VCPKG_BASELINE }}-x264-libyuv-opus-v1
       - uses: actions/cache@v4
         with:
           path: .vcpkg-downloads
           key: vcpkg-downloads-${{ env.VCPKG_BASELINE }}-v1
-      - name: libyuv and Opus (vcpkg)
+      - name: x264, libyuv and Opus (vcpkg)
         run: |
           mkdir -p .vcpkg-cache .vcpkg-downloads
           retry() { for i in 1 2 3; do "$@" && return; [ "$i" = 3 ] || sleep $((i * 30)); done; return 1; }
           retry git clone --quiet --depth 1 --branch "$VCPKG_BASELINE" https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
           retry "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          retry "$VCPKG_ROOT/vcpkg" install libyuv opus --triplet "$VCPKGRS_TRIPLET"
+          retry "$VCPKG_ROOT/vcpkg" install x264 libyuv opus --triplet "$VCPKGRS_TRIPLET"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -195,8 +316,10 @@ jobs:
             echo "HOMEBREW_REPOSITORY=$("$brew" --repository)"
           } >> "$GITHUB_ENV"
           printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
-      # Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
-      - run: brew install opus pkgconf esbuild
+      # x264 and Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
+      - run: |
+          brew install x264 opus pkgconf esbuild
+          [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
       - uses: actions/cache@v4
         with:
           path: |

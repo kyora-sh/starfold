@@ -2,6 +2,7 @@ use super::*;
 use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo};
 use crate::input::InputEvent;
 use crate::negotiate::Implementation;
+use std::collections::HashMap;
 use std::sync::{Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -82,7 +83,14 @@ struct Fake {
     delay: Option<Duration>,
     /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
     slow_keys: Option<(usize, Duration)>,
+    /// Runs at its cap whatever the picture.
+    holds: bool,
+    /// Which open this encoder is (0 = the sample's), and every encode's (open, rate, keyframe).
+    id: usize,
+    encodes: Option<Encodes>,
 }
+
+type Encodes = Arc<StdMutex<Vec<(usize, u32, bool)>>>;
 
 type Refines = Arc<StdMutex<Vec<(Option<Refine>, u32)>>>;
 
@@ -126,6 +134,11 @@ impl VideoEncoder for Fake {
         }
         if let Some(r) = &self.refines {
             r.lock().unwrap().push((opts.refine, self.kbps));
+        }
+        if let Some(e) = &self.encodes {
+            e.lock()
+                .unwrap()
+                .push((self.id, self.kbps, opts.force_keyframe));
         }
         if let (Some(step), Some(r)) = (self.step_bytes, opts.refine) {
             if r.max_bytes.is_some_and(|m| m < step) {
@@ -191,6 +204,10 @@ impl VideoEncoder for Fake {
                 .step_bytes
                 .is_none_or(|b| r.max_bytes.is_none_or(|m| m >= b))
     }
+
+    fn holds_cap(&self) -> bool {
+        self.holds
+    }
 }
 
 #[derive(Default)]
@@ -215,6 +232,8 @@ struct Opts {
     h264_keys: Option<Arc<(AtomicUsize, AtomicUsize)>>,
     /// Hardware H.264 cohorts fail to open (the offer's sample encode still works).
     h264_hw_fails: bool,
+    /// Hardware H.264 opens nothing at this size, the offer's sample encode included.
+    h264_hw_unsized: bool,
     /// Hardware H.264 cohorts' encoders fail from their 3rd picture on, and so do
     /// reopened ones.
     h264_hw_breaks: bool,
@@ -233,6 +252,14 @@ struct Opts {
     h264_hw_delay: Option<Duration>,
     /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
     h264_hw_slow_keys: Option<(usize, Duration)>,
+    /// Hardware H.264 encoders hold their cap.
+    h264_hw_holds: bool,
+    /// Which hardware H.264 opens (0 = the sample's) hold their cap, over `h264_hw_holds`.
+    h264_hw_holding: Option<fn(usize) -> bool>,
+    /// The hardware H.264 encoder of this open fails this one picture.
+    h264_hw_fail_once: Option<(usize, usize)>,
+    /// Every hardware H.264 encode's (open, rate, keyframe).
+    h264_hw_encodes: Option<Encodes>,
 }
 
 fn fakes(o: Opts) -> Open {
@@ -242,6 +269,9 @@ fn fakes(o: Opts) -> Open {
     Arc::new(move |c: &EncoderConfig| {
         if c.codec == Codec::H264 && c.backend == Backend::VideoToolbox {
             let earlier = hw_opened.fetch_add(1, Ordering::Relaxed);
+            if o.h264_hw_unsized {
+                return Err(EncodeError("MFX_ERR_UNSUPPORTED at this size".into()));
+            }
             if o.h264_hw_fails && earlier > 0 {
                 return Err(EncodeError("no session".into()));
             }
@@ -256,7 +286,9 @@ fn fakes(o: Opts) -> Open {
                 } else {
                     1
                 }),
-                fail_at: None,
+                fail_at: o
+                    .h264_hw_fail_once
+                    .and_then(|(open, at)| (open == earlier).then_some(at)),
                 gate: None,
                 keys: None,
                 kbps: 0,
@@ -268,6 +300,9 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
+                holds: o.h264_hw_holding.map_or(o.h264_hw_holds, |f| f(earlier)),
+                id: earlier,
+                encodes: o.h264_hw_encodes.clone(),
             }) as Box<dyn VideoEncoder>);
         }
         let hevc = c.codec == Codec::Hevc;
@@ -314,6 +349,9 @@ fn fakes(o: Opts) -> Open {
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
             delay: None,
             slow_keys: None,
+            holds: false,
+            id: 0,
+            encodes: None,
         }) as Box<dyn VideoEncoder>)
     })
 }
@@ -329,6 +367,7 @@ fn config() -> VideoConfig {
         crf: 24.0,
         max_kbps: 30000,
         paintover_crf: 16.0,
+        paintover_qp: None,
         paintover_burst: 3,
         paintover_delay_ms: 150,
         min_kbps: 2000,
@@ -749,6 +788,240 @@ fn an_encoder_that_fails_to_open_falls_back() {
     assert_eq!(route_codec(&d), Some(Codec::H264));
 }
 
+fn offered_codecs(hub: &Hub) -> Vec<Codec> {
+    hub.offers.lock().iter().map(|o| o.codec).collect()
+}
+
+fn hellos(m: &[Msg]) -> Vec<&serde_json::Value> {
+    m.iter()
+        .filter_map(|m| match m {
+            Msg::Json(j) if j["t"] == "hello" => Some(j),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Makes `hub` read the turned-off backends from the returned list.
+fn fake_off(hub: &Hub) -> Arc<StdMutex<Vec<(Backend, String)>>> {
+    let off = Arc::new(StdMutex::new(Vec::new()));
+    let read = off.clone();
+    *hub.off.lock() = Arc::new(move || read.lock().unwrap().clone());
+    off
+}
+
+const GIVEN_UP: &str = "videotoolbox given up: a second helper failed";
+
+/// A candidate whose encoder failed to open at this size is out of use there, so a later
+/// hello does not offer it.
+#[test]
+fn a_later_hello_does_not_offer_a_failed_candidate() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_fails: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(offered_codecs(&hub), vec![Codec::Hevc, Codec::H264]);
+    let (c, _rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert_eq!(offered_codecs(&hub), vec![Codec::H264]);
+}
+
+/// A failed cohort changes only what later hellos offer: the viewers already connected
+/// keep their stream and are sent no new hello.
+#[test]
+fn a_cohort_that_fails_sends_connected_viewers_no_new_hello() {
+    let hub = Hub::new();
+    let mut eng = engine(
+        &hub,
+        &[HEVC, H264],
+        Opts {
+            hevc_fails: true,
+            ..Default::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    let (d, mut rd) = client(&hub);
+    join_v2(&hub, &d, &[Codec::H264]);
+    push(&mut eng);
+    drain(&mut rd);
+    let gen = hub.offer_gen.load(Ordering::Relaxed);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert!(hellos(&drain(&mut rx)).is_empty());
+    assert!(hellos(&drain(&mut rd)).is_empty());
+    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen);
+    assert_eq!(route_codec(&d), Some(Codec::H264));
+}
+
+/// A backend turned off before the engine starts is not offered, and /stats says why.
+#[test]
+fn a_backend_that_is_off_is_not_offered() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    let _eng = engine(&hub, &[HEVC, H264], Opts::default());
+    assert_eq!(offered_codecs(&hub), vec![Codec::H264]);
+    let enc = hub.encoder.lock();
+    let failed = enc["failed"].as_array().cloned().unwrap_or_default();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["backend"], "videotoolbox");
+    assert_eq!(
+        failed[0]["reason"],
+        format!("not offered at {W}x{H}: {GIVEN_UP}")
+    );
+}
+
+/// What a hello built now offers.
+fn hello_offers(hub: &Hub) -> serde_json::Value {
+    let h: serde_json::Value = serde_json::from_str(&hub.hello()).unwrap();
+    h["videoOffers"].clone()
+}
+
+/// The offers of `cands` at this size, as a hello carries them (it does not name the
+/// backend, so they are told apart by the offer itself).
+fn offers_of(hub: &Hub, cands: &[Candidate]) -> serde_json::Value {
+    let all = hub.offers.lock().clone();
+    let v: Vec<_> = cands
+        .iter()
+        .filter_map(|c| all.iter().find(|o| o.cand == *c))
+        .collect();
+    serde_json::json!(v)
+}
+
+/// A backend turned off while a viewer streams from it: the next hello built leaves it out
+/// at once, the plan moves the viewer to the next codec, and no viewer is sent a new
+/// hello for it (connected viewers keep the offers they had).
+#[test]
+fn a_backend_turned_off_is_left_out_of_the_next_hello() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let mut eng = engine(&hub, &[HEVC, H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_v2(&hub, &c, &[Codec::Hevc, Codec::H264]);
+    push(&mut eng);
+    assert_eq!(route_codec(&c), Some(Codec::Hevc));
+    drain(&mut rx);
+    let gen = hub.offer_gen.load(Ordering::Relaxed);
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+    hub.replan();
+    push(&mut eng);
+    assert!(hellos(&drain(&mut rx)).is_empty(), "no new hello");
+    assert_eq!(hub.offer_gen.load(Ordering::Relaxed), gen);
+    assert_eq!(eng.failed, vec![HEVC]);
+    assert!(eng.why.contains(&(HEVC, GIVEN_UP.to_string())));
+    assert_eq!(route_codec(&c), Some(Codec::H264));
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+}
+
+/// The H.264 stream's own backend turned off: a hello built before the engine routes again
+/// already offers the H.264 encoder it falls back to, never the one that is off.
+#[test]
+fn a_hello_never_offers_an_h264_encoder_that_is_off() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let mut eng = engine(&hub, &[H264_HW, H264], Opts::default());
+    assert_eq!(eng.h264, H264_HW);
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264_HW, H264]));
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+    hub.replan();
+    push(&mut eng);
+    assert_eq!(eng.h264, H264);
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+}
+
+/// A backend that goes off while the engine is being built (one of its own sample encodes
+/// gives it up) is left out of every hello from the start.
+#[test]
+fn a_backend_that_goes_off_while_the_engine_starts_is_not_offered() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let base = fakes(Opts::default());
+    let flip = off.clone();
+    let open: Open = Arc::new(move |c: &EncoderConfig| {
+        if c.codec == Codec::H264 && c.backend == Backend::VideoToolbox {
+            flip.lock()
+                .unwrap()
+                .push((Backend::VideoToolbox, GIVEN_UP.into()));
+        }
+        base(c)
+    });
+    let mut eng = Engine::new(config(), hub.clone(), W, H, &[HEVC, H264_HW, H264], open).unwrap();
+    assert_eq!(hello_offers(&hub), offers_of(&hub, &[H264]));
+    hub.replan();
+    push(&mut eng);
+    assert_eq!(eng.h264, H264);
+    assert!(eng.failed.contains(&HEVC) && eng.failed.contains(&H264_HW));
+}
+
+/// A hello's offers are the ones of the generation it carries: after each new size, a
+/// hello names that size's generation and offers coded at that size, with the backends
+/// that are off left out.
+#[test]
+fn a_hellos_offers_match_its_generation() {
+    let hub = Hub::new();
+    let off = fake_off(&hub);
+    let sized = |h: &serde_json::Value| -> Vec<(u64, u64)> {
+        h["videoOffers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|o| o["stripes"].as_array().cloned().unwrap_or_default())
+            .map(|s| {
+                let c = &s["config"];
+                (
+                    c["codedWidth"].as_u64().unwrap(),
+                    c["codedHeight"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+    let _a = engine(&hub, &[HEVC, H264], Opts::default());
+    let (g1, h1) = hub.hello_gen();
+    let h1 = parse(&h1);
+    assert_eq!(h1["offer"], g1);
+    assert!(sized(&h1).iter().all(|&(w, _)| w >= W as u64));
+    assert_eq!(h1["videoOffers"], offers_of(&hub, &[HEVC, H264]));
+    off.lock()
+        .unwrap()
+        .push((Backend::VideoToolbox, GIVEN_UP.into()));
+    let (w2, h2) = (320, 240);
+    let _b = Engine::new(
+        config(),
+        hub.clone(),
+        w2,
+        h2,
+        &[HEVC, H264],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    let (g2, hello2) = hub.hello_gen();
+    let hello2 = parse(&hello2);
+    assert_eq!((g2, hello2["offer"].as_u64()), (g1 + 1, Some(g1 + 1)));
+    assert_eq!(hello2["videoOffers"], offers_of(&hub, &[H264]));
+    let s2 = sized(&hello2);
+    assert!(!s2.is_empty());
+    assert!(
+        s2.iter().all(|&(w, h)| w < W as u64 && h < H as u64),
+        "offers coded at {w2}x{h2}: {s2:?}"
+    );
+}
+
 #[test]
 fn errors_and_timeouts_walk_down_to_no_codec() {
     let hub = Hub::new();
@@ -1012,6 +1285,13 @@ fn an_encoder_that_keeps_failing_falls_back() {
     assert_eq!(route_codec(&c), Some(Codec::H264));
     assert!(eng.failed.contains(&HEVC));
     assert!(eng.cohorts.iter().all(|k| k.shared.cand != HEVC));
+    let enc = hub.encoder.lock();
+    let failed = &enc["failed"];
+    assert_eq!(failed[0]["codec"], "hevc", "{failed}");
+    assert_eq!(
+        failed[0]["reason"], "keeps failing to encode: session lost",
+        "/stats says why the encoder was left: {failed}"
+    );
 }
 
 /// `c`'s messages, with every frame in them acked.
@@ -1164,6 +1444,72 @@ fn a_viewer_that_cant_decode_hardware_h264_gets_openh264() {
     assert!(!vl.is_empty());
 }
 
+/// A backend that gave up for good is not offered at the next size (a rebuild after a
+/// resize); /stats still says why it's gone.
+#[test]
+fn stats_keep_the_reason_of_an_encoder_not_offered() {
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_unsized: true,
+        ..Default::default()
+    };
+    let eng = Engine::new(config(), hub.clone(), W, H, &[H264_HW, H264], fakes(o)).unwrap();
+    assert_eq!(eng.h264, H264);
+    let enc = hub.encoder.lock();
+    let failed = enc["failed"].as_array().cloned().unwrap_or_default();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["backend"], "videotoolbox");
+    assert_eq!(
+        failed[0]["reason"],
+        "not offered at 640x480: MFX_ERR_UNSUPPORTED at this size"
+    );
+}
+
+#[test]
+fn a_pinned_hardware_encoder_that_cannot_start_stops_the_stream_with_the_reason() {
+    let cands = [H264_HW, H264];
+    let pinned = || VideoConfig {
+        selection: encoder::Selection::Pinned(Backend::VideoToolbox),
+        ..config()
+    };
+    let cases = [
+        (
+            Opts {
+                h264_hw_fails: true,
+                ..Default::default()
+            },
+            "failed to open: no session",
+        ),
+        (
+            Opts {
+                h264_hw_unsized: true,
+                ..Default::default()
+            },
+            "not offered at 640x480: MFX_ERR_UNSUPPORTED at this size",
+        ),
+    ];
+    for (o, said) in cases {
+        let hub = Hub::new();
+        let eng = Engine::new(pinned(), hub.clone(), W, H, &cands, fakes(o)).unwrap();
+        assert_eq!(eng.h264, H264, "the engine itself falls back");
+        let e = eng.require_pin(&cands).unwrap_err();
+        assert!(
+            e.starts_with("--encoder videotoolbox: H.264 from videotoolbox did not start")
+                && e.contains(said),
+            "{e}"
+        );
+    }
+    let hub = Hub::new();
+    let eng = Engine::new(pinned(), hub.clone(), W, H, &cands, fakes(Opts::default())).unwrap();
+    assert_eq!(eng.require_pin(&cands), Ok(()), "a pin that starts");
+    let o = Opts {
+        h264_hw_fails: true,
+        ..Default::default()
+    };
+    let eng = Engine::new(config(), Hub::new(), W, H, &cands, fakes(o)).unwrap();
+    assert_eq!(eng.require_pin(&cands), Ok(()), "auto may fall back");
+}
+
 #[test]
 fn a_hardware_h264_encoder_that_fails_to_open_falls_back() {
     let hub = Hub::new();
@@ -1182,6 +1528,15 @@ fn a_hardware_h264_encoder_that_fails_to_open_falls_back() {
     push(&mut eng);
     assert!(!videos(&drain(&mut rl)).is_empty());
     assert_eq!(hub.encoder.lock()["chosen"][0]["backend"], "openh264");
+    let enc = hub.encoder.lock();
+    let failed = &enc["failed"];
+    assert_eq!(failed[0]["backend"], "videotoolbox", "{failed}");
+    assert!(
+        failed[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("failed to open: ")),
+        "{failed}"
+    );
 }
 
 #[test]
@@ -2083,7 +2438,7 @@ fn hevc_nal_types(d: &[u8]) -> Vec<u8> {
 fn videotoolbox_hevc_negotiated() {
     use crate::encoder::caps::{host_providers, Registry, PROBE_TIMEOUT};
     let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
-    let cands = negotiate::candidates(&reg, Backend::OpenH264);
+    let cands = negotiate::candidates(&reg, encoder::SOFTWARE_H264);
     if !cands.iter().any(|c| c.codec == Codec::Hevc) {
         assert!(
             std::env::var_os("STARFOLD_EXPECT_HEVC").is_none(),
@@ -2410,6 +2765,11 @@ fn what_an_uncapped_stream_spent_is_no_debt_under_a_cap() {
 }
 
 fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
+    refines_through_holding(cand, false)
+}
+
+/// Every encode's refine option and rate, on encoders that do or don't `hold` their cap.
+fn refines_through_holding(cand: Candidate, holds: bool) -> Vec<(Option<Refine>, u32)> {
     let seen = Refines::default();
     let hub = Hub::new();
     let cands = [cand];
@@ -2418,6 +2778,7 @@ fn refines_through(cand: Candidate) -> Vec<(Option<Refine>, u32)> {
         &cands,
         Opts {
             refines: Some(seen.clone()),
+            h264_hw_holds: holds,
             ..Default::default()
         },
     );
@@ -2447,25 +2808,102 @@ fn a_pass_reaches_openh264_with_its_budget_and_no_rate_change() {
     );
     assert_ne!(
         kbps,
-        stripe_share(START_KBPS as u32, 1) * 2,
+        stripe_share(START_KBPS as u32, 1, false) * 2,
         "paint-over rate applied"
     );
+}
+
+/// A capped x264 stream that may run at CRF 0 keeps its plain paint-over; every other one
+/// refines by QP as its backend does.
+#[test]
+fn qp_refinement_needs_a_crf_above_0_on_a_capped_x264_stream() {
+    let at = |crf: f32, paintover_crf: f32, max_kbps: u32| VideoConfig {
+        crf,
+        paintover_crf,
+        max_kbps,
+        ..config()
+    };
+    assert!(qp_refinement(&at(0.0, 0.0, 30000), Backend::OpenH264));
+    #[cfg(feature = "x264")]
+    {
+        assert!(qp_refinement(&config(), Backend::X264));
+        assert!(!qp_refinement(&at(24.0, 0.0, 30000), Backend::X264));
+        assert!(!qp_refinement(&at(0.0, 16.0, 30000), Backend::X264));
+        assert!(qp_refinement(&at(24.0, 0.0, 0), Backend::X264));
+    }
+}
+
+#[test]
+fn the_ladder_ends_at_its_finest_rung() {
+    assert_eq!(rungs(12), REFINE_RUNGS);
+    assert_eq!(rungs(0), [8, 4, 0]);
+    assert_eq!(rungs(48), [51, 51, 48]);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::OpenH264), 12, "x264's setting");
+    assert_eq!(finest_rung(&config(), Backend::OpenH264), 12);
+}
+
+/// An explicit --paintover-crf on x264 is where its passes end, and what the encoder is
+/// asked whether it can still sharpen to.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_refines_down_to_an_explicit_paintover_crf() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(finest_rung(&config(), Backend::X264), 12);
+    let cfg = VideoConfig {
+        paintover_qp: Some(0),
+        ..config()
+    };
+    assert_eq!(finest_rung(&cfg, Backend::X264), 0);
+    let mut b = Burst {
+        finest: finest_rung(&cfg, x264.backend),
+        ..Burst::new(3, NO_DELAY, Instant::now())
+    };
+    let now = Instant::now();
+    b.moved(now);
+    assert_eq!(passes(&mut b, now), [Some(8), Some(4), Some(0)]);
+}
+
+#[cfg(feature = "x264")]
+#[test]
+fn x264_takes_the_ladder_and_its_budget() {
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    assert_eq!(refines_through(x264), refines_through(H264));
+    assert!(refines_through(x264)
+        .iter()
+        .any(|(r, _)| r.is_some_and(|r| r.max_bytes.is_some())));
 }
 
 /// A legacy viewer on OpenH264 whose encoder has `left` refining passes' worth to sharpen:
 /// the QP of every pass over `turns` still turns, each acked.
 fn tail(left: usize, turns: usize, motion_at: Option<usize>) -> Vec<u8> {
+    tail_on(config(), H264, left, turns, motion_at)
+}
+
+fn tail_on(
+    cfg: VideoConfig,
+    cand: Candidate,
+    left: usize,
+    turns: usize,
+    motion_at: Option<usize>,
+) -> Vec<u8> {
     let seen = Refines::default();
     let hub = Hub::new();
-    let mut eng = engine(
-        &hub,
-        &[H264],
-        Opts {
-            refines: Some(seen.clone()),
-            h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
-            ..Default::default()
-        },
-    );
+    let opts = Opts {
+        refines: Some(seen.clone()),
+        h264_refinable: Some(Arc::new(AtomicUsize::new(left))),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[cand], fakes(opts)).unwrap();
     let (c, mut rx) = client(&hub);
     join_legacy(&hub, &c);
     push(&mut eng);
@@ -2494,6 +2932,25 @@ fn a_still_picture_is_refined_until_the_encoder_has_nothing_left() {
 #[test]
 fn new_damage_cancels_the_tail() {
     assert_eq!(tail(100, 8, Some(5)), [20, 16, 12, 12, 20, 16]);
+}
+
+/// An x264 stream refining down to an explicit --paintover-crf below 12 under CAVLC: its passes
+/// never count as settled, so the encoder keeps offering one, and the tail limit ends them.
+#[cfg(feature = "x264")]
+#[test]
+fn an_unsettled_x264_tail_ends_at_the_limit() {
+    let cfg = VideoConfig {
+        paintover_qp: Some(8),
+        ..config()
+    };
+    let x264 = Candidate {
+        backend: Backend::X264,
+        ..H264
+    };
+    let qps = tail_on(cfg, x264, usize::MAX, 200, None);
+    assert_eq!(qps.len(), 3 + REFINE_TAIL_MAX as usize);
+    assert_eq!(qps[..3], [16, 12, 8]);
+    assert!(qps[3..].iter().all(|&q| q == 8));
 }
 
 #[test]
@@ -3041,11 +3498,101 @@ fn a_pass_stays_a_rate_change_for_other_encoders() {
     let seen = refines_through(H264_HW);
     let (refine, kbps) = seen.last().copied().unwrap();
     assert_eq!(refine, None);
-    assert_eq!(kbps, stripe_share(START_KBPS as u32, 1) * 2);
+    assert_eq!(kbps, stripe_share(START_KBPS as u32, 1, false) * 2);
+}
+
+/// A cohort whose encoder holds its cap runs it at the cohort's share, not twice it.
+#[test]
+fn a_cohort_that_holds_its_cap_gets_no_headroom() {
+    let start = START_KBPS as u32;
+    let held = refines_through_holding(H264_HW, true);
+    let free = refines_through_holding(H264_HW, false);
+    let (_, held) = held.last().copied().unwrap();
+    let (_, free) = free.last().copied().unwrap();
+    assert_eq!(held, start * 2, "a paint-over's double of the exact share");
+    assert_eq!(free, start * 4, "a paint-over's double of twice the share");
+}
+
+/// A hardware H.264 cohort on `cfg` whose opens hold their cap as `holding` says, after
+/// a viewer and some moving frames: each open's last (non-keyframe) rate, and the target.
+fn shares_by_open(
+    cfg: VideoConfig,
+    holding: fn(usize) -> bool,
+    fail_once: Option<(usize, usize)>,
+) -> (HashMap<usize, u32>, u32) {
+    let encodes = Encodes::default();
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_holding: Some(holding),
+        h264_hw_fail_once: fail_once,
+        h264_hw_encodes: Some(encodes.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(cfg, hub.clone(), W, H, &[H264_HW], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    for _ in 0..12 {
+        push(&mut eng);
+        settle(&eng);
+        acked(&c, &mut rx);
+    }
+    let target = eng.cohorts[0].shared.target.load(Ordering::Relaxed);
+    let mut last = HashMap::new();
+    for &(open, kbps, key) in encodes.lock().unwrap().iter() {
+        if !key {
+            last.insert(open, kbps);
+        }
+    }
+    (last, target)
+}
+
+/// Within the 4% a stripe lets its rate drift before it sets it again.
+fn near(got: u32, want: u32) -> bool {
+    (got as f64 - want as f64).abs() <= want as f64 * 0.04
+}
+
+/// Two stripes, one on an encoder that holds its cap and one on one that doesn't: each
+/// gets its own share.
+#[test]
+fn each_stripe_gets_the_share_of_its_own_encoder() {
+    let (last, target) = shares_by_open(two_stripes(), |open| open == 1, None);
+    let (held, free) = (last[&1], last[&2]);
+    assert!(
+        near(held, stripe_share(target, 2, true)),
+        "{held} at {target}"
+    );
+    assert!(
+        near(free, stripe_share(target, 2, false)),
+        "{free} at {target}"
+    );
+}
+
+/// A stripe whose encoder holds its cap, replaced after a failure by one that doesn't, gets
+/// twice its share from then on.
+#[test]
+fn a_replaced_encoder_gets_the_share_of_the_new_one() {
+    let (last, target) = shares_by_open(config(), |open| open <= 1, Some((1, 3)));
+    assert!(
+        near(last[&1], stripe_share(target, 1, true)),
+        "{last:?} at {target}"
+    );
+    let after = last
+        .iter()
+        .filter(|(&o, _)| o > 1)
+        .map(|(_, &k)| k)
+        .collect::<Vec<_>>();
+    assert!(
+        !after.is_empty(),
+        "no encode after the replacement: {last:?}"
+    );
+    for k in after {
+        assert!(near(k, stripe_share(target, 1, false)), "{k} at {target}");
+    }
 }
 
 /// Real OpenH264 through the engine: whether the library takes the switch or refuses it,
 /// a viewer gets no keyframe beyond its first and the stream carries on.
+#[cfg(feature = "openh264")]
 fn passes_through_openh264(break_switch: bool) -> (u64, u64, u32, bool) {
     let hub = Hub::new();
     let open: Open = Arc::new(move |c: &EncoderConfig| {
@@ -3082,12 +3629,14 @@ fn passes_through_openh264(break_switch: bool) -> (u64, u64, u32, bool) {
     )
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn a_refused_switch_is_no_keyframe_storm() {
     let (keys, _, failures, needs_key) = passes_through_openh264(true);
     assert_eq!((keys, failures, needs_key), (1, 0, false));
 }
 
+#[cfg(feature = "openh264")]
 #[test]
 fn the_switch_through_the_engine_sends_its_frames() {
     let (keys, frames, failures, needs_key) = passes_through_openh264(false);
@@ -3141,6 +3690,58 @@ fn high_fps_caps_hardware_videotoolbox_only() {
     assert_eq!(encoder_config(&on, HEVC, W, H, 1).fps, 120);
     assert_eq!(encoder_config(&on, HEVC, W, H, 1).rate.fps, 120);
     assert_eq!(encoder_config(&on, H264, W, H, 1).fps, 60);
+}
+
+const SOFTWARE: Candidate = Candidate {
+    codec: Codec::H264,
+    backend: encoder::SOFTWARE_H264,
+    hardware: false,
+};
+
+#[test]
+fn preset_goes_only_to_the_encoder_it_was_given_for() {
+    let pinned = VideoConfig {
+        selection: encoder::Selection::Pinned(Backend::VideoToolbox),
+        preset: "12".into(),
+        ..config()
+    };
+    assert_eq!(encoder_config(&pinned, H264_HW, W, H, 1).preset, "12");
+    assert_eq!(
+        encoder_config(&pinned, SOFTWARE, W, H, 1).preset,
+        encoder::DEFAULT_PRESET
+    );
+    let auto = VideoConfig {
+        preset: "veryfast".into(),
+        ..config()
+    };
+    assert_eq!(encoder_config(&auto, SOFTWARE, W, H, 1).preset, "veryfast");
+    assert_eq!(
+        encoder_config(&auto, H264_HW, W, H, 1).preset,
+        encoder::DEFAULT_PRESET
+    );
+}
+
+#[cfg(feature = "sw-arm")]
+#[test]
+fn a_bench_arms_preset_stays_off_its_h264_cohort() {
+    for &(name, backend, codec) in encoder::ARMS {
+        let cfg = VideoConfig {
+            selection: encoder::Selection::Arm(name, backend, codec),
+            preset: "12".into(),
+            ..config()
+        };
+        let arm = Candidate {
+            codec,
+            backend,
+            hardware: false,
+        };
+        assert_eq!(encoder_config(&cfg, arm, W, H, 1).preset, "12", "{name}");
+        assert_eq!(
+            encoder_config(&cfg, SOFTWARE, W, H, 1).preset,
+            encoder::DEFAULT_PRESET,
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -3535,4 +4136,95 @@ fn viewers_change_nothing_without_high_fps() {
         push(&mut eng);
         assert!(eng.cohorts.iter().all(|c| c.fps() == 30), "{hz}");
     }
+}
+
+/// The share every stripe got before encoders said whether they hold their cap.
+fn twice_the_area_share(target: u32, n: usize) -> u32 {
+    if target == 0 {
+        return 0;
+    }
+    ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
+}
+
+const TARGETS: [u32; 5] = [0, 1, 4_000, 30_000, 120_001];
+
+#[test]
+fn an_encoder_that_holds_its_cap_gets_exactly_its_area_share() {
+    for n in [1, 2, 4] {
+        assert_eq!(stripe_share(30_000, n, true), 30_000 / n as u32, "{n}");
+        assert_eq!(stripe_share(0, n, true), 0, "uncapped stays uncapped");
+    }
+    assert_eq!(stripe_share(3, 4, true), 1, "never a zero cap");
+}
+
+#[test]
+fn an_encoder_under_its_cap_keeps_twice_its_area_share() {
+    for n in 1..=8 {
+        for t in TARGETS {
+            assert_eq!(
+                stripe_share(t, n, false),
+                twice_the_area_share(t, n),
+                "{t}/{n}"
+            );
+        }
+    }
+    assert_eq!(stripe_share(30_000, 1, false), 60_000);
+}
+
+/// Every software encoder this build has, opened capped as a stream opens it, keeps the
+/// share it had.
+#[test]
+fn no_software_encoders_share_moves() {
+    let codecs = [
+        Codec::H264,
+        Codec::Hevc,
+        Codec::Av1,
+        #[cfg(feature = "libvpx")]
+        Codec::Vp8,
+        #[cfg(feature = "libvpx")]
+        Codec::Vp9,
+    ];
+    let software = [
+        Backend::OpenH264,
+        #[cfg(feature = "x264")]
+        Backend::X264,
+        #[cfg(feature = "libvpx")]
+        Backend::Libvpx,
+        #[cfg(feature = "libaom")]
+        Backend::Libaom,
+        #[cfg(feature = "svt-av1")]
+        Backend::SvtAv1,
+        #[cfg(feature = "kvazaar")]
+        Backend::Kvazaar,
+        #[cfg(feature = "x265")]
+        Backend::X265,
+    ];
+    let mut opened = 0;
+    for backend in software {
+        for codec in codecs.into_iter().filter(|&c| backend.implements(c)) {
+            let cfg = EncoderConfig {
+                backend,
+                codec,
+                width: 320,
+                height: 192,
+                fps: 30,
+                threads: 1,
+                rate: RateConfig::new(24.0, 4_000, 30),
+                best_quality: 16.0,
+                preset: crate::encoder::DEFAULT_PRESET.into(),
+            };
+            let enc = crate::encoder::open(&cfg).unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+            for n in 1..=8 {
+                for t in TARGETS {
+                    assert_eq!(
+                        stripe_share(t, n, enc.holds_cap()),
+                        twice_the_area_share(t, n),
+                        "{backend:?} {codec:?} {t}/{n}"
+                    );
+                }
+            }
+            opened += 1;
+        }
+    }
+    assert!(opened > 0);
 }

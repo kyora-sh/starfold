@@ -28,7 +28,7 @@ pub struct Ivars {
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and Output doesn't implement Drop.
     #[unsafe(super(NSObject))]
-    #[name = "VoxlStreamOutput"]
+    #[name = "StarfoldStreamOutput"]
     #[ivars = Ivars]
     struct Output;
 
@@ -107,7 +107,7 @@ pub fn start(
     let d = shareable_display(display)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let output = Output::new(Box::new(handler), stopped.clone());
-    let queue = DispatchQueue::new(&format!("voxl.{name}"), None);
+    let queue = DispatchQueue::new(&format!("starfold.{name}"), None);
     let stream = unsafe {
         let filter = SCContentFilter::initWithDisplay_excludingWindows(
             SCContentFilter::alloc(),

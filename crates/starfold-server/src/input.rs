@@ -54,7 +54,7 @@ enum ShiftFix {
 fn scratch_file(display: Option<&str>) -> std::path::PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let d = display.unwrap_or(":0").replace([':', '/'], "_");
-    std::path::Path::new(&dir).join(format!("voxl-keymap{d}"))
+    std::path::Path::new(&dir).join(format!("starfold-keymap{d}"))
 }
 
 /// X keycodes (evdev + 8) with no entry in Chromium's DOM code table.

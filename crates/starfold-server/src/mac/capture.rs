@@ -109,7 +109,7 @@ impl Capturer {
         let fps = super::fps();
         let incoming = Arc::new(Mutex::new(Incoming::default()));
         let (wake_r, wake_w) = crate::hub::wake_pipe().map_err(|e| e.to_string())?;
-        let debug = std::env::var("VOXL_DEBUG_DAMAGE").is_ok();
+        let debug = crate::compat::is_set("STARFOLD_DEBUG_DAMAGE");
         let inc = incoming.clone();
         let (w, h) = (width, height);
         let on_frame = move |sb: CMSampleBufferRef, ty: OutputType| unsafe {
@@ -186,8 +186,9 @@ impl Capturer {
                 cfg.setColorSpaceName(&*(kCGColorSpaceSRGB as *const CFString));
                 // Clients draw the cursor themselves (see desktop.rs), so pointer motion
                 // costs no encode and has no stream latency.
-                // If the system cursor can't be read, it has to be in the video.
-                cfg.setShowsCursor(!super::desktop::cursor_readable());
+                // If the system cursor can't be read, or --show-cursor is set (e.g. for viewers),
+                // it has to be in the video.
+                cfg.setShowsCursor(super::show_cursor() || !super::desktop::cursor_readable());
                 cfg.setCaptureResolution(SCCaptureResolutionType::Best);
                 cfg.setQueueDepth(6);
             },

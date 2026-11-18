@@ -69,7 +69,7 @@ pub fn spawn(device: String, bitrate: i32, hub: Arc<Hub>) {
                 return;
             }
             opus_encoder_ctl(enc, 4002, bitrate as c_int);
-            let name = c"voxl";
+            let name = c"starfold";
             let dev = CString::new(device).unwrap();
             let ss = PaSampleSpec {
                 format: 3,

@@ -116,7 +116,10 @@ impl Rc {
             r.data.target_percentage = if self.mode == RcMode::Cbr { 100 } else { 95 };
             r.data.window_size =
                 ((self.buffer_bits as u64 * 1000 / self.bps.max(1) as u64) as u32).max(1);
-            r.data.rc_flags = reset as u32 | 1 << 1;
+            r.data.rc_flags = ffi::RC_FLAG_DISABLE_FRAME_SKIP | ffi::RC_FLAG_DISABLE_BIT_STUFFING;
+            if reset {
+                r.data.rc_flags |= ffi::RC_FLAG_RESET;
+            }
         });
         let hrd = ffi::param(|h: &mut ffi::Misc<ffi::VAEncMiscParameterHRD>| {
             h.kind = ffi::MISC_HRD;
@@ -148,7 +151,9 @@ impl Choice {
 }
 
 /// The first of `profiles` (best first) the driver encodes 8-bit 4:2:0 at `size` with
-/// one reference, low-power entrypoint first.
+/// one reference. Per profile the full entrypoint goes first; low-power is taken where the
+/// full one is not advertised, its attributes cannot be read or it fails a check (no 8-bit
+/// 4:2:0, no reference frames, picture too large), before the next profile is tried.
 pub fn choose(
     drv: &mut dyn Driver,
     profiles: &[c_int],
@@ -164,7 +169,7 @@ pub fn choose(
                 continue;
             }
         };
-        for entrypoint in [ffi::ENTRYPOINT_ENC_SLICE_LP, ffi::ENTRYPOINT_ENC_SLICE] {
+        for entrypoint in [ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP] {
             if !eps.contains(&entrypoint) {
                 continue;
             }
@@ -258,6 +263,15 @@ pub struct Session<P: Params> {
     idrs: u32,
     /// The next picture must be an IDR: first frame, or the last encode failed.
     need_idr: bool,
+    /// The driver keeps a constant bitrate at its target whatever the picture.
+    holds_cap: bool,
+}
+
+/// Whether the driver named `vendor` keeps a constant bitrate at its target on any
+/// picture: Intel's media driver does (no filler data, still at the cap); Mesa's
+/// radeonsi doesn't since filler data is off. Others are unknown, so no.
+pub fn holds_cap(vendor: &str) -> bool {
+    vendor.starts_with("Intel iHD driver")
 }
 
 impl<P: Params> Session<P> {
@@ -278,6 +292,7 @@ impl<P: Params> Session<P> {
             attribs.push((ffi::ATTRIB_PACKED_HEADERS, p));
         }
         let config = drv.create_config(choice.profile, choice.entrypoint, &attribs)?;
+        let holds_cap = holds_cap(&drv.vendor());
         let mut s = Session {
             drv,
             params,
@@ -292,6 +307,7 @@ impl<P: Params> Session<P> {
             n: 0,
             idrs: 0,
             need_idr: true,
+            holds_cap,
         };
         let (w, h) = s.params.surface_size();
         s.surfaces = s.drv.create_surfaces(w, h, 3)?;
@@ -391,5 +407,9 @@ impl<P: Params> VideoEncoder for Session<P> {
 
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
         Ok(Vec::new())
+    }
+
+    fn holds_cap(&self) -> bool {
+        self.holds_cap && self.rc.mode == RcMode::Cbr
     }
 }

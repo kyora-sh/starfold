@@ -94,7 +94,7 @@ fn open_fifo(path: &std::ffi::CStr) -> Option<std::os::fd::OwnedFd> {
 }
 
 #[cfg(target_os = "linux")]
-fn writer(path: std::ffi::CString, queue: Arc<Mutex<Queue>>) {
+fn writer(paths: Vec<String>, queue: Arc<Mutex<Queue>>) {
     use nix::errno::Errno;
     use nix::unistd::write;
     use std::time::Duration;
@@ -112,15 +112,21 @@ fn writer(path: std::ffi::CString, queue: Arc<Mutex<Queue>>) {
         }
         next_frame(&queue, &mut frame);
         if fd.is_none() {
-            fd = open_fifo(&path);
-            match fd {
-                Some(_) => {
+            let opened = paths.iter().find_map(|p| {
+                let c = std::ffi::CString::new(p.as_str()).ok()?;
+                open_fifo(&c).map(|f| (p, f))
+            });
+            match opened {
+                Some((path, f)) => {
                     log::info!("microphone: writing to {path:?}");
+                    crate::compat::opened_fifo(path);
+                    fd = Some(f);
                     warned = false;
                 }
                 None if !warned => {
                     log::warn!(
-                        "microphone: cannot open {path:?} (is PulseAudio's pipe source loaded?)"
+                        "microphone: cannot open {} (is PulseAudio's pipe source loaded?)",
+                        paths.join(" or ")
                     );
                     warned = true;
                 }
@@ -138,14 +144,20 @@ fn writer(path: std::ffi::CString, queue: Arc<Mutex<Queue>>) {
     }
 }
 
-/// `sink` is the FIFO's path on Linux and the output device's ID on macOS and Windows.
-pub fn spawn(sink: String, hub: Arc<Hub>) -> mpsc::Sender<MicMsg> {
+/// Where the microphone goes: the FIFOs to try in order on Linux, the output device's
+/// ID on macOS and Windows.
+#[cfg(target_os = "linux")]
+pub type Sink = Vec<String>;
+#[cfg(not(target_os = "linux"))]
+pub type Sink = String;
+
+pub fn spawn(sink: Sink, hub: Arc<Hub>) -> mpsc::Sender<MicMsg> {
     let (tx, rx) = mpsc::channel::<MicMsg>();
     let queue = Arc::new(Mutex::new(Queue::default()));
     {
         let queue = queue.clone();
         #[cfg(target_os = "linux")]
-        let run = move || writer(std::ffi::CString::new(sink).unwrap(), queue);
+        let run = move || writer(sink, queue);
         #[cfg(target_os = "macos")]
         let run = move || crate::mac::mic::play(&sink, queue);
         #[cfg(windows)]

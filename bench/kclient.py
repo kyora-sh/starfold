@@ -19,7 +19,7 @@ mx, my = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (300, 15
 # extensions that don't affect the picture: CopyRect, Tight, TightPNG, Hextile, RRE,
 # Raw, quality 6, compression 2, DesktopSize, LastRect, Fence, ContinuousUpdates,
 # WebP, then Kasm's quality/video settings (ignored by servers with
-# IgnoreClientSettingsKasm, as in Tembo) and PreferBandwidth.
+# IgnoreClientSettingsKasm, as upstream runs it) and PreferBandwidth.
 ENCODINGS = [1, 7, -260, 5, 2, 0, -26, -254, -223, -224, -312, -313, -1024,
              -1016, -1006, -996, -987, -972, -907, -865, -1984, -1996, -2034, -1997, -992]
 

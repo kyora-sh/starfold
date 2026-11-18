@@ -1,4 +1,4 @@
-// macOS end to end, as a raw WebSocket client of a running voxl (PORT, default 6960):
+// macOS end to end, as a raw WebSocket client of a running starfold (PORT, default 6960):
 // hello, keyframe, cursor image, clipboard text both ways, system audio, typing and
 // mouse in a scratch TextEdit document (closed unsaved) and, with --enable-resize,
 // a display mode switch and back. Restores the text clipboard; plays one quiet sound.
@@ -64,7 +64,7 @@ const ks = (ch) => { const cp = ch.codePointAt(0); return (cp >= 0x20 && cp <= 0
 
 	// Clipboard both ways (the user's text clipboard is restored afterwards).
 	const saved = sh('pbpaste');
-	sh(`printf 'voxl mac clipboard %s' ${Date.now()} | pbcopy`);
+	sh(`printf 'starfold mac clipboard %s' ${Date.now()} | pbcopy`);
 	const want = sh('pbpaste');
 	await sleep(800);
 	check(c.clips.includes(want), `Mac -> viewer clipboard (${JSON.stringify(c.clips.slice(-1))})`);

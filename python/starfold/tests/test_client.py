@@ -35,6 +35,7 @@ class Server:
         self.segments = [b"mp4"]
         self.end_reason = "stopped"
         self.content_type = "application/zip"
+        self.seq_header = "x-starfold-seq"
 
     def recording(self, *parts: bytes) -> httpx.Response:
         names = [f"segment-{i + 1}.mp4" for i in range(len(parts))]
@@ -52,10 +53,10 @@ class Server:
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.seen.append(req)
         if req.headers.get("authorization") != f"Bearer {self.password}":
-            return httpx.Response(401, text="voxl needs its password")
+            return httpx.Response(401, text="starfold needs its password")
         path, q = req.url.path, req.url.params
         if path == "/screenshot":
-            return httpx.Response(200, content=PNG, headers={"x-voxl-seq": "41"})
+            return httpx.Response(200, content=PNG, headers={self.seq_header: "41"})
         if path == "/wait":
             return httpx.Response(200, json={"changed": "since" in q, "timed_out": False, "seq": 42, "waited_ms": 7})
         if path == "/input":
@@ -80,6 +81,7 @@ class Server:
         if path == "/files/download":
             return httpx.Response(403, json={"error": "downloads are disabled"})
         if path == "/files/upload":
+            assert req.headers["x-starfold-upload"] == "1"
             assert req.headers["x-voxl-upload"] == "1"
             return httpx.Response(200, json={"path": f"Downloads/{q['name']}", "size": len(req.content)})
         return httpx.Response(404, json={"error": "not found"})
@@ -186,9 +188,33 @@ def test_wrong_password():
 
 
 def test_password_from_environment(monkeypatch):
-    monkeypatch.setenv("VOXL_PASSWORD", "pw")
+    monkeypatch.delenv("VOXL_PASSWORD", raising=False)
+    monkeypatch.setenv("STARFOLD_PASSWORD", "pw")
     with Starfold("http://desk:6901", transport=httpx.MockTransport(Server())) as c:
         assert c.screenshot().seq == 41
+
+
+def test_voxl_password_still_works_and_warns(monkeypatch):
+    monkeypatch.delenv("STARFOLD_PASSWORD", raising=False)
+    monkeypatch.setenv("VOXL_PASSWORD", "pw")
+    with pytest.warns(DeprecationWarning, match="VOXL_PASSWORD is deprecated: use STARFOLD_PASSWORD"):
+        c = Starfold("http://desk:6901", transport=httpx.MockTransport(Server()))
+    with c:
+        assert c.screenshot().seq == 41
+
+
+def test_starfold_password_wins_over_voxl_password(monkeypatch):
+    monkeypatch.setenv("STARFOLD_PASSWORD", "pw")
+    monkeypatch.setenv("VOXL_PASSWORD", "old")
+    with pytest.warns(DeprecationWarning, match="VOXL_PASSWORD is ignored: STARFOLD_PASSWORD is set"):
+        c = Starfold("http://desk:6901", transport=httpx.MockTransport(Server()))
+    with c:
+        assert c.screenshot().seq == 41
+
+
+def test_seq_from_a_server_that_only_sends_the_voxl_header(sf, server):
+    server.seq_header = "x-voxl-seq"
+    assert sf.screenshot().seq == 41
 
 
 def test_recording(sf, server):

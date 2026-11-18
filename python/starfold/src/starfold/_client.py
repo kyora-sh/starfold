@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import warnings
 import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -79,7 +80,23 @@ def _transport_error(e: httpx.TransportError) -> StarfoldError:
 
 
 def _screenshot() -> _Req[Screenshot]:
-    return _Req("GET", "/screenshot", lambda r: Screenshot(png=r.content, seq=int(r.headers["x-voxl-seq"])))
+    return _Req("GET", "/screenshot", lambda r: Screenshot(png=r.content, seq=int(_seq_header(r.headers))))
+
+
+def _seq_header(headers: httpx.Headers) -> str:
+    return headers.get("x-starfold-seq") or headers["x-voxl-seq"]
+
+
+def _env_password() -> str | None:
+    new, old = os.environ.get("STARFOLD_PASSWORD"), os.environ.get("VOXL_PASSWORD")
+    if old is not None:
+        msg = (
+            "VOXL_PASSWORD is ignored: STARFOLD_PASSWORD is set"
+            if new is not None
+            else "VOXL_PASSWORD is deprecated: use STARFOLD_PASSWORD"
+        )
+        warnings.warn(msg, DeprecationWarning, stacklevel=4)
+    return new if new is not None else old
 
 
 def _wait(
@@ -164,14 +181,14 @@ def _files_upload(name: str, data: bytes | str | os.PathLike[str], path: str | N
         lambda r: Upload(path=r.json()["path"], size=int(r.json()["size"])),
         params=params,
         content=body,
-        headers={"X-Voxl-Upload": "1"},
+        headers={"X-Starfold-Upload": "1", "X-Voxl-Upload": "1"},
     )
 
 
 class _Base:
     def __init__(self, url: str, password: str | None, timeout: float) -> None:
         self.url = url.rstrip("/")
-        password = password if password is not None else os.environ.get("VOXL_PASSWORD")
+        password = password if password is not None else _env_password()
         self._headers = {"Authorization": f"Bearer {password}"} if password else {}
         self.timeout = timeout
 
@@ -188,7 +205,7 @@ class _Base:
 class Starfold(_Base):
     """A starfold desktop, for agents: screenshots, waiting for the screen, mouse and keyboard.
 
-    `password` defaults to $VOXL_PASSWORD. `timeout` is in seconds; waits and recordings
+    `password` defaults to $STARFOLD_PASSWORD. `timeout` is in seconds; waits and recordings
     get their own length on top.
     """
 

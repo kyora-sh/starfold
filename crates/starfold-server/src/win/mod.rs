@@ -1,5 +1,5 @@
 //! Windows backend: the same modules as the X11 one (capture, desktop, input, audio,
-//! screen) on Win32 APIs, so the rest of voxl (encoder, flow control, server, web
+//! screen) on Win32 APIs, so the rest of starfold (encoder, flow control, server, web
 //! client) runs unchanged.
 //!
 //! - capture: DXGI Desktop Duplication, BGRA frames with dirty and move rectangles
@@ -29,7 +29,7 @@ use windows::Win32::UI::HiDpi::{
     MDT_EFFECTIVE_DPI,
 };
 
-/// Where the captured display sits on the virtual desktop, in physical pixels (voxl is
+/// Where the captured display sits on the virtual desktop, in physical pixels (starfold is
 /// per-monitor DPI aware, so these are the pixels it streams).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
@@ -100,7 +100,7 @@ pub fn outputs() -> Vec<Output> {
     out
 }
 
-/// The display voxl streams, as picked with --display.
+/// The display starfold streams, as picked with --display.
 pub fn output() -> Option<Output> {
     let i = SETTINGS.lock().display;
     outputs().into_iter().nth(i)
@@ -111,7 +111,7 @@ pub fn output() -> Option<Output> {
 pub fn init(a: &HashMap<String, String>) {
     if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_err()
     {
-        log::warn!("could not make voxl DPI aware; a scaled display may stream blurry");
+        log::warn!("could not make starfold DPI aware; a scaled display may stream blurry");
     }
     let outs = outputs();
     for (i, o) in outs.iter().enumerate() {
@@ -170,7 +170,7 @@ pub fn cast<T: Interface, U: Interface>(v: &T) -> Result<U, String> {
 }
 
 /// Puts this thread on the desktop that receives input (the lock screen or a UAC
-/// prompt, when voxl runs as SYSTEM), so capture and input follow it. Does nothing
+/// prompt, when starfold runs as SYSTEM), so capture and input follow it. Does nothing
 /// for a normal user, who can't open those desktops anyway.
 pub fn follow_input_desktop() {
     use windows::Win32::System::StationsAndDesktops::{

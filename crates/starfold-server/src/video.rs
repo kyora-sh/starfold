@@ -35,6 +35,8 @@ pub struct VideoConfig {
     pub crf: f32,
     pub max_kbps: u32,
     pub paintover_crf: f32,
+    /// `--paintover-crf` as given: the QP x264's refinement settles a still picture at.
+    pub paintover_qp: Option<u8>,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
     pub min_kbps: u32,
@@ -273,6 +275,8 @@ struct Shared {
     /// The most consecutive failed encodes of any stripe; at FAIL_AFTER the cohort is
     /// given up.
     failures: AtomicU32,
+    /// What the last failed encode said.
+    last_error: Mutex<Option<String>>,
     /// When the capture thread last sent this cohort a keyframe job.
     last_key: Mutex<Instant>,
     /// Keyframes this cohort sent.
@@ -283,6 +287,8 @@ struct Shared {
     /// budget and at the ladder's.
     refinable: AtomicBool,
     refinable_small: AtomicBool,
+    /// The QP its refinement settles a still picture at.
+    finest: u8,
     /// The most this cohort takes frames at: its cap until encodes can't keep up, then
     /// `base_fps` until the encoder reopens.
     fps: AtomicU32,
@@ -538,15 +544,24 @@ fn encoder_config(
         },
         rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,
-        preset: cfg.preset.clone(),
+        preset: if cand.backend == cfg.selection.preset_backend() {
+            cfg.preset.clone()
+        } else {
+            encoder::DEFAULT_PRESET.into()
+        },
     }
 }
 
 /// Each stripe may use up to twice its area share of the budget; the delay-based
-/// controller reins the total in if several stripes move at once. 0 = uncapped.
-fn stripe_share(target: u32, n: usize) -> u32 {
+/// controller reins the total in if several stripes move at once. An encoder that
+/// `holds` its cap runs at it on any picture, so it gets its area share exactly.
+/// 0 = uncapped.
+fn stripe_share(target: u32, n: usize, holds: bool) -> u32 {
     if target == 0 {
         return 0;
+    }
+    if holds {
+        return (target as u64 / n as u64).max(1) as u32;
     }
     ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
 }
@@ -554,7 +569,7 @@ fn stripe_share(target: u32, n: usize) -> u32 {
 /// A keyframe is what a new viewer sees first; don't starve it to the steady-state
 /// frame budget (up to ~8 frames' worth at 4x the cap). An uncapped stream (cap 0)
 /// stays uncapped.
-fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
+pub(crate) fn keyframe_rate(crf: f32, cap: u32, fps: u32) -> RateConfig {
     let boost = if cap == 0 {
         0
     } else {
@@ -580,7 +595,11 @@ fn sample(
     let target = if cfg.max_kbps == 0 {
         0
     } else {
-        stripe_share(START_KBPS.min(cfg.max_kbps as f64) as u32, n)
+        stripe_share(
+            START_KBPS.min(cfg.max_kbps as f64) as u32,
+            n,
+            enc.holds_cap(),
+        )
     };
     enc.set_rate(keyframe_rate(cfg.crf, target, ecfg.fps))?;
     let (w, h) = (ecfg.width as usize, ecfg.height as usize);
@@ -688,6 +707,10 @@ struct Engine {
     offers: Vec<Offer>,
     /// Candidates whose encoders failed to open at this size.
     failed: Vec<Candidate>,
+    /// Why each failed one did, for /stats.
+    why: Vec<(Candidate, String)>,
+    /// Candidates not offered at this size, and why.
+    unoffered: Vec<(Candidate, String)>,
     cohorts: Vec<Cohort>,
     best: Option<Candidate>,
     open: Open,
@@ -706,8 +729,22 @@ impl Engine {
         open: Open,
     ) -> Result<Engine, String> {
         let mut offers = Vec::new();
+        let mut unoffered = Vec::new();
         let mut h264_err = String::from("no H.264 encoder");
+        let off = hub.off();
         for &c in cands {
+            if let Some((_, why)) = off.iter().find(|(b, _)| *b == c.backend) {
+                log::warn!(
+                    "{:?} from {} is not offered at {w}x{h}: {why}",
+                    c.codec,
+                    c.backend.name()
+                );
+                unoffered.push((c, format!("not offered at {w}x{h}: {why}")));
+                if c.codec == Codec::H264 {
+                    h264_err = why.clone();
+                }
+                continue;
+            }
             match make_offer(&cfg, &open, c, w, h) {
                 Ok(o) => {
                     log::info!(
@@ -731,6 +768,7 @@ impl Engine {
                         c.codec,
                         c.backend.name()
                     );
+                    unoffered.push((c, format!("not offered at {w}x{h}: {e}")));
                     if c.codec == Codec::H264 {
                         h264_err = e;
                     }
@@ -750,6 +788,8 @@ impl Engine {
             h264,
             offers,
             failed: Vec::new(),
+            why: Vec::new(),
+            unoffered,
             cohorts: Vec::new(),
             best: None,
             open,
@@ -760,7 +800,7 @@ impl Engine {
                 Ok(c) => break c,
                 Err(e) => {
                     log::warn!("H264 from {} failed to open: {e}", eng.h264.backend.name());
-                    eng.failed.push(eng.h264);
+                    eng.fail(eng.h264, format!("failed to open: {e}"));
                     eng.h264 = eng.next_h264().ok_or(e)?;
                 }
             }
@@ -774,12 +814,47 @@ impl Engine {
             .map(|s| (s.y, s.h))
             .collect();
         eng.cohorts.push(c);
-        *hub.offers.lock() = eng.offers.clone();
-        hub.offer_gen.fetch_add(1, Ordering::Relaxed);
+        eng.publish_offers();
+        // Under the lock a connecting viewer's first-hello check also takes
+        // (Hub::send_first_hello_with), released before the restart hellos below.
+        hub.next_offer_gen();
         eng.publish();
         // New geometry and offers (and a keyframe) for clients already connected; no-op at startup.
         hub.restart_clients();
         Ok(eng)
+    }
+
+    /// Fails if `--encoder` pins a hardware H.264 encoder that is not the one streaming: one
+    /// that wasn't offered at this size or failed to open, so the stream fell back to
+    /// software. Checked when the stream starts, for every hardware backend, so a pin never
+    /// starts silently on software; later fallbacks (a resize, a failing encoder) stay.
+    fn require_pin(&self, cands: &[Candidate]) -> Result<(), String> {
+        let encoder::Selection::Pinned(b) = self.cfg.selection else {
+            return Ok(());
+        };
+        let Some(pin) = cands
+            .iter()
+            .copied()
+            .find(|c| c.codec == Codec::H264 && c.backend == b && c.hardware)
+        else {
+            return Ok(());
+        };
+        if self.h264 == pin {
+            return Ok(());
+        }
+        let why = self
+            .why
+            .iter()
+            .chain(&self.unoffered)
+            .find(|(c, _)| *c == pin)
+            .map_or_else(|| "not offered".to_string(), |(_, w)| w.clone());
+        Err(format!(
+            "--encoder {}: H.264 from {} did not start at {}x{}: {why}",
+            b.name(),
+            b.name(),
+            self.w,
+            self.h
+        ))
     }
 
     /// The H.264 candidate to fall back to from the current one.
@@ -800,7 +875,7 @@ impl Engine {
                     Ok(c) => self.cohorts.push(c),
                     Err(e) => {
                         log::warn!("H264 from {} failed to open: {e}", n.backend.name());
-                        self.failed.push(n);
+                        self.fail(n, format!("failed to open: {e}"));
                         continue;
                     }
                 }
@@ -811,6 +886,7 @@ impl Engine {
                 n.backend.name()
             );
             self.h264 = n;
+            self.publish_offers();
             if self.best == Some(n) {
                 self.best = None;
             }
@@ -835,6 +911,55 @@ impl Engine {
             return;
         }
         self.failed.retain(|c| *c != old);
+        self.why.retain(|(c, _)| *c != old);
+        self.publish_offers();
+    }
+
+    /// Takes `cand` out of use at this size; /stats says `why`.
+    fn fail(&mut self, cand: Candidate, why: String) {
+        if !self.failed.contains(&cand) {
+            self.failed.push(cand);
+        }
+        self.why.retain(|(c, _)| *c != cand);
+        self.why.push((cand, why));
+        self.publish_offers();
+    }
+
+    /// This size's offers but those that failed here, as the plan would never give them.
+    /// The H.264 stream's own offer stays: it is the last resort. A hello also drops the
+    /// offers of backends that are off when it is built ([`Hub::hello`]).
+    fn offered(&self) -> Vec<Offer> {
+        self.offers
+            .iter()
+            .filter(|o| o.cand == self.h264 || !self.failed.contains(&o.cand))
+            .cloned()
+            .collect()
+    }
+
+    /// Sets what later hellos offer. Connected viewers keep what they were sent.
+    fn publish_offers(&self) {
+        *self.hub.offers.lock() = self.offered();
+    }
+
+    /// Takes the offers of a backend turned off out of use, so the plan gives none of them
+    /// and a cohort on one closes, its viewers moving to the next codec.
+    fn follow_off(&mut self) {
+        for (b, why) in self.hub.off() {
+            let cands: Vec<Candidate> = self
+                .offers
+                .iter()
+                .map(|o| o.cand)
+                .filter(|c| c.backend == b && !self.failed.contains(c))
+                .collect();
+            for c in cands {
+                log::warn!(
+                    "{:?} from {} is off: {why}; no longer offered",
+                    c.codec,
+                    b.name()
+                );
+                self.fail(c, why.clone());
+            }
+        }
     }
 
     fn open_cohort(&self, cand: Candidate) -> Result<Cohort, String> {
@@ -874,11 +999,13 @@ impl Engine {
             idr_inflight: AtomicBool::new(false),
             target: AtomicU32::new(rc.target as u32),
             failures: AtomicU32::new(0),
+            last_error: Mutex::new(None),
             last_key: Mutex::new(Instant::now() - RETRY_EVERY),
             keyframes: AtomicU64::new(0),
             paintover_bytes: AtomicU64::new(0),
             refinable: AtomicBool::new(true),
             refinable_small: AtomicBool::new(true),
+            finest: finest_rung(&self.cfg, cand.backend),
             fps: AtomicU32::new(fps),
             base_fps: base_fps(&self.cfg),
             hz: AtomicU32::new(u32::MAX),
@@ -905,6 +1032,7 @@ impl Engine {
         if fps > shared.base_fps {
             log::info!("cohort {}: up to {fps} fps (--high-fps)", shared.id);
         }
+        let finest = shared.finest;
         Ok(Cohort {
             shared,
             tx: Some(tx),
@@ -913,7 +1041,13 @@ impl Engine {
             skipped: None,
             active: false,
             viewers: Vec::new(),
-            refine: Refinement::new(&self.cfg, cand.backend.refines_by_qp(), self.w, self.h),
+            refine: Refinement::new(
+                &self.cfg,
+                qp_refinement(&self.cfg, cand.backend),
+                finest,
+                self.w,
+                self.h,
+            ),
             pace: Pace::new(fps),
             last_take: None,
         })
@@ -931,25 +1065,34 @@ impl Engine {
             self.last_tick = Instant::now();
             self.expire();
         }
+        self.follow_off();
         // A cohort whose encoder keeps failing: its candidate is off until the next size.
         // The last H.264 encoder is the last resort and stays.
         let h264_fallback = self.next_h264().is_some();
-        for c in &self.cohorts {
-            let sh = &c.shared;
-            if (sh.cand != self.h264 || h264_fallback)
-                && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
-                && !self.failed.contains(&sh.cand)
-            {
-                log::warn!(
-                    "{:?} from {} keeps failing to encode; trying the next encoder",
-                    sh.cand.codec,
-                    sh.cand.backend.name()
-                );
-                self.failed.push(sh.cand);
-            }
+        let failing: Vec<(Candidate, String)> = self
+            .cohorts
+            .iter()
+            .map(|c| &c.shared)
+            .filter(|sh| {
+                (sh.cand != self.h264 || h264_fallback)
+                    && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
+                    && !self.failed.contains(&sh.cand)
+            })
+            .map(|sh| {
+                let last = sh.last_error.lock().clone().unwrap_or_default();
+                (sh.cand, format!("keeps failing to encode: {last}"))
+            })
+            .collect();
+        for (cand, why) in failing {
+            log::warn!(
+                "{:?} from {} {why}; trying the next encoder",
+                cand.codec,
+                cand.backend.name()
+            );
+            self.fail(cand, why);
         }
         if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
-            self.failed.push(self.h264);
+            self.fail(self.h264, "failed by /debug/fail-h264".into());
         }
         if self.failed.contains(&self.h264) {
             self.replace_h264();
@@ -1008,7 +1151,7 @@ impl Engine {
                                 b.codec,
                                 b.backend.name()
                             );
-                            self.failed.push(b);
+                            self.fail(b, format!("failed to open: {e}"));
                             continue;
                         }
                     }
@@ -1124,9 +1267,21 @@ impl Engine {
             .map(|o| o.cand)
             .filter(|c| !self.failed.contains(c))
             .collect();
+        // Encoders left at this size, and those never offered at it: after a rebuild (a
+        // resize) a backend that gave up for good shows up as the latter, with its reason.
+        let failed: Vec<serde_json::Value> = self
+            .why
+            .iter()
+            .filter(|(c, _)| self.failed.contains(c))
+            .chain(&self.unoffered)
+            .map(|(c, why)| {
+                serde_json::json!({"codec": c.codec, "backend": c.backend, "reason": why})
+            })
+            .collect();
         *self.hub.encoder.lock() = serde_json::json!({
             "mode": self.cfg.selection.name(),
             "chosen": negotiate::chosen(&live),
+            "failed": failed,
         });
     }
 
@@ -1445,6 +1600,7 @@ pub fn spawn(
     }
     let open: Open = Arc::new(|c: &EncoderConfig| encoder::open(c));
     let mut p = build(&cfg, &hub, &cands, &open)?;
+    p.engine.require_pin(&cands)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
@@ -1710,10 +1866,32 @@ struct Burst {
     /// Last-rung passes after the ladder, while the encoder still has something one of them
     /// could sharpen: they fill an idle link, so their bytes aren't counted in `spent`.
     tail: u32,
+    /// The last rung's QP.
+    finest: u8,
 }
 
 /// Coarse to fine: a thin link gets something early, and new damage saves the costly last one.
-const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+pub(crate) const REFINE_RUNGS: [u8; 3] = [20, 16, 12];
+
+/// The ladder spaced as REFINE_RUNGS, ending at `finest`.
+fn rungs(finest: u8) -> [u8; 3] {
+    REFINE_RUNGS.map(|r| (r + finest).saturating_sub(REFINE_RUNGS[2]).min(51))
+}
+
+/// Whether a cohort refines by QP. x264 can't undo a pass's rate-control change on a capped
+/// stream at CRF 0, so one that may run at it keeps its plain paint-over.
+fn qp_refinement(cfg: &VideoConfig, backend: encoder::Backend) -> bool {
+    backend.refines_by_qp()
+        && !(backend.name() == "x264" && cfg.max_kbps > 0 && cfg.crf.min(cfg.paintover_crf) <= 0.0)
+}
+
+/// An encoder whose build-facts row says so (x264) settles at an explicit --paintover-crf;
+/// every other ladder at REFINE_RUNGS' last.
+fn finest_rung(cfg: &VideoConfig, backend: encoder::Backend) -> u8 {
+    cfg.paintover_qp
+        .filter(|_| crate::build_facts::refines_to_paintover_crf(backend.name()))
+        .unwrap_or(REFINE_RUNGS[2])
+}
 /// The most of the bitrate cap a ladder pass may take. Ladder passes count against the share,
 /// so a stop leaves little debt and the burst after the next one isn't kept waiting.
 const REFINE_LADDER_MS: usize = 200;
@@ -1757,6 +1935,7 @@ impl Burst {
             target: 0,
             ladder: true,
             tail: 0,
+            finest: REFINE_RUNGS[2],
         }
     }
     fn moved(&mut self, now: Instant) {
@@ -1820,7 +1999,7 @@ impl Burst {
     fn rung(&self) -> Option<u8> {
         let last = REFINE_RUNGS.len() - 1;
         self.ladder
-            .then(|| REFINE_RUNGS[last.saturating_sub(self.left as usize - 1)])
+            .then(|| rungs(self.finest)[last.saturating_sub(self.left as usize - 1)])
     }
     /// Takes a pass.
     fn pass(&mut self, now: Instant) {
@@ -1860,12 +2039,13 @@ enum Step {
 }
 
 impl Refinement {
-    fn new(cfg: &VideoConfig, ladder: bool, w: u32, h: u32) -> Self {
+    fn new(cfg: &VideoConfig, ladder: bool, finest: u8, w: u32, h: u32) -> Self {
         let (w, h) = (w as usize, h as usize);
         let delay = Duration::from_millis(cfg.paintover_delay_ms);
         Refinement {
             burst: Burst {
                 ladder,
+                finest,
                 ..Burst::new(cfg.paintover_burst, delay, Instant::now())
             },
             refiner: Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16)),
@@ -1879,6 +2059,7 @@ impl Refinement {
         let b = &self.burst;
         self.burst = Burst {
             ladder: b.ladder,
+            finest: b.finest,
             ..Burst::new(b.len, b.delay, Instant::now())
         };
         self.settling = false;
@@ -2126,7 +2307,7 @@ fn capture_loop(
     let mut last_capture = Instant::now() - Duration::from_secs(1);
     let mut had_clients = false;
     let mut full_next = true;
-    let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+    let debug_marker = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
 
     loop {
         if hub.resize_req.lock().is_some() || cap.needs_rebuild() {
@@ -2344,7 +2525,11 @@ struct StripeJob {
     force_idr: bool,
     boost: bool,
     crf: f32,
-    cap: u32,
+    /// The cohort's target (0 = uncapped), its stripes, and whether this is a paint-over:
+    /// the worker takes its share from them with the encoder it has at the time.
+    target: u32,
+    stripes: usize,
+    paintover: bool,
     refine: Option<PassBudget>,
     fps: u32,
     /// The cohort's cap: the encoder's opening rate and the governor's frame budget.
@@ -2353,11 +2538,25 @@ struct StripeJob {
     mb_cols: usize,
 }
 
+impl StripeJob {
+    /// This stripe's cap, on an encoder that does or doesn't `hold` its cap; a paint-over
+    /// gets twice it.
+    fn cap(&self, holds: bool) -> u32 {
+        let share = stripe_share(self.target, self.stripes, holds);
+        if self.paintover {
+            share.saturating_mul(2)
+        } else {
+            share
+        }
+    }
+}
+
 /// A refining pass's QP, what its frame may cost, and what a tail pass after it may on a busy
 /// and on an idle screen (None: uncapped).
 #[derive(Clone, Copy)]
 struct PassBudget {
     qp: u8,
+    finest: u8,
     max_bytes: Option<usize>,
     busy: Option<usize>,
     idle: Option<usize>,
@@ -2369,6 +2568,8 @@ struct StripeResult {
     out: Option<(bool, Vec<u8>)>,
     config: Option<StreamConfig>,
     failed: bool,
+    /// What the failed encode said.
+    error: Option<String>,
     /// A refining pass left something a tail pass could still sharpen, at the tail's budget and
     /// at the ladder's.
     refinable: bool,
@@ -2485,20 +2686,21 @@ fn stripe_worker(
         let refine = job
             .refine
             .filter(|_| !job.force_idr && s.cfg.backend.refines_by_qp());
+        let cap = job.cap(s.enc.holds_cap());
         let rate = if refine.is_some() {
             None
         } else if job.force_idr && job.boost {
             s.applied_kbps = None;
-            Some(keyframe_rate(job.crf, job.cap, job.fps))
+            Some(keyframe_rate(job.crf, cap, job.fps))
         } else {
             let moved = s
                 .applied_kbps
-                .is_none_or(|a| (job.cap as f64 - a as f64).abs() > a as f64 * 0.04);
+                .is_none_or(|a| (cap as f64 - a as f64).abs() > a as f64 * 0.04);
             (job.crf != s.applied_crf || moved || job.fps != s.applied_fps).then(|| {
                 s.applied_crf = job.crf;
-                s.applied_kbps = Some(job.cap);
+                s.applied_kbps = Some(cap);
                 s.applied_fps = job.fps;
-                RateConfig::new(job.crf, job.cap, job.fps)
+                RateConfig::new(job.crf, cap, job.fps)
             })
         };
         if let Some(r) = rate {
@@ -2596,6 +2798,7 @@ fn stripe_worker(
             }
         }
         let failed = out.is_err();
+        let error = out.as_ref().err().map(|e| e.0.clone());
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
             Ok(_) => None,
@@ -2622,14 +2825,14 @@ fn stripe_worker(
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);
-        let can = |max_bytes| {
+        let can = |b: PassBudget, max_bytes| {
             s.enc.refinable(Refine {
-                qp: REFINE_RUNGS[REFINE_RUNGS.len() - 1],
+                qp: b.finest,
                 max_bytes,
             })
         };
         let (refinable, refinable_small) =
-            refine.map_or((false, false), |b| (can(b.idle), can(b.busy)));
+            refine.map_or((false, false), |b| (can(b, b.idle), can(b, b.busy)));
         let r = StripeResult {
             i,
             out: res,
@@ -2637,6 +2840,7 @@ fn stripe_worker(
             refinable,
             refinable_small,
             failed,
+            error,
         };
         if done.send(r).is_err() {
             return;
@@ -2657,7 +2861,7 @@ fn encode_loop(
     let start = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
-    let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
+    let debug_stripes = crate::compat::is_set("STARFOLD_DEBUG_STRIPES");
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
         stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
@@ -2715,9 +2919,6 @@ fn encode_loop(
         }
         let target = sh.target.load(Ordering::Relaxed);
         let want_crf = if job.paintover { po_crf } else { crf };
-        // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once.
-        let share = if uncapped { 0 } else { stripe_share(target, n) };
         let ts = job.captured_at.duration_since(start).as_millis() as i64;
         let budget =
             |ms: usize| (!uncapped).then_some(target as usize * ms / 8 / n * REFINE_PLAN_PCT / 100);
@@ -2728,6 +2929,7 @@ fn encode_loop(
             };
             PassBudget {
                 qp,
+                finest: sh.finest,
                 max_bytes: budget(ms),
                 busy: budget(REFINE_LADDER_MS),
                 idle: budget(REFINE_FRAME_MS),
@@ -2737,18 +2939,15 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover {
-                    share.saturating_mul(2)
-                } else {
-                    share
-                };
                 let _ = workers[i].0.send(StripeJob {
                     buf: job.buf.clone(),
                     ts,
                     force_idr,
                     boost,
                     crf: want_crf,
-                    cap,
+                    target: if uncapped { 0 } else { target },
+                    stripes: n,
+                    paintover: job.paintover,
                     refine,
                     fps,
                     max_fps: sh.cap(),
@@ -2766,6 +2965,9 @@ fn encode_loop(
         for _ in 0..pending {
             if let Ok(r) = done_rx.recv() {
                 failed |= r.failed;
+                if let Some(e) = r.error {
+                    *sh.last_error.lock() = Some(e);
+                }
                 refinable[r.i] = r.refinable;
                 refinable_small |= r.refinable_small;
                 fails[r.i] = if r.failed { fails[r.i] + 1 } else { 0 };
@@ -2988,8 +3190,7 @@ fn thread_cpu_us() -> i64 {
 
 fn marker_probe(buf: &[u8], stride: usize, what: &str) -> i64 {
     let mut v: u64 = 0;
-    let (mx, my) = std::env::var("VOXL_DEBUG_MARKER")
-        .ok()
+    let (mx, my) = crate::compat::env("STARFOLD_DEBUG_MARKER")
         .and_then(|s| {
             s.split_once(',')
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))

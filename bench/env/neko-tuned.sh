@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Neko tuned like voxl: 60 FPS H.264 from x264 ultrafast/zerolatency at up to 30 Mbps
+# Neko tuned like starfold: 60 FPS H.264 from x264 ultrafast/zerolatency at up to 30 Mbps
 # (Neko's default is VP8 at 25 FPS, ~2 Mbps).
 cd "$(dirname "$(readlink -f "$0")")"
 D=${BENCH_DISPLAY:-:2}

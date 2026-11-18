@@ -1,9 +1,9 @@
 // Microphone end to end: a private PulseAudio whose default source is a pipe source
-// reading voxl's FIFO (as in the Computer preview), voxl with
+// reading starfold's FIFO (as in the Computer preview), starfold with
 // --microphone-enabled, and headless Chromium whose fake microphone plays a 440 Hz
 // tone. Turns the mic on from the toolbar, records the VM's default source and checks
 // the tone arrives; then checks turning it off and a second client taking it over.
-// Usage: node mictest.mjs   (VOXL_BIN, PULSEAUDIO = pulseaudio package, BENCH_DISPLAY,
+// Usage: node mictest.mjs   (STARFOLD_BIN, PULSEAUDIO = pulseaudio package, BENCH_DISPLAY,
 // CHROMIUM, PLAYWRIGHT_NODE_MODULES)
 import { createRequire } from 'module';
 import { spawn, execFileSync } from 'child_process';
@@ -14,10 +14,10 @@ const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd
 const { chromium } = require('playwright');
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
+const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
 const pa = process.env.PULSEAUDIO || '/run/current-system/sw';
-const port = process.env.VOXL_PORT || '6907';
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'voxl-mic-'));
+const port = process.env.STARFOLD_PORT || '6907';
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'starfold-mic-'));
 const sock = path.join(dir, 'pulse.sock');
 const env = { ...process.env, PULSE_SERVER: `unix:${sock}`, HOME: dir, XDG_RUNTIME_DIR: dir, DISPLAY: process.env.BENCH_DISPLAY || ':2' };
 
@@ -57,10 +57,10 @@ function analyse(raw) {
   return { rms: Math.sqrt(sum / Math.max(n, 1)), hz: crossings / (n / 48000) };
 }
 const pulse = spawn(`${pa}/bin/pulseaudio`, ['-n', '--daemonize=no', '--exit-idle-time=-1', '--disable-shm=yes', `--file=${paConf}`], { env, stdio: 'ignore' });
-let voxl, b;
+let starfold, b;
 try {
   for (let i = 0; i < 50 && !fs.existsSync(sock); i++) await sleep(100);
-  voxl = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--microphone-enabled=true', `--microphone-fifo=${path.join(dir, 'mic.fifo')}`], { env, stdio: ['ignore', fs.openSync(process.env.VOXL_LOG || '/dev/null', 'w'), fs.openSync(process.env.VOXL_LOG || '/dev/null', 'w')] });
+  starfold = spawn(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--microphone-enabled=true', `--microphone-fifo=${path.join(dir, 'mic.fifo')}`], { env, stdio: ['ignore', fs.openSync(process.env.STARFOLD_LOG || '/dev/null', 'w'), fs.openSync(process.env.STARFOLD_LOG || '/dev/null', 'w')] });
   for (let i = 0; i < 50; i++) { try { if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) break; } catch {} await sleep(100); }
 
   b = await chromium.launch({ executablePath: process.env.CHROMIUM || 'chromium', args: ['--no-sandbox', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, '--autoplay-policy=no-user-gesture-required'] });
@@ -83,7 +83,7 @@ try {
   await sleep(1500);
   const live = record(2);
   check(live.rms > 500 && Math.abs(live.hz - 440) < 25, `VM microphone hears the 440 Hz tone (rms ${live.rms.toFixed(0)}, ${live.hz.toFixed(0)} Hz)`);
-  await p.screenshot({ path: path.join(os.tmpdir(), 'voxl-mic-on.png'), clip: { x: 1240, y: 0, width: 160, height: 56 } });
+  await p.screenshot({ path: path.join(os.tmpdir(), 'starfold-mic-on.png'), clip: { x: 1240, y: 0, width: 160, height: 56 } });
 
   await p.click('#mic-btn');
   check(!(await p.evaluate(() => document.getElementById('mic-btn').classList.contains('on'))), 'turning the mic off updates the button');
@@ -108,7 +108,7 @@ try {
   check(gone.rms < 50, `closing the owner's tab releases the microphone (rms ${gone.rms.toFixed(0)})`);
 } finally {
   if (b) await b.close();
-  if (voxl) voxl.kill();
+  if (starfold) starfold.kill();
   pulse.kill();
   fs.rmSync(dir, { recursive: true, force: true });
 }

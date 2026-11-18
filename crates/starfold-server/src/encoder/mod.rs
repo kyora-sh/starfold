@@ -36,7 +36,15 @@ mod kvazaar;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
+#[cfg(feature = "openh264")]
 pub(crate) mod openh264;
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod qsv;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use qsv::{helper_main, HELPER_FLAG};
+#[cfg(any(feature = "openh264", feature = "x264"))]
+pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]
 mod svt;
 #[cfg(test)]
@@ -217,7 +225,27 @@ pub trait VideoEncoder: Send {
     fn refinable(&self, _r: Refine) -> bool {
         false
     }
+    /// Runs at its cap whatever the picture (constant bitrate, padded): seen on Quick Sync
+    /// and on Intel's VA-API driver. Such an encoder gets exactly its area share of the
+    /// budget, not the headroom one that stays under its cap gets.
+    fn holds_cap(&self) -> bool {
+        false
+    }
 }
+
+#[cfg(not(any(feature = "x264", feature = "openh264")))]
+compile_error!(
+    "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
+);
+
+/// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
+const MAX_MBS: usize = 36864;
+
+/// The software H.264 encoder: x264, or OpenH264 in a build without it.
+#[cfg(feature = "x264")]
+pub const SOFTWARE_H264: Backend = Backend::X264;
+#[cfg(not(feature = "x264"))]
+pub const SOFTWARE_H264: Backend = Backend::OpenH264;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -239,12 +267,18 @@ pub enum Backend {
     Vaapi,
     Nvenc,
     MediaFoundation,
+    Qsv,
 }
 
 impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
+            #[cfg(feature = "openh264")]
             "openh264" => Ok(Backend::OpenH264),
+            #[cfg(not(feature = "openh264"))]
+            "openh264" => {
+                Err("this build has no OpenH264 (build with `--features openh264`)".into())
+            }
             #[cfg(feature = "x264")]
             "x264" => Ok(Backend::X264),
             #[cfg(not(feature = "x264"))]
@@ -265,18 +299,18 @@ impl Backend {
             "mediafoundation" => Ok(Backend::MediaFoundation),
             #[cfg(not(windows))]
             "mediafoundation" => Err("mediafoundation is Windows-only".into()),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            "qsv" => Ok(Backend::Qsv),
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            "qsv" => Err("qsv is Windows-only (64-bit)".into()),
             _ => Err(format!(
-                "unknown encoder {s:?} (auto, openh264{}{})",
-                if cfg!(feature = "x264") { ", x264" } else { "" },
-                if cfg!(target_os = "macos") {
-                    ", videotoolbox"
-                } else if cfg!(target_os = "linux") {
-                    ", vaapi, nvenc"
-                } else if cfg!(windows) {
-                    ", nvenc, mediafoundation"
-                } else {
-                    ""
-                }
+                "unknown encoder {s:?} (auto, {})",
+                [
+                    crate::build_facts::encoder_names(),
+                    crate::build_facts::hardware_encoders()
+                ]
+                .concat()
+                .join(", ")
             )),
         }
     }
@@ -300,13 +334,14 @@ impl Backend {
             Backend::Vaapi => "vaapi",
             Backend::Nvenc => "nvenc",
             Backend::MediaFoundation => "mediafoundation",
+            Backend::Qsv => "qsv",
         }
     }
 
     /// Whether this build has an encoder for `codec` on this backend.
     pub fn implements(self, codec: Codec) -> bool {
         match self {
-            Backend::OpenH264 => codec == Codec::H264,
+            Backend::OpenH264 => cfg!(feature = "openh264") && codec == Codec::H264,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
             #[cfg(feature = "libvpx")]
@@ -332,13 +367,17 @@ impl Backend {
             Backend::MediaFoundation => {
                 cfg!(windows) && matches!(codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             }
+            Backend::Qsv => {
+                cfg!(all(windows, target_arch = "x86_64"))
+                    && matches!(codec, Codec::H264 | Codec::Hevc)
+            }
         }
     }
 
     /// The most 16x16 macroblocks one encoder takes, if it has a limit.
     pub fn max_mbs(self) -> Option<usize> {
         match self {
-            Backend::OpenH264 => Some(openh264::MAX_MBS),
+            Backend::OpenH264 => Some(MAX_MBS),
             #[cfg(feature = "x264")]
             Backend::X264 => None,
             #[cfg(feature = "libvpx")]
@@ -352,8 +391,8 @@ impl Backend {
             #[cfg(feature = "x265")]
             Backend::X265 => None,
             // H.264 level 5.2's frame size; HEVC level 5.1's is about the same.
-            Backend::VideoToolbox => Some(openh264::MAX_MBS),
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation => None,
+            Backend::VideoToolbox => Some(MAX_MBS),
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv => None,
         }
     }
 
@@ -377,6 +416,7 @@ impl Backend {
             Backend::Vaapi => 128,
             Backend::Nvenc => 160,
             Backend::MediaFoundation => 128,
+            Backend::Qsv => 128,
         }
     }
 
@@ -385,13 +425,18 @@ impl Backend {
     pub fn experimental(self) -> bool {
         matches!(
             self,
-            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation
+            Backend::Vaapi | Backend::Nvenc | Backend::MediaFoundation | Backend::Qsv
         )
     }
 
     /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
     pub fn refines_by_qp(self) -> bool {
-        self == Backend::OpenH264
+        match self {
+            Backend::OpenH264 => true,
+            #[cfg(feature = "x264")]
+            Backend::X264 => true,
+            _ => false,
+        }
     }
 
     pub fn fits(self, width: u32, height: u32) -> bool {
@@ -401,12 +446,12 @@ impl Backend {
 }
 
 /// `--encoder`: `auto` streams each codec from its eligible hardware encoder (H.264
-/// from OpenH264 where there is none); a backend name pins the H.264 one.
+/// from [`SOFTWARE_H264`] where there is none); a backend name pins the H.264 one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     Auto,
     Pinned(Backend),
-    /// A bench arm: this encoder, with the OpenH264 cohort beside it.
+    /// A bench arm: this encoder, with the [`SOFTWARE_H264`] cohort beside it.
     #[cfg(feature = "sw-arm")]
     Arm(&'static str, Backend, Codec),
 }
@@ -468,7 +513,22 @@ impl Selection {
             Selection::Arm(name, ..) => name,
         }
     }
+
+    /// The encoder `--preset` is given for: the pinned one or the bench arm, and under
+    /// `auto` [`SOFTWARE_H264`]. Every other encoder opens with [`DEFAULT_PRESET`].
+    pub fn preset_backend(self) -> Backend {
+        match self {
+            Selection::Auto => SOFTWARE_H264,
+            Selection::Pinned(b) => b,
+            #[cfg(feature = "sw-arm")]
+            Selection::Arm(_, b, _) => b,
+        }
+    }
 }
+
+/// The preset every encoder takes as its own default: x264's name for its fastest preset,
+/// which the bench arms read as "no preset given".
+pub const DEFAULT_PRESET: &str = "ultrafast";
 
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
@@ -483,6 +543,51 @@ pub struct EncoderConfig {
     pub best_quality: f32,
     /// x264's preset; a bench arm's preset or speed.
     pub preset: String,
+}
+
+/// The backends turned off for this process, and why, as they stand now: Quick Sync after
+/// a give-up, with the helpers that haven't exited yet.
+pub fn turned_off() -> Vec<(Backend, String)> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(why) = qsv::off() {
+        return vec![(Backend::Qsv, why)];
+    }
+    Vec::new()
+}
+
+/// `/stats`' `encoder` object with `off`'s reasons as they stand now: each backend in it is
+/// listed under `off` and no longer under `chosen` (a codec no stream used keeps its offer
+/// there otherwise), and its `failed` entries give that reason rather than the one recorded
+/// when the stream fell back.
+pub fn with_live(encoder: &serde_json::Value, off: &[(Backend, String)]) -> serde_json::Value {
+    let mut e = encoder.clone();
+    let Some(obj) = e.as_object_mut() else {
+        return e;
+    };
+    let is_off = |v: &serde_json::Value| {
+        off.iter()
+            .any(|(b, _)| v.get("backend") == Some(&serde_json::json!(b)))
+    };
+    if let Some(chosen) = obj.get_mut("chosen").and_then(|c| c.as_array_mut()) {
+        chosen.retain(|c| !is_off(c));
+    }
+    if let Some(failed) = obj.get_mut("failed").and_then(|f| f.as_array_mut()) {
+        for f in failed {
+            let backend = f.get("backend").and_then(|b| b.as_str()).map(str::to_owned);
+            if let Some((_, why)) = off
+                .iter()
+                .find(|(b, _)| Some(b.name()) == backend.as_deref())
+            {
+                f["reason"] = serde_json::Value::from(why.as_str());
+            }
+        }
+    }
+    let list: Vec<serde_json::Value> = off
+        .iter()
+        .map(|(b, why)| serde_json::json!({"backend": b, "reason": why}))
+        .collect();
+    obj.insert("off".into(), serde_json::Value::Array(list));
+    e
 }
 
 /// Opens `cfg.backend`. Sizes it can't code (odd, or below its minimum) are coded
@@ -518,6 +623,7 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         ..cfg.clone()
     };
     let inner: Box<dyn VideoEncoder> = match cfg.backend {
+        #[cfg(feature = "openh264")]
         Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
@@ -539,6 +645,8 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         Backend::Nvenc => nvenc::open(&coded)?,
         #[cfg(windows)]
         Backend::MediaFoundation => mf::open(&coded)?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        Backend::Qsv => qsv::open(&coded)?,
         b => return Err(EncodeError(format!("no {} encoder", b.name()))),
     };
     if (coded.width, coded.height) == (cfg.width, cfg.height) {
@@ -633,5 +741,9 @@ impl VideoEncoder for Pad {
 
     fn refinable(&self, r: Refine) -> bool {
         self.inner.refinable(r)
+    }
+
+    fn holds_cap(&self) -> bool {
+        self.inner.holds_cap()
     }
 }

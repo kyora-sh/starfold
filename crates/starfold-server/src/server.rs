@@ -377,7 +377,7 @@ pub fn index_html(title: &str) -> Bytes {
     Bytes::from(include_str!("../../../packages/web/index.html").replace("{{title}}", &escaped))
 }
 
-/// The page's icon (--favicon): that file's bytes and content type, or voxl's own icon.
+/// The page's icon (--favicon): that file's bytes and content type, or starfold's own icon.
 pub fn favicon(path: Option<&str>) -> Result<(Bytes, &'static str), String> {
     let Some(path) = path else {
         return Ok((
@@ -486,10 +486,10 @@ pub fn router(state: AppState) -> Router {
     let wait_routes = Router::new()
         .route("/wait", get(crate::wait::wait))
         .with_state(state.hub.clone());
-    // VOXL_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
+    // STARFOLD_TEST_HOOKS: POST /debug/renegotiate moves every protocol 2 viewer to a new
     // epoch (a codec switch, even to the same codec), and POST /debug/fail-h264 makes the
     // H.264 encoder fall back to the next one, for end-to-end tests.
-    let debug_routes: Router = if std::env::var_os("VOXL_TEST_HOOKS").is_some() {
+    let debug_routes: Router = if crate::compat::is_set("STARFOLD_TEST_HOOKS") {
         Router::new()
             .route("/debug/renegotiate", axum::routing::post(renegotiate))
             .route("/debug/fail-h264", axum::routing::post(fail_h264))
@@ -600,7 +600,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
         "cohorts": &*s.hub.cohorts.lock(),
-        "encoder": &*s.hub.encoder.lock(),
+        "encoder": crate::encoder::with_live(&s.hub.encoder.lock(), &crate::encoder::turned_off()),
         "encoders": &*s.encoders,
     });
     (
@@ -623,12 +623,12 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     let framed = s.framed;
     let client = s.hub.add_client(tx);
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
+    s.hub.send_first_hello(&client);
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
     let mut writer = tokio::spawn(async move {
-        let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+        let dbg = crate::compat::is_set("STARFOLD_DEBUG_MARKER");
         loop {
             let m = tokio::select! {
                 biased;
@@ -807,7 +807,7 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             set_hz(c, hz);
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
-            if offer.is_some_and(|o| o != gen) {
+            if !Hub::answers(offer, gen) {
                 return;
             }
             c.caps_hello(crate::negotiate::decode_caps(&decode), gen);
@@ -974,6 +974,94 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::HelloStep;
+
+    /// A client as `handle_socket` registers one, and the generations of the hellos queued
+    /// to it, in order.
+    fn connected(hub: &Hub) -> (Arc<Client>, mpsc::UnboundedReceiver<Out>) {
+        let (tx, rx) = mpsc::unbounded_channel::<Out>();
+        (hub.add_client(tx), rx)
+    }
+
+    fn hello_gens(rx: &mut mpsc::UnboundedReceiver<Out>) -> Vec<u64> {
+        let mut v = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Out::Text(t) = m {
+                let j: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if j["t"] == "hello" {
+                    v.push(j["offer"].as_u64().unwrap());
+                }
+            }
+        }
+        v
+    }
+
+    /// What the video thread does for a new screen size: a new offer generation, then a
+    /// hello at it to every connected client.
+    fn new_size(hub: &Hub) {
+        hub.next_offer_gen();
+        hub.restart_clients();
+    }
+
+    /// A new size between a client's registration and its first hello's enqueue: its
+    /// queue still ends on the newest generation, and only that one's answer is taken.
+    #[test]
+    fn a_new_size_while_a_viewer_connects_ends_its_queue_on_the_newest_hello() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        hub.send_first_hello_with(&c, |s| {
+            if s == HelloStep::Built(0) {
+                new_size(&hub);
+            }
+        });
+        let gens = hello_gens(&mut rx);
+        assert_eq!(gens, vec![1, 0, 1], "restart hello, ours at 0, ours at 1");
+        let now = hub.offer_gen.load(Ordering::SeqCst);
+        assert_eq!(gens.last(), Some(&now));
+        assert!(Hub::answers(gens.last().copied(), now));
+        assert!(
+            !Hub::answers(Some(0), now),
+            "an answer to the stale hello is refused"
+        );
+    }
+
+    /// Two new sizes between a check and the next enqueue: the loop checks again after
+    /// every enqueue, so the queue still ends on the newest.
+    #[test]
+    fn two_new_sizes_between_a_check_and_the_next_hello_still_end_on_the_newest() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        hub.send_first_hello_with(&c, |s| match s {
+            HelloStep::Built(0) => new_size(&hub),
+            HelloStep::Built(1) => {
+                new_size(&hub);
+                new_size(&hub);
+            }
+            _ => {}
+        });
+        let gens = hello_gens(&mut rx);
+        assert_eq!(gens, vec![1, 0, 2, 3, 1, 3]);
+        let now = hub.offer_gen.load(Ordering::SeqCst);
+        assert_eq!((now, gens.last()), (3, Some(&3)));
+        assert!(Hub::answers(Some(3), now));
+    }
+
+    /// No new size meanwhile: exactly one hello.
+    #[test]
+    fn a_viewer_that_connects_gets_one_hello_when_nothing_changes() {
+        let hub = Hub::new();
+        let (c, mut rx) = connected(&hub);
+        let mut steps = Vec::new();
+        hub.send_first_hello_with(&c, |s| steps.push(s));
+        assert_eq!(steps, vec![HelloStep::Built(0), HelloStep::Sent(0)]);
+        assert_eq!(hello_gens(&mut rx), vec![0]);
+        hub.send_first_hello(&c);
+        assert_eq!(
+            hello_gens(&mut rx),
+            vec![0],
+            "the plain entry point: one hello"
+        );
+    }
 
     #[tokio::test]
     async fn dav1d_wasm_is_served_as_wasm() {
@@ -1015,7 +1103,7 @@ mod tests {
             audio: true,
             epoch: Instant::now(),
             files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
+                root: None,
                 upload: false,
                 download: false,
                 default_dir: String::new(),
@@ -1181,7 +1269,7 @@ mod tests {
         assert_eq!(content_type, "image/x-icon");
         assert!(!bytes.is_empty());
 
-        let dir = std::env::temp_dir().join(format!("voxl-favicon-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("starfold-favicon-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("icon.PNG");
         std::fs::write(&png, b"\\x89PNG").unwrap();

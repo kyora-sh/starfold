@@ -1,4 +1,4 @@
-//! Minimal MP4 writer for recordings: the H.264 voxl already sends, rewrapped without
+//! Minimal MP4 writer for recordings: the H.264 starfold already sends, rewrapped without
 //! re-encoding. Frames arrive only when the screen changes, so each sample lasts until
 //! the next one (variable frame rate).
 
@@ -174,7 +174,7 @@ pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<V
     let mut hdlr = u32s(&[0]);
     hdlr.extend_from_slice(b"vide");
     hdlr.extend_from_slice(&[0u8; 12]);
-    hdlr.extend_from_slice(b"voxl\0");
+    hdlr.extend_from_slice(b"starfold\0");
     let hdlr = fbx(b"hdlr", 0, &hdlr);
     let mut mdhd = u32s(&[0, 0, TIMESCALE, total as u32]);
     mdhd.extend_from_slice(&[0x55, 0xc4, 0, 0]); // language "und"

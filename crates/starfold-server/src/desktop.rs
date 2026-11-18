@@ -102,7 +102,7 @@ pub fn spawn(
         text: atom(&conn, "TEXT")?,
         text_plain: atom(&conn, "text/plain;charset=utf-8")?,
         incr: atom(&conn, "INCR")?,
-        prop: atom(&conn, "VOXL_CLIP")?,
+        prop: atom(&conn, "STARFOLD_CLIP")?,
         png: atom(&conn, "image/png")?,
     };
     conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)

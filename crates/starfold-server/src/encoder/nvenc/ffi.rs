@@ -14,6 +14,20 @@ const LIB_CUDA: &str = "nvcuda.dll";
 #[cfg(not(windows))]
 const LIB_CUDA: &str = "libcuda.so.1";
 
+#[cfg(windows)]
+unsafe fn open(name: &str) -> Result<Library, String> {
+    crate::winlib::system(name)
+}
+
+#[cfg(not(windows))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Linux sonames resolve through the system linker path, not a DLL search order"
+)]
+unsafe fn open(name: &str) -> Result<Library, String> {
+    Library::new(name).map_err(|e| format!("{name}: {e}"))
+}
+
 pub const API_MAJOR: u32 = 12;
 pub const API_MINOR: u32 = 1;
 pub const API_VERSION: u32 = API_MAJOR | (API_MINOR << 24);
@@ -597,7 +611,7 @@ impl Api {
     /// Loads the library; fails unless its driver has API 12.1 or later.
     pub fn load() -> Result<Api, String> {
         unsafe {
-            let lib = Library::new(LIB_ENCODE).map_err(|e| format!("{LIB_ENCODE}: {e}"))?;
+            let lib = open(LIB_ENCODE)?;
             let max_version: unsafe extern "system" fn(*mut u32) -> Status =
                 sym!(lib, "NvEncodeAPIGetMaxSupportedVersion");
             let create: unsafe extern "system" fn(*mut FunctionList) -> Status =
@@ -662,7 +676,7 @@ impl Cuda {
     /// Loads the CUDA driver and initializes it.
     pub fn load() -> Result<Cuda, String> {
         unsafe {
-            let lib = Library::new(LIB_CUDA).map_err(|e| format!("{LIB_CUDA}: {e}"))?;
+            let lib = open(LIB_CUDA)?;
             let init: unsafe extern "system" fn(u32) -> c_int = sym!(lib, "cuInit");
             let cuda = Cuda {
                 device_get_count: sym!(lib, "cuDeviceGetCount"),

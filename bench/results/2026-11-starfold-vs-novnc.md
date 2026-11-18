@@ -280,8 +280,7 @@ do not change the rate parity.
 Code: starfold and its upstream voxl are MIT; OpenH264 is BSD-2-Clause; noVNC is MPL-2.0; x11vnc is GPL-2.0, used here as an external
 process. x264 is GPL and only behind an off-by-default cargo feature. Patents, descriptively and without legal conclusions: HEVC has
 established patent pools that can reach anyone distributing an encoder. AV1 and VP9 are offered royalty-free by their developers,
-though third-party pools also assert claims over them, so "no exposure" is not accurate. H.264 has its own pool; the owner has accepted
-that residual risk for self-built OpenH264. This needs legal review before any wide ship and is not a finding of this bench.
+though third-party pools also assert claims over them, so "no exposure" is not accurate. H.264 has its own pool. This needs legal review before any wide ship and is not a finding of this bench.
 
 ## Refresh, 8 November 2026: #13 against main
 

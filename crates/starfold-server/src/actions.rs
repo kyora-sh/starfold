@@ -406,7 +406,7 @@ pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -
         );
     }
     // A JSON body also means a browser on another site can't send this without a CORS
-    // preflight, which voxl never answers.
+    // preflight, which starfold never answers.
     let is_json = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -643,7 +643,7 @@ mod tests {
             audio: false,
             epoch: std::time::Instant::now(),
             files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
+                root: None,
                 upload: false,
                 download: false,
                 default_dir: String::new(),

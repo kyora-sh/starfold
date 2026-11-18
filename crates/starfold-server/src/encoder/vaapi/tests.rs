@@ -93,6 +93,7 @@ struct Log {
     surfaces: Vec<VaId>,
     encoded: Vec<VaId>,
     config: Vec<Config>,
+    context: Option<(u32, u32)>,
     destroyed: bool,
 }
 
@@ -106,6 +107,13 @@ struct Fake {
     extra: Vec<Option<u32>>,
     slice: fn(bool) -> Vec<u8>,
     fail_encode: Option<usize>,
+    /// The smallest context it takes, reported as surface attributes.
+    min: Option<(u32, u32)>,
+    /// Like Mesa's radeonsi: packed headers come out only when the picture also has a
+    /// packed slice header, and an H.264 slice it writes takes its NAL header byte from
+    /// that packed slice header (zero without one).
+    mesa: bool,
+    vendor: &'static str,
     next: VaId,
     out: Vec<u8>,
 }
@@ -121,6 +129,9 @@ impl Fake {
             extra: Vec::new(),
             slice,
             fail_encode: None,
+            min: None,
+            mesa: false,
+            vendor: "",
             next: 100,
             out: Vec::new(),
         };
@@ -138,6 +149,10 @@ fn err(s: &str) -> EncodeError {
 }
 
 impl Driver for Fake {
+    fn vendor(&mut self) -> String {
+        self.vendor.into()
+    }
+
     fn entrypoints(&mut self, profile: i32) -> Result<Vec<i32>, EncodeError> {
         Ok(self
             .profiles
@@ -173,7 +188,15 @@ impl Driver for Fake {
         Ok(s)
     }
 
-    fn create_context(&mut self, _: VaId, _: u32, _: u32, _: &[VaId]) -> Result<VaId, EncodeError> {
+    fn min_size(&mut self, _: i32, _: i32) -> Option<(u32, u32)> {
+        self.min
+    }
+
+    fn create_context(&mut self, _: VaId, w: u32, h: u32, _: &[VaId]) -> Result<VaId, EncodeError> {
+        if self.min.is_some_and(|m| w < m.0 || h < m.1) {
+            return Err(err("vaCreateContext: resolution not supported (19)"));
+        }
+        self.log.lock().unwrap().context = Some((w, h));
         Ok(self.id())
     }
 
@@ -206,12 +229,42 @@ impl Driver for Fake {
         }
         let bufs: Vec<(i32, Vec<u8>)> = ids.iter().map(|i| log.buffers[i].clone()).collect();
         let idr = bufs.iter().any(|b| b.0 == ffi::BUF_SEQUENCE);
-        self.out = bufs
+        let mut packed: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut kind = 0;
+        for b in &bufs {
+            if b.0 == ffi::BUF_PACKED_PARAM {
+                kind = ffi::read::<ffi::VAEncPackedHeaderParameterBuffer>(&b.1).kind;
+            } else if b.0 == ffi::BUF_PACKED_DATA {
+                packed.push((kind, b.1.clone()));
+            }
+        }
+        let slice_header = packed
             .iter()
-            .filter(|b| b.0 == ffi::BUF_PACKED_DATA)
-            .flat_map(|b| b.1.clone())
-            .collect();
-        self.out.extend((self.slice)(idr));
+            .find(|p| p.0 == ffi::PACKED_TYPE_SLICE)
+            .map(|p| p.1.clone());
+        let h264 = self.profiles.iter().any(|p| h264::PROFILES.contains(&p.0));
+        let mut slice = (self.slice)(idr);
+        if !self.mesa {
+            self.out = packed.into_iter().flat_map(|p| p.1).collect();
+        } else if h264 {
+            self.out = match &slice_header {
+                Some(_) => packed
+                    .into_iter()
+                    .filter(|p| p.0 != ffi::PACKED_TYPE_SLICE)
+                    .flat_map(|p| p.1)
+                    .collect(),
+                None => Vec::new(),
+            };
+            if slice.len() > 4 {
+                slice[4] = slice_header.as_ref().map_or(0, |h| h[4]);
+            }
+        } else {
+            self.out = match slice_header {
+                Some(_) => packed.into_iter().flat_map(|p| p.1).collect(),
+                None => Vec::new(),
+            };
+        }
+        self.out.extend(slice);
         log.frames.push(bufs);
         log.encoded.push(surface);
         Ok(())
@@ -441,7 +494,7 @@ fn rate_control_follows_rate_config() {
     let r: ffi::Misc<ffi::VAEncMiscParameterRateControl> = ffi::read(&misc[1].data);
     assert_eq!(
         (r.kind, r.data.bits_per_second, r.data.rc_flags),
-        (1, 8_000_000, 3)
+        (1, 8_000_000, 0b111)
     );
     assert_eq!(Rc::new(RcMode::Cqp, &uncapped, None).misc(false).len(), 1);
 
@@ -465,6 +518,66 @@ fn rate_control_follows_rate_config() {
         (r.data.bits_per_second, r.data.rc_flags & 1),
         (2_000_000, 1)
     );
+}
+
+/// Without `disable_bit_stuffing` a constant-bitrate driver pads every picture with
+/// filler data up to the target rate, so every rate control buffer sends it.
+#[test]
+fn rate_control_turns_off_filler_data() {
+    for (codec, profile, slice, extra) in [
+        (
+            Codec::H264,
+            ffi::PROFILE_H264_HIGH,
+            h264_slice as fn(bool) -> Vec<u8>,
+            vec![],
+        ),
+        (
+            Codec::Hevc,
+            ffi::PROFILE_HEVC_MAIN,
+            hevc_slice,
+            vec![None, None],
+        ),
+        (
+            Codec::Av1,
+            ffi::PROFILE_AV1_0,
+            av1_tile_group,
+            vec![Some(0x1f), Some(3 << 2 | 4 << 4)],
+        ),
+    ] {
+        let (mut fake, log) = Fake::new(profile, slice);
+        fake.extra = extra;
+        let mut enc = session(Box::new(fake), &cfg(codec, 640, 480)).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        enc.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
+        encode(enc.as_mut(), 640, 480, false).unwrap();
+        encode(enc.as_mut(), 640, 480, true).unwrap();
+        drop(enc);
+        let log = log.lock().unwrap();
+        let rc: Vec<(u32, u32, u32)> = log
+            .frames
+            .iter()
+            .flat_map(|f| find(f, ffi::BUF_MISC))
+            .filter(|b| b[..4] == ffi::MISC_RATE_CONTROL.to_ne_bytes())
+            .map(|b| ffi::read::<ffi::Misc<ffi::VAEncMiscParameterRateControl>>(&b))
+            .map(|m| {
+                (
+                    m.data.target_percentage,
+                    m.data.bits_per_second,
+                    m.data.rc_flags,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rc,
+            vec![
+                (100, 4_000_000, 0b110),
+                (100, 2_000_000, 0b111),
+                (100, 2_000_000, 0b110)
+            ],
+            "{codec:?}"
+        );
+    }
 }
 
 #[test]
@@ -632,23 +745,79 @@ fn av1_tiles_and_driver_requirements() {
 }
 
 #[test]
-fn choose_prefers_low_power_and_the_best_profile() {
+fn choose_prefers_the_full_entrypoint_and_the_best_profile() {
     let (mut fake, _) = Fake::new(ffi::PROFILE_H264_MAIN, h264_slice);
     fake.profiles = vec![
         (
             ffi::PROFILE_H264_MAIN,
-            vec![ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP],
+            vec![ffi::ENTRYPOINT_ENC_SLICE_LP, ffi::ENTRYPOINT_ENC_SLICE],
         ),
         (ffi::PROFILE_H264_CB, vec![ffi::ENTRYPOINT_ENC_SLICE]),
     ];
     let c = choose(&mut fake, h264::PROFILES, (640, 480), &[]).unwrap();
     assert_eq!(
         (c.profile, c.entrypoint),
-        (ffi::PROFILE_H264_MAIN, ffi::ENTRYPOINT_ENC_SLICE_LP)
+        (ffi::PROFILE_H264_MAIN, ffi::ENTRYPOINT_ENC_SLICE)
     );
     assert!(choose(&mut fake, h264::PROFILES, (8192, 480), &[]).is_err());
     fake.profiles.clear();
     assert!(session(Box::new(fake), &cfg(Codec::H264, 640, 480)).is_err());
+}
+
+/// Low-power encoding with constant bitrate has faulted a GPU's video engine, so a
+/// session takes the full entrypoint wherever the driver offers it, and low-power only
+/// where that is all there is.
+#[test]
+fn sessions_take_low_power_only_when_it_is_all_there_is() {
+    let (slice, lp) = (ffi::ENTRYPOINT_ENC_SLICE, ffi::ENTRYPOINT_ENC_SLICE_LP);
+    for (codec, profile, data, extra) in [
+        (
+            Codec::H264,
+            ffi::PROFILE_H264_HIGH,
+            h264_slice as fn(bool) -> Vec<u8>,
+            vec![],
+        ),
+        (
+            Codec::Hevc,
+            ffi::PROFILE_HEVC_MAIN,
+            hevc_slice,
+            vec![None, None],
+        ),
+        (
+            Codec::Av1,
+            ffi::PROFILE_AV1_0,
+            av1_tile_group,
+            vec![Some(0x1f), Some(3 << 2 | 4 << 4)],
+        ),
+    ] {
+        for (offered, want) in [
+            (vec![lp, slice], Some(slice)),
+            (vec![slice, lp], Some(slice)),
+            (vec![lp], Some(lp)),
+            (vec![slice], Some(slice)),
+            (vec![1], None),
+        ] {
+            let (mut fake, log) = Fake::new(profile, data);
+            fake.profiles = vec![(profile, offered.clone())];
+            fake.extra = extra.clone();
+            let r = sample_on(Box::new(fake), codec);
+            let got = log.lock().unwrap().config.last().map(|c| c.1);
+            match want {
+                Some(e) => {
+                    assert!(r.is_ok(), "{codec:?} {offered:?}: {r:?}");
+                    assert_eq!(got, Some(e), "{codec:?} {offered:?}");
+                }
+                None => {
+                    let e = r.err().unwrap();
+                    assert!(
+                        e.0.contains("no encode entrypoint"),
+                        "{codec:?} {offered:?}: {e}"
+                    );
+                    assert_eq!(got, None, "{codec:?} {offered:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -725,13 +894,28 @@ fn a_higher_rate_raises_the_level_at_an_idr() {
 #[test]
 fn h264_packs_both_parameter_sets_or_neither() {
     let both = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE;
-    assert_eq!(
-        h264::H264::packed(Some(both | ffi::PACKED_SLICE)),
-        Some(both)
-    );
-    assert_eq!(h264::H264::packed(Some(ffi::PACKED_SEQUENCE)), Some(0));
-    assert_eq!(h264::H264::packed(Some(ffi::PACKED_PICTURE)), Some(0));
-    assert_eq!(h264::H264::packed(None), None);
+    let all = both | ffi::PACKED_SLICE;
+    for slices in [false, true] {
+        assert_eq!(
+            h264::H264::packed(Some(all), slices),
+            Some(if slices { all } else { both })
+        );
+        assert_eq!(h264::H264::packed(Some(both), slices), Some(both));
+        assert_eq!(
+            h264::H264::packed(Some(ffi::PACKED_SEQUENCE | ffi::PACKED_SLICE), slices),
+            Some(0)
+        );
+        assert_eq!(
+            h264::H264::packed(Some(ffi::PACKED_PICTURE), slices),
+            Some(0)
+        );
+        assert_eq!(h264::H264::packed(None, slices), None);
+    }
+    assert!(h264::H264::wants_slice_headers(MESA));
+    assert!(!h264::H264::wants_slice_headers(
+        "Intel iHD driver for Intel(R) Gen Graphics - 25.2.6"
+    ));
+    assert!(!h264::H264::wants_slice_headers(""));
     let (mut fake, log) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
     fake.packed = Some(ffi::PACKED_SEQUENCE);
     let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
@@ -742,6 +926,179 @@ fn h264_packs_both_parameter_sets_or_neither() {
     let log = log.lock().unwrap();
     assert!(find(&log.frames[0], ffi::BUF_PACKED_DATA).is_empty());
     assert!(log.config[0].2.contains(&(ffi::ATTRIB_PACKED_HEADERS, 0)));
+}
+
+fn nal_types(a: &AccessUnit) -> Vec<u8> {
+    h264_nal::nal_units(&a.data)
+        .map(h264_nal::nal_type)
+        .collect()
+}
+
+const MESA: &str = "Mesa Gallium driver 26.0.8 for AMD Radeon Vega 11 Graphics (radeonsi)";
+
+/// The packed slice header of each frame, as (NAL header byte, RBSP reader).
+fn packed_slices(frames: &[Vec<(i32, Vec<u8>)>]) -> Vec<(u8, Reader)> {
+    frames
+        .iter()
+        .map(|f| {
+            let mut kind = 0;
+            let mut found = Vec::new();
+            for b in f {
+                if b.0 == ffi::BUF_PACKED_PARAM {
+                    kind = ffi::read::<ffi::VAEncPackedHeaderParameterBuffer>(&b.1).kind;
+                } else if b.0 == ffi::BUF_PACKED_DATA && kind == ffi::PACKED_TYPE_SLICE {
+                    found.push((b.1[4], Reader::nal(&b.1, 5)));
+                }
+            }
+            assert_eq!(found.len(), 1, "one packed slice header per picture");
+            found.pop().unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn h264_packs_slice_headers_for_mesa() {
+    for (profile, cqp) in [
+        (ffi::PROFILE_H264_HIGH, false),
+        (ffi::PROFILE_H264_HIGH, true),
+        (ffi::PROFILE_H264_CB, false),
+    ] {
+        let (mut fake, log) = Fake::new(profile, h264_slice);
+        fake.mesa = true;
+        fake.vendor = MESA;
+        let mut c = cfg(Codec::H264, 320, 240);
+        if cqp {
+            c.rate.max_kbps = 0;
+        }
+        let mut enc = session(Box::new(fake), &c).unwrap();
+        let mut aus = Vec::new();
+        for key in [false, false, true, false] {
+            aus.extend(encode(enc.as_mut(), 320, 240, key).unwrap());
+        }
+        assert_eq!(
+            aus.iter().map(nal_types).collect::<Vec<_>>(),
+            vec![vec![7, 8, 5], vec![1], vec![7, 8, 5], vec![1]]
+        );
+        assert!(aus[0].config.is_some());
+        let log = log.lock().unwrap();
+        let all = ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE | ffi::PACKED_SLICE;
+        assert!(log.config[0].2.contains(&(ffi::ATTRIB_PACKED_HEADERS, all)));
+        let cabac = profile != ffi::PROFILE_H264_CB;
+        for (i, (head, mut r)) in packed_slices(&log.frames).into_iter().enumerate() {
+            let sl: ffi::VAEncSliceParameterBufferH264 =
+                ffi::read(&find(&log.frames[i], ffi::BUF_SLICE)[0]);
+            let idr = i % 2 == 0;
+            let n = if idr { 0 } else { 1 };
+            assert_eq!(head, if idr { 0x65 } else { 0x41 }, "frame {i}");
+            assert_eq!(r.ue(), 0, "first_mb_in_slice");
+            assert_eq!(r.ue() % 5, sl.slice_type as u32, "slice_type");
+            assert_eq!(r.ue(), 0, "pic_parameter_set_id");
+            assert_eq!(r.u(8), n, "frame_num");
+            if idr {
+                assert_eq!(r.ue(), sl.idr_pic_id as u32, "idr_pic_id");
+                assert_eq!(r.u(2), 0, "no_output_of_prior_pics, long_term_reference");
+            } else {
+                assert_eq!(r.u(3), 0, "no override, no list modification, no MMCO");
+                if cabac {
+                    assert_eq!(r.ue(), 0, "cabac_init_idc");
+                }
+            }
+            assert_eq!(r.se(), sl.slice_qp_delta as i32, "slice_qp_delta");
+            assert_eq!((r.ue(), r.se(), r.se()), (0, 0, 0), "deblocking");
+            assert!(r.at_end(), "frame {i}");
+        }
+    }
+}
+
+#[test]
+fn h264_packs_no_slice_headers_for_other_drivers() {
+    let (fake, log) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    for key in [false, false] {
+        encode(enc.as_mut(), 320, 240, key).unwrap();
+    }
+    let log = log.lock().unwrap();
+    let both = (
+        ffi::ATTRIB_PACKED_HEADERS,
+        ffi::PACKED_SEQUENCE | ffi::PACKED_PICTURE,
+    );
+    assert!(log.config[0].2.contains(&both));
+    for f in &log.frames {
+        for p in find(f, ffi::BUF_PACKED_PARAM) {
+            let p: ffi::VAEncPackedHeaderParameterBuffer = ffi::read(&p);
+            assert_ne!(p.kind, ffi::PACKED_TYPE_SLICE);
+        }
+    }
+}
+
+#[test]
+fn h264_output_without_a_usable_slice_is_refused() {
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.mesa = true;
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    let e = encode(enc.as_mut(), 320, 240, false).err().unwrap();
+    assert!(e.0.contains("without a picture"), "{e}");
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, |_| Vec::new());
+    fake.mesa = true;
+    fake.vendor = MESA;
+    let mut enc = session(Box::new(fake), &cfg(Codec::H264, 320, 240)).unwrap();
+    let e = encode(enc.as_mut(), 320, 240, false).err().unwrap();
+    assert!(e.0.contains("without a picture"), "{e}");
+}
+
+/// Mesa 26.0's radeonsi on VCN 1.0: 128x128 at the least, 130 wide for HEVC, packed
+/// headers only beside a packed slice header, H.264 slice NAL headers from it.
+#[test]
+fn a_radeonsi_shaped_driver_passes_the_probe_sample() {
+    type Slice = fn(bool) -> Vec<u8>;
+    let h264: Slice = h264_slice;
+    for (profile, codec, slice, min, want) in [
+        (
+            ffi::PROFILE_H264_HIGH,
+            Codec::H264,
+            h264,
+            (128, 128),
+            (128, 128),
+        ),
+        (
+            ffi::PROFILE_HEVC_MAIN,
+            Codec::Hevc,
+            hevc_slice,
+            (130, 128),
+            (144, 128),
+        ),
+    ] {
+        let (mut fake, log) = Fake::new(profile, slice);
+        fake.min = Some(min);
+        fake.mesa = true;
+        fake.vendor = MESA;
+        sample_on(Box::new(fake), codec).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(log.lock().unwrap().context, Some(want), "{codec:?}");
+    }
+}
+
+#[test]
+fn the_probe_sample_stays_128_unless_the_driver_needs_more() {
+    for min in [None, Some((32, 32)), Some((128, 128))] {
+        for (profile, codec, slice) in [
+            (
+                ffi::PROFILE_H264_HIGH,
+                Codec::H264,
+                h264_slice as fn(bool) -> Vec<u8>,
+            ),
+            (ffi::PROFILE_HEVC_MAIN, Codec::Hevc, hevc_slice),
+        ] {
+            let (mut fake, log) = Fake::new(profile, slice);
+            fake.min = min;
+            sample_on(Box::new(fake), codec).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+            assert_eq!(log.lock().unwrap().context, Some((128, 128)), "{min:?}");
+        }
+    }
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.min = Some((130, 200));
+    assert_eq!(sample_size(&mut fake, Codec::H264), (144, 208));
+    fake.profiles.clear();
+    assert_eq!(sample_size(&mut fake, Codec::H264), (128, 128));
 }
 
 #[test]
@@ -854,6 +1211,14 @@ fn layouts_match_libva() {
         "VAEncMiscParameterBuffer_header",
         offset_of!(ffi::Misc<u32>, data),
     ));
+    want.push((
+        "VASurfaceAttribMinWidth",
+        ffi::SURFACE_ATTRIB_MIN_WIDTH as usize,
+    ));
+    want.push((
+        "VASurfaceAttribMinHeight",
+        ffi::SURFACE_ATTRIB_MIN_HEIGHT as usize,
+    ));
     let dir = std::env::temp_dir().join(format!("va-layout-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut c = String::from(
@@ -862,6 +1227,8 @@ fn layouts_match_libva() {
     for (t, _) in &want {
         if *t == "VAEncMiscParameterBuffer_header" {
             c.push_str("printf(\"%zu\\n\", offsetof(VAEncMiscParameterBuffer, data));\n");
+        } else if t.starts_with("VASurfaceAttribMin") {
+            c.push_str(&format!("printf(\"%zu\\n\", (size_t){t});\n"));
         } else {
             c.push_str(&format!("printf(\"%zu\\n\", sizeof({t}));\n"));
         }
@@ -925,4 +1292,173 @@ fn hardware_smoke() {
             Err(e) => eprintln!("{codec:?}: {e}"),
         }
     }
+}
+
+/// Whether `a` is shaped as asked: an IDR with its parameter sets, or a P frame, and the
+/// stream announced on its first unit.
+fn au_shape(codec: Codec, a: &AccessUnit, key: bool, first: bool) -> Result<(), String> {
+    let units: Vec<&[u8]> = h264_nal::nal_units(&a.data).collect();
+    let (types, slice, irap, params): (Vec<u8>, bool, bool, bool) = match codec {
+        Codec::H264 => {
+            let t: Vec<u8> = units.iter().map(|n| h264_nal::nal_type(n)).collect();
+            let slice = t.iter().any(|&t| t == 1 || t == 5);
+            let idr = t.contains(&5);
+            let ps = t.contains(&7) && t.contains(&8);
+            (t, slice, idr, ps)
+        }
+        _ => {
+            use crate::encoder::hevc;
+            let t: Vec<u8> = units.iter().map(|n| hevc::nal_type(n)).collect();
+            let slice = t.iter().any(|&t| hevc::is_slice(t));
+            let irap = t.iter().any(|&t| hevc::is_random_access(t));
+            let ps = [hevc::NAL_VPS, hevc::NAL_SPS, hevc::NAL_PPS]
+                .iter()
+                .all(|p| t.contains(p));
+            (t, slice, irap, ps)
+        }
+    };
+    let ok = slice
+        && irap == key
+        && a.keyframe == key
+        && (!key || params)
+        && (!first || a.config.is_some());
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "keyframe {} (asked {key}), NAL types {types:?}, config {}",
+            a.keyframe,
+            a.config.is_some()
+        ))
+    }
+}
+
+/// Real hardware, a minute per codec: 1280x720 at 30 fps of moving content, paced to the
+/// clock, in the session `--encoder vaapi` opens, with a keyframe asked for every 10 s.
+/// Fails if either codec can't open, any frame fails, or a unit isn't shaped as asked.
+/// Each stream goes to `$STARFOLD_VAAPI_OUT/minute.{h264,hevc}` when that is set.
+#[test]
+#[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
+fn hardware_minute() {
+    hardware_run(true, "minute");
+}
+
+/// [`hardware_minute`] on a picture that never changes, where a constant-bitrate stream
+/// has nothing to spend its rate on. Streams go to `$STARFOLD_VAAPI_OUT/static.{h264,hevc}`.
+#[test]
+#[ignore = "needs a VA-API GPU (/dev/dri/renderD*); takes two minutes"]
+fn hardware_minute_static() {
+    hardware_run(false, "static");
+}
+
+fn hardware_run(moving: bool, name: &str) {
+    use std::time::{Duration, Instant};
+    let node = render_nodes()
+        .ok()
+        .and_then(|n| n.into_iter().next())
+        .expect("no render node in /dev/dri");
+    let (w, h, fps) = (1280u32, 720u32, 30u64);
+    let out = std::env::var_os("STARFOLD_VAAPI_OUT").map(std::path::PathBuf::from);
+    let mut failed = Vec::new();
+    for (codec, ext) in [(Codec::H264, "h264"), (Codec::Hevc, "hevc")] {
+        let mut enc = match open_on(&node, &cfg(codec, w, h)) {
+            Ok(e) => e,
+            Err(e) => {
+                failed.push(format!("{codec:?}: open: {e}"));
+                continue;
+            }
+        };
+        let (mut y, uv) = grey(w, h);
+        let (mut stream, mut keys, mut slowest) = (Vec::new(), 0, Duration::ZERO);
+        let start = Instant::now();
+        let mut run = || -> Result<(), String> {
+            for i in 0..fps * 60 {
+                let shift = if moving { 8 * i as usize } else { 0 };
+                for (row, line) in y.chunks_mut(w as usize).enumerate() {
+                    for (col, p) in line.iter_mut().enumerate() {
+                        *p = ((col + row + shift) % 220 + 16) as u8;
+                    }
+                }
+                let f = FrameView {
+                    width: w,
+                    height: h,
+                    y: &y,
+                    u: &uv,
+                    v: &uv,
+                    stride_y: w as usize,
+                    stride_uv: w.div_ceil(2) as usize,
+                };
+                let key = i > 0 && i % (fps * 10) == 0;
+                let t = Instant::now();
+                let aus = enc
+                    .encode(
+                        &f,
+                        EncodeOptions {
+                            pts_ms: (i * 1000 / fps) as i64,
+                            force_keyframe: key,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| format!("frame {i}: {e}"))?;
+                slowest = slowest.max(t.elapsed());
+                let [a] = aus.as_slice() else {
+                    return Err(format!("frame {i}: {} access units", aus.len()));
+                };
+                au_shape(codec, a, i == 0 || key, i == 0).map_err(|e| format!("frame {i}: {e}"))?;
+                keys += a.keyframe as u32;
+                stream.extend_from_slice(&a.data);
+                let next = start + Duration::from_millis((i + 1) * 1000 / fps);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+            Ok(())
+        };
+        let r = run();
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{codec:?}: {:.1} s, {keys} keyframes, {} bytes ({:.0} kbit/s), slowest frame {slowest:?}",
+            secs,
+            stream.len(),
+            stream.len() as f64 * 8.0 / secs / 1000.0
+        );
+        if let Some(dir) = &out {
+            std::fs::write(dir.join(format!("{name}.{ext}")), &stream).unwrap();
+        }
+        if let Err(e) = r {
+            failed.push(format!("{codec:?}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+const IHD: &str = "Intel iHD driver for Intel(R) Gen Graphics - 26.1.2 ()";
+
+/// Whether a session on the driver named `vendor`, offered `rc` modes and capped at
+/// `max_kbps`, holds its cap.
+fn holds(vendor: &'static str, rc: u32, max_kbps: u32) -> bool {
+    let (mut fake, _) = Fake::new(ffi::PROFILE_H264_HIGH, h264_slice);
+    fake.vendor = vendor;
+    fake.rc = rc;
+    let mut c = cfg(Codec::H264, 320, 240);
+    c.rate = RateConfig::new(24.0, max_kbps, 30);
+    session(Box::new(fake), &c).unwrap().holds_cap()
+}
+
+/// Intel's media driver runs a capped stream at its cap on any picture; Mesa's radeonsi
+/// stays under it since filler data is off, and a driver not seen yet is taken to as well.
+#[test]
+fn only_intels_driver_holds_its_cap() {
+    let all = ffi::RC_CBR | ffi::RC_VBR | ffi::RC_CQP;
+    assert!(holds(IHD, all, 4_000));
+    assert!(!holds(MESA, all, 4_000), "radeonsi");
+    assert!(!holds(
+        "Mesa Gallium driver 26.0.8 for virgl (virgl)",
+        all,
+        4_000
+    ));
+    assert!(!holds("", all, 4_000), "a driver with no vendor string");
+    assert!(!holds(IHD, all, 0), "uncapped: constant QP");
+    assert!(
+        !holds(IHD, ffi::RC_VBR | ffi::RC_CQP, 4_000),
+        "no CBR offered: variable bitrate"
+    );
 }

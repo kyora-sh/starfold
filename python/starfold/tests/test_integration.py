@@ -4,13 +4,15 @@ Needs Linux with Xvfb and xterm, and STARFOLD_BIN pointing at a built `starfold`
 
     STARFOLD_BIN=target/release/starfold uv run pytest -m integration
 
-The encoder fallback test also needs ffprobe and a binary built with `--features x264`
-(STARFOLD_X264=1): x264 is the only other H.264 encoder a machine without a hardware one has.
+The encoder fallback test also needs ffprobe and a binary built with `--features openh264`, so it
+has both software H.264 encoders: it starts on OpenH264 and falls back to x264, the only other
+H.264 encoder a machine without a hardware one has.
 """
 
 import contextlib
 import json
 import os
+import re
 import secrets
 import select
 import shutil
@@ -70,7 +72,7 @@ def server_args():
 @pytest.fixture
 def desktop(tmp_path, server_args):
     marker = secrets.token_hex(8)
-    env = {**os.environ, "STARFOLD_TEST_RUN": marker, "VOXL_TEST_HOOKS": "1"}
+    env = {**os.environ, "STARFOLD_TEST_RUN": marker, "STARFOLD_TEST_HOOKS": "1"}
     procs: list[subprocess.Popen] = []
 
     def start(args, **kw):
@@ -94,7 +96,7 @@ def desktop(tmp_path, server_args):
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         password = secrets.token_hex(16)
-        env["VOXL_PASSWORD"] = password
+        env["STARFOLD_PASSWORD"] = password
         files = tmp_path / "files"
         files.mkdir()
         server = start(
@@ -220,11 +222,24 @@ def _activity(sf: Starfold, text: str) -> None:
     sf.wait(idle_ms=300)
 
 
+def _software_encoders() -> set[str]:
+    """The software H.264 encoders STARFOLD_BIN was built with, from its `--version` line."""
+    path = os.environ.get("STARFOLD_BIN")
+    if not path:
+        return set()
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    m = re.search(r"encoders: ([^;)]*)", out)
+    return set(m.group(1).split(", ")) if m else set()
+
+
 @pytest.mark.skipif(
-    not os.environ.get("STARFOLD_X264") or not shutil.which("ffprobe"),
-    reason="set STARFOLD_X264 (a binary with x264) and install ffprobe to run",
+    not {"openh264", "x264"} <= _software_encoders() or not shutil.which("ffprobe"),
+    reason="needs ffprobe and a STARFOLD_BIN with OpenH264 and x264 (`--features openh264`)",
 )
-@pytest.mark.parametrize("server_args", [["--encoder=x264"]])
+@pytest.mark.parametrize("server_args", [["--encoder=openh264"]])
 def test_encoder_fallback_rolls_the_recording(desktop):
     sf, cwd, _ = desktop
     sf.click(100, 100)
@@ -235,7 +250,7 @@ def test_encoder_fallback_rolls_the_recording(desktop):
     deadline = time.monotonic() + 15
     while True:
         chosen = sf._http.get("/stats").json()["encoder"]["chosen"]
-        if any(c["codec"] == "h264" and c["backend"] == "openh264" for c in chosen):
+        if any(c["codec"] == "h264" and c["backend"] == "x264" for c in chosen):
             break
         assert time.monotonic() < deadline, f"no fallback: {chosen}"
         time.sleep(0.1)

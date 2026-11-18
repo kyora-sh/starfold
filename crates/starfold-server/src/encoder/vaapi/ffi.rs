@@ -38,6 +38,9 @@ pub const CODED_BAD_BITSTREAM: u32 = 0x8000;
 pub const RC_CBR: u32 = 0x2;
 pub const RC_VBR: u32 = 0x4;
 pub const RC_CQP: u32 = 0x10;
+pub const RC_FLAG_RESET: u32 = 0x1;
+pub const RC_FLAG_DISABLE_FRAME_SKIP: u32 = 0x2;
+pub const RC_FLAG_DISABLE_BIT_STUFFING: u32 = 0x4;
 pub const PACKED_SEQUENCE: u32 = 0x1;
 pub const PACKED_PICTURE: u32 = 0x2;
 pub const PACKED_SLICE: u32 = 0x4;
@@ -60,6 +63,8 @@ pub const PACKED_TYPE_SLICE: u32 = 3;
 
 pub const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
 pub const SURFACE_ATTRIB_PIXEL_FORMAT: c_int = 1;
+pub const SURFACE_ATTRIB_MIN_WIDTH: c_int = 2;
+pub const SURFACE_ATTRIB_MIN_HEIGHT: c_int = 4;
 pub const SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 pub const GENERIC_VALUE_INTEGER: c_int = 1;
 pub const PROGRESSIVE: c_int = 0x1;
@@ -551,6 +556,8 @@ pub struct Va {
         *mut VaId,
     ) -> VAStatus,
     pub destroy_config: unsafe extern "C" fn(VADisplay, VaId) -> VAStatus,
+    pub query_surface_attributes:
+        unsafe extern "C" fn(VADisplay, VaId, *mut VASurfaceAttrib, *mut c_uint) -> VAStatus,
     pub create_surfaces: unsafe extern "C" fn(
         VADisplay,
         c_uint,
@@ -609,6 +616,10 @@ pub struct Va {
 }
 
 impl Va {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Linux sonames resolve through the system linker path, not a DLL search order"
+    )]
     pub fn load() -> Result<Va, String> {
         unsafe {
             let va = Library::new("libva.so.2").map_err(|e| format!("libva.so.2: {e}"))?;
@@ -633,6 +644,7 @@ impl Va {
                 vendor: sym!(va, "vaQueryVendorString"),
                 create_config: sym!(va, "vaCreateConfig"),
                 destroy_config: sym!(va, "vaDestroyConfig"),
+                query_surface_attributes: sym!(va, "vaQuerySurfaceAttributes"),
                 create_surfaces: sym!(va, "vaCreateSurfaces"),
                 destroy_surfaces: sym!(va, "vaDestroySurfaces"),
                 create_context: sym!(va, "vaCreateContext"),

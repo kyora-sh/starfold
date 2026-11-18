@@ -26,7 +26,7 @@ export function createAudio(app: App) {
 			app.post({ t: 'audioPort', port: ch.port1 }, [ch.port1]);
 			if (ac.state !== 'running') ac.resume().catch(() => {});
 		} catch (err) {
-			console.warn('[voxl] audio unavailable', err);
+			console.warn('[starfold] audio unavailable', err);
 		}
 	}
 	return { start };

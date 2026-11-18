@@ -1,8 +1,8 @@
-// Codec negotiation end to end: a starfold with VOXL_TEST_HOOKS on its own Xvfb, the
+// Codec negotiation end to end: a starfold with STARFOLD_TEST_HOOKS on its own Xvfb, the
 // real page in Chrome negotiating protocol 2, a switch forced through the test hook,
 // a resize through the same epoch transition, and a protocol 1 client decoding beside
 // it. Fails on any decoder error.
-// Usage: node negotiation.mjs   (XVFB, VOXL_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
+// Usage: node negotiation.mjs   (XVFB, STARFOLD_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES)
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -17,11 +17,11 @@ try {
 const { chromium } = pw;
 
 const HERE = new URL('.', import.meta.url).pathname;
-const bin = process.env.VOXL_BIN || path.join(HERE, '../../target/release/starfold');
+const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
 const DISPLAY = process.env.NEGOTIATION_DISPLAY || ':9';
-const port = process.env.VOXL_PORT || '6909';
+const port = process.env.STARFOLD_PORT || '6909';
 const base = `http://127.0.0.1:${port}`;
-const log = '/tmp/voxl-negotiation.log';
+const log = '/tmp/starfold-negotiation.log';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
 const check = (ok, what) => {
@@ -44,7 +44,7 @@ await sleep(1000);
 // Something always moving, so frames keep coming.
 procs.push(group('sh', ['-c', 'while :; do xsetroot -solid "#$(od -An -N3 -tx1 /dev/urandom | tr -d " ")"; sleep 0.04; done'], { env: { ...process.env, DISPLAY }, stdio: 'ignore' }));
 const out = fs.openSync(log, 'w');
-procs.push(group(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--enable-resize=true', '--framerate=30'], { env: { ...process.env, DISPLAY, VOXL_TEST_HOOKS: '1', RUST_LOG: 'info' }, stdio: ['ignore', out, out] }));
+procs.push(group(bin, [`--port=${port}`, '--audio-enabled=false', '--enable-basic-auth=false', '--enable-resize=true', '--framerate=30'], { env: { ...process.env, DISPLAY, STARFOLD_TEST_HOOKS: '1', RUST_LOG: 'info' }, stdio: ['ignore', out, out] }));
 
 const stats = async () => (await fetch(`${base}/stats`)).json();
 const viewer = async (protocol) => (await stats()).clients.find((c) => c.video && c.stream.protocol === protocol);
@@ -62,7 +62,7 @@ try {
 	p.on('console', (m) => {
 		const t = m.text();
 		if (/decoder error|configure failed|decode threw|no video/.test(t)) errors.push(t);
-		if (/\[voxl\]/.test(t)) console.log('[page]', t);
+		if (/\[(starfold|voxl)\]/.test(t)) console.log('[page]', t);
 	});
 	p.on('pageerror', (e) => errors.push(String(e)));
 	await p.goto(`${base}/?stats`, { waitUntil: 'commit' });
@@ -74,7 +74,7 @@ try {
 			const v = [...document.querySelectorAll('video.stripe')];
 			return v.length ? v.reduce((n, x) => n + x.getVideoPlaybackQuality().totalVideoFrames, 0) : null;
 		});
-	const report = () => p.evaluate(() => window.voxlStats || {});
+	const report = () => p.evaluate(() => (window.starfoldStats || window.voxlStats) || {});
 	const decoding = async (what, width) => {
 		await sleep(1500);
 		const n0 = await presented();
@@ -104,8 +104,8 @@ try {
 	check(r1.codec === v1?.coded.codec, `worker decoders configured with ${r1.codec}`);
 	const enc = (await stats()).encoder;
 	const h264 = enc?.chosen?.find((c) => c.codec === 'h264');
-	check(enc?.mode === 'auto' && h264?.backend === 'openh264', `--encoder ${enc?.mode}: H.264 from ${h264?.backend}`);
-	check(r1.encoder === 'openh264 (sw)', `stats overlay encoder ${r1.encoder}`);
+	check(enc?.mode === 'auto' && h264?.backend === 'x264', `--encoder ${enc?.mode}: H.264 from ${h264?.backend}`);
+	check(r1.encoder === 'x264 (sw)', `stats overlay encoder ${r1.encoder}`);
 	const e1 = v1 ? v1.v.stream.epoch : 0;
 
 	// 2) A forced switch: a new epoch, a keyframe, frames keep decoding.

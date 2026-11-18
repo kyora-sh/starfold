@@ -7,7 +7,7 @@
 //! - `GET /wait?change`: at the first change.
 //! - `region=x,y,w,h` only counts changes in that rectangle (desktop pixels, to the
 //!   16-pixel block), `timeout=ms` gives up (default 10 s), and `since=n` counts changes
-//!   after an earlier `seq` (from `/wait` or a screenshot's `X-Voxl-Seq` header) instead of
+//!   after an earlier `seq` (from `/wait` or a screenshot's `X-Starfold-Seq` header) instead of
 //!   after the request, so a change that came before the request isn't missed.
 //!
 //! The answer is JSON: `changed` (anything changed since `since`), `timed_out`, `seq`

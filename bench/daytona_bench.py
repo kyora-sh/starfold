@@ -34,7 +34,7 @@ d = Daytona()
 cmd = sys.argv[1] if len(sys.argv) > 1 else 'up'
 if cmd == 'up':
     sb = d.create(CreateSandboxFromSnapshotParams(env_vars={'VNC_RESOLUTION': '2560x1600'},
-                                                  labels={'purpose': 'voxl-bench'}, auto_stop_interval=60), timeout=300)
+                                                  labels={'purpose': 'starfold-bench'}, auto_stop_interval=60), timeout=300)
     open(ID, 'w').write(sb.id)
     sb.computer_use.start()
     sb.fs.upload_file(open(os.path.join(HERE, 'loadgen.c'), 'rb').read(), '/tmp/loadgen.c')

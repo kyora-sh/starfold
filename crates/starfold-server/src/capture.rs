@@ -214,7 +214,7 @@ impl Capturer {
             }
             if let Event::DamageNotify(e) = ev {
                 DAMAGE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("VOXL_DEBUG_DAMAGE").is_ok() {
+                if crate::compat::is_set("STARFOLD_DEBUG_DAMAGE") {
                     log::info!(
                         "dmg {:?} x{} y{} {}x{}",
                         std::time::SystemTime::now()
@@ -394,7 +394,7 @@ fn find_xvfb_framebuffer(
     height: u32,
     server_pid: Option<u32>,
 ) -> Option<(ShmBuf, usize, usize)> {
-    if std::env::var("VOXL_NO_DIRECT_FB").is_ok() {
+    if crate::compat::is_set("STARFOLD_NO_DIRECT_FB") {
         return None;
     }
     let table = std::fs::read_to_string("/proc/sysvipc/shm").ok()?;
