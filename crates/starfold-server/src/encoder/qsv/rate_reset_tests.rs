@@ -366,7 +366,10 @@ fn an_undefined_frame_rate_leaves_the_rate_unknown() {
         assert_eq!(s.rate_in_force(), RateInForce::Unknown, "{n}/{d}");
         let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
         assert!(e.0.contains("no defined frame rate"), "{n}/{d}: {e}");
-        assert!(log.lock().unwrap().reset.is_empty(), "no Reset scaled by it");
+        assert!(
+            log.lock().unwrap().reset.is_empty(),
+            "no Reset scaled by it"
+        );
         assert_eq!(s.rate_in_force(), RateInForce::Unknown);
         assert!(frame(&mut s, false).is_err(), "out of use");
     }

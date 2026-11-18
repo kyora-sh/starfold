@@ -521,7 +521,10 @@ impl Session {
                 m.rate_control_method
             ))
         } else if m.codec_id != codec {
-            Some(format!("the runtime runs codec {:#x}, not {codec:#x}", m.codec_id))
+            Some(format!(
+                "the runtime runs codec {:#x}, not {codec:#x}",
+                m.codec_id
+            ))
         } else if fi.fourcc != ffi::FOURCC_NV12 || (fi.crop_w as u32, fi.crop_h as u32) != (w0, h0)
         {
             Some(format!(

@@ -145,7 +145,12 @@ fn every_length_and_count_is_capped() {
     assert!(Reply::parse(&bodies(&short)[0])
         .unwrap_err()
         .contains("short"));
-    for junk in [vec![0x99], vec![0x84, 2, 0, 0], vec![0x83, 0]] {
+    for junk in [
+        vec![0x99],
+        vec![0x84, 2, 0, 0],
+        vec![0x83, 3],
+        vec![0x83, 1, 0],
+    ] {
         assert!(Reply::parse(&junk).is_err(), "{junk:?}");
     }
     let mut long_text = vec![0x84, 1];
@@ -671,7 +676,10 @@ mod remote {
             RateInForce::Unknown,
             RateInForce::NotRead,
         ] {
-            let enc = start(policy(QUICK), format!("{}; sleep 30", opened_at(true, rate)));
+            let enc = start(
+                policy(QUICK),
+                format!("{}; sleep 30", opened_at(true, rate)),
+            );
             assert_eq!(enc.rate_in_force(), rate);
         }
     }
