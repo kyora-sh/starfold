@@ -7,7 +7,7 @@ use super::proto::{Decoder, Open, Rate, Reply, Request, Unit, MAX_MESSAGE, MAX_U
 use super::remote::slot_size;
 use super::session::Session;
 use super::tests::{bitstream, Fake};
-use crate::encoder::{Codec, EncodeError, EncoderConfig, RateInForce};
+use crate::encoder::{Codec, EncodeError, EncoderConfig};
 use std::collections::VecDeque;
 
 fn rate() -> Rate {
@@ -64,19 +64,16 @@ fn requests_and_replies_round_trip() {
         Reply::Opened {
             low_power: Some(true),
             holds_cap: false,
-            rate: RateInForce::NotRead,
             name: "mfx-gen".into(),
         },
         Reply::Opened {
             low_power: Some(false),
             holds_cap: true,
-            rate: RateInForce::Known(7_990),
             name: "mfx-gen".into(),
         },
         Reply::Opened {
             low_power: None,
             holds_cap: true,
-            rate: RateInForce::Unknown,
             name: "mfx-gen".into(),
         },
         Reply::Done {
@@ -90,15 +87,7 @@ fn requests_and_replies_round_trip() {
             slot: 1,
             units: Vec::new(),
         },
-        Reply::RateSet {
-            rate: RateInForce::Known(7_990),
-        },
-        Reply::RateSet {
-            rate: RateInForce::NotRead,
-        },
-        Reply::RateSet {
-            rate: RateInForce::Unknown,
-        },
+        Reply::RateSet,
         Reply::Error {
             stopped: true,
             reason: "Quick Sync stopped: x".into(),
@@ -145,12 +134,7 @@ fn every_length_and_count_is_capped() {
     assert!(Reply::parse(&bodies(&short)[0])
         .unwrap_err()
         .contains("short"));
-    for junk in [
-        vec![0x99],
-        vec![0x84, 2, 0, 0],
-        vec![0x83, 3],
-        vec![0x83, 1, 0],
-    ] {
+    for junk in [vec![0x99], vec![0x84, 2, 0, 0], vec![0x83, 0]] {
         assert!(Reply::parse(&junk).is_err(), "{junk:?}");
     }
     let mut long_text = vec![0x84, 1];
@@ -219,10 +203,8 @@ fn the_helper_serves_a_session() {
         Reply::Opened {
             low_power: Some(false),
             holds_cap: true,
-            rate: RateInForce::Known(2_000),
             name: "fake-gen".into()
-        },
-        "Init's read-back goes with Opened"
+        }
     );
     let keys: Vec<(u8, bool)> = replies[1..4]
         .iter()
@@ -235,13 +217,7 @@ fn the_helper_serves_a_session() {
     if let Reply::Done { units, .. } = &replies[1] {
         assert_eq!(units[0].data, bitstream(Codec::H264, true, true));
     }
-    assert_eq!(
-        replies[4],
-        Reply::RateSet {
-            rate: RateInForce::Known(5_000)
-        },
-        "what the encoder reads back that it runs"
-    );
+    assert_eq!(replies[4], Reply::RateSet);
 }
 
 /// The helper says whether its session holds its cap: a capped one runs constant bitrate,
@@ -465,8 +441,7 @@ mod remote {
     use crate::encoder::hw::sample_config;
     use crate::encoder::isolate::{Report, VERSION};
     use crate::encoder::{
-        Backend, Codec, EncodeOptions, EncoderConfig, FrameView, RateConfig, RateInForce,
-        VideoEncoder,
+        Backend, Codec, EncodeOptions, EncoderConfig, FrameView, RateConfig, VideoEncoder,
     };
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -495,15 +470,9 @@ mod remote {
 
     /// A helper's open, its session holding its cap or not.
     fn opened_holding(holds_cap: bool) -> String {
-        opened_at(holds_cap, RateInForce::NotRead)
-    }
-
-    /// A helper's open, its session saying `rate` about what Init left it running at.
-    fn opened_at(holds_cap: bool, rate: RateInForce) -> String {
         let opened = says(&Reply::Opened {
             low_power: Some(true),
             holds_cap,
-            rate,
             name: "fake-gen".into(),
         });
         format!("{}; {opened}", super::super::r1_tests::READS_OPEN)
@@ -602,7 +571,6 @@ mod remote {
         let opened = says(&Reply::Opened {
             low_power,
             holds_cap: true,
-            rate: RateInForce::NotRead,
             name: "fake-gen".into(),
         });
         let reads = super::super::r1_tests::READS_OPEN;
@@ -639,62 +607,24 @@ mod remote {
         );
     }
 
-    /// The rate the helper read back is kept until a rate change fails; then it is unknown,
-    /// not the one before, and stays unknown while nothing is read back.
+    /// A rate change that fails leaves the encoder no longer said to hold its cap: what its
+    /// rate control runs is then unknown.
     #[test]
-    fn a_failed_rate_change_makes_the_helpers_rate_unknown() {
+    fn a_failed_rate_change_drops_holding_the_cap() {
         let p = policy(QUICK);
-        let set = says(&Reply::RateSet {
-            rate: RateInForce::Known(5_000),
-        });
         let refused = says(&Reply::Error {
             stopped: false,
             reason: "MFXVideoENCODE_Reset failed".into(),
         });
-        let opened = opened_at(true, RateInForce::Known(2_000));
-        let mut enc = start(p, format!("{opened}; {set}; {refused}; sleep 30"));
-        assert_eq!(
-            enc.rate_in_force(),
-            RateInForce::Known(2_000),
-            "what Init read back"
+        let mut enc = start(
+            p,
+            format!("{}; {}; {refused}; sleep 30", opened(), says(&Reply::RateSet)),
         );
         enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
-        assert_eq!(enc.rate_in_force(), RateInForce::Known(5_000));
         assert!(enc.holds_cap());
         assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
-        assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
-        assert!(!enc.holds_cap(), "its rate control is unknown too");
+        assert!(!enc.holds_cap());
         assert!(p.off().is_none(), "an ordinary failure");
-    }
-
-    /// A fresh helper (one that replaces an encoder whose rate change was refused) says at
-    /// once what its Init left it running at: the server never stands its target in for it.
-    #[test]
-    fn a_replacement_reports_its_inits_rate_before_any_change() {
-        for rate in [
-            RateInForce::Known(30_000),
-            RateInForce::Unknown,
-            RateInForce::NotRead,
-        ] {
-            let enc = start(
-                policy(QUICK),
-                format!("{}; sleep 30", opened_at(true, rate)),
-            );
-            assert_eq!(enc.rate_in_force(), rate);
-        }
-    }
-
-    /// A rate change the helper took but could read no rate back from stays unknown at the
-    /// server: not 'not read' (where the target would stand), and not the rate asked.
-    #[test]
-    fn a_rate_set_with_no_rate_read_back_stays_unknown() {
-        let set = says(&Reply::RateSet {
-            rate: RateInForce::Unknown,
-        });
-        let opened = opened_at(true, RateInForce::Known(2_000));
-        let mut enc = start(policy(QUICK), format!("{opened}; {set}; sleep 30"));
-        enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
-        assert_eq!(enc.rate_in_force(), RateInForce::Unknown);
     }
 
     #[test]

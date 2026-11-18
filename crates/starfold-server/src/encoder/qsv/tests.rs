@@ -307,8 +307,10 @@ pub(super) struct Fake {
     pub(super) hrd_report: Option<u16>,
     /// A Reset it takes leaves NalHrdConformance reading back as this.
     pub(super) hrd_after_reset: Option<u16>,
-    /// What GetVideoParam fills into an attached signal info, over what Init was given.
-    pub(super) signal_report: Option<ExtVideoSignalInfo>,
+    /// From its n-th GetVideoParam call on (the first is Init's), it says this, over `got`.
+    pub(super) got_from: Option<(usize, VideoParam)>,
+    /// GetVideoParam calls so far.
+    video_params: usize,
     /// IDRs after the first come without parameter sets.
     sets_once: bool,
     idrs: usize,
@@ -339,7 +341,8 @@ impl Fake {
                 hrd_off: false,
                 hrd_report: None,
                 hrd_after_reset: None,
-                signal_report: None,
+                got_from: None,
+                video_params: 0,
                 sets_once: false,
                 idrs: 0,
             },
@@ -429,10 +432,11 @@ impl Runtime for Fake {
         }
     }
 
-    /// Fills what the encoder runs with into `par`, NalHrdConformance into a coding option
-    /// attached to it, and the colour signalling into a signal info, as the runtime does.
+    /// Fills what the encoder runs with into `par`, and NalHrdConformance into a coding
+    /// option attached to it, as the runtime does.
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
-        let given = self.call().signal.last().copied();
+        drop(self.call());
+        self.video_params += 1;
         let r = self.video_param.pop_front().unwrap_or(0);
         if r < 0 {
             return r;
@@ -443,24 +447,17 @@ impl Runtime for Fake {
         } else {
             ffi::CODINGOPTION_ON
         });
-        let says = self.signal_report.or(given).unwrap_or_default();
         for i in 0..n as usize {
             let b = unsafe { *ext.add(i) };
-            match unsafe { (*b).buffer_id } {
-                CODING_OPTION => unsafe {
-                    *((b as *mut u8).add(NAL_HRD_CONFORMANCE) as *mut u16) = hrd
-                },
-                ffi::EXTBUFF_VIDEO_SIGNAL_INFO => {
-                    let s = unsafe { &mut *(b as *mut ExtVideoSignalInfo) };
-                    *s = ExtVideoSignalInfo {
-                        header: s.header,
-                        ..says
-                    };
-                }
-                _ => {}
+            if unsafe { (*b).buffer_id } == CODING_OPTION {
+                unsafe { *((b as *mut u8).add(NAL_HRD_CONFORMANCE) as *mut u16) = hrd };
             }
         }
-        *par = self.got.or(self.running).unwrap_or_default();
+        let later = self
+            .got_from
+            .filter(|(from, _)| self.video_params >= *from)
+            .map(|(_, p)| p);
+        *par = later.or(self.got).or(self.running).unwrap_or_default();
         if self.normalize && par.mfx.rate_control_method == ffi::RATECONTROL_CBR {
             let m = &mut par.mfx;
             let k = m.brc_param_multiplier.max(1) as u32;

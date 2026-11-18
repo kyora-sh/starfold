@@ -116,13 +116,9 @@ pub fn serve(
             if let Some(why) = &s.low_power_why {
                 eprintln!("LowPower asked: the runtime refused the full encoder ({why})");
             }
-            if !s.signal_read {
-                eprintln!("colour signalling unknown: the runtime did not read it back");
-            }
             let opened = Reply::Opened {
                 low_power: s.low_power_read,
                 holds_cap: s.holds_cap(),
-                rate: s.rate_in_force(),
                 name,
             };
             if !reply(&mut output, &opened) {
@@ -199,9 +195,7 @@ pub fn serve(
                     quality: r.quality,
                 };
                 match session.set_rate(rate) {
-                    Ok(()) => Reply::RateSet {
-                        rate: session.rate_in_force(),
-                    },
+                    Ok(()) => Reply::RateSet,
                     Err(e) => error(&e, session.stopped().is_some()),
                 }
             }

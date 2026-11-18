@@ -1,16 +1,16 @@
 //! Rate changes on a constant-bitrate Quick Sync session, against the fake runtime, which
 //! refuses one by Reset unless Init turned HRD conformance off (as oneVPL documents it): the
 //! stream's first rate change right after open, its steady-state ones, what a Reset changes
-//! and starts from, what the session then reports, and a Reset the runtime refuses.
+//! and starts from, the ceiling it is held to, and what takes the encoder out of use.
 
 use super::driver::STOPPED;
-use super::ffi::{self, ExtVideoSignalInfo, VideoParam};
+use super::ffi::{self, VideoParam};
 use super::session::Session;
 use super::tests::{Fake, INCOMPATIBLE_VIDEO_PARAM};
 use crate::encoder::hw::{sample_config, Rc};
 use crate::encoder::{
     AccessUnit, Backend, Codec, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    RateInForce, VideoEncoder,
+    VideoEncoder,
 };
 use crate::video::keyframe_rate;
 use std::collections::VecDeque;
@@ -80,7 +80,6 @@ fn the_first_rate_change_after_open_goes_through() {
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(keyframe_rate(24.0, 16_000, 30)).unwrap();
     assert!(frame(&mut s, false).unwrap()[0].keyframe);
-    assert_eq!(s.rate_in_force(), RateInForce::Known(at(64_000)));
     let l = log.lock().unwrap();
     assert_eq!(
         l.hrd,
@@ -93,7 +92,7 @@ fn the_first_rate_change_after_open_goes_through() {
 }
 
 /// What a stream does for each rate it settles on (video.rs, a stripe's rate): every
-/// change goes through Reset, with pictures in between, and what runs is each one.
+/// change goes through Reset, with pictures in between.
 #[test]
 fn steady_state_rate_changes_go_through() {
     let (fake, log) = Fake::new(Codec::H264);
@@ -107,14 +106,11 @@ fn steady_state_rate_changes_go_through() {
         RateConfig::new(24.0, 20_000, 30),
         RateConfig::new(24.0, 8_000, 30),
     ];
-    let mut ran = Vec::new();
     for r in rates {
         s.set_rate(r).unwrap();
-        ran.push(s.rate_in_force());
         frame(&mut s, false).unwrap();
     }
     let want = [12_000, 6_000, 24_000, 20_000, 8_000].map(at);
-    assert_eq!(ran, want.map(RateInForce::Known));
     let l = log.lock().unwrap();
     let asked: Vec<u32> = l.reset.iter().map(kbps).collect();
     assert_eq!(asked[0], at(64_000));
@@ -122,29 +118,21 @@ fn steady_state_rate_changes_go_through() {
     assert_eq!(l.inited.len(), 1, "no encoder opened again");
 }
 
-/// A Reset changes TargetKbps and MaxKbps only, as the spec allows a constant-bitrate
-/// encoder: the buffer, the initial delay, the multiplier and the frame rate stay as the
-/// encoder runs them. A stream taking pictures at another rate than the encoder's gets the
-/// same budget per picture through TargetKbps, and the session reports the rate in the
-/// stream's own terms.
+/// A Reset changes TargetKbps and MaxKbps only: the buffer, the initial delay, the
+/// multiplier and the frame rate stay as the encoder runs them. A stream taking pictures at
+/// another rate than the encoder's gets the same budget per picture through TargetKbps.
 #[test]
 fn a_reset_changes_the_bitrate_only() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 12_000, 10)).unwrap();
-    let per_picture = at(12_000 * 30 / 10);
-    assert_eq!(
-        s.rate_in_force(),
-        RateInForce::Known(per_picture * 10 / 30),
-        "per second at 10 fps"
-    );
     let l = log.lock().unwrap();
     let (init, reset) = (l.inited[0], l.reset[0]);
     assert_eq!(rest(&reset), rest(&init));
     assert_eq!(reset.mfx.max_kbps, reset.mfx.target_kbps);
     assert_eq!(
         kbps(&reset),
-        per_picture,
+        at(12_000 * 30 / 10),
         "12 Mbit/s at 10 fps, per picture at 30 fps"
     );
 }
@@ -171,21 +159,19 @@ fn a_raised_rate_needs_no_idr() {
     assert_eq!(l.frame_types, vec![idr, None, None, idr]);
 }
 
-/// A Reset the runtime corrects is reported as what it corrected it to, from reading the
-/// encoder back: not as the rate asked for, and not as a failure.
+/// A Reset the runtime takes but corrects (answering MFX_WRN_INCOMPATIBLE_VIDEO_PARAM) is no
+/// failure when what it reads back afterwards is still the encoder asked for.
 #[test]
-fn a_corrected_rate_is_reported_as_the_one_in_force() {
+fn a_corrected_rate_is_no_failure() {
     let (mut fake, log) = Fake::new(Codec::H264);
     fake.correct = Some(25_000);
     let mut s = Session::new(Box::new(fake), &cfg(2_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
-    assert_eq!(s.rate_in_force(), RateInForce::Known(25_000));
-    let ran = s.in_force().unwrap();
-    assert_eq!((ran.target_kbps, ran.max_kbps), (25_000, 25_000));
     assert!(
         !frame(&mut s, false).unwrap().is_empty(),
         "the session goes on"
     );
+    assert!(s.holds_cap(), "constant bitrate, read back");
     assert_eq!(
         kbps(&log.lock().unwrap().reset[0]),
         40_000,
@@ -212,7 +198,7 @@ fn a_refused_reset_puts_the_encoder_out_of_use() {
             "{e}"
         );
         assert!(s.stopped().is_none(), "the device still answers");
-        assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+        assert!(!s.holds_cap(), "what it runs is unknown");
         let pictures = log.lock().unwrap().frame_types.len();
         assert_eq!(frame(&mut s, false).err(), Some(e.clone()), "no picture");
         assert_eq!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).unwrap_err(), e);
@@ -222,19 +208,18 @@ fn a_refused_reset_puts_the_encoder_out_of_use() {
     }
 }
 
-/// A rate above what the session was sized for is clamped to it: the encoder stays in use,
-/// and what it runs at is reported as what was read back, not what was asked.
+/// A rate above what the session was sized for is clamped to it, and the encoder stays in
+/// use.
 #[test]
 fn a_rate_above_the_ceiling_is_clamped_to_it() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(2_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
     assert_eq!(
-        s.rate_in_force(),
-        RateInForce::Known(48_000),
+        kbps(&log.lock().unwrap().reset[0]),
+        48_000,
         "a 2 Mbit/s cap's boosted keyframe at 10 fps, per picture at 30"
     );
-    assert_eq!(kbps(&log.lock().unwrap().reset[0]), 48_000);
     assert!(!frame(&mut s, false).unwrap().is_empty(), "still in use");
 }
 
@@ -252,57 +237,58 @@ fn the_box_ramp() -> [RateConfig; 5] {
 
 /// On a runtime that reports the smallest multiplier that holds the rates (Intel's H.264
 /// runtime turned the 11 Init asked into 1), each rate goes in at that multiplier: one above
-/// what it holds (65535 kbit/s per picture) is clamped there, the session stays in use, and
-/// what runs is read back.
+/// what it holds (65535 kbit/s per picture) is clamped there, and the session stays in use.
 #[test]
 fn a_runtime_that_normalizes_the_multiplier_clamps_at_what_it_holds() {
     let (mut fake, log) = Fake::new(Codec::H264);
     fake.normalize = true;
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-    let mut ran = Vec::new();
     for r in the_box_ramp() {
         s.set_rate(r).unwrap();
-        ran.push(s.rate_in_force());
     }
-    // Per picture at 30 fps: 21818, 32727, 62204 fit; 90282 and 327273 are held to 65535,
-    // which is 48059 kbit/s at 22 pictures a second.
-    let want = [16_000, 24_000, 45_616, 48_059, 48_059].map(RateInForce::Known);
-    assert_eq!(ran, want);
     let l = log.lock().unwrap();
     assert!(l.reset.iter().all(|p| p.mfx.brc_param_multiplier == 1));
-    assert_eq!(kbps(&l.reset[4]), 65_535);
+    let asked: Vec<u32> = l.reset.iter().map(kbps).collect();
+    assert_eq!(
+        asked,
+        [21_818, 32_727, 62_204, 65_535, 65_535],
+        "per picture at 30 fps; 90282 and 327273 held to 65535"
+    );
 }
 
 /// On a runtime that keeps the multiplier Init asked (HEVC's did), the same ramp and boost
-/// run as asked, within the multiplier's steps.
+/// go in as asked, within the multiplier's steps.
 #[test]
 fn a_runtime_that_keeps_the_multiplier_runs_the_ramp_as_asked() {
     let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     for r in the_box_ramp() {
         s.set_rate(r).unwrap();
-        let RateInForce::Known(k) = s.rate_in_force() else {
-            panic!("{:?}", s.rate_in_force())
-        };
-        let asked = r.max_kbps;
-        assert!(asked.abs_diff(k) <= 8, "asked {asked}, in force {k}");
     }
     let l = log.lock().unwrap();
     assert!(l.reset.iter().all(|p| p.mfx.brc_param_multiplier == 11));
+    for (r, p) in the_box_ramp().iter().zip(&l.reset) {
+        let per_picture = (r.max_kbps as u64 * 60 + 22) / 44;
+        let k = kbps(p) as u64;
+        assert!(
+            per_picture.abs_diff(k) < 11,
+            "asked {per_picture} a picture, Reset {k}"
+        );
+    }
 }
 
 /// Init leaves room in the multiplier for the most a Reset can ask: a first keyframe's boost
 /// of a stripe's largest share, budgeted per picture at 10 fps.
 #[test]
 fn init_leaves_room_for_a_boosted_keyframe() {
-    let (fake, _) = Fake::new(Codec::H264);
+    let (fake, log) = Fake::new(Codec::H264);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(keyframe_rate(24.0, 60_000, 10)).unwrap();
-    assert_eq!(s.rate_in_force(), RateInForce::Known(239_998));
+    assert_eq!(kbps(&log.lock().unwrap().reset[0]), 719_994);
 }
 
-/// A frame rate the runtime reports as a fraction (30000/1001) is kept as one, wherever it
-/// turns a rate asked per second at the stream's picture rate into TargetKbps and back.
+/// A frame rate the runtime reports as a fraction (30000/1001) is kept as one where it turns
+/// a rate asked per second at the stream's picture rate into TargetKbps.
 #[test]
 fn a_fractional_frame_rate_is_kept_as_a_fraction() {
     let (mut fake, log) = Fake::new(Codec::H264);
@@ -312,24 +298,22 @@ fn a_fractional_frame_rate_is_kept_as_a_fraction() {
     // 12000 kbit/s at 10 pictures a second is 1200 kbit a picture: 35964 kbit/s at
     // 30000/1001 (34800 if that were taken for 29).
     assert_eq!(kbps(&log.lock().unwrap().reset[0]), 35_964);
-    assert_eq!(s.rate_in_force(), RateInForce::Known(12_000));
 }
 
-/// A rate change that fails, even after the runtime took the Reset (here the read-back
-/// fails), leaves the rate unknown: never the one before it, never the one asked for.
+/// A rate change that fails after the runtime took the Reset (here the read-back fails)
+/// takes the encoder out of use, and it no longer counts as holding its cap.
 #[test]
-fn a_failed_rate_change_leaves_the_rate_unknown() {
+fn a_rate_change_whose_read_back_fails_takes_the_encoder_out_of_use() {
     let (mut fake, _) = Fake::new(Codec::H264);
     fake.video_param = VecDeque::from([0, 0, 0, 0, -1]);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
     s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap();
-    assert_eq!(s.rate_in_force(), RateInForce::Known(at(12_000)));
+    assert!(s.holds_cap());
     let e = s.set_rate(RateConfig::new(24.0, 6_000, 30)).unwrap_err();
     assert!(e.0.contains("GetVideoParam"), "{e}");
-    assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+    assert!(!s.holds_cap());
     assert!(frame(&mut s, false).is_err());
     assert!(s.set_rate(RateConfig::new(24.0, 8_000, 30)).is_err());
-    assert_eq!(s.rate_in_force(), RateInForce::Unknown, "still unknown");
 }
 
 /// A Reset starts from what the runtime says the encoder runs with (GetVideoParam), which
@@ -355,22 +339,20 @@ fn a_reset_starts_from_what_the_encoder_runs_with() {
 }
 
 /// A frame rate the runtime leaves undefined (FrameRateExtD 0, or FrameRateExtN 0) is not
-/// made into a number: the rate in force is unknown, and a rate change, which would have to
-/// scale by it, takes the encoder out of use.
+/// made into a number: a rate change, which would have to scale by it, takes the encoder
+/// out of use, and no Reset goes out.
 #[test]
-fn an_undefined_frame_rate_leaves_the_rate_unknown() {
+fn an_undefined_frame_rate_takes_no_rate_change() {
     for (n, d) in [(30_000, 0), (0, 1)] {
         let (mut fake, log) = Fake::new(Codec::H264);
         fake.frame_rate = Some((n, d));
         let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-        assert_eq!(s.rate_in_force(), RateInForce::Unknown, "{n}/{d}");
         let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
         assert!(e.0.contains("no defined frame rate"), "{n}/{d}: {e}");
         assert!(
             log.lock().unwrap().reset.is_empty(),
             "no Reset scaled by it"
         );
-        assert_eq!(s.rate_in_force(), RateInForce::Unknown);
         assert!(frame(&mut s, false).is_err(), "out of use");
     }
 }
@@ -394,37 +376,40 @@ fn an_init_that_leaves_hrd_conformance_on_opens_no_session() {
     let (mut fake, _) = Fake::new(Codec::H264);
     fake.hrd_report = Some(ffi::CODINGOPTION_ON);
     let s = Session::new(Box::new(fake), &cfg(0)).unwrap();
-    assert_eq!(s.rate_in_force(), RateInForce::NotRead, "constant QP");
+    assert!(!s.holds_cap(), "constant QP");
 }
 
 /// A Reset the runtime takes but that leaves HRD conformance reading back on takes the
-/// encoder out of use: its rate is unknown, and the next change would be refused.
+/// encoder out of use: the next change would be refused.
 #[test]
 fn a_reset_that_leaves_hrd_conformance_on_takes_the_encoder_out_of_use() {
     let (mut fake, log) = Fake::new(Codec::H264);
     fake.hrd_after_reset = Some(ffi::CODINGOPTION_ON);
     let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-    assert_eq!(s.rate_in_force(), RateInForce::Known(at(30_000)));
     let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
     assert!(e.0.contains("HRD conformance on"), "{e}");
     assert_eq!(log.lock().unwrap().reset.len(), 1, "the Reset went through");
-    assert_eq!(s.rate_in_force(), RateInForce::Unknown);
+    assert!(!s.holds_cap());
     assert!(frame(&mut s, false).is_err(), "out of use");
+}
+
+/// What Init asks for a 30 Mbit/s cap, with `change` applied.
+fn asked(change: impl FnOnce(&mut VideoParam)) -> VideoParam {
+    let rc = Rc::new(Codec::H264, &cfg(30_000).rate, None);
+    let mut p = super::session::params(Codec::H264, (W, H), &rc, false);
+    change(&mut p);
+    p
 }
 
 /// What GetVideoParam says after Init: what Init asked, with `change` applied.
 fn reads_back(change: impl FnOnce(&mut VideoParam)) -> Fake {
     let (mut fake, _) = Fake::new(Codec::H264);
-    let rc = Rc::new(Codec::H264, &cfg(30_000).rate, None);
-    let mut got = super::session::params(Codec::H264, (W, H), &rc, false);
-    change(&mut got);
-    fake.got = Some(got);
+    fake.got = Some(asked(change));
     fake
 }
 
 /// An Init the runtime takes but that runs another rate control method than the one asked
-/// (constant bitrate turned into a variable one) opens no session: the stream would report a
-/// rate, or the target in its place, that the encoder doesn't run.
+/// (constant bitrate turned into a variable one) opens no session.
 #[test]
 fn an_init_that_runs_another_rate_control_method_opens_no_session() {
     let fake = reads_back(|p| p.mfx.rate_control_method = 2);
@@ -432,8 +417,8 @@ fn an_init_that_runs_another_rate_control_method_opens_no_session() {
     assert!(e.0.contains("rate control method 2"), "{e}");
 }
 
-/// An Init that codes another picture size or format than the one asked opens no session:
-/// the stream would report the size it asked for.
+/// An Init that codes another picture size or format, or another codec, than the one asked
+/// opens no session.
 #[test]
 fn an_init_at_another_picture_size_opens_no_session() {
     let fake = reads_back(|p| p.mfx.frame_info.crop_h = 1088);
@@ -444,38 +429,22 @@ fn an_init_at_another_picture_size_opens_no_session() {
     assert!(e.0.contains("runs codec"), "{e}");
 }
 
-/// BT.709 full range, where BT.601 limited was asked.
-fn bt709_full() -> ExtVideoSignalInfo {
-    ExtVideoSignalInfo {
-        video_format: 5,
-        video_full_range: 1,
-        colour_description_present: 1,
-        colour_primaries: 1,
-        transfer_characteristics: 1,
-        matrix_coefficients: 1,
-        ..Default::default()
-    }
-}
-
-/// Colour signalling the runtime fills in otherwise than asked opens no session.
+/// What the encoder reads back before a rate change is held to what Init's was: one that
+/// now runs another rate control method, or holds HRD conformance again, takes no Reset and
+/// is out of use.
 #[test]
-fn colour_signalling_read_back_otherwise_is_refused() {
-    let (mut fake, _) = Fake::new(Codec::H264);
-    fake.signal_report = Some(bt709_full());
-    let e = Session::new(Box::new(fake), &cfg(30_000)).err().unwrap();
-    assert!(e.0.contains("signals colour"), "{e}");
-    let (fake, _) = Fake::new(Codec::H264);
-    let s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-    assert!(s.signal_read, "the fake reads back what Init was given");
-}
-
-/// A runtime that leaves the signal info all zero says nothing about colour: the session
-/// opens, its rate read back as usual, and its colour signalling stays unconfirmed.
-#[test]
-fn colour_signalling_not_read_back_stays_unconfirmed() {
-    let (mut fake, _) = Fake::new(Codec::H264);
-    fake.signal_report = Some(ExtVideoSignalInfo::default());
-    let s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
-    assert!(!s.signal_read);
-    assert_eq!(s.rate_in_force(), RateInForce::Known(at(30_000)));
+fn a_session_read_back_otherwise_before_a_rate_change_takes_no_reset() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.got_from = Some((2, asked(|p| p.mfx.rate_control_method = 2)));
+    let mut s = Session::new(Box::new(fake), &cfg(30_000)).unwrap();
+    let e = s.set_rate(RateConfig::new(24.0, 12_000, 30)).unwrap_err();
+    assert!(
+        e.0.contains("out of use")
+            && e.0.contains("before a rate change")
+            && e.0.contains("rate control method 2"),
+        "{e}"
+    );
+    assert!(log.lock().unwrap().reset.is_empty(), "no Reset");
+    assert!(!s.holds_cap());
+    assert!(frame(&mut s, false).is_err(), "out of use");
 }

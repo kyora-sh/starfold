@@ -6,17 +6,14 @@
 //! The stream is not held to HRD conformance (NalHrdConformance off, no NAL HRD parameters
 //! in its VUI): oneVPL lets a constant-bitrate encoder change its bitrate through Reset only
 //! then (the spec's "Dynamic Bitrate Change"), and every rate change goes through Reset. A
-//! Reset changes TargetKbps (and MaxKbps with it) and nothing else of what the encoder runs
-//! with, as the spec allows; what it then runs is read back (GetVideoParam, HRD conformance
-//! and colour signalling with it) and is what the session reports, never what it asked for.
-//! An encoder that doesn't read back the rate control method, codec, picture size and
-//! format asked for, colour signalling as asked (where the runtime fills it in), and at
-//! constant bitrate HRD conformance off, is not kept: Init fails, and after a Reset it is
-//! out of use. A runtime that leaves the colour signalling unfilled says nothing about it:
-//! the session is kept, and the colour stays unconfirmed. A Reset the runtime refuses, or
-//! a rate it can only reach by changing more, takes this encoder out of use: it takes no
-//! more pictures and the stream opens a fresh one. A rate is reported only as it was read back; a frame rate the runtime
-//! leaves undefined (FrameRateExtN or FrameRateExtD 0) makes the rate unknown.
+//! Reset is built from what the encoder reads back (GetVideoParam) with TargetKbps (and
+//! MaxKbps with it) changed, held to the one ceiling the session was sized for and its
+//! BRCParamMultiplier can hold; a raise is no IDR. An encoder that doesn't read back the
+//! rate control method, codec, picture size and format asked for, and at constant bitrate
+//! HRD conformance off, is not used: Init fails, and before or after a Reset it is out of
+//! use. So is one that reads back no defined frame rate when a rate change needs it, and
+//! one whose Reset the runtime refuses: it takes no more pictures and the stream opens a
+//! fresh one. The session reports no bitrate; the server's figure is what it asked for.
 //!
 //! It runs in the encoder helper process (see [`super::remote`]). A device that hangs or is
 //! lost stops the session: it calls the runtime no more, not even to close it, and its error
@@ -31,7 +28,7 @@ use super::ffi::{
 use crate::encoder::hw::{self, Rc};
 use crate::encoder::{
     AccessUnit, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig, FrameView, RateConfig,
-    RateInForce, VideoEncoder,
+    VideoEncoder,
 };
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
@@ -128,26 +125,11 @@ fn signal(c: ColorInfo) -> ExtVideoSignalInfo {
     }
 }
 
-/// What a signal info says: video format, full range, colour description present,
-/// primaries, transfer, matrix.
-fn signal_fields(s: &ExtVideoSignalInfo) -> [u16; 6] {
-    [
-        s.video_format,
-        s.video_full_range,
-        s.colour_description_present,
-        s.colour_primaries,
-        s.transfer_characteristics,
-        s.matrix_coefficients,
-    ]
-}
-
 /// What GetVideoParam says the encoder runs with.
 struct Working {
     par: VideoParam,
     /// NalHrdConformance (0: not said).
     hrd: u16,
-    /// The colour signalling ([`signal_fields`]); None: not said.
-    signal: Option<[u16; 6]>,
 }
 
 /// The most kbit/s a Reset may put in TargetKbps for a stream capped at `cap_kbps` and
@@ -213,11 +195,9 @@ pub struct Session {
     signal: Box<ExtVideoSignalInfo>,
     coding: Box<ExtCodingOption>,
     ext: Box<[*mut ExtBuffer; 2]>,
-    /// The coding option and signal info GetVideoParam fills in, so HRD conformance and
-    /// colour signalling are read back.
+    /// The coding option GetVideoParam fills in, so HRD conformance is read back.
     readback: Box<ExtCodingOption>,
-    readback_signal: Box<ExtVideoSignalInfo>,
-    readback_ext: Box<[*mut ExtBuffer; 2]>,
+    readback_ext: Box<[*mut ExtBuffer; 1]>,
     /// The output buffer and the descriptors the runtime is handed, at fixed addresses.
     buf: Vec<u8>,
     bs: Box<Bitstream>,
@@ -228,17 +208,14 @@ pub struct Session {
     pub low_power_read: Option<bool>,
     /// Why it does: how the runtime refused the full encoder.
     pub low_power_why: Option<String>,
-    /// The runtime read back the colour signalling asked for; false: it left it unfilled,
-    /// so the colour the stream reports is what was asked, unconfirmed.
-    pub signal_read: bool,
-    /// The rate last asked for, so the same request isn't made twice. What the encoder runs
-    /// is `in_force`.
+    /// The rate last asked for, so the same request isn't made twice.
     rc: Rc,
     /// The most kbit/s TargetKbps may be given, from the configured maximum (see
     /// [`brc_ceiling`]).
     sized_for: u64,
-    /// What the encoder runs with, as the runtime last reported it; None once a rate change
-    /// failed and nothing has been read back since.
+    /// What the encoder runs with, as the runtime last read it back: rate control method,
+    /// multiplier (for the ceiling) and frame rate (for a rate change's scaling). None once a
+    /// rate change failed and nothing has been read back since.
     in_force: Option<InForce>,
     /// The next picture must be an IDR: the first frame, or the last encode failed.
     need_idr: bool,
@@ -304,15 +281,6 @@ impl InForce {
             )
         })
     }
-
-    /// What this TargetKbps comes to per second at `fps` pictures a second. None if the
-    /// runtime reports no defined frame rate.
-    fn kbps_at(&self, fps: u32) -> Option<u32> {
-        self.has_frame_rate().then(|| {
-            let per_second = self.target_kbps as u64 * fps.max(1) as u64 * self.fps_d as u64;
-            div_round(per_second, self.fps_n as u64) as u32
-        })
-    }
 }
 
 // The raw pointers point into the session's own boxes, or at the runtime's surface.
@@ -357,15 +325,13 @@ impl Session {
             coding: Box::new(coding_option()),
             ext: Box::new([std::ptr::null_mut(); 2]),
             readback: Box::default(),
-            readback_signal: Box::default(),
-            readback_ext: Box::new([std::ptr::null_mut(); 2]),
+            readback_ext: Box::new([std::ptr::null_mut()]),
             buf: Vec::new(),
             bs: Box::new(Bitstream::over(&mut [])),
             ctrl: Box::default(),
             low_power: false,
             low_power_read: None,
             low_power_why: None,
-            signal_read: false,
             rc,
             sized_for: ceiling,
             in_force: None,
@@ -431,12 +397,6 @@ impl Session {
         self.stopped.as_deref()
     }
 
-    /// What the encoder runs with, as the runtime last reported it.
-    #[cfg(test)]
-    pub fn in_force(&self) -> Option<InForce> {
-        self.in_force
-    }
-
     /// `p` with the session's extension buffers: its colour signalling, and no HRD.
     fn with_ext(&mut self, mut p: VideoParam) -> VideoParam {
         *self.signal = signal(self.color);
@@ -459,10 +419,9 @@ impl Session {
         EncodeError(why)
     }
 
-    /// What the encoder runs with now (GetVideoParam): its parameters, NalHrdConformance as
-    /// the runtime fills it into the coding option attached to the call (0 if it doesn't
-    /// say), and the signal info it fills into the one attached (None if it leaves it
-    /// all zero, saying nothing).
+    /// What the encoder runs with now (GetVideoParam): its parameters, and NalHrdConformance
+    /// as the runtime fills it into the coding option attached to the call (0 if it doesn't
+    /// say).
     fn working(&mut self) -> Result<Working, EncodeError> {
         *self.readback = ExtCodingOption {
             header: ExtBuffer {
@@ -471,16 +430,10 @@ impl Session {
             },
             ..Default::default()
         };
-        *self.readback_signal = ExtVideoSignalInfo {
-            header: signal(self.color).header,
-            ..Default::default()
-        };
         self.readback_ext[0] = &mut *self.readback as *mut ExtCodingOption as *mut ExtBuffer;
-        self.readback_ext[1] =
-            &mut *self.readback_signal as *mut ExtVideoSignalInfo as *mut ExtBuffer;
         let mut par = VideoParam {
             ext_param: self.readback_ext.as_mut_ptr(),
-            num_ext_param: 2,
+            num_ext_param: 1,
             ..Default::default()
         };
         let r = self.rt.video_param(&mut par);
@@ -489,18 +442,15 @@ impl Session {
         }
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;
-        let s = signal_fields(&self.readback_signal);
         Ok(Working {
             par,
             hrd: self.readback.nal_hrd_conformance,
-            signal: (s != [0; 6]).then_some(s),
         })
     }
 
     /// Why what the runtime read back is not the encoder asked for: another rate control
-    /// method, codec, picture format or size, colour signalling it filled in differently,
-    /// HRD conformance not read back off at constant bitrate (only then can the bitrate
-    /// change through Reset), or B frames.
+    /// method, codec, picture format or size, HRD conformance not read back off at constant
+    /// bitrate (only then can the bitrate change through Reset), or B frames.
     fn mismatch(&self, w: &Working) -> Option<String> {
         let m = &w.par.mfx;
         let fi = &m.frame_info;
@@ -513,7 +463,6 @@ impl Session {
             Codec::Hevc => ffi::CODEC_HEVC,
             _ => ffi::CODEC_AVC,
         };
-        let asked = signal_fields(&signal(self.color));
         let (w0, h0) = self.size;
         if m.rate_control_method != method {
             Some(format!(
@@ -530,12 +479,6 @@ impl Session {
             Some(format!(
                 "the runtime codes {:#x} pictures at {}x{}, not NV12 at {w0}x{h0}",
                 fi.fourcc, fi.crop_w, fi.crop_h
-            ))
-        } else if w.signal.is_some_and(|s| s != asked) {
-            Some(format!(
-                "the runtime signals colour {:?}, not the {asked:?} asked \
-                 (format, range, description, primaries, transfer, matrix)",
-                w.signal.unwrap_or_default()
             ))
         } else if self.rc.cbr && w.hrd != ffi::CODINGOPTION_OFF {
             let state = if w.hrd == 0 { "unconfirmed" } else { "on" };
@@ -555,8 +498,7 @@ impl Session {
     }
 
     /// Reads back what the encoder runs with and keeps it, if it is the encoder asked for
-    /// ([`Session::mismatch`]); sizes the output buffer. Until it is kept, nothing about
-    /// its rate is known.
+    /// ([`Session::mismatch`]); sizes the output buffer.
     fn refit(&mut self) -> Result<(), EncodeError> {
         self.in_force = None;
         let w = self.working()?;
@@ -569,7 +511,6 @@ impl Session {
         if let Some(why) = self.mismatch(&w) {
             return Err(EncodeError(why));
         }
-        self.signal_read = w.signal.is_some();
         self.in_force = Some(InForce::of(&got.mfx));
         let fi = &self.par.mfx.frame_info;
         let picture = fi.width as usize * fi.height as usize * 3 / 2;
@@ -621,17 +562,16 @@ impl Session {
         if rc == self.rc {
             return Ok(());
         }
-        let (mut working, hrd) = match self.working() {
-            Ok(w) => (w.par, w.hrd),
+        let w = match self.working() {
+            Ok(w) => w,
             Err(e) => return Err(self.out_of_use(e)),
         };
-        let m = &mut working.mfx;
-        if rc.cbr && hrd != ffi::CODINGOPTION_OFF {
-            let e = EncodeError(format!(
-                "the runtime no longer reads back HRD conformance off (NalHrdConformance {hrd})"
-            ));
+        if let Some(why) = self.mismatch(&w) {
+            let e = EncodeError(format!("before a rate change, {why}"));
             return Err(self.out_of_use(e));
         }
+        let mut working = w.par;
+        let m = &mut working.mfx;
         if rc.cbr {
             // The same budget per picture at the encoder's own frame rate, which stays.
             let ran = InForce::of(m);
@@ -642,7 +582,7 @@ impl Session {
                 ));
                 return Err(self.out_of_use(e));
             };
-            // Above what the session can be given, it gets that, and the read-back says so.
+            // Above what the session can be given, it gets that.
             let kbps = asked.min(brc_ceiling(self.sized_for, ran.multiplier));
             let field = (kbps / ran.multiplier as u64).clamp(1, u16::MAX as u64) as u16;
             m.target_kbps = field;
@@ -669,30 +609,14 @@ impl Session {
 }
 
 impl VideoEncoder for Session {
-    /// A rate change that fails, however, leaves the rate in force unknown until the next
-    /// read-back.
+    /// A rate change that fails, however, leaves what the encoder runs with unknown until
+    /// the next read-back.
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         let r = self.change_rate(rate);
         if r.is_err() {
             self.in_force = None;
         }
         r
-    }
-
-    /// The bitrate in force, in the terms it was asked in: per second at the rate the
-    /// stream takes pictures at, which TargetKbps scales to the encoder's own frame rate.
-    /// Unknown once a rate change failed, or once the session is stopped or out of use.
-    fn rate_in_force(&self) -> RateInForce {
-        if self.stopped.is_some() || self.out_of_use.is_some() {
-            return RateInForce::Unknown;
-        }
-        match self.in_force {
-            None => RateInForce::Unknown,
-            Some(f) if !f.cbr => RateInForce::NotRead,
-            Some(f) => f
-                .kbps_at(self.rc.fps)
-                .map_or(RateInForce::Unknown, RateInForce::Known),
-        }
     }
 
     fn encode(

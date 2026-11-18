@@ -4,7 +4,7 @@
 //! length and count is capped, and the parsing has no `unsafe`, so a helper that writes
 //! garbage costs the server an error, nothing more.
 
-use crate::encoder::{Codec, RateInForce};
+use crate::encoder::Codec;
 
 /// The most a message may carry: a few IDRs' worth at 4096x4096.
 pub const MAX_MESSAGE: usize = 32 << 20;
@@ -71,16 +71,12 @@ pub enum Reply {
         low_power: Option<bool>,
         /// The session holds its cap ([`crate::encoder::VideoEncoder::holds_cap`]).
         holds_cap: bool,
-        /// The bitrate the session read back after Init, as it says it
-        /// ([`crate::encoder::VideoEncoder::rate_in_force`]).
-        rate: RateInForce,
         name: String,
     },
     /// The frame in `slot` is coded; its units, none if it was skipped.
     Done { slot: u8, units: Vec<Unit> },
-    /// The rate is set; `rate`: the bitrate the session read back after it, as it says it
-    /// (not read at a constant QP; unknown if nothing it read back defines one).
-    RateSet { rate: RateInForce },
+    /// The rate change went through, and the session read back what it requires.
+    RateSet,
     /// The request failed; `stopped`: the device hung, failed or was lost.
     Error { stopped: bool, reason: String },
 }
@@ -105,18 +101,6 @@ fn put_rate(b: &mut Vec<u8>, r: &Rate) {
     b.extend_from_slice(&r.buf_kbit.to_le_bytes());
     b.extend_from_slice(&r.fps.to_le_bytes());
     b.extend_from_slice(&r.quality.to_le_bytes());
-}
-
-/// A rate in force: 0 not read, 1 known (then its kbit/s), 2 unknown.
-fn put_in_force(b: &mut Vec<u8>, r: RateInForce) {
-    match r {
-        RateInForce::NotRead => b.push(0),
-        RateInForce::Known(k) => {
-            b.push(1);
-            b.extend_from_slice(&k.to_le_bytes());
-        }
-        RateInForce::Unknown => b.push(2),
-    }
 }
 
 fn put_text(b: &mut Vec<u8>, s: &str) {
@@ -200,7 +184,6 @@ impl Reply {
             Reply::Opened {
                 low_power,
                 holds_cap,
-                rate,
                 name,
             } => {
                 b.push(OPENED);
@@ -210,7 +193,6 @@ impl Reply {
                     None => 2,
                 });
                 b.push(*holds_cap as u8);
-                put_in_force(&mut b, *rate);
                 put_text(&mut b, name);
             }
             Reply::Done { slot, units } => {
@@ -223,10 +205,7 @@ impl Reply {
                     b.extend_from_slice(&u.data);
                 }
             }
-            Reply::RateSet { rate } => {
-                b.push(RATE_SET);
-                put_in_force(&mut b, *rate);
-            }
+            Reply::RateSet => b.push(RATE_SET),
             Reply::Error { stopped, reason } => {
                 b.push(ERROR);
                 b.push(*stopped as u8);
@@ -243,7 +222,6 @@ impl Reply {
             OPENED => Reply::Opened {
                 low_power: c.maybe_flag()?,
                 holds_cap: c.flag()?,
-                rate: c.in_force()?,
                 name: c.text()?,
             },
             DONE => {
@@ -263,9 +241,7 @@ impl Reply {
                 }
                 Reply::Done { slot, units }
             }
-            RATE_SET => Reply::RateSet {
-                rate: c.in_force()?,
-            },
+            RATE_SET => Reply::RateSet,
             ERROR => Reply::Error {
                 stopped: c.flag()?,
                 reason: c.text()?,
@@ -365,15 +341,6 @@ impl<'a> Cursor<'a> {
             fps: self.u32()?,
             quality: f32::from_bits(self.u32()?),
         })
-    }
-
-    fn in_force(&mut self) -> Result<RateInForce, String> {
-        match self.u8()? {
-            0 => Ok(RateInForce::NotRead),
-            1 => Ok(RateInForce::Known(self.u32()?)),
-            2 => Ok(RateInForce::Unknown),
-            v => Err(format!("{v} where a rate in force belongs")),
-        }
     }
 
     fn text(&mut self) -> Result<String, String> {

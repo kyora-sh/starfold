@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo, RateInForce};
+use crate::encoder::{AccessUnit, Backend, BitstreamFormat, ColorInfo};
 use crate::input::InputEvent;
 use crate::negotiate::Implementation;
 use std::collections::HashMap;
@@ -83,8 +83,6 @@ struct Fake {
     delay: Option<Duration>,
     /// Every n-th picture comes out a keyframe nobody asked for, taking this long.
     slow_keys: Option<(usize, Duration)>,
-    /// The bitrate it says it runs at, whatever it was asked for.
-    in_force: RateInForce,
     /// Runs at its cap whatever the picture.
     holds: bool,
     /// Which open this encoder is (0 = the sample's), and every encode's (open, rate, keyframe).
@@ -114,10 +112,6 @@ impl VideoEncoder for Fake {
             rates.lock().unwrap().push(r.fps);
         }
         Ok(())
-    }
-
-    fn rate_in_force(&self) -> RateInForce {
-        self.in_force
     }
 
     fn encode(
@@ -258,8 +252,6 @@ struct Opts {
     h264_hw_delay: Option<Duration>,
     /// Every n-th hardware H.264 picture is a slow keyframe nobody asked for.
     h264_hw_slow_keys: Option<(usize, Duration)>,
-    /// H.264 encoders say this about their rate, whatever they are asked for.
-    h264_in_force: Option<RateInForce>,
     /// Hardware H.264 encoders hold their cap.
     h264_hw_holds: bool,
     /// Which hardware H.264 opens (0 = the sample's) hold their cap, over `h264_hw_holds`.
@@ -308,7 +300,6 @@ fn fakes(o: Opts) -> Open {
                 step_bytes: None,
                 delay: o.h264_hw_delay,
                 slow_keys: o.h264_hw_slow_keys,
-                in_force: RateInForce::NotRead,
                 holds: o.h264_hw_holding.map_or(o.h264_hw_holds, |f| f(earlier)),
                 id: earlier,
                 encodes: o.h264_hw_encodes.clone(),
@@ -358,10 +349,6 @@ fn fakes(o: Opts) -> Open {
             step_bytes: o.h264_step_bytes.filter(|_| !hevc),
             delay: None,
             slow_keys: None,
-            in_force: o
-                .h264_in_force
-                .filter(|_| !hevc)
-                .unwrap_or(RateInForce::NotRead),
             holds: false,
             id: 0,
             encodes: None,
@@ -1746,6 +1733,109 @@ fn a_failed_session_is_reopened() {
         "a keyframe on every stripe, the bottom one from its new session: {v:?}"
     );
     assert!(!eng.cohorts[0].shared.degraded());
+}
+
+/// An encoder holding one of the few sessions a backend has, as a GPU's encoder slots: it
+/// gives its slot back when it is dropped.
+struct Slot {
+    inner: Box<dyn VideoEncoder>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl VideoEncoder for Slot {
+    fn set_rate(&mut self, r: RateConfig) -> Result<(), EncodeError> {
+        self.inner.set_rate(r)
+    }
+
+    fn encode(
+        &mut self,
+        f: &FrameView<'_>,
+        o: EncodeOptions<'_>,
+    ) -> Result<Vec<AccessUnit>, EncodeError> {
+        self.inner.encode(f, o)
+    }
+
+    fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
+        self.inner.drain()
+    }
+}
+
+/// `open` with `slots` sessions at most open at once, and `opens` opens in all: past
+/// either, an open fails. `live` counts the sessions open.
+fn slotted(open: Open, slots: usize, opens: usize, live: Arc<AtomicUsize>) -> Open {
+    let opened = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |c: &EncoderConfig| {
+        if live.load(Ordering::SeqCst) >= slots {
+            return Err(EncodeError("no encoder slot free".into()));
+        }
+        if opened.fetch_add(1, Ordering::SeqCst) >= opens {
+            return Err(EncodeError("the backend opens no more sessions".into()));
+        }
+        let inner = open(c)?;
+        live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Slot {
+            inner,
+            live: live.clone(),
+        }) as Box<dyn VideoEncoder>)
+    })
+}
+
+/// A failed session is closed before its replacement opens: on a backend with no slot to
+/// spare, the replacement still opens.
+#[test]
+fn a_failed_session_is_closed_before_its_replacement_opens() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        h264_reopen_heals: true,
+        ..Default::default()
+    };
+    let live = Arc::new(AtomicUsize::new(0));
+    let open = slotted(fakes(o), 2, usize::MAX, live.clone());
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], open).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    assert!(
+        videos(&drain(&mut rx)).is_empty(),
+        "the bottom stripe failed"
+    );
+    push_band(&mut eng, W, H, None);
+    let v = videos(&drain(&mut rx));
+    assert_eq!(v.len(), 2, "both stripes, the bottom one from its new session: {v:?}");
+    assert_eq!(live.load(Ordering::SeqCst), 2, "the two stripes' sessions");
+}
+
+/// A failed session is closed even when no replacement opens: it holds nothing on.
+#[test]
+fn a_failed_session_is_closed_when_no_replacement_opens() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        ..Default::default()
+    };
+    let live = Arc::new(AtomicUsize::new(0));
+    // The sample's session and the two stripes' open; nothing after them.
+    let open = slotted(fakes(o), 2, 3, live.clone());
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], open).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    drain(&mut rx);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "only the stripe that works holds a session"
+    );
+    push_band(&mut eng, W, H, None);
+    drain(&mut rx);
+    assert_eq!(live.load(Ordering::SeqCst), 1, "and no retry leaves one behind");
 }
 
 #[test]
@@ -4101,65 +4191,6 @@ fn a_pass_held_back_by_the_cap_is_still_work() {
         turn.work(),
         "the loop waits for the cap, not the idle timeout"
     );
-}
-
-/// A stream whose H.264 encoders say `rate`, after a few pictures: the hub's bitrate, and
-/// that cohort's own target and its `/stats` entry's target_kbps.
-fn stats_with(rate: RateInForce, stored: u32) -> (u32, u32, serde_json::Value) {
-    let hub = Hub::new();
-    let opts = Opts {
-        h264_in_force: Some(rate),
-        ..Default::default()
-    };
-    let mut eng = engine(&hub, &[H264], opts);
-    let (c, mut rx) = client(&hub);
-    join_legacy(&hub, &c);
-    push(&mut eng);
-    acked(&c, &mut rx);
-    let mut t = Instant::now();
-    for _ in 0..3 {
-        t += Duration::from_millis(100);
-        capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
-        acked(&c, &mut rx);
-    }
-    let reporting = eng
-        .cohorts
-        .iter()
-        .find(|c| c.shared.in_force.load(Ordering::Relaxed) == stored)
-        .expect("the cohort of the encoders that said it");
-    let target = reporting.shared.target.load(Ordering::Relaxed);
-    let id = reporting.shared.id;
-    eng.publish();
-    let cohorts = hub.cohorts.lock().clone();
-    let shown = cohorts
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["id"] == id)
-        .map(|c| c["target_kbps"].clone())
-        .expect("its /stats entry");
-    (hub.target_kbps.load(Ordering::Relaxed), target, shown)
-}
-
-/// `/stats` shows the bitrate a cohort's encoders say they run at, read back from the
-/// encoder, not the target the stream asked them for.
-#[test]
-fn stats_show_the_bitrate_the_encoders_run_at() {
-    let (hub, target, shown) = stats_with(RateInForce::Known(12_345), 12_345);
-    assert_ne!(target, 12_345, "the stream's own target is another");
-    assert_eq!(hub, 12_345);
-    assert_eq!(shown, serde_json::json!(12_345));
-}
-
-/// While an encoder's rate is unknown (a rate change failed and nothing was read back since),
-/// `/stats` shows the cohort's and the overall bitrate as null: never a number, not the
-/// target.
-#[test]
-fn stats_show_an_unknown_bitrate_as_null() {
-    let (hub, target, shown) = stats_with(RateInForce::Unknown, UNKNOWN_KBPS);
-    assert_ne!(target, 0, "the stream has a target");
-    assert_eq!(hub, UNKNOWN_KBPS, "null in /stats");
-    assert_eq!(shown, serde_json::Value::Null);
 }
 
 #[test]
