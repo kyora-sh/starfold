@@ -14,6 +14,7 @@ from starfold import (
     NotFoundError,
     ReadOnlyError,
     Recording,
+    RecordingOffError,
     Segments,
     Starfold,
     StarfoldConnectionError,
@@ -22,6 +23,7 @@ from starfold import (
     act,
 )
 
+RID = "5f0c2a9e41b7d36c8e0f1a2b3c4d5e6f"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1280, 800) + b"\x08\x02\x00\x00\x00"
 
 
@@ -36,6 +38,7 @@ class Server:
         self.end_reason = "stopped"
         self.content_type = "application/zip"
         self.seq_header = "x-starfold-seq"
+        self.recording_on = True
 
     def recording(self, *parts: bytes) -> httpx.Response:
         names = [f"segment-{i + 1}.mp4" for i in range(len(parts))]
@@ -65,13 +68,18 @@ class Server:
                     403, json={"error": "this server is read-only (--read-only): input is refused", "read_only": True}
                 )
             return httpx.Response(200, json={"seq": 40, "events": len(json.loads(req.content))})
+        if path.startswith("/record") and not self.recording_on:
+            return httpx.Response(
+                403,
+                json={"error": "recording is off (start the server with --enable-recording)", "recording": False},
+            )
         if path == "/record":
             assert q["format"] == "zip"
             return self.recording(b"mp4:" + q["seconds"].encode())
         if path == "/record/start":
-            return httpx.Response(200, json={"id": 3, "max_seconds": 300})
+            return httpx.Response(200, json={"id": RID, "max_seconds": 300})
         if path == "/record/stop":
-            if q["id"] != "3":
+            if q["id"] != RID:
                 return httpx.Response(404, json={"error": "no such recording"})
             assert q["format"] == "zip"
             return self.recording(*self.segments)
@@ -221,18 +229,36 @@ def test_recording(sf, server):
     assert sf.record(2.5) == [b"mp4:2.5"]
     assert server.seen[-1].extensions["timeout"]["read"] == 32.5
     rec = sf.record_start()
-    assert rec == Recording(id=3, max_seconds=300)
+    assert rec == Recording(id=RID, max_seconds=300)
     clips = sf.record_stop(rec)
     assert clips == [b"mp4"]
     assert clips.end_reason == "stopped"
+    assert sf.record_stop(RID) == [b"mp4"]
     with pytest.raises(NotFoundError):
-        sf.record_stop(4)
+        sf.record_stop("0" * 32)
+
+
+def test_a_number_is_not_a_recording_id_and_is_never_sent(sf, server):
+    sent = len(server.seen)
+    for wrong in (3, 3.0, None, Recording(id=3, max_seconds=300)):  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="a recording id is a string"):
+            sf.record_stop(wrong)  # type: ignore[arg-type]
+    assert len(server.seen) == sent
+
+
+def test_a_server_that_does_not_record_says_so(sf, server):
+    server.recording_on = False
+    for call in (lambda: sf.record(1), sf.record_start, lambda: sf.record_stop(RID)):
+        with pytest.raises(RecordingOffError, match="--enable-recording") as e:
+            call()
+        assert isinstance(e.value, ForbiddenError)
+        assert e.value.status == 403
 
 
 def test_recording_with_several_segments(sf, server):
     server.segments = [b"part1", b"part2", b"part3"]
     server.end_reason = "segment_cap"
-    clips = sf.record_stop(3)
+    clips = sf.record_stop(RID)
     assert isinstance(clips, Segments)
     assert clips == [b"part1", b"part2", b"part3"]
     assert clips.end_reason == "segment_cap"
@@ -240,7 +266,7 @@ def test_recording_with_several_segments(sf, server):
 
 def test_the_zip_media_type_is_case_insensitive(sf, server):
     server.content_type = "Application/Zip; charset=binary"
-    assert sf.record_stop(3) == [b"mp4"]
+    assert sf.record_stop(RID) == [b"mp4"]
 
 
 def test_a_server_without_segments_answers_with_one_mp4():
@@ -248,7 +274,7 @@ def test_a_server_without_segments_answers_with_one_mp4():
         return httpx.Response(200, content=b"mp4", headers={"content-type": "video/mp4"})
 
     with Starfold("http://desk:6901", password="pw", transport=httpx.MockTransport(older)) as c:
-        clips = c.record_stop(3)
+        clips = c.record_stop(RID)
     assert clips == [b"mp4"]
     assert clips.end_reason is None
 
