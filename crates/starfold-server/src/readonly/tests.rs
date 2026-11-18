@@ -5,171 +5,269 @@ use std::collections::BTreeSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SERVER: &str = include_str!("../server.rs");
+const LOCK: &str = include_str!("../../../../Cargo.lock");
 
-fn ident(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+// The source scan below reads server.rs and fails closed: every call in router() is either
+// one it parses (a route, a merged local router, the layer) or one on a short list of known
+// harmless calls, and every arm of handle_text's command match is a plain string literal
+// or `_`. Anything else is refused, so a registration form the scan does not understand
+// fails the tests instead of passing unseen.
+
+fn is_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
-/// `text` without its comments; string, raw string and char literals are kept whole.
-fn code(text: &str) -> String {
-    let t: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+/// A source text with its comments removed (nested block comments included), as two texts
+/// of the same length: `code` keeps every literal, `blank` has each literal's contents
+/// replaced by spaces, so a parenthesis, keyword or name inside a string is not code.
+struct Src {
+    code: String,
+    blank: String,
+}
+
+/// Where a raw string (`r"…"`, `r#"…"#`, `br"…"`) starting at `i` opens and ends: the
+/// length of its opening delimiter, its number of `#`s and the index just past its end.
+fn raw_string(t: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+    let mut j = i;
+    if t[j] == b'b' {
+        j += 1;
+    }
+    if t.get(j) != Some(&b'r') {
+        return None;
+    }
+    j += 1;
+    let hashes_from = j;
+    while t.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    if t.get(j) != Some(&b'"') {
+        return None;
+    }
+    let hashes = j - hashes_from;
+    let mut k = j + 1;
+    while k < t.len() {
+        if t[k] == b'"' && t[k + 1..].iter().take(hashes).filter(|h| **h == b'#').count() == hashes
+        {
+            return Some((j + 1 - i, hashes, k + 1 + hashes));
+        }
+        k += 1;
+    }
+    Some((j + 1 - i, hashes, t.len()))
+}
+
+fn lex(text: &str) -> Src {
+    let t = text.as_bytes();
+    let mut code = Vec::with_capacity(t.len());
+    let mut blank = Vec::with_capacity(t.len());
+    let literal = |code: &mut Vec<u8>, blank: &mut Vec<u8>, a: usize, b: usize, open: usize| {
+        let b = b.min(t.len());
+        let close = (b - a - open).min(if b > a { 1 } else { 0 });
+        code.extend_from_slice(&t[a..b]);
+        blank.extend_from_slice(&t[a..a + open]);
+        blank.extend(std::iter::repeat_n(b' ', b - a - open - close));
+        blank.extend_from_slice(&t[b - close..b]);
+    };
     let mut i = 0;
     while i < t.len() {
-        let c = t[i];
-        if c == 'r' && (i == 0 || !ident(t[i - 1])) {
-            let mut j = i + 1;
-            while t.get(j) == Some(&'#') {
-                j += 1;
-            }
-            if t.get(j) == Some(&'"') {
-                let hashes = j - i - 1;
-                let closes = |k: usize| {
-                    t[k] == '"'
-                        && t[k + 1..]
-                            .iter()
-                            .take(hashes)
-                            .filter(|h| **h == '#')
-                            .count()
-                            == hashes
-                };
-                let mut k = j + 1;
-                while k < t.len() && !closes(k) {
-                    k += 1;
-                }
-                let end = (k + 1 + hashes).min(t.len());
-                out.extend(&t[i..end]);
-                i = end;
-                continue;
-            }
-        }
-        let end = match c {
-            '"' => {
-                let mut k = i + 1;
-                while k < t.len() && t[k] != '"' {
-                    k += if t[k] == '\\' { 2 } else { 1 };
-                }
-                k + 1
-            }
-            '\'' if t.get(i + 1) == Some(&'"') => i + 2,
-            '\'' if t.get(i + 1) == Some(&'\\') => {
-                let mut k = i + 3;
-                while k < t.len() && t[k] != '\'' {
-                    k += 1;
-                }
-                k + 1
-            }
-            '/' if t.get(i + 1) == Some(&'/') => {
-                while i < t.len() && t[i] != '\n' {
+        let after_ident = i > 0 && is_ident(t[i - 1]);
+        match t[i] {
+            b'/' if t.get(i + 1) == Some(&b'/') => {
+                while i < t.len() && t[i] != b'\n' {
                     i += 1;
                 }
-                continue;
             }
-            '/' if t.get(i + 1) == Some(&'*') => {
-                i += 2;
-                while i + 1 < t.len() && !(t[i] == '*' && t[i + 1] == '/') {
-                    i += 1;
-                }
-                i += 2;
-                continue;
-            }
-            _ => i + 1,
-        };
-        let end = end.min(t.len());
-        out.extend(&t[i..end]);
-        i = end;
-    }
-    out
-}
-
-/// Each `.name(` in `code`: where `name` starts and the text after its `(`. Whitespace may
-/// sit around the dot and before the parenthesis.
-fn method_calls<'a>(code: &'a str, name: &str) -> Vec<(usize, &'a str)> {
-    let mut out = Vec::new();
-    for (at, _) in code.match_indices(name) {
-        let before = &code[..at];
-        let after = &code[at + name.len()..];
-        if before.ends_with(ident) || after.starts_with(ident) || !before.trim_end().ends_with('.')
-        {
-            continue;
-        }
-        if let Some(args) = after.trim_start().strip_prefix('(') {
-            out.push((at, args));
-        }
-    }
-    out
-}
-
-/// The arguments of a call: `rest` from just after its `(` up to the `)` that closes it.
-fn arguments(rest: &str) -> &str {
-    let mut depth = 1;
-    let mut chars = rest.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => {
-                while let Some((_, s)) = chars.next() {
-                    match s {
-                        '\\' => {
-                            chars.next();
+            b'/' if t.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0;
+                while i < t.len() {
+                    if t[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if t[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
                         }
-                        '"' => break,
-                        _ => {}
+                    } else {
+                        i += 1;
                     }
                 }
+                code.push(b' ');
+                blank.push(b' ');
             }
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &rest[..i];
+            b'r' | b'b' if !after_ident && raw_string(t, i).is_some() => {
+                let (open, hashes, end) = raw_string(t, i).unwrap();
+                let end = end.min(t.len());
+                code.extend_from_slice(&t[i..end]);
+                blank.extend_from_slice(&t[i..i + open]);
+                let inner = end.saturating_sub(i + open + 1 + hashes);
+                blank.extend(std::iter::repeat_n(b' ', inner));
+                blank.extend_from_slice(&t[i + open + inner..end]);
+                i = end;
+            }
+            b'"' => {
+                let mut k = i + 1;
+                while k < t.len() && t[k] != b'"' {
+                    k += if t[k] == b'\\' { 2 } else { 1 };
+                }
+                literal(&mut code, &mut blank, i, k + 1, 1);
+                i = (k + 1).min(t.len());
+            }
+            b'\'' if t.get(i + 1) == Some(&b'\\') => {
+                let mut k = i + 3;
+                while k < t.len() && t[k] != b'\'' {
+                    k += 1;
+                }
+                literal(&mut code, &mut blank, i, k + 1, 1);
+                i = (k + 1).min(t.len());
+            }
+            b'\'' if i + 1 < t.len() => {
+                let n = match t[i + 1] {
+                    b if b < 0x80 => 1,
+                    b if b < 0xe0 => 2,
+                    b if b < 0xf0 => 3,
+                    _ => 4,
+                };
+                if t.get(i + 1 + n) == Some(&b'\'') {
+                    literal(&mut code, &mut blank, i, i + 2 + n, 1);
+                    i += 2 + n;
+                } else {
+                    code.push(b'\'');
+                    blank.push(b'\'');
+                    i += 1;
                 }
             }
-            _ => {}
-        }
-    }
-    panic!("a call that is never closed: {rest}")
-}
-
-/// Every name called in `args` (`name(` or `name!(`), string literals left out.
-fn called(args: &str) -> Vec<String> {
-    let chars: Vec<char> = args.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                i += if chars[i] == '\\' { 2 } else { 1 };
-            }
-            i += 1;
-        } else if ident(chars[i]) {
-            let start = i;
-            while i < chars.len() && ident(chars[i]) {
+            b => {
+                code.push(b);
+                blank.push(b);
                 i += 1;
             }
-            let mut name: String = chars[start..i].iter().collect();
-            let mut j = i;
-            if chars.get(j) == Some(&'!') {
-                name.push('!');
-                j += 1;
-            }
-            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-                j += 1;
-            }
-            if chars.get(j) == Some(&'(') {
-                out.push(name);
-            }
-        } else {
-            i += 1;
         }
+    }
+    Src {
+        code: String::from_utf8(code).unwrap(),
+        blank: String::from_utf8(blank).unwrap(),
+    }
+}
+
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    let b = s.as_bytes();
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// The index of the bracket that closes the one opened just before `from`.
+fn closing(blank: &str, from: usize, open: u8, close: u8) -> usize {
+    let mut depth = 1;
+    for (i, b) in blank.bytes().enumerate().skip(from) {
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+    }
+    panic!("an unclosed bracket")
+}
+
+/// Every whole-word use of `word` in `blank`.
+fn words<'a>(blank: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let b = blank.as_bytes();
+    blank.match_indices(word).map(|m| m.0).filter(move |&at| {
+        (at == 0 || !is_ident(b[at - 1])) && !b.get(at + word.len()).is_some_and(|c| is_ident(*c))
+    })
+}
+
+/// The body of the one function `sig` (`fn name(`) in `blank`: from after its `{` to its `}`.
+fn body(blank: &str, sig: &str) -> (usize, usize) {
+    let at: Vec<usize> = blank.match_indices(sig).map(|m| m.0).collect();
+    assert_eq!(at.len(), 1, "one {sig}");
+    let open = at[0] + blank[at[0]..].find('{').expect("its body");
+    (open + 1, closing(blank, open + 1, b'{', b'}'))
+}
+
+/// A call in the source: `name(`, `name!(`, or `name::<` (a turbofish).
+struct Call {
+    at: usize,
+    name: String,
+    /// The whole path, `a::b::name`, without whitespace.
+    path: String,
+    /// Called as a method, `.name(`.
+    method: bool,
+    macro_call: bool,
+    turbofish: bool,
+    /// Just after its `(`, unless it is a turbofish.
+    open: Option<usize>,
+}
+
+fn calls(blank: &str) -> Vec<Call> {
+    let b = blank.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !is_ident(b[i]) || (i > 0 && is_ident(b[i - 1])) || b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < b.len() && is_ident(b[j]) {
+            j += 1;
+        }
+        let k = skip_ws(blank, j);
+        let (macro_call, turbofish, open) = match b.get(k) {
+            Some(b'!') => {
+                let k = skip_ws(blank, k + 1);
+                (true, false, matches!(b.get(k), Some(b'(' | b'[' | b'{')).then_some(k + 1))
+            }
+            Some(b'(') => (false, false, Some(k + 1)),
+            Some(b':') if blank[k..].starts_with("::") && b.get(skip_ws(blank, k + 2)) == Some(&b'<') => {
+                (false, true, None)
+            }
+            _ => {
+                i = j;
+                continue;
+            }
+        };
+        if macro_call && open.is_none() {
+            i = j;
+            continue;
+        }
+        let mut start = i;
+        loop {
+            let before = blank[..start].trim_end();
+            let Some(prefix) = before.strip_suffix("::") else {
+                break;
+            };
+            let prefix = prefix.trim_end();
+            let seg = prefix.len() - prefix.bytes().rev().take_while(|c| is_ident(*c)).count();
+            if seg == prefix.len() {
+                break;
+            }
+            start = seg;
+        }
+        out.push(Call {
+            at: i,
+            name: blank[i..j].to_string(),
+            path: blank[start..j].split_whitespace().collect(),
+            method: blank[..start].trim_end().ends_with('.'),
+            macro_call,
+            turbofish,
+            open,
+        });
+        i = j;
     }
     out
 }
 
-/// The method a method-routing function (or its `_service` form) registers; `any` and `on`
-/// take every method. The bundled! and asset! macros are get.
+/// The method a method-routing function registers; `any` and `on` take every method, which
+/// no table entry matches. The bundled! and asset! macros are get. The `_service` forms
+/// are not parsed: a service can be a whole method router.
 fn method_of(f: &str) -> Option<&'static str> {
-    Some(match f.strip_suffix("_service").unwrap_or(f) {
+    Some(match f {
         "get" | "bundled!" | "asset!" => "GET",
         "head" => "HEAD",
         "post" => "POST",
@@ -184,72 +282,74 @@ fn method_of(f: &str) -> Option<&'static str> {
     })
 }
 
-/// Every `.route(` in `code`: its path (the first string literal of its arguments) with
-/// each method its arguments register, chained ones (`get(a).post(b)`) included. One whose
-/// arguments call no method-routing function is `?`, which no table entry matches.
-fn routes_in(code: &str) -> BTreeSet<(String, String)> {
-    let mut out = BTreeSet::new();
-    for (_, rest) in method_calls(code, "route") {
-        let args = arguments(rest);
-        let (_, path) = args.split_once('"').expect("a path literal");
-        let (path, _) = path.split_once('"').expect("its end");
-        let methods: Vec<_> = called(args).iter().filter_map(|f| method_of(f)).collect();
-        if methods.is_empty() {
-            out.insert(("?".to_string(), path.to_string()));
-        }
-        for m in methods {
-            out.insert((m.to_string(), path.to_string()));
-        }
-    }
-    out
+fn is_path(s: &str) -> bool {
+    !s.is_empty()
+        && s
+            .split("::")
+            .all(|seg| !seg.is_empty() && seg.bytes().all(is_ident))
 }
 
-fn routes_in_server() -> BTreeSet<(String, String)> {
-    routes_in(&code(SERVER))
-}
-
-/// Every command a match takes: each literal of an arm's pattern (`"a" =>`, `"a" | "b" =>`,
-/// `"a" if ... =>`), alternatives on earlier lines included.
-fn commands_in(body: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut pattern = String::new();
-    for l in body.lines().map(str::trim) {
-        let continues = !pattern.is_empty() && l.starts_with('|');
-        if !l.starts_with('"') && !continues {
-            pattern.clear();
-            continue;
-        }
-        pattern.push(' ');
-        pattern.push_str(l);
-        let Some((p, _)) = pattern.split_once("=>") else {
-            continue;
-        };
-        let p = p.split(" if ").next().unwrap_or(p);
-        for alt in p.split('|') {
-            if let Some(cmd) = alt
-                .trim()
-                .strip_prefix('"')
-                .and_then(|a| a.strip_suffix('"'))
-            {
-                out.insert(cmd.to_string());
+/// The methods a route's method router registers, if it is a chain of method-routing calls
+/// (`get(a)`, `axum::routing::post(b).put(c)`, `bundled!("x")`) whose handlers are paths,
+/// or closures and macro arguments that call nothing. None for anything else.
+fn chain(blank: &str, from: usize, to: usize) -> Option<Vec<&'static str>> {
+    let b = blank.as_bytes();
+    let mut out = Vec::new();
+    let mut i = skip_ws(blank, from);
+    loop {
+        let start = i;
+        loop {
+            let s = i;
+            while i < to && is_ident(b[i]) {
+                i += 1;
+            }
+            if i == s {
+                return None;
+            }
+            if blank[i..to].starts_with("::") {
+                i += 2;
+            } else {
+                break;
             }
         }
-        pattern.clear();
+        let mut name = blank[start..i].rsplit("::").next()?.to_string();
+        if b.get(i) == Some(&b'!') {
+            name.push('!');
+            i += 1;
+        }
+        i = skip_ws(blank, i);
+        if i >= to || b[i] != b'(' {
+            return None;
+        }
+        let close = closing(blank, i + 1, b'(', b')');
+        let inner = blank[i + 1..close].trim();
+        let calls_nothing = !inner.contains('(') && !inner.contains('!');
+        let handler = if name.ends_with('!') {
+            calls_nothing
+        } else {
+            is_path(inner)
+                || ((inner.starts_with('|') || inner.starts_with("move")) && calls_nothing)
+        };
+        if !handler {
+            return None;
+        }
+        out.push(method_of(&name)?);
+        i = skip_ws(blank, close + 1);
+        if i >= to {
+            return Some(out);
+        }
+        if b[i] != b'.' {
+            return None;
+        }
+        i = skip_ws(blank, i + 1);
     }
-    out
 }
 
-fn commands_in_server() -> BTreeSet<String> {
-    let server = code(SERVER);
-    let start = server.find("fn handle_text(").expect("handle_text");
-    let body = &server[start..];
-    commands_in(&body[..body.find("\n}\n").expect("its end")])
-}
-
-/// Calls that add routes, fallbacks or other routers to a router.
+/// Calls that register routes, fallbacks or other routers on a router (axum 0.8).
 const REGISTERING: &[&str] = &[
     "route",
     "route_service",
+    "route_layer",
     "merge",
     "nest",
     "nest_service",
@@ -257,61 +357,200 @@ const REGISTERING: &[&str] = &[
     "fallback_service",
     "method_not_allowed_fallback",
 ];
+/// The other calls router() may make on its routers and state.
+const CHAIN: &[&str] = &["with_state", "layer", "clone"];
+/// The functions router() may call outside its routes.
+const PATHS: &[&str] = &[
+    "Router::new",
+    "axum::middleware::from_fn_with_state",
+    "crate::compat::is_set",
+];
 
-#[test]
-fn the_scan_sees_the_shapes_a_route_or_command_can_take() {
-    let routes = routes_in(&code(
-        r#"Router::new()
-            .route ( "/a", get(a).post(b) )
-            .route("/b",
-                axum::routing::head(h))
-            // .route("/commented", post(x))
-            /* .route("/block", post(x)) */
-            .route("/c", on(MethodFilter::PUT, c))
-            .route("/d", helper())
-            .route("/e", bundled!("e.js"))"#,
-    ));
-    let want = [
-        ("GET", "/a"),
-        ("POST", "/a"),
-        ("HEAD", "/b"),
-        ("ANY", "/c"),
-        ("?", "/d"),
-        ("GET", "/e"),
-    ]
-    .map(|(m, p)| (m.to_string(), p.to_string()));
-    assert_eq!(routes, BTreeSet::from(want));
-    let commands = commands_in(
-        r#"
-        "a" => x(),
-        "b"
-        | "c" => y(),
-        "d" | "e"
-            | "f" if z => w(),
-        other => {}
-        "#,
-    );
-    let want = ["a", "b", "c", "d", "e", "f"].map(String::from);
-    assert_eq!(commands, BTreeSet::from(want));
-    for (text, name) in [
-        (
-            "r . method_not_allowed_fallback (h)",
-            "method_not_allowed_fallback",
-        ),
-        ("r.fallback\n(h)", "fallback"),
-        ("r\n    .route(\n\"/x\", get(h))", "route"),
-        ("let s = r#\"// \"#; r.merge(x)", "merge"),
-    ] {
-        assert_eq!(method_calls(&code(text), name).len(), 1, "{text}");
+/// Whole-word uses of a registering name as a method (`.route(`, `.merge::<`) or through a
+/// path (`Router::route`); fields (`x.route.lock()`) and the crate's own functions and
+/// variables of those names are not.
+fn registering_uses(blank: &str) -> Vec<(usize, &'static str)> {
+    let mut out = Vec::new();
+    for name in REGISTERING {
+        for at in words(blank, name) {
+            let before = blank[..at].trim_end();
+            let after = blank[at + name.len()..].trim_start();
+            let method = before.ends_with('.') && (after.starts_with('(') || after.starts_with("::"));
+            if method || before.ends_with("::") {
+                out.push((at, *name));
+            }
+        }
     }
-    for (text, name) in [
-        ("c.route.lock()", "route"),
-        ("// r.route(\"/x\", get(h))", "route"),
-        ("r.route_service(\"/x\", s)", "route"),
-        ("r.nest_service(\"/x\", s)", "nest"),
-    ] {
-        assert!(method_calls(&code(text), name).is_empty(), "{text}");
+    out
+}
+
+fn snippet(code: &str, at: usize) -> String {
+    let end = (at + 60).min(code.len());
+    let end = (end..=code.len()).find(|e| code.is_char_boundary(*e)).unwrap();
+    code[at..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What router() in `text` registers, as (method, path), and every form the scan does not
+/// understand, refused.
+fn registrations(text: &str) -> (BTreeSet<(String, String)>, Vec<String>) {
+    let Src { code, blank } = lex(text);
+    let mut routes = BTreeSet::new();
+    let mut refused = Vec::new();
+    let (from, to) = body(&blank, "fn router(");
+    let checks: Vec<usize> = blank
+        .match_indices("crate::readonly::check")
+        .map(|m| m.0)
+        .collect();
+    if checks.len() != 1 || !(from..to).contains(&checks[0]) {
+        refused.push("not exactly one read-only layer, inside router()".to_string());
     }
+    let layer = checks.first().copied().unwrap_or(0);
+    let mut parsed_args: Vec<(usize, usize)> = Vec::new();
+    let mut accepted = BTreeSet::new();
+    for c in calls(&blank) {
+        if parsed_args.iter().any(|(a, b)| (*a..*b).contains(&c.at)) {
+            continue;
+        }
+        let inside = (from..to).contains(&c.at);
+        let what = format!("{} at byte {}: {}", c.path, c.at, snippet(&code, c.at));
+        if REGISTERING.contains(&c.name.as_str()) {
+            let Some(open) = c.open.filter(|_| {
+                inside && c.method && !c.turbofish && !c.macro_call && c.at < layer
+            }) else {
+                refused.push(format!("a registration outside router()'s chain before the read-only layer: {what}"));
+                continue;
+            };
+            let close = closing(&blank, open, b'(', b')');
+            parsed_args.push((open, close));
+            match c.name.as_str() {
+                "route" => {
+                    let mut depth = 0;
+                    let comma = (open..close).find(|&i| {
+                        match blank.as_bytes()[i] {
+                            b'(' | b'[' | b'{' => depth += 1,
+                            b')' | b']' | b'}' => depth -= 1,
+                            b',' if depth == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    });
+                    let path = comma.and_then(|comma| {
+                        let p = code[open..comma].trim();
+                        let ok = p.len() >= 2
+                            && p.starts_with('"')
+                            && p.ends_with('"')
+                            && !p.contains('\\');
+                        ok.then(|| p[1..p.len() - 1].to_string())
+                    });
+                    match (path, comma.and_then(|comma| chain(&blank, comma + 1, close))) {
+                        (Some(path), Some(methods)) => {
+                            accepted.insert(c.at);
+                            for m in methods {
+                                routes.insert((m.to_string(), path.clone()));
+                            }
+                        }
+                        _ => refused.push(format!("a route the scan cannot read: {what}")),
+                    }
+                }
+                "merge" if is_path(blank[open..close].trim()) && !blank[open..close].contains("::") => {
+                    accepted.insert(c.at);
+                }
+                _ => refused.push(format!("a registration the scan does not parse: {what}")),
+            }
+        } else if inside {
+            let known = if c.turbofish || c.macro_call {
+                false
+            } else if c.method {
+                CHAIN.contains(&c.name.as_str())
+            } else {
+                PATHS.contains(&c.path.as_str())
+            };
+            if !known {
+                refused.push(format!("a call in router() the scan does not know: {what}"));
+            }
+        }
+    }
+    for (at, name) in registering_uses(&blank) {
+        if !accepted.contains(&at) && !refused.iter().any(|r| r.contains(&format!("at byte {at}:"))) {
+            refused.push(format!("{name} used at byte {at}: {}", snippet(&code, at)));
+        }
+    }
+    (routes, refused)
+}
+
+/// The commands handle_text in `text` matches on, and every form the scan does not
+/// understand, refused: `cmd` may only be bound, passed to readonly::command and matched
+/// once, and each arm of that match is plain string literals (with `|` and a guard) or `_`.
+fn commands(text: &str) -> (BTreeSet<String>, Vec<String>) {
+    let Src { code, blank } = lex(text);
+    let (from, to) = body(&blank, "fn handle_text(");
+    let mut refused = Vec::new();
+    let mut matched = None;
+    for at in words(&blank, "cmd").filter(|at| (from..to).contains(at)) {
+        let before = blank[from..at].trim_end();
+        let after = blank[at + 3..to].trim_start();
+        if before.ends_with("let (") && after.starts_with(", rest)") {
+        } else if before.ends_with("crate::readonly::command(") && after.starts_with(')') {
+        } else if before.ends_with("match") && after.starts_with('{') && matched.is_none() {
+            matched = Some(to - after.len());
+        } else {
+            refused.push(format!("cmd used at byte {at}: {}", snippet(&code, at)));
+        }
+    }
+    let mut out = BTreeSet::new();
+    let Some(open) = matched else {
+        refused.push("no `match cmd`".to_string());
+        return (out, refused);
+    };
+    let b = blank.as_bytes();
+    let close = closing(&blank, open + 1, b'{', b'}');
+    let mut i = open + 1;
+    loop {
+        while i < close && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i >= close {
+            break;
+        }
+        let Some(arrow) = blank[i..close].find("=>").map(|a| i + a) else {
+            refused.push(format!("an arm without =>: {}", snippet(&code, i)));
+            break;
+        };
+        let guard = words(&blank[..arrow], "if").find(|g| *g >= i).unwrap_or(arrow);
+        let mut alt = i;
+        for end in (i..guard).filter(|e| b[*e] == b'|').chain([guard]) {
+            let lit = code[alt..end].trim();
+            let blanked = blank[alt..end].trim();
+            let plain = lit.len() >= 2
+                && lit.starts_with('"')
+                && lit.ends_with('"')
+                && blanked[1..blanked.len() - 1].bytes().all(|c| c == b' ')
+                && !lit.contains('\\');
+            if plain {
+                out.insert(lit[1..lit.len() - 1].to_string());
+            } else if lit != "_" {
+                refused.push(format!("an arm the scan does not read: {}", snippet(&code, alt)));
+            }
+            alt = end + 1;
+        }
+        let mut j = skip_ws(&blank, arrow + 2);
+        if b.get(j) == Some(&b'{') {
+            j = closing(&blank, j + 1, b'{', b'}') + 1;
+        } else {
+            let mut depth = 0;
+            while j < close {
+                match b[j] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b',' if depth == 0 => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        i = j;
+    }
+    (out, refused)
 }
 
 /// Every source file of the crate but its tests, as (path, text).
@@ -331,53 +570,152 @@ fn sources() -> Vec<(std::path::PathBuf, String)> {
     out
 }
 
+/// A router() for the scan's own tests, with `chain` added before its layer.
+fn router_with(chain: &str) -> String {
+    format!(
+        "fn other() {{ c.route.lock(); }}
+pub fn router(state: AppState) -> Router {{
+    let files = Router::new().route(\"/f\", get(files::list)).with_state(state.files.clone());
+    Router::new()
+        .route ( \"/a\", get(a).post(b) )
+        .route(\"/b\",
+            axum::routing::head(h))
+        // .route(\"/commented\", post(x))
+        /* /* nested */ .route(\"/block\", post(x)) */
+        .route(\"/c\", bundled!(\"c.js\"))
+        .route(\"/s\", get(|| async {{ \".route(\\\"/zz\\\", post(x))\" }}))
+        .merge(files)
+        {chain}
+        .layer(axum::middleware::from_fn_with_state(
+            read_only,
+            crate::readonly::check,
+        ))
+}}"
+    )
+}
+
+/// handle_text for the scan's own tests, with `arms` added to its match.
+fn handle_text_with(arms: &str) -> String {
+    format!(
+        "fn handle_text(s: &AppState, t: &str) {{
+    let (cmd, rest) = t.split_once(',').unwrap_or((t, \"\"));
+    if s.read_only && crate::readonly::command(cmd) != Some(Watch) {{
+        return;
+    }}
+    match cmd {{
+        \"a\" => {{
+            x(\"=> | \\\"q\\\"\");
+        }}
+        \"b\"
+        | \"c\" => y(),
+        \"d\" | \"e\"
+            | \"f\" if z => w(rest),
+        {arms}
+        _ => {{}}
+    }}
+}}"
+    )
+}
+
+#[test]
+fn the_scan_reads_what_it_knows_and_refuses_the_rest() {
+    let (routes, refused) = registrations(&router_with(""));
+    assert!(refused.is_empty(), "{refused:#?}");
+    let want = [
+        ("GET", "/a"),
+        ("POST", "/a"),
+        ("HEAD", "/b"),
+        ("GET", "/c"),
+        ("GET", "/s"),
+        ("GET", "/f"),
+    ]
+    .map(|(m, p)| (m.to_string(), p.to_string()));
+    assert_eq!(routes, BTreeSet::from(want));
+    for chain in [
+        ".route(\"/d\", helper())",
+        ".route(\"/e\", get(a).merge(h))",
+        ".route(\"/g\", get_service(s))",
+        ".route(\"/h\", get(make()))",
+        ".route(PATH, get(a))",
+        ".merge::<Router>(x)",
+        ".merge(helper())",
+        ".method_not_allowed_fallback(h)",
+        ". fallback (h)",
+        ".nest(\"/n\", x)",
+        ".route_service(\"/r\", s)",
+        ".route_layer(l)",
+        ".merge(Router::route(Router::new(), \"/u\", get(a)))",
+        ".add_more()",
+        ".layer(more_routes!())",
+        ".with_state(axum::routing::head(h))",
+    ] {
+        let (_, refused) = registrations(&router_with(chain));
+        assert!(!refused.is_empty(), "not refused: {chain}");
+    }
+    let late = router_with("").replace("\n}", "\n    .route(\"/late\", get(a))\n}");
+    assert!(!registrations(&late).1.is_empty(), "a route after the layer");
+    let local = router_with("").replace(
+        "    Router::new()\n",
+        "    let h = axum::routing::head(x);\n    Router::new()\n",
+    );
+    assert!(!registrations(&local).1.is_empty(), "a method router in a local");
+    let (commands_found, refused) = commands(&handle_text_with(""));
+    assert!(refused.is_empty(), "{refused:#?}");
+    let want = ["a", "b", "c", "d", "e", "f"].map(String::from);
+    assert_eq!(commands_found, BTreeSet::from(want));
+    for arms in [
+        "r\"q\" => q(),",
+        "r#\"q\"# => q(),",
+        "Q => q(),",
+        "x @ \"q\" => q(),",
+        "\"q\\x41\" => q(),",
+        "_ if cmd == \"q\" => q(),",
+    ] {
+        let (_, refused) = commands(&handle_text_with(arms));
+        assert!(!refused.is_empty(), "not refused: {arms}");
+    }
+}
+
+#[test]
+fn the_scan_is_for_the_axum_it_was_written_against() {
+    let axum = LOCK
+        .split("[[package]]")
+        .find(|p| p.contains("\nname = \"axum\"\n"))
+        .expect("axum in Cargo.lock");
+    assert!(
+        axum.contains("\nversion = \"0.8."),
+        "a new axum: check REGISTERING against its Router and MethodRouter methods: {axum}"
+    );
+}
+
 #[test]
 fn routes_are_only_registered_where_the_table_is_checked() {
     let mut seen_server = false;
     for (path, text) in sources() {
-        let text = code(&text);
         if path.ends_with("server.rs") {
             seen_server = true;
-            for f in REGISTERING
-                .iter()
-                .filter(|f| !["route", "merge"].contains(f))
-            {
-                assert!(
-                    method_calls(&text, f).is_empty(),
-                    "server.rs calls .{f}(: decide what it serves under --read-only in readonly.rs"
-                );
-            }
-            // Every route and merged router is added inside router(), before its one
-            // read-only layer, which Router::layer applies only to what is there already.
-            let start = text.find("pub fn router(").expect("router()");
-            let layers: Vec<_> = text.match_indices("crate::readonly::check").collect();
-            assert_eq!(layers.len(), 1, "one read-only layer in server.rs");
-            let layer = layers[0].0;
-            for f in ["route", "merge"] {
-                for (at, rest) in method_calls(&text, f) {
-                    assert!(
-                        start < at && at < layer,
-                        ".{f}({} is not inside router() before the read-only layer",
-                        &rest[..rest.len().min(40)]
-                    );
-                }
-            }
+            let (_, refused) = registrations(&text);
+            assert!(
+                refused.is_empty(),
+                "server.rs: forms the read-only scan does not understand; register routes as plain .route(\"/path\", method(handler)) calls in router() before the layer, with decisions in readonly.rs: {refused:#?}"
+            );
             continue;
         }
-        for f in REGISTERING {
+        let Src { code, blank } = lex(&text);
+        for (at, name) in registering_uses(&blank) {
+            panic!(
+                "{} uses {name} at byte {at} ({}): routes are added in server.rs's router(), before the read-only layer",
+                path.display(),
+                snippet(&code, at)
+            );
+        }
+        for word in ["Router", "MethodRouter"] {
             assert!(
-                method_calls(&text, f).is_empty(),
-                "{} calls .{f}(: routes are added in server.rs's router(), before the read-only layer, with decisions in readonly.rs",
+                words(&blank, word).next().is_none(),
+                "{} names {word}: routes are added in server.rs's router()",
                 path.display()
             );
         }
-        assert!(
-            !text
-                .split(|c: char| !ident(c))
-                .any(|w| w == "Router" || w == "MethodRouter"),
-            "{} names a router type: routes are added in server.rs's router()",
-            path.display()
-        );
     }
     assert!(seen_server);
 }
@@ -390,7 +728,8 @@ fn every_route_the_server_has_is_decided_once() {
         .collect();
     let decided: BTreeSet<_> = table.iter().cloned().collect();
     assert_eq!(decided.len(), table.len(), "a route decided twice");
-    let routes = routes_in_server();
+    let (routes, refused) = registrations(SERVER);
+    assert!(refused.is_empty(), "{refused:#?}");
     assert!(routes.len() >= 20, "{routes:?}");
     assert_eq!(
         routes, decided,
@@ -402,7 +741,8 @@ fn every_route_the_server_has_is_decided_once() {
 fn every_command_the_server_takes_is_decided_once() {
     let decided: BTreeSet<String> = COMMANDS.iter().map(|(c, _)| c.to_string()).collect();
     assert_eq!(decided.len(), COMMANDS.len(), "a command decided twice");
-    let commands = commands_in_server();
+    let (commands, refused) = commands(SERVER);
+    assert!(refused.is_empty(), "{refused:#?}");
     assert!(commands.len() >= 10, "{commands:?}");
     assert_eq!(
         commands, decided,

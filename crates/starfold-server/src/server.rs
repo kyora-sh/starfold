@@ -990,4 +990,43 @@ mod tests {
             assert_eq!(status, 404, "id {guess}: {text}");
         }
     }
+
+    #[tokio::test]
+    async fn a_recording_stopped_with_its_id_returns_its_clip_once() {
+        let hub = Hub::new();
+        hub.width.store(64, Ordering::Relaxed);
+        hub.height.store(32, Ordering::Relaxed);
+        let mut s = app(&hub, false, None);
+        s.recorder = crate::record::Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
+        let (status, text) = ask(port, "POST", "/record/start", "").await;
+        assert_eq!(status, 200, "{text}");
+        let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        // Three H.264 access units as the hub sends them: a keyframe with SPS and PPS, then
+        // two more frames.
+        let recorder = hub.clients.lock()[0].clone();
+        let mut key = vec![0x01, 1, 0, 0, 0, 1];
+        key.resize(16, 0);
+        key.extend_from_slice(&[
+            0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
+        ]);
+        let mut delta = vec![0x01, 0, 0, 0, 0, 2];
+        delta.resize(16, 0);
+        delta.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]);
+        for frame in [&key, &delta, &delta] {
+            recorder.send(Out::Bin(Bytes::copy_from_slice(frame)));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stop = format!("/record/stop?id={id}");
+        let (status, clip) = ask(port, "POST", &stop, "").await;
+        assert_eq!(status, 200, "{clip}");
+        assert!(clip.len() > 100, "a clip of {} bytes", clip.len());
+        assert_eq!(clip.get(4..8), Some("ftyp"), "an MP4");
+        assert!(clip.contains("moov") && clip.contains("mdat"));
+        let (status, text) = ask(port, "POST", &stop, "").await;
+        assert_eq!(status, 404, "a second stop: {text}");
+    }
 }

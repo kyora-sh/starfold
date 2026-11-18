@@ -424,8 +424,14 @@ fn begin(
     client.set_video(true);
     r.hub.replan();
     let hub = r.hub.clone();
+    // The size the recording starts with is the size of its MP4 track; a hello for any other
+    // ends it.
+    let size = (
+        hub.width.load(Ordering::Relaxed),
+        hub.height.load(Ordering::Relaxed),
+    );
     Ok(tokio::spawn(async move {
-        let (parts, end) = collect(&hub, &client, rx, stop, max).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, size, max).await;
         // Writing takes a while: nothing acknowledges frames now, so leave first.
         hub.remove_client(client.id);
         tokio::task::spawn_blocking(move || Clip::write(parts, end))
@@ -439,6 +445,7 @@ async fn collect(
     client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
+    size: (u32, u32),
     max: Duration,
 ) -> (Vec<Part>, End) {
     let start = Instant::now();
@@ -446,7 +453,6 @@ async fn collect(
     tokio::pin!(deadline);
     let mut parts: Vec<Part> = Vec::new();
     let mut frames: Vec<mp4::Frame> = Vec::new();
-    let mut size = (0, 0);
     let mut first: Option<Vec<Vec<u8>>> = None;
     let mut last_ms = None;
     let end = loop {
@@ -487,9 +493,6 @@ async fn collect(
                             Some(_) => {}
                         }
                     }
-                    if frames.is_empty() {
-                        size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
-                    }
                     last_ms = Some(ms);
                     frames.push(mp4::Frame {
                         ms,
@@ -497,8 +500,10 @@ async fn collect(
                         data: b.slice(16..),
                     });
                 }
-                // A new size restarts the stream; an MP4 track keeps one size, so stop.
-                Some(Out::Text(t)) if !frames.is_empty() && resizes(&t, size) => {
+                // A new size restarts the stream; an MP4 track keeps the size the recording
+                // started with, so stop. The hub's size is not read here: a frame queued
+                // before a resize can be read after the hub has the new size.
+                Some(Out::Text(t)) if resizes(&t, size) => {
                     break End::Resized
                 }
                 _ => {}
@@ -670,7 +675,7 @@ mod tests {
         tx.send(Out::Text("{\"t\":\"hello\"}".into())).unwrap();
         let (parts, end) = tokio::time::timeout(
             Duration::from_secs(5),
-            collect(&hub, &client, rx, stop, Duration::from_secs(30)),
+            collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)),
         )
         .await
         .expect("the recording ended");
@@ -787,7 +792,7 @@ mod tests {
         b.resize(16, 0);
         b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
         tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
-        let (parts, end) = collect(&hub, &client, rx, stop, Duration::from_secs(30)).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)).await;
         let c = Clip::write(parts, end).unwrap();
         assert_eq!(c.end, End::BadParameterSets);
         assert_eq!(c.segments.len(), 1);
@@ -1032,7 +1037,7 @@ mod tests {
         tx.send(unit(Some((100, 40)))).unwrap();
         tx.send(Out::Text(text.into())).unwrap();
         tx.send(unit(None)).unwrap();
-        let recording = collect(&hub, &client, rx, stop, Duration::from_secs(30));
+        let recording = collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30));
         let stopper = async {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = stop_tx.send(());
@@ -1077,5 +1082,69 @@ mod tests {
         let c = with_a_broadcast(r#"{"t":"hello","w":800,"h":600,"offer":3}"#).await;
         assert_eq!(c.end, End::Stopped);
         assert_eq!(c.segments[0].frames, 2);
+    }
+
+    /// The width and height an MP4's avc1 sample entry gives its samples.
+    fn dims(mp4: &[u8]) -> (u16, u16) {
+        let stsd = find(
+            mp4,
+            &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+        );
+        assert_eq!(&stsd[12..16], b"avc1");
+        let at = 16 + 24;
+        (
+            u16::from_be_bytes([stsd[at], stsd[at + 1]]),
+            u16::from_be_bytes([stsd[at + 2], stsd[at + 3]]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_after_the_hub_has_a_new_size_keeps_the_size_the_recording_started_with()
+    {
+        // A capture rebuild sets the hub's new size and says hello while a frame captured at
+        // the old size is still queued for the recorder.
+        let hub = Hub::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx.clone());
+        let (_keep, stop) = oneshot::channel();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        hub.width.store(1024, Ordering::Relaxed);
+        hub.height.store(768, Ordering::Relaxed);
+        tx.send(Out::Text(r#"{"t":"hello","w":1024,"h":768}"#.into()))
+            .unwrap();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        let (parts, end) = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30)),
+        )
+        .await
+        .expect("the recording ended");
+        assert_eq!(end, End::Resized);
+        let c = Clip::write(parts, end).unwrap();
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(c.segments[0].frames, 1, "only the old-size frame");
+        assert_eq!(dims(&c.segments[0].mp4), (800, 600));
+    }
+
+    #[tokio::test]
+    async fn a_recording_takes_its_size_from_the_hub_when_it_starts() {
+        let hub = Hub::new();
+        hub.width.store(800, Ordering::Relaxed);
+        hub.height.store(600, Ordering::Relaxed);
+        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let (stop_tx, stop) = oneshot::channel();
+        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
+        let recorder = hub.clients.lock()[0].clone();
+        recorder.send(unit(Some((100, 40))));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.width.store(1024, Ordering::Relaxed);
+        recorder.send(Out::Text(r#"{"t":"hello","w":800,"h":600}"#.into()));
+        recorder.send(unit(None));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send(()).unwrap();
+        let c = done.await.unwrap().unwrap();
+        assert_eq!(c.end, End::Stopped, "the hello is for the size it started with");
+        assert_eq!(c.segments[0].frames, 2);
+        assert_eq!(dims(&c.segments[0].mp4), (800, 600));
     }
 }
