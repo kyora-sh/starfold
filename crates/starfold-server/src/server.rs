@@ -1762,13 +1762,20 @@ mod tests {
             };
             let d = dir("setgid");
             let c = std::ffi::CString::new(d.as_os_str().as_encoded_bytes()).unwrap();
-            assert_eq!(unsafe { libc::chown(c.as_ptr(), libc::uid_t::MAX, other) }, 0);
+            assert_eq!(
+                unsafe { libc::chown(c.as_ptr(), libc::uid_t::MAX, other) },
+                0
+            );
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2700)).unwrap();
             let at = d.join("sf");
             let (l, file) = bind_unix(&at, 0o660).unwrap();
             let meta = |p: &std::path::Path| std::fs::metadata(p).unwrap();
             assert_eq!(meta(&at).gid(), egid, "the directory's group");
-            assert_eq!(meta(&unix_socket_path(&at)).gid(), egid, "the socket's group");
+            assert_eq!(
+                meta(&unix_socket_path(&at)).gid(),
+                egid,
+                "the socket's group"
+            );
             assert_eq!(meta(&at).mode() & 0o7777, 0o710);
             drop(l);
             remove_unix(&file);
