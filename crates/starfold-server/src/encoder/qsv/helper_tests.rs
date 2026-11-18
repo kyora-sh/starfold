@@ -618,7 +618,11 @@ mod remote {
         });
         let mut enc = start(
             p,
-            format!("{}; {}; {refused}; sleep 30", opened(), says(&Reply::RateSet)),
+            format!(
+                "{}; {}; {refused}; sleep 30",
+                opened(),
+                says(&Reply::RateSet)
+            ),
         );
         enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
         assert!(enc.holds_cap());

@@ -1808,7 +1808,11 @@ fn a_failed_session_is_closed_before_its_replacement_opens() {
     );
     push_band(&mut eng, W, H, None);
     let v = videos(&drain(&mut rx));
-    assert_eq!(v.len(), 2, "both stripes, the bottom one from its new session: {v:?}");
+    assert_eq!(
+        v.len(),
+        2,
+        "both stripes, the bottom one from its new session: {v:?}"
+    );
     assert_eq!(live.load(Ordering::SeqCst), 2, "the two stripes' sessions");
 }
 
@@ -1835,7 +1839,11 @@ fn a_failed_session_is_closed_when_no_replacement_opens() {
     );
     push_band(&mut eng, W, H, None);
     drain(&mut rx);
-    assert_eq!(live.load(Ordering::SeqCst), 1, "and no retry leaves one behind");
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "and no retry leaves one behind"
+    );
 }
 
 #[test]

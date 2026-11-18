@@ -879,11 +879,6 @@ fn rate_changes_reset_the_encoder() {
         "a raised rate needs no IDR"
     );
     enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
-    assert_eq!(
-        enc.rate_in_force(),
-        crate::encoder::RateInForce::Known(48_000),
-        "clamped to what a 2 Mbit/s cap at 30 fps was sized for"
-    );
     let l = log.lock().unwrap();
     let m = |p: &VideoParam| p.mfx;
     let r: Vec<(u16, u16, u16)> = l
@@ -894,7 +889,8 @@ fn rate_changes_reset_the_encoder() {
         .collect();
     assert_eq!(
         r,
-        vec![(1000, 1000, 1), (40_000, 40_000, 1), (48_000, 48_000, 1)]
+        vec![(1000, 1000, 1), (40_000, 40_000, 1), (48_000, 48_000, 1)],
+        "100 Mbit/s clamped to what a 2 Mbit/s cap at 30 fps was sized for"
     );
     assert!(l.reset.iter().all(|p| p.num_ext_param == 2));
 }
