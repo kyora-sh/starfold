@@ -4,10 +4,13 @@ import type { App } from './app';
 
 export function createAudio(app: App) {
 	let started = false;
+	let enabled = false;
 	let ac: AudioContext | null = null;
 
-	/** Starts (or resumes) playback; browsers only allow it after a user gesture. */
+	/** Starts (or resumes) playback; browsers only allow it after a user gesture. Nothing
+	 * happens until the server's hello says it streams audio. */
 	async function start() {
+		if (!enabled) return;
 		if (ac && ac.state === 'suspended') {
 			ac.resume().catch(() => {});
 			return;
@@ -29,5 +32,14 @@ export function createAudio(app: App) {
 			console.warn('[starfold] audio unavailable', err);
 		}
 	}
-	return { start };
+
+	/** What a hello says (one per connection): with audio, playback starts right away if
+	 * the browser allows it (autoplay, or a gesture seen before), else at the next gesture;
+	 * without, nothing is loaded and audio already playing is suspended. */
+	function setEnabled(on: boolean) {
+		enabled = on;
+		if (on) void start();
+		else if (ac && ac.state === 'running') ac.suspend().catch(() => {});
+	}
+	return { start, setEnabled };
 }

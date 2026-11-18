@@ -104,6 +104,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--read-only`                                                  | `false`                                                               | viewers only watch: input, clipboard writes, the microphone, uploads and resizing (`--enable-resize`) are refused                                                                                         |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
+| `--base-path`                                                  | none                                                                  | serve everything under this path prefix (such as `/desktop`), for a reverse proxy that forwards it unchanged; see [Hosts and origins](#hosts-and-origins)                                                 |
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
@@ -158,6 +159,11 @@ host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-
 To let a page on another site connect, name that site with `--allowed-origins`.
 Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as
 usual. A refused request gets a 403 that names the flag to add.
+
+A proxy that serves starfold under a path, such as `https://example.com/desktop/`, and
+forwards the path unchanged needs `--base-path=/desktop`: starfold then answers under
+`/desktop/` only, sends `/desktop` on to `/desktop/`, and prints its link with the prefix.
+A proxy that strips the prefix before forwarding needs no flag.
 
 ### For agents and scripts
 

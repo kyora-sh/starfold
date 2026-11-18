@@ -168,6 +168,7 @@ function main() {
 				files.setup(m.files);
 				mic.setup(!!m.mic && !app.readOnly);
 				resize.setup(m.resize);
+				audio.setEnabled(!!m.audio);
 				statusEl.style.display = 'none';
 				break;
 			case 'codec':
@@ -222,9 +223,6 @@ function main() {
 				break;
 		}
 	});
-
-	// Autoplay may be allowed (iframe allow="autoplay"); try right away.
-	audio.start();
 }
 
 main();

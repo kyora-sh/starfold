@@ -8,6 +8,7 @@ mod access;
 mod actions;
 #[cfg(target_os = "linux")]
 mod audio;
+mod base_path;
 mod build_facts;
 #[cfg(target_os = "linux")]
 mod capture;
@@ -162,6 +163,13 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| default_addr.into());
     let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
+    let base = match base_path::parse(a.get("base-path").map(|s| s.as_str())) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("--base-path: {e}");
+            std::process::exit(2);
+        }
+    };
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -474,15 +482,20 @@ async fn serve(a: HashMap<String, String>) {
     // Added last, so it runs first: a request for the wrong host or from another site's
     // page is turned away before the login is asked for.
     let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
+    let prefix = base.as_deref().unwrap_or("");
+    let app = match base.as_deref() {
+        Some(p) => base_path::under(p, app),
+        None => app,
+    };
     let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
         .await
         .expect("bind");
-    log::info!("listening on http://{addr}:{port}");
+    log::info!("listening on http://{addr}:{port}{prefix}/");
     // Where to point a browser on this machine.
     let page = match addr.as_str() {
-        "0.0.0.0" | "::" => format!("http://localhost:{port}/"),
-        a if a.contains(':') => format!("http://[{a}]:{port}/"),
-        a => format!("http://{a}:{port}/"),
+        "0.0.0.0" | "::" => format!("http://localhost:{port}{prefix}/"),
+        a if a.contains(':') => format!("http://[{a}]:{port}{prefix}/"),
+        a => format!("http://{a}:{port}{prefix}/"),
     };
     match &login {
         Some((l, true)) => log::info!(
