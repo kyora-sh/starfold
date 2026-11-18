@@ -139,7 +139,10 @@ pub fn main() {
 
 /// The socket --listen-unix binds before the server starts, and what removes it.
 #[cfg(target_os = "linux")]
-type Prebound = (std::os::unix::net::UnixListener, &'static server::SocketFile);
+type Prebound = (
+    std::os::unix::net::UnixListener,
+    &'static server::SocketFile,
+);
 #[cfg(not(target_os = "linux"))]
 type Prebound = std::convert::Infallible;
 
