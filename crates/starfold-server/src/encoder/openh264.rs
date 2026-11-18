@@ -43,6 +43,30 @@ fn check(what: &str, r: c_int) -> Result<(), EncodeError> {
     }
 }
 
+/// `ForceIntraFrame` with the parameters of the method the vtable slot holds.
+type ForceIntraFrame = unsafe extern "C" fn(*mut sys::ISVCEncoder, bool, c_int) -> c_int;
+/// The same slot as openh264-sys2 binds it.
+type AsBound = unsafe extern "C" fn(*mut sys::ISVCEncoder, bool) -> c_int;
+
+/// Asks `enc` for an IDR on every spatial layer (`iLayerId` -1) of the next frame.
+///
+/// # Safety
+/// `enc` is a live encoder from `WelsCreateSVCEncoder`.
+unsafe fn force_intra_frame(enc: *mut sys::ISVCEncoder) -> c_int {
+    // SAFETY: openh264-sys2 0.9.9 binds this slot from the C vtable in codec_api.h:489,
+    //   int (*ForceIntraFrame) (ISVCEncoder*, bool bIDR);
+    // but it holds the C++ method declared at codec_api.h:323 and defined at
+    // welsEncoderExt.cpp:491,
+    //   virtual int EXTAPI ForceIntraFrame (bool bIDR, int iLayerId = -1) = 0;
+    // whose default argument only a C++ caller supplies. Called with the method's own
+    // parameters, the callee reads the layer id passed here.
+    unsafe {
+        let slot = (**enc).ForceIntraFrame.unwrap();
+        let f = std::mem::transmute::<AsBound, ForceIntraFrame>(slot);
+        f(enc, true, -1)
+    }
+}
+
 /// The bitrate to give OpenH264 so that frames arriving at `fps` share `max_kbps`: it
 /// budgets per second over at most MAX_FPS frames.
 fn bps(max_kbps: u32, fps: u32) -> c_int {
@@ -268,9 +292,7 @@ impl VideoEncoder for OpenH264 {
             ..Default::default()
         };
         if opts.force_keyframe {
-            check("ForceIntraFrame", unsafe {
-                self.vt().ForceIntraFrame.unwrap()(self.enc, true)
-            })?;
+            check("ForceIntraFrame", unsafe { force_intra_frame(self.enc) })?;
         }
         if let Some(qp) = fixed {
             // Nothing is lost, the picture just stays as it is: not worth the keyframe a
@@ -337,5 +359,32 @@ impl Drop for OpenH264 {
             self.vt().Uninitialize.unwrap()(self.enc);
             sys::source::APILoader::WelsDestroySVCEncoder(self.enc);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static SEEN: Mutex<Option<(bool, c_int)>> = Mutex::new(None);
+
+    unsafe extern "C" fn record(_: *mut sys::ISVCEncoder, idr: bool, layer: c_int) -> c_int {
+        *SEEN.lock().unwrap() = Some((idr, layer));
+        0
+    }
+
+    /// The slot gets the IDR flag and the layer id the C++ method reads: -1, every layer.
+    #[test]
+    fn a_forced_keyframe_names_every_layer() {
+        let vt = sys::ISVCEncoderVtbl {
+            ForceIntraFrame: Some(unsafe {
+                std::mem::transmute::<ForceIntraFrame, AsBound>(record)
+            }),
+            ..Default::default()
+        };
+        let mut obj: sys::ISVCEncoder = &vt;
+        assert_eq!(unsafe { force_intra_frame(&mut obj) }, 0);
+        assert_eq!(*SEEN.lock().unwrap(), Some((true, -1)));
     }
 }
