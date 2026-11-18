@@ -438,19 +438,63 @@ fn short_or_wrapping_planes_are_rejected() {
     }
 }
 
+/// `len` bytes of read-only address space reading as zeros, that no page backs until it is
+/// touched; unmapped on drop.
+#[cfg(all(unix, target_pointer_width = "64"))]
+struct Untouched {
+    at: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl Untouched {
+    fn new(len: usize) -> Self {
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            at,
+            libc::MAP_FAILED,
+            "mapping {len} bytes: {}",
+            std::io::Error::last_os_error()
+        );
+        Untouched { at, len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: a live, readable mapping of `len` bytes, never written, for `self`'s lifetime.
+        unsafe { std::slice::from_raw_parts(self.at.cast(), self.len) }
+    }
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl Drop for Untouched {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.at, self.len) };
+    }
+}
+
 /// A plane whose rows times its stride doesn't fit a C int is refused, though it holds them
-/// all; two rows fewer, it fits. The 2 GiB plane is zeroed memory nothing reads, so the
-/// system hands out no pages for it.
-#[cfg(target_pointer_width = "64")]
+/// all; two rows fewer, it fits. Any plane the bound refuses and the rest of the check accepts
+/// is longer than `i32::MAX` bytes, so the luma plane is a 2 GiB mapping that nothing reads:
+/// it takes address space, not memory.
+#[cfg(all(unix, target_pointer_width = "64"))]
 #[test]
 fn a_plane_past_a_c_int_is_refused() {
     let stride = 1usize << 26;
-    let y = vec![0u8; 32 * stride];
+    let y = Untouched::new(32 * stride);
     let uv = vec![128u8; 32 * 16];
     let at = |height: u32| FrameView {
         width: 64,
         height,
-        y: &y,
+        y: y.bytes(),
         u: &uv,
         v: &uv,
         stride_y: stride,
