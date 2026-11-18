@@ -14,7 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
-import { frameBinary, frameText, unframe } from './frame';
+import { frameBinary, frameText, sendLimit, unframe } from './frame';
 import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
@@ -147,9 +147,19 @@ const st = {
 	dropped: 0,
 };
 
+const utf8 = new TextEncoder();
+
+/** A message over `sendLimit` isn't sent: the server would close the socket for it. */
+function sendable(n: number): boolean {
+	if (n <= sendLimit(framed)) return true;
+	console.warn(`[starfold] not sent: a ${n}-byte message is over the limit`);
+	return false;
+}
+
 function send(s: string) {
-	if (ws && ws.readyState === WebSocket.OPEN)
-		ws.send(framed ? frameText(s) : s);
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	if (!sendable(utf8.encode(s).byteLength)) return;
+	ws.send(framed ? frameText(s) : s);
 }
 function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
@@ -680,7 +690,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			send(m.d);
 			break;
 		case 'sendBin':
-			if (ws && ws.readyState === WebSocket.OPEN)
+			if (ws && ws.readyState === WebSocket.OPEN && sendable(m.d.byteLength))
 				ws.send(framed ? frameBinary(m.d) : m.d);
 			break;
 		case 'video':

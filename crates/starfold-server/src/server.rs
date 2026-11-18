@@ -42,7 +42,7 @@ pub struct AppState {
 
 /// The directory --listen-unix made and the socket in it, with what shutdown needs to
 /// remove exactly those: both directories as opened, and each entry's device and inode.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct SocketFile {
     parent: std::os::fd::OwnedFd,
@@ -53,16 +53,16 @@ pub struct SocketFile {
 }
 
 /// The socket's name in the --listen-unix directory.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const SOCKET: &std::ffi::CStr = c"s";
 
 /// Where clients connect for --listen-unix `dir`.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn unix_socket_path(dir: &Path) -> std::path::PathBuf {
     dir.join(SOCKET.to_str().unwrap())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn cvt(r: libc::c_int) -> std::io::Result<libc::c_int> {
     if r < 0 {
         Err(std::io::Error::last_os_error())
@@ -71,7 +71,7 @@ fn cvt(r: libc::c_int) -> std::io::Result<libc::c_int> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn cname(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(s.as_bytes())
@@ -79,7 +79,7 @@ fn cname(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
 }
 
 /// Opens `name` in `dir` (or a path, with `dir` None), refusing a symlink.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_at(
     dir: Option<&std::os::fd::OwnedFd>,
     name: &std::ffi::CStr,
@@ -97,7 +97,7 @@ fn open_at(
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn fstat(fd: &std::os::fd::OwnedFd) -> std::io::Result<libc::stat> {
     use std::os::fd::AsRawFd;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -106,7 +106,7 @@ fn fstat(fd: &std::os::fd::OwnedFd) -> std::io::Result<libc::stat> {
 }
 
 /// `name` in `dir`, not following a symlink.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn stat_at(dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
     use std::os::fd::AsRawFd;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -121,17 +121,17 @@ fn stat_at(dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result
     Ok(st)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn id(st: &libc::stat) -> (libc::dev_t, libc::ino_t) {
     (st.st_dev, st.st_ino)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_socket(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFSOCK
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn unlink_at(
     dir: &std::os::fd::OwnedFd,
     name: &std::ffi::CStr,
@@ -141,7 +141,7 @@ fn unlink_at(
     cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) }).map(|_| ())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn acl_left() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -171,57 +171,12 @@ fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Replaces the extended ACL a new directory inherits (which grants access whatever the
-/// mode bits say) with an empty one, and checks it reads back empty.
-#[cfg(target_os = "macos")]
-fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::raw::{c_int, c_void};
-    extern "C" {
-        fn acl_init(count: c_int) -> *mut c_void;
-        fn acl_set_fd(fd: c_int, acl: *mut c_void) -> c_int;
-        fn acl_get_fd(fd: c_int) -> *mut c_void;
-        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
-        fn acl_free(obj: *mut c_void) -> c_int;
-    }
-    const ACL_FIRST_ENTRY: c_int = 0;
-    unsafe {
-        let empty = acl_init(0);
-        if empty.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let set = acl_set_fd(dir.as_raw_fd(), empty);
-        let e = std::io::Error::last_os_error();
-        acl_free(empty);
-        if set < 0 {
-            return Err(e);
-        }
-        let acl = acl_get_fd(dir.as_raw_fd());
-        if acl.is_null() {
-            let e = std::io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::ENOENT) => Ok(()),
-                _ => Err(e),
-            };
-        }
-        let mut entry = std::ptr::null_mut();
-        let any = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
-        acl_free(acl);
-        if any {
-            Err(acl_left())
-        } else {
-            Ok(())
-        }
-    }
-}
-
 /// The --listen-unix parent's contract, checked on the parent as opened: no other user can
 /// rename or replace entries in it. That is a parent owned by this user or by root,
 /// writable by no one else unless it is sticky (as /tmp is), and with no ACL entry that
-/// lets anyone else add to it, delete from it, or (on macOS) gets inherited with such
-/// rights. With such a parent, nobody else can move the new directory aside or put
-/// something in its place while it is set up.
-#[cfg(unix)]
+/// lets anyone else write to it. With such a parent, nobody else can move the new
+/// directory aside or put something in its place while it is set up.
+#[cfg(target_os = "linux")]
 fn check_parent(parent: &std::os::fd::OwnedFd, path: &Path) -> std::io::Result<()> {
     let st = fstat(parent)?;
     let refuse = |why: &str| {
@@ -293,88 +248,13 @@ fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
             .any(|e| (e.0 == USER || e.0 == GROUP) && e.1 & WRITE != 0))
 }
 
-/// The parent's extended ACL has an allow entry that lets someone add to it or delete from
-/// it, or one inherited by a new directory that would let someone delete it or add to it
-/// before its ACL is cleared. Such an entry may name this user too; it is refused all the
-/// same.
-#[cfg(target_os = "macos")]
-fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    use std::os::raw::{c_int, c_void};
-    extern "C" {
-        fn acl_get_fd(fd: c_int) -> *mut c_void;
-        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
-        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
-        fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
-        fn acl_get_perm_np(permset: *mut c_void, perm: c_int) -> c_int;
-        fn acl_get_flagset_np(entry: *mut c_void, flagset: *mut *mut c_void) -> c_int;
-        fn acl_get_flag_np(flagset: *mut c_void, flag: c_int) -> c_int;
-        fn acl_free(obj: *mut c_void) -> c_int;
-    }
-    const ACL_FIRST_ENTRY: c_int = 0;
-    const ACL_NEXT_ENTRY: c_int = -1;
-    const ACL_EXTENDED_ALLOW: c_int = 1;
-    const ACL_ADD_FILE: c_int = 1 << 2;
-    const ACL_DELETE: c_int = 1 << 4;
-    const ACL_ADD_SUBDIRECTORY: c_int = 1 << 5;
-    const ACL_DELETE_CHILD: c_int = 1 << 6;
-    const ACL_ENTRY_DIRECTORY_INHERIT: c_int = 1 << 6;
-    unsafe {
-        let acl = acl_get_fd(dir.as_raw_fd());
-        if acl.is_null() {
-            let e = std::io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::ENOENT) => Ok(false),
-                _ => Err(e),
-            };
-        }
-        let mut found = false;
-        let mut entry = std::ptr::null_mut();
-        let mut which = ACL_FIRST_ENTRY;
-        while !found && acl_get_entry(acl, which, &mut entry) == 0 {
-            which = ACL_NEXT_ENTRY;
-            let mut tag = 0;
-            if acl_get_tag_type(entry, &mut tag) != 0 || tag != ACL_EXTENDED_ALLOW {
-                continue;
-            }
-            let (mut perms, mut flags) = (std::ptr::null_mut(), std::ptr::null_mut());
-            if acl_get_permset(entry, &mut perms) != 0 || acl_get_flagset_np(entry, &mut flags) != 0
-            {
-                found = true;
-                break;
-            }
-            let has = |p| acl_get_perm_np(perms, p) == 1;
-            let inherited = acl_get_flag_np(flags, ACL_ENTRY_DIRECTORY_INHERIT) == 1;
-            found = has(ACL_ADD_FILE)
-                || has(ACL_ADD_SUBDIRECTORY)
-                || has(ACL_DELETE_CHILD)
-                || (inherited && has(ACL_DELETE));
-        }
-        acl_free(acl);
-        Ok(found)
-    }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn acl_lets_others_write(_: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
-    Ok(false)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn clear_acl(_: &std::os::fd::OwnedFd) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "unix sockets need Linux or macOS",
-    ))
-}
-
 /// Serves --listen-unix: makes the directory `path` (it must not exist yet; its parent
 /// must) for this user alone and binds a socket named `s` in it with permissions `mode`.
 /// Every step after the mkdir works on the directory as opened, and nothing that already
 /// existed is used, replaced or removed: a path that exists, a server's or a stale one, is
 /// an error. Group or other access in `mode` gives that class search permission on the
 /// directory, once the socket has its mode.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn bind_unix(
     path: &Path,
     mode: u32,
@@ -496,7 +376,9 @@ pub fn bind_unix(
         if let Some(race) = BEFORE_BIND.with(|h| h.take()) {
             race();
         }
-        let listener = tokio::net::UnixListener::bind(bind_path(&file.dir, &socket))?;
+        // Bound (and listening) first, registered with tokio last: the socket is on record
+        // for the cleanup before anything else can fail.
+        let bound = std::os::unix::net::UnixListener::bind(bind_path(&file.dir))?;
         // Only this user can add to the directory, so a socket in it is the one just bound.
         let st = stat_at(&file.dir, SOCKET)
             .ok()
@@ -508,7 +390,12 @@ pub fn bind_unix(
             _ => e,
         })?;
         set_mode(&file, 0o700 | reach)?;
-        Ok(listener)
+        bound.set_nonblocking(true)?;
+        #[cfg(test)]
+        if REGISTRATION_FAILS.with(|f| f.take()) {
+            return Err(Error::other("injected: the listener's registration failed"));
+        }
+        tokio::net::UnixListener::from_std(bound)
     })();
     match bound {
         Ok(listener) => Ok((listener, file)),
@@ -520,10 +407,8 @@ pub fn bind_unix(
 }
 
 /// Gives the socket `s` in `dir`, the one with identity `want`, permissions `mode`, and
-/// reads them back. On Linux through an O_PATH descriptor of that socket, checked to be it
-/// before the change (a socket can't be fchmod'ed); elsewhere by name without following a
-/// symlink, checked to be it after. A same-user process swapping `s` in between is out of
-/// scope.
+/// reads them back, through an O_PATH descriptor of that socket checked to be it before
+/// the change (a socket can't be fchmod'ed).
 #[cfg(target_os = "linux")]
 fn chmod_socket(
     dir: &std::os::fd::OwnedFd,
@@ -551,55 +436,27 @@ fn chmod_socket(
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn chmod_socket(
-    dir: &std::os::fd::OwnedFd,
-    want: (libc::dev_t, libc::ino_t),
-    mode: u32,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    cvt(unsafe {
-        libc::fchmodat(
-            dir.as_raw_fd(),
-            SOCKET.as_ptr(),
-            mode as libc::mode_t,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })?;
-    let st = stat_at(dir, SOCKET)?;
-    if !is_socket(&st) || id(&st) != want || st.st_mode as u32 & 0o7777 != mode {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "the socket was replaced while it was set up",
-        ));
-    }
-    Ok(())
-}
-
-/// Where `bind` puts the socket. On Linux, through the directory as opened
-/// (`/proc/self/fd/N/s`), so the socket lands in it whatever happened to its path since;
-/// elsewhere the path itself, which the parent's contract keeps pointing at it.
+/// Where `bind` puts the socket: through the directory as opened (`/proc/self/fd/N/s`), so
+/// the socket lands in it whatever happened to its path or any of its ancestors since.
 #[cfg(target_os = "linux")]
-fn bind_path(dir: &std::os::fd::OwnedFd, _path: &Path) -> std::path::PathBuf {
+fn bind_path(dir: &std::os::fd::OwnedFd) -> std::path::PathBuf {
     use std::os::fd::AsRawFd;
     std::path::PathBuf::from(format!("/proc/self/fd/{}/s", dir.as_raw_fd()))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn bind_path(_dir: &std::os::fd::OwnedFd, path: &Path) -> std::path::PathBuf {
-    path.to_path_buf()
-}
-
-#[cfg(all(unix, test))]
+#[cfg(all(target_os = "linux", test))]
 thread_local! {
     /// Runs on this thread just before `bind_unix` binds, once: what a race would do there.
     pub static BEFORE_BIND: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    /// The next `bind_unix` on this thread fails to register its listener with tokio (as
+    /// an exhausted epoll watch limit makes it), once.
+    pub static REGISTRATION_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Removes what `bind_unix` made, each only if it is still the entry that was made (type,
 /// device and inode: a freed socket's inode can come back as another file): the socket,
 /// then the directory if nothing else is in it.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn remove_unix(file: &SocketFile) {
     let at = |dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr, kind, want| {
         stat_at(dir, name).is_ok_and(|st| st.st_mode & libc::S_IFMT == kind && id(&st) == want)
@@ -1543,7 +1400,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     mod socket {
         use super::*;
         use crate::frame::Payload;
@@ -2136,7 +1993,7 @@ mod tests {
                 assert!(!at.exists(), "{} left behind ({e})", at.display());
                 return;
             }
-            let d = dir("umask");
+            let d = dir("umask-child");
             let at = d.join("sf");
             let name = "server::tests::socket::a_directory_its_owner_cant_open_is_taken_back";
             let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2371,67 +2228,23 @@ mod tests {
             std::fs::remove_dir_all(&d).unwrap();
         }
 
-        #[cfg(target_os = "macos")]
+        /// A listener bound but refused by tokio's registration (an exhausted epoll watch
+        /// limit, say) leaves neither the socket nor the directory: the socket was on
+        /// record before the registration, and the next start on the path works.
         #[test]
-        fn an_inherited_acl_is_cleared() {
+        fn a_failed_registration_leaves_nothing_behind() {
             let rt = runtime();
             let _guard = rt.enter();
-            let d = dir("acl");
-            // Inherited, but adding nothing: the parent's contract takes it, and the new
-            // directory's copy is cleared.
-            let granted = std::process::Command::new("/bin/chmod")
-                .arg("+a")
-                .arg("everyone allow list,search,readattr,file_inherit,directory_inherit")
-                .arg(&d)
-                .status()
-                .unwrap();
-            assert!(granted.success());
-            // `ls -led` lists ACL entries on the lines after the file's own.
-            let acl = |p: &std::path::Path| {
-                let out = std::process::Command::new("/bin/ls")
-                    .arg("-led")
-                    .arg(p)
-                    .output()
-                    .unwrap();
-                String::from_utf8_lossy(&out.stdout).lines().count() > 1
-            };
-            let plain = d.join("plain");
-            std::fs::create_dir(&plain).unwrap();
-            assert!(acl(&plain), "no ACL to inherit");
+            let d = dir("registration");
             let at = d.join("sf");
-            let (l, file) = bind_unix(&at, 0o600).unwrap();
-            assert!(!acl(&at), "the directory kept an ACL");
-            assert!(!acl(&unix_socket_path(&at)), "the socket has an ACL");
-            drop((l, file));
+            REGISTRATION_FAILS.with(|f| f.set(true));
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert!(e.to_string().contains("registration"), "{e}");
+            assert!(!at.exists(), "{} left behind", at.display());
+            let (l, file) = bind_unix(&at, 0o600).expect("a start after it");
+            drop(l);
+            remove_unix(&file);
             std::fs::remove_dir_all(&d).unwrap();
-        }
-
-        /// A parent with an entry that lets anyone add to it or delete from it (and so
-        /// rename in it), or an inherited one that would let them into the new directory
-        /// before its ACL is cleared, is refused before anything is made in it.
-        #[cfg(target_os = "macos")]
-        #[test]
-        fn a_parent_with_an_ace_that_adds_or_deletes_is_refused() {
-            let rt = runtime();
-            let _guard = rt.enter();
-            for ace in [
-                "everyone allow add_file",
-                "everyone allow add_subdirectory",
-                "everyone allow delete_child",
-                "everyone allow delete,directory_inherit",
-            ] {
-                let d = dir("ace");
-                let granted = std::process::Command::new("/bin/chmod")
-                    .args(["+a", ace])
-                    .arg(&d)
-                    .status()
-                    .unwrap();
-                assert!(granted.success(), "{ace}");
-                let e = bind_unix(&d.join("sf"), 0o600).unwrap_err();
-                assert!(e.to_string().contains("ACL entry"), "{ace}: {e}");
-                assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "{ace}");
-                std::fs::remove_dir_all(&d).unwrap();
-            }
         }
     }
 }

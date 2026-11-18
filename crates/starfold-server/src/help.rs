@@ -12,7 +12,7 @@ WebSocket, and prints a link that signs you in. Flags take --name=value or
 Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
   --listen-tcp                 listen on --addr/--port (default true)
-  --listen-unix                 also serve on a unix socket (Linux, macOS): makes
+  --listen-unix                 also serve on a unix socket (Linux only): makes
                                 this directory, which must not exist yet, for
                                 this user alone and listens on the socket s in
                                 it; removes both on exit; the host and origin

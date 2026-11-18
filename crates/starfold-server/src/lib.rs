@@ -109,8 +109,8 @@ fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
     let unix = match a.get("listen-unix").map(String::as_str) {
         None => None,
         Some("" | "true") => return Err("--listen-unix needs a path".into()),
-        Some(_) if cfg!(not(unix)) => {
-            return Err("--listen-unix: unix sockets need Linux or macOS".into())
+        Some(_) if cfg!(not(target_os = "linux")) => {
+            return Err("--listen-unix is not available on this platform yet".into())
         }
         Some(p) => Some((p.into(), mode)),
     };
@@ -526,7 +526,17 @@ async fn serve(a: HashMap<String, String>) {
         ),
         false => None,
     };
+    // Taken before the unix socket is bound: a SIGTERM or SIGINT from here on waits for the
+    // shutdown below, which removes the socket, instead of ending the process with it left.
     #[cfg(unix)]
+    let (mut term, mut int) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate()).unwrap(),
+            signal(SignalKind::interrupt()).unwrap(),
+        )
+    };
+    #[cfg(target_os = "linux")]
     let (unix, socket_file) = match &listen.unix {
         Some((path, mode)) => {
             let (l, file) = server::bind_unix(path, *mode).unwrap_or_else(|e| {
@@ -567,19 +577,14 @@ async fn serve(a: HashMap<String, String>) {
     let shutdown_hub = hub.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate()).unwrap();
-            let mut int = signal(SignalKind::interrupt()).unwrap();
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-        }
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         #[cfg(windows)]
         let _ = tokio::signal::ctrl_c().await;
         log::info!("shutting down");
         if let Some(tx) = shutdown_hub.input.lock().as_ref() {
             let _ = tx.send(input::InputEvent::Shutdown);
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         if let Some(file) = &socket_file {
             server::remove_unix(file);
         }
@@ -587,7 +592,7 @@ async fn serve(a: HashMap<String, String>) {
         std::process::exit(0);
     });
     let mut servers = tokio::task::JoinSet::new();
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(l) = unix {
         servers.spawn(axum::serve(l, app.clone()).into_future());
     }
@@ -618,10 +623,13 @@ mod tests {
             unix: None,
         };
         assert_eq!(listen(&[]), Ok(tcp_only));
-        // Unix sockets need Linux or macOS; elsewhere asking for one is an error.
-        let unix = |args: &[&str], want: Listen| match cfg!(unix) {
+        // --listen-unix is Linux's only; elsewhere asking for it is refused at start.
+        let unix = |args: &[&str], want: Listen| match cfg!(target_os = "linux") {
             true => assert_eq!(listen(args), Ok(want)),
-            false => assert!(listen(args).is_err_and(|e| e.contains("Linux or macOS"))),
+            false => assert_eq!(
+                listen(args),
+                Err("--listen-unix is not available on this platform yet".into())
+            ),
         };
         unix(
             &["--listen-unix", "/run/sf.sock"],

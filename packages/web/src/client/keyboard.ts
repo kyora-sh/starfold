@@ -98,12 +98,6 @@ export function setupKeyboard(
 		code: string;
 		ks: number;
 		timer: ReturnType<typeof setTimeout>;
-		/** An image is on its way to the remote clipboard: the shortcut waits for it. */
-		image?: boolean;
-		/** The key was released while it waited. */
-		up?: boolean;
-		/** The modifiers held when it began waiting for an image. */
-		mods?: [string, number][];
 	} | null = null;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
@@ -128,19 +122,7 @@ export function setupKeyboard(
 		const p = pendingPaste;
 		pendingPaste = null;
 		clearTimeout(p.timer);
-		// Modifiers let go while an image was on its way are held again for the shortcut.
-		const gone = (p.mods ?? []).filter(([code]) => !down.has(code));
-		for (const [code, ks] of gone) press(code, ks);
 		press(p.code, p.ks);
-		if (p.up) release(p.code);
-		for (const [code] of gone) release(code);
-	}
-	// The local contents never reached the remote clipboard: the shortcut would paste
-	// whatever was there before, so it isn't sent.
-	function dropPaste() {
-		if (!pendingPaste) return;
-		clearTimeout(pendingPaste.timer);
-		pendingPaste = null;
 	}
 
 	function onKeyDown(e: KeyboardEvent) {
@@ -165,13 +147,7 @@ export function setupKeyboard(
 	}
 	function onKeyUp(e: KeyboardEvent) {
 		e.preventDefault();
-		if (pendingPaste && pendingPaste.code === e.code) {
-			if (pendingPaste.image) {
-				pendingPaste.up = true;
-				return;
-			}
-			flushPaste();
-		}
+		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
 		release(e.code);
 		// macOS swallows keyups of keys released while Cmd is held.
 		if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
@@ -206,22 +182,12 @@ export function setupKeyboard(
 		// Hold the paste shortcut until the image is on the remote clipboard.
 		if (pendingPaste) {
 			clearTimeout(pendingPaste.timer);
-			pendingPaste.image = true;
-			pendingPaste.mods = [...down].filter(([code]) =>
-				/^(Shift|Control|Alt|Meta)/.test(code)
-			);
-			pendingPaste.timer = setTimeout(dropPaste, 3000);
+			pendingPaste.timer = setTimeout(flushPaste, 3000);
 		}
 		toPng(file)
-			.then((png) =>
-				app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
-					? flushPaste()
-					: dropPaste()
-			)
-			.catch((err) => {
-				console.warn('[starfold] image paste failed', err);
-				dropPaste();
-			});
+			.then((png) => app.sendBin(Bin.ClipImageUp, new Uint8Array(png)))
+			.catch((err) => console.warn('[starfold] image paste failed', err))
+			.finally(flushPaste);
 	});
 
 	// Text that arrives without usable keydowns (IME, dead-key composition, mobile

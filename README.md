@@ -222,6 +222,20 @@ curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901
 # {"seq":812,"events":19}
 ```
 
+### On a unix socket (Linux only)
+
+`--listen-unix DIR` serves the same routes, with the same login and host checks, on a
+unix socket: starfold makes `DIR` (which must not exist yet) for its user alone and
+listens on `DIR/s`; `--listen-tcp=false` turns TCP off. `DIR`'s parent must not let other
+users rename entries in it: owned by you or root, writable by no one else unless sticky
+(as `/tmp` is), and with no ACL entry that lets anyone else write. On other platforms the
+flag is refused: `--listen-unix is not available on this platform yet`.
+
+`--framed` sends every WebSocket message as binary with a kind byte, for hops that carry
+binary messages only; the page then needs `?framed=1`. A message from the page is at most
+64 MiB framed (kind byte included) and 16 MiB otherwise (one WebSocket frame); the page
+doesn't send a larger one.
+
 ### macOS
 
 starfold also streams a Mac's own screen, with every feature of the Linux version

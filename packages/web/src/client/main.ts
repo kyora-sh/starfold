@@ -1,7 +1,6 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
 import { aliasVoxlStats } from '../compat';
-import { fitsMessage } from '../frame';
 import { displayHz } from '../pace';
 import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
@@ -76,18 +75,11 @@ function main() {
 		},
 		sendBin: (type, bytes) => {
 			// The server drops every binary message from read-only viewers.
-			if (app.readOnly) return false;
-			if (!fitsMessage(bytes.byteLength + 1)) {
-				console.warn(
-					`[starfold] not sent: ${bytes.byteLength + 1} bytes is over one message`
-				);
-				return false;
-			}
+			if (app.readOnly) return;
 			const msg = new Uint8Array(bytes.byteLength + 1);
 			msg[0] = type;
 			msg.set(bytes, 1);
 			post({ t: 'sendBin', d: msg.buffer }, [msg.buffer]);
-			return true;
 		},
 		surface: el('surface'),
 		kbd: el<HTMLTextAreaElement>('kbd'),
