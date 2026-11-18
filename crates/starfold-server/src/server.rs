@@ -2461,13 +2461,18 @@ mod tests {
             let server = tokio::spawn(
                 axum::serve(PeerChecked(l), router(app(&hub, false, None))).into_future(),
             );
+            // The server closes with the request unread, so the read ends with EOF or a reset:
+            // either way, what counts is the bytes that came before it.
             let client = "import socket, sys\n\
                 s = socket.socket(socket.AF_UNIX)\n\
                 s.connect(sys.argv[1])\n\
                 s.settimeout(5)\n\
-                try:\n    s.sendall(b'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')\n\
-                except OSError:\n    pass\n\
-                print(len(s.recv(100)))\n";
+                data = b''\n\
+                try:\n    s.sendall(b'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')\n    \
+                while True:\n        b = s.recv(100)\n        if not b:\n            break\n        \
+                data += b\n\
+                except (ConnectionResetError, BrokenPipeError):\n    pass\n\
+                print(len(data))\n";
             let socket = unix_socket_path(&path);
             let to = socket.clone();
             let out = tokio::task::spawn_blocking(move || {
