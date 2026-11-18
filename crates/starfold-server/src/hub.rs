@@ -423,8 +423,10 @@ pub struct Hub {
     pub height: AtomicU32,
     /// Encoded stripes as (y, height).
     pub stripes: Mutex<Vec<(u32, u32)>>,
-    /// The adaptive bitrate cap the rate controller requests of the encoders (kbit/s): what
-    /// was asked for, not a rate any encoder read back.
+    /// The rate controller's target (kbit/s), not a rate any encoder read back. A capped
+    /// stream asks its encoders for it; with `--max-kbps 0` they are asked for no cap, while
+    /// congestion can still lift this target from 0 to `--min-kbps` (the next raise puts it
+    /// back to 0).
     pub target_kbps: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,

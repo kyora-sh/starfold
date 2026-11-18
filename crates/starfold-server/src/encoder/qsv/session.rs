@@ -13,10 +13,13 @@
 //! BRCParamMultiplier can hold; a raise is no IDR. An encoder that doesn't read back the
 //! rate control method, codec, picture size and format asked for, and at constant bitrate
 //! HRD conformance off, is not used: Init fails, and before or after a Reset it is out of
-//! use. The colour signalling asked for is not read back: the stream's own description of
-//! its colour says what was asked, and viewers take colour from the bitstream. So is one that reads back no defined frame rate when a rate change needs it, and
+//! use. So is one that reads back no defined frame rate when a rate change needs it, and
 //! one whose Reset the runtime refuses: it takes no more pictures and the stream opens a
-//! fresh one. The session reports no bitrate; the server's figure is what it asked for.
+//! fresh one. The session reports no bitrate.
+//!
+//! The colour signalling is asked for, not read back: the stream's `StreamConfig` carries
+//! the colour asked for, which can differ from what the bitstream signals; nothing outside
+//! the encoders reads it, and viewers take colour from the bitstream.
 //!
 //! It runs in the encoder helper process (see [`super::remote`]). A device that hangs or is
 //! lost stops the session: it calls the runtime no more, not even to close it, and its error
