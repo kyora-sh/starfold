@@ -47,6 +47,21 @@ afterEach(() => {
 
 const embed: LinkMode = { embed: true };
 
+/** A socket that opens at once and, closed, reports an abnormal close (1006, no reason). */
+class DropsOnClose extends EventTarget {
+	binaryType = '';
+	constructor() {
+		super();
+		queueMicrotask(() => this.dispatchEvent(new Event('open')));
+	}
+	send() {}
+	close() {
+		this.dispatchEvent(
+			Object.assign(new Event('close'), { code: 1006, reason: '' })
+		);
+	}
+}
+
 /** A WebSocket constructor that throws, as one does for a bad URL. */
 function Throws(): never {
 	throw new SyntaxError('bad url ws://x/?token=secret');
@@ -173,6 +188,21 @@ describe('abort', () => {
 		link.abort(4000, 'starfold: protocol error');
 		await until(() => r.closed.length === 1 && s.conns[0].closed);
 		expect(r.closed[0]).toEqual([1, 4000, 'starfold: protocol error']);
+	});
+
+	test("reports the given code even when the socket's own close says otherwise", async () => {
+		const { r, h } = recorder();
+		const link = new Link(
+			'ws://x/ws',
+			embed,
+			h,
+			DropsOnClose as unknown as typeof WebSocket
+		);
+		link.request(1);
+		link.preamble(1, []);
+		await until(() => r.opened.length === 1);
+		link.abort(4000, 'starfold: protocol error');
+		expect(r.closed).toEqual([[1, 4000, 'starfold: protocol error']]);
 	});
 
 	test('does nothing on the served page', async () => {
