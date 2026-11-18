@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { Link, RETRY_MS } from '../src/link';
 import type { LinkHandlers, LinkMode } from '../src/link';
 import { answerPreamble } from '../src/embed/preamble';
-import type { ToWorker } from '../src/protocol';
+import type { PreambleAnswer } from '../src/embed/preamble';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -81,7 +81,7 @@ function until(f: () => boolean, ms = 2000): Promise<void> {
 
 /** What `answerPreamble` posts to the worker and reports for `p`. */
 async function answer(p: Parameters<typeof answerPreamble>[0]) {
-	const posted: ToWorker[] = [];
+	const posted: PreambleAnswer[] = [];
 	const failed: unknown[] = [];
 	await answerPreamble(
 		p,

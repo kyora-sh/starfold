@@ -19,6 +19,10 @@ mkdir -p "$pkg"
 	--log-level=warning --outdir="$pkg"
 bun x tsc -p tsconfig.embed.json --outDir "$work/types"
 cp "$work/types/embed/index.d.ts" "$work/types/embed/preamble.d.ts" "$pkg/"
+if grep -n "from '\.\./" "$pkg"/*.d.ts; then
+	echo "pack.sh: a declaration imports from outside the package" >&2
+	exit 1
+fi
 cp dav1d/dav1d.wasm "$pkg/"
 cp ../../LICENSE "$pkg/LICENSE"
 cp dav1d/COPYING-dav1d dav1d/COPYING-wasi-libc "$pkg/"
