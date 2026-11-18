@@ -195,7 +195,13 @@ fn cases() -> Vec<(Vec<OsString>, Want)> {
             out.push((w, want));
         }
     }
-    for (first, second) in [("/d", "/d"), ("/d", "/e"), ("/d", ""), ("//", "/d"), ("/d", "/")] {
+    for (first, second) in [
+        ("/d", "/d"),
+        ("/d", "/e"),
+        ("/d", ""),
+        ("//", "/d"),
+        ("/d", "/"),
+    ] {
         for (a, _) in writings(first) {
             for (b, _) in writings(second) {
                 out.push(([a.clone(), b].concat(), Want::Refused(TWICE)));
@@ -211,7 +217,9 @@ fn cases() -> Vec<(Vec<OsString>, Want)> {
 fn every_refused_writing_stops_with_exit_2_and_its_reason() {
     let mut n = 0;
     for (flags, want) in cases() {
-        let Want::Refused(reason) = want else { continue };
+        let Want::Refused(reason) = want else {
+            continue;
+        };
         let out = run_to_exit(&[quiet(free_port()), flags.clone()].concat());
         assert_refused(&out, reason, &format!("{flags:?}"));
         n += 1;
@@ -311,7 +319,11 @@ fn every_accepted_writing_serves_under_its_prefix_and_not_at_the_root() {
         assert_eq!(status(port, "/healthz"), Some(404), "{flags:?}: /healthz");
         assert_eq!(status(port, prefix), Some(308), "{flags:?}: {prefix}");
         let link = format!("anyone who reaches http://127.0.0.1:{port}{prefix}/ can use");
-        assert!(link_line(&server).contains(&link), "{flags:?}: {}", link_line(&server));
+        assert!(
+            link_line(&server).contains(&link),
+            "{flags:?}: {}",
+            link_line(&server)
+        );
         n += 1;
     }
     assert_eq!(n, 8);
@@ -329,5 +341,9 @@ fn without_the_flag_it_serves_at_the_root() {
     let link = format!("anyone who reaches http://127.0.0.1:{port}/ can use");
     assert!(link_line(&server).contains(&link), "{}", link_line(&server));
     let listening = format!("listening on http://127.0.0.1:{port}\n");
-    assert!(server.1.lock().unwrap().contains(&listening), "{}", server.1.lock().unwrap());
+    assert!(
+        server.1.lock().unwrap().contains(&listening),
+        "{}",
+        server.1.lock().unwrap()
+    );
 }
