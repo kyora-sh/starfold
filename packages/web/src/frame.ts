@@ -23,6 +23,9 @@ function frame(kind: number, payload: Uint8Array): Uint8Array<ArrayBuffer> {
 	return m;
 }
 
+/** A binary message of `n` bytes fits in one message, framed or not (framing adds one). */
+export const fitsMessage = (n: number) => n + 1 <= MAX_MESSAGE;
+
 export const frameText = (s: string) => frame(Kind.Text, encoder.encode(s));
 
 export const frameBinary = (b: ArrayBuffer | Uint8Array) =>

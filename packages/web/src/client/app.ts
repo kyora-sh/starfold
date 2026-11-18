@@ -5,8 +5,9 @@ export interface App {
 	worker: Worker;
 	/** Send a text command (see `cmd` in protocol.ts). */
 	send(command: string): void;
-	/** Send a binary message: `type` byte, then `bytes`. */
-	sendBin(type: number, bytes: Uint8Array): void;
+	/** Send a binary message: `type` byte, then `bytes`. False: not sent (a read-only
+	 * viewer, or more than one message holds). */
+	sendBin(type: number, bytes: Uint8Array): boolean;
 	post(m: ToWorker, transfer?: Transferable[]): void;
 	surface: HTMLElement;
 	/** Hidden textarea that receives keyboard, IME and paste input. */

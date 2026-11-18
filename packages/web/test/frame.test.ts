@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	fitsMessage,
 	frameBinary,
 	frameText,
 	Kind,
@@ -57,5 +58,12 @@ describe('framed messages', () => {
 		expect(frameBinary(max).length).toBe(MAX_MESSAGE);
 		expect(() => frameBinary(new Uint8Array(MAX_MESSAGE))).toThrow(RangeError);
 		expect(() => unframe(new ArrayBuffer(MAX_MESSAGE + 1))).toThrow(RangeError);
+	});
+
+	test('the page sends a binary message only if it fits one framed message', () => {
+		expect(fitsMessage(MAX_MESSAGE - 1)).toBe(true);
+		expect(() => frameBinary(new Uint8Array(MAX_MESSAGE - 1))).not.toThrow();
+		expect(fitsMessage(MAX_MESSAGE)).toBe(false);
+		expect(() => frameBinary(new Uint8Array(MAX_MESSAGE))).toThrow(RangeError);
 	});
 });
