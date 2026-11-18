@@ -18,11 +18,23 @@ mkdir -p "$pkg"
 "$esbuild" index=src/embed/index.ts --bundle --format=esm --target=es2022 --minify \
 	--log-level=warning --outdir="$pkg"
 bun x tsc -p tsconfig.embed.json --outDir "$work/types"
-cp "$work/types/embed/index.d.ts" "$work/types/embed/preamble.d.ts" "$pkg/"
-if grep -n "from '\.\./" "$pkg"/*.d.ts; then
-	echo "pack.sh: a declaration imports from outside the package" >&2
-	exit 1
-fi
+cp "$work/types/embed/index.d.ts" "$work/types/embed/types.d.ts" "$pkg/"
+# Every relative specifier in the declarations must name a file in the package, with the .js
+# extension ESM (NodeNext) resolution requires.
+for d in "$pkg"/*.d.ts; do
+	for spec in $(grep -o -E "from '[^']+'" "$d" | sed -E "s/^from '(.*)'$/\1/"); do
+		case $spec in
+		./*.js) [ -f "$pkg/${spec#./}" ] || [ -f "$pkg/${spec%.js}.d.ts" ] || {
+			echo "pack.sh: $(basename "$d") imports $spec, which the package lacks" >&2
+			exit 1
+		} ;;
+		./* | ../*)
+			echo "pack.sh: $(basename "$d") imports $spec: not a .js file in the package" >&2
+			exit 1
+			;;
+		esac
+	done
+done
 cp dav1d/dav1d.wasm "$pkg/"
 cp ../../LICENSE "$pkg/LICENSE"
 cp dav1d/COPYING-dav1d dav1d/COPYING-wasi-libc "$pkg/"

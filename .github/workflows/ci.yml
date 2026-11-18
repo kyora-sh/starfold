@@ -47,10 +47,11 @@ jobs:
       - name: Unit tests
         run: bun run test
       # The embeddable client (packages/web/src/embed), packed per commit; the served page's
-      # bundle stays build.rs's.
+      # bundle stays build.rs's. Named by github.sha, the commit this job checked out and
+      # built: on a pull request that is its merge commit with main, not the head.
       - name: Embeddable client package
         env:
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SHA: ${{ github.sha }}
         run: |
           sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 update
           sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 install -y esbuild
@@ -59,7 +60,7 @@ jobs:
           tar -tzf "$RUNNER_TEMP/embed/starfold-web-embed-$SHA.tgz"
       - uses: actions/upload-artifact@v4
         with:
-          name: starfold-web-embed-${{ github.event.pull_request.head.sha || github.sha }}
+          name: starfold-web-embed-${{ github.sha }}
           path: ${{ runner.temp }}/embed/starfold-web-embed-*.tgz
           retention-days: 90
           if-no-files-found: error

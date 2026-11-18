@@ -218,5 +218,11 @@ export function setupKeyboard(
 	surface.addEventListener('focus', () => kbd.focus({ preventScroll: true }));
 	if (!app.inIframe) kbd.focus({ preventScroll: true });
 
-	return { releaseAll };
+	return {
+		releaseAll,
+		/** Removes the window listener (the rest live on elements the caller removes). */
+		dispose() {
+			window.removeEventListener('blur', releaseAll);
+		},
+	};
 }

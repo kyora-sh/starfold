@@ -1,35 +1,61 @@
-// Embedded: the embedder's preamble, asked for before every connect. Its messages go to the
-// worker, which sends them first on the socket it opens next; nothing here keeps or logs them.
-/** Text message(s) to send before anything of starfold's: a ticket, say. Called before every connect. */
-export type Preamble = () => string | string[] | Promise<string | string[]>;
+// Embedded: the embedder's preamble, called before every connect. What it gives is copied into
+// a plain array of strings; nothing here keeps, logs or reports it, and a failure is reported
+// as a fixed value that carries nothing of what the preamble threw or gave.
+import type { ConnectFailure, Preamble } from './types';
 
-/** The worker messages that answer its request for the preamble. */
-export type PreambleAnswer =
-	| { t: 'preamble'; msgs: string[] }
-	| { t: 'preambleFailed' };
+const failed = (cause: 'threw' | 'rejected' | 'not-text'): ConnectFailure => ({
+	kind: 'preamble-failed',
+	cause,
+	message: {
+		threw: 'the preamble threw',
+		rejected: "the preamble's promise rejected",
+		'not-text':
+			'the preamble gave something other than a string or an array of strings',
+	}[cause],
+});
 
-/**
- * Calls `preamble` (none: nothing to send) and posts its messages to the worker. If it throws,
- * rejects or gives anything but text, the worker is told that nothing opens, and `failed` gets
- * the error; the error itself is passed on, not logged.
- */
-export async function answerPreamble(
-	preamble: Preamble | undefined,
-	post: (m: PreambleAnswer) => void,
-	failed: (err: unknown) => void
-): Promise<void> {
-	let msgs: string[];
+export const CONNECT_FAILED: ConnectFailure = {
+	kind: 'connect-failed',
+	message:
+		'the WebSocket could not be created (check the URL and the subprotocols)',
+};
+
+export type PreambleResult =
+	| { ok: true; msgs: string[] }
+	| { ok: false; failure: ConnectFailure };
+
+/** Calls `preamble` (none: nothing to send) and copies what it gives. */
+export async function callPreamble(
+	preamble: Preamble | undefined
+): Promise<PreambleResult> {
+	let given: unknown;
 	try {
-		const given = preamble ? await preamble() : [];
-		msgs = typeof given === 'string' ? [given] : given;
-		if (!Array.isArray(msgs) || msgs.some((m) => typeof m !== 'string'))
-			throw new TypeError(
-				'the preamble must give a string or an array of strings'
-			);
-	} catch (err) {
-		post({ t: 'preambleFailed' });
-		failed(err);
-		return;
+		given = preamble ? preamble() : [];
+	} catch {
+		return { ok: false, failure: failed('threw') };
 	}
-	post({ t: 'preamble', msgs });
+	try {
+		given = await given;
+	} catch {
+		return { ok: false, failure: failed('rejected') };
+	}
+	try {
+		return { ok: true, msgs: copyText(given) };
+	} catch {
+		return { ok: false, failure: failed('not-text') };
+	}
+}
+
+/** A plain array of the strings in `v`, read by index (holes and proxies included); throws otherwise. */
+function copyText(v: unknown): string[] {
+	if (typeof v === 'string') return [v];
+	if (!Array.isArray(v)) throw new TypeError('not text');
+	const n = v.length;
+	const out: string[] = [];
+	for (let i = 0; i < n; i++) {
+		const s: unknown = v[i];
+		if (typeof s !== 'string') throw new TypeError('not text');
+		out.push(s);
+	}
+	return out;
 }

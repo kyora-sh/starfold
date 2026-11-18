@@ -49,7 +49,9 @@ export function createVideo(
 	viewport: () => { w: number; h: number } = () => ({
 		w: window.innerWidth,
 		h: window.innerHeight,
-	})
+	}),
+	/** Inline styles for each stripe <video>; the served page styles `.stripe` in its CSS. */
+	stripeStyle: Partial<Record<keyof CSSStyleDeclaration, string>> = {}
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
@@ -90,6 +92,7 @@ export function createVideo(
 			const gen = new MediaStreamTrackGenerator({ kind: 'video' });
 			const video = document.createElement('video');
 			video.className = 'stripe';
+			Object.assign(video.style, stripeStyle);
 			video.muted = true;
 			video.autoplay = true;
 			video.playsInline = true;

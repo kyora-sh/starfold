@@ -1,10 +1,9 @@
 // The embeddable client: `mount(container, options)` shows a starfold desktop inside an element of
-// another page. The worker opens the socket to `connect.url` exactly as given (no query string
-// added), sends the preamble's messages before anything of starfold's, and never reconnects on
-// its own: every close goes to `onClose` with its code and reason, and `connect()` opens again,
-// asking the preamble again. v1 keeps the picture, keyboard and pointer input, pasting into the
-// desktop, the cursor, read-only display and (opt-in) audio; no toolbar, files, microphone or
-// resizing.
+// another page. The worker opens the socket to `connect.url` exactly as given, sends the
+// preamble's messages before anything of starfold's, and never reconnects on its own. The
+// connection's lifecycle runs over a port of its own (life.ts, attempts.ts), apart from the
+// server's data. v1 keeps the picture, keyboard and pointer input, pasting into the desktop, the
+// cursor, read-only display and (opt-in) audio; no toolbar, files, microphone or resizing.
 import type { App } from '../client/app';
 import { blocksInput } from '../client/app';
 import { createAudio } from '../client/audio';
@@ -16,43 +15,71 @@ import { createVideo } from '../client/video';
 import { displayHz } from '../pace';
 import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
-import { answerPreamble } from './preamble';
-import type { Preamble } from './preamble';
+import { PageLife } from './attempts';
+import { onStream } from './stream';
+import {
+	KBD,
+	SCREEN,
+	STRIPE,
+	SURFACE,
+	applyStyle,
+	assetBaseUrl,
+} from './styles';
+import type { ConnectFailure, Preamble, Status } from './types.js';
 
-export type { Preamble } from './preamble';
+export type { ConnectFailure, Preamble, Status } from './types.js';
+export { UNMOUNTED } from './types.js';
 
 export interface ConnectOptions {
-	/** The WebSocket URL, used exactly as given. */
+	/** The WebSocket URL, used exactly as given (no query string is added). */
 	url: string;
 	/** WebSocket subprotocols. */
 	protocols?: string | string[];
-	/** Text message(s) sent first on every connection; called before every connect. */
+	/**
+	 * Text message(s) sent first on every connection, before anything of starfold's; called
+	 * before every connect. What it gives is copied, posted to the worker, sent once the socket
+	 * opens and then dropped; it is never logged or passed to a callback.
+	 */
 	preamble?: Preamble;
 }
 
-export type Status = 'connecting' | 'open' | 'closed' | 'preamble-failed';
-
 export interface MountOptions {
 	connect: ConnectOptions;
-	/** Where worker.js, dav1d.js, dav1d.wasm and audio.js are; default: beside this module. */
+	/**
+	 * The directory with worker.js, dav1d.js, dav1d.wasm and audio.js (a trailing slash is
+	 * added if missing); default: this module's directory. It must be on the page's own origin:
+	 * browsers start a worker only from a same-origin script.
+	 */
 	assetBase?: string | URL;
 	/** Play the desktop's audio (after the first user gesture). Default off. */
 	audio?: boolean;
-	/** Every close of the socket, with the close frame's code and reason. Nothing reconnects. */
+	/**
+	 * Called exactly once for every connection whose socket was asked for, with the close
+	 * frame's code and reason as the server sent them (a reason is the server's text: a server
+	 * that echoes a ticket there leaks it itself). After `unmount()` it is called at once with
+	 * `UNMOUNTED` (1001, "unmounted"), and nothing about that connection follows.
+	 * Called before `onStatus('closed')`; if it throws, `onStatus('closed')` still runs.
+	 */
 	onClose?(code: number, reason: string): void;
-	/** `preamble-failed` carries the preamble's error; nothing opened. */
-	onStatus?(status: Status, detail?: unknown): void;
+	/**
+	 * `preamble-failed` and `connect-failed` carry a fixed `ConnectFailure`, never the
+	 * preamble's own error. Each connect ends in exactly one of `onClose`, `preamble-failed`
+	 * or `connect-failed`, unless a newer `connect()` or `unmount()` came first while it was
+	 * still waiting for its preamble.
+	 */
+	onStatus?(status: Status, detail?: ConnectFailure): void;
 }
 
 export interface Handle {
-	/** Connects, calling the preamble first. Ignored while connected or connecting. */
+	/**
+	 * Connects, calling the preamble first. While the preamble of an earlier connect is
+	 * pending, starts over (the earlier answer is dropped); while a socket is open or being
+	 * made, does nothing; after `unmount()`, does nothing.
+	 */
 	connect(): void;
-	/** Closes the socket, stops the worker and removes what `mount` added. */
+	/** Reports the close (see `onClose`), closes the socket, stops the worker and removes what `mount` added. */
 	unmount(): void;
 }
-
-const css = (e: HTMLElement, s: Partial<CSSStyleDeclaration>) =>
-	Object.assign(e.style, s);
 
 /** Shows a starfold desktop in `container` and connects once; see `Handle` for the rest. */
 export function mount(container: HTMLElement, options: MountOptions): Handle {
@@ -60,38 +87,19 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		throw new Error(
 			'starfold: browsers only decode video on secure pages (HTTPS or localhost)'
 		);
-	const base = new URL(options.assetBase ?? '.', import.meta.url);
+	const base = assetBaseUrl(options.assetBase, import.meta.url);
 	const surface = document.createElement('div');
 	surface.tabIndex = 0;
-	css(surface, { position: 'relative', outline: 'none', touchAction: 'none' });
+	applyStyle(surface, SURFACE);
 	const canvas = document.createElement('canvas');
-	css(canvas, {
-		position: 'absolute',
-		inset: '0',
-		width: '100%',
-		height: '100%',
-		display: 'block',
-		pointerEvents: 'none',
-	});
+	applyStyle(canvas, SCREEN);
 	if (!canvas.transferControlToOffscreen)
 		throw new Error('starfold: this browser lacks OffscreenCanvas support');
 	surface.append(canvas);
 	// Receives keyboard, IME and paste input; on-screen so mobile browsers open a keyboard.
 	const kbd = document.createElement('textarea');
 	kbd.setAttribute('aria-hidden', 'true');
-	css(kbd, {
-		position: 'fixed',
-		left: '0',
-		bottom: '0',
-		width: '1px',
-		height: '1px',
-		opacity: '0.01',
-		border: '0',
-		padding: '0',
-		resize: 'none',
-		pointerEvents: 'none',
-		fontSize: '16px',
-	});
+	applyStyle(kbd, KBD);
 	container.append(surface, kbd);
 
 	const worker = new Worker(new URL('worker.js', base));
@@ -141,7 +149,8 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		() => ({
 			w: container.clientWidth,
 			h: container.clientHeight,
-		})
+		}),
+		STRIPE
 	);
 	const clipboard = createClipboard(app);
 	const audio = options.audio
@@ -152,9 +161,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		clipboard.flush();
 	};
 	setupPointer(app, onInteract);
-	setupKeyboard(app, clipboard, onInteract);
+	const keyboard = setupKeyboard(app, clipboard, onInteract);
 
 	const offscreen = canvas.transferControlToOffscreen();
+	const lifeChannel = new MessageChannel();
 	const protocols = options.connect.protocols;
 	post(
 		{
@@ -167,9 +177,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 					protocols === undefined
 						? undefined
 						: ([] as string[]).concat(protocols),
+				life: lifeChannel.port2,
 			},
 		},
-		[offscreen]
+		[offscreen, lifeChannel.port2]
 	);
 
 	let videoOn: boolean | null = null;
@@ -195,71 +206,59 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	resized.observe(container);
 	updateVisibility();
 
-	const status = (s: Status, detail?: unknown) => options.onStatus?.(s, detail);
-	let mounted = true;
-	worker.addEventListener('message', (e: MessageEvent<FromWorker>) => {
-		const m = e.data;
-		switch (m.t) {
-			case 'frames':
-				video.present(m.parts);
-				break;
-			case 'surface':
-				video.setSurface(m.s);
-				break;
-			case 'hello':
+	const life = new PageLife(lifeChannel.port1, {
+		preamble: options.connect.preamble,
+		onClose: options.onClose,
+		onStatus: (s, detail) => {
+			if (s === 'open') updateVisibility(true);
+			options.onStatus?.(s, detail);
+		},
+	});
+
+	worker.addEventListener('message', (e: MessageEvent<FromWorker>) =>
+		onStream(e.data, {
+			frames: (m) => video.present(m.parts),
+			surface: (m) => video.setSurface(m.s),
+			hello: (m) => {
 				app.desk.w = m.w;
 				app.desk.h = m.h;
 				app.remoteMac = m.os === 'macos';
 				app.readOnly = !!m.readOnly;
 				video.build(m.stripes && m.stripes.length ? m.stripes : [[0, m.h]]);
 				video.layout();
-				break;
-			case 'codec':
-				if (m.error === undefined) {
-					app.desk.w = m.w;
-					app.desk.h = m.h;
-					video.build(m.stripes.map((s): [number, number] => [s.y, s.h]));
-					video.layout();
-				}
-				break;
-			case 'preamble':
-				status('connecting');
-				void answerPreamble(options.connect.preamble, post, (err) =>
-					status('preamble-failed', err)
-				);
-				break;
-			case 'status':
-				if (m.s === 'open') {
-					updateVisibility(true);
-					status('open');
-				} else {
-					status('closed');
-					options.onClose?.(m.code, m.reason);
-				}
-				break;
-			case 'cursor':
-				cursor.set(m.buf);
-				break;
-			case 'log':
-				console.warn('[starfold]', m.s);
-				break;
-		}
-	});
+			},
+			codec: (m) => {
+				if (m.error !== undefined) return;
+				app.desk.w = m.w;
+				app.desk.h = m.h;
+				video.build(m.stripes.map((s): [number, number] => [s.y, s.h]));
+				video.layout();
+			},
+			cursor: (m) => cursor.set(m.buf),
+		})
+	);
 
+	let mounted = true;
 	const handle: Handle = {
 		connect() {
-			if (mounted) post({ t: 'connect' });
+			life.connect();
 		},
 		unmount() {
 			if (!mounted) return;
 			mounted = false;
-			post({ t: 'disconnect' });
 			resized.disconnect();
 			document.removeEventListener('visibilitychange', onVisibility);
-			// Let the worker send its close frame before it stops.
-			setTimeout(() => worker.terminate(), 250);
+			keyboard.dispose();
+			clipboard.dispose();
+			audio?.close();
 			surface.remove();
 			kbd.remove();
+			// Reports the close itself; the worker gets a moment to send its close frame.
+			try {
+				life.unmount();
+			} finally {
+				setTimeout(() => worker.terminate(), 250);
+			}
 		},
 	};
 	handle.connect();

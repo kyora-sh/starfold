@@ -14,6 +14,8 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { serveLife } from './life';
+import type { LifeUp } from './life';
 import { Link } from './link';
 import type { LinkMode } from './link';
 import { FellBehind, StreamRate } from './pace';
@@ -155,6 +157,12 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
 }
 
+/** Embedded: the page's lifecycle port (life.ts); nothing from the server is posted on it. */
+let life: MessagePort | null = null;
+function up(m: LifeUp) {
+	life?.postMessage(m, []);
+}
+
 function makeLink(mode: LinkMode) {
 	return new Link(url, mode, {
 		opening(sock) {
@@ -164,12 +172,14 @@ function makeLink(mode: LinkMode) {
 			behind = new FellBehind();
 			hzOwed = false;
 		},
-		open() {
-			post({ t: 'status', s: 'open' });
+		open(id) {
+			if (life) up({ t: 'open', id });
+			else post({ t: 'status', s: 'open' });
 			send(cmd.audio(wantAudio));
 		},
-		closed(code, reason) {
-			post({ t: 'status', s: 'closed', code, reason });
+		closed(id, code, reason) {
+			if (life) up({ t: 'closed', id, code, reason });
+			else post({ t: 'status', s: 'closed' });
 			proto = 0;
 			videoSent = false;
 			epoch = 0;
@@ -177,8 +187,11 @@ function makeLink(mode: LinkMode) {
 			encoder = null;
 			resetDecoder();
 		},
-		askPreamble() {
-			post({ t: 'preamble' });
+		askPreamble(id) {
+			up({ t: 'preamble', id });
+		},
+		connectFailed(id) {
+			up({ t: 'connectFailed', id });
 		},
 		message(data) {
 			if (typeof data === 'string') return onText(data);
@@ -665,24 +678,14 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			url = m.url;
 			presentToMain = m.presentToMain;
 			ctx = get2dContext(canvas);
-			link = makeLink(
-				m.embed
-					? { embed: true, protocols: m.embed.protocols }
-					: { embed: false }
-			);
+			if (m.embed) {
+				life = m.embed.life;
+				link = makeLink({ embed: true, protocols: m.embed.protocols });
+				serveLife(life, link);
+			} else {
+				link = makeLink({ embed: false });
+			}
 			link.start();
-			break;
-		case 'connect':
-			link?.request();
-			break;
-		case 'preamble':
-			link?.preamble(m.msgs);
-			break;
-		case 'preambleFailed':
-			link?.refused();
-			break;
-		case 'disconnect':
-			ws?.close(1000);
 			break;
 		case 'send':
 			send(m.d);
