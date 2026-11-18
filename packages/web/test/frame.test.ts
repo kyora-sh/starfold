@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	FRAMED_SEND_LIMIT,
 	frameBinary,
 	frameText,
 	Kind,
 	MAX_MESSAGE,
-	sendLimit,
 	unframe,
 } from '../src/frame';
 import { cmd, msg } from '../src/protocol';
@@ -59,10 +59,12 @@ describe('framed messages', () => {
 		expect(() => frameBinary(new Uint8Array(MAX_MESSAGE))).toThrow(RangeError);
 		expect(() => unframe(new ArrayBuffer(MAX_MESSAGE + 1))).toThrow(RangeError);
 	});
-	test('the page sends up to what the server takes in the current mode', () => {
-		const framed = sendLimit(true);
-		expect(() => frameBinary(new Uint8Array(framed))).not.toThrow();
-		expect(() => frameBinary(new Uint8Array(framed + 1))).toThrow(RangeError);
-		expect(sendLimit(false)).toBe(16 << 20);
+	test('framed, the page sends up to what framing takes', () => {
+		expect(() =>
+			frameBinary(new Uint8Array(FRAMED_SEND_LIMIT))
+		).not.toThrow();
+		expect(() => frameBinary(new Uint8Array(FRAMED_SEND_LIMIT + 1))).toThrow(
+			RangeError
+		);
 	});
 });

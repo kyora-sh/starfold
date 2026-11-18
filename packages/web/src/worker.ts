@@ -14,7 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
-import { frameBinary, frameText, sendLimit, unframe } from './frame';
+import { FRAMED_SEND_LIMIT, frameBinary, frameText, unframe } from './frame';
 import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
@@ -149,16 +149,17 @@ const st = {
 
 const utf8 = new TextEncoder();
 
-/** A message over `sendLimit` isn't sent: the server would close the socket for it. */
+/** Framed, a message over `FRAMED_SEND_LIMIT` isn't sent (framing it would fail);
+ * unframed, everything is sent as it always was. */
 function sendable(n: number): boolean {
-	if (n <= sendLimit(framed)) return true;
+	if (!framed || n <= FRAMED_SEND_LIMIT) return true;
 	console.warn(`[starfold] not sent: a ${n}-byte message is over the limit`);
 	return false;
 }
 
 function send(s: string) {
 	if (!ws || ws.readyState !== WebSocket.OPEN) return;
-	if (!sendable(utf8.encode(s).byteLength)) return;
+	if (framed && !sendable(utf8.encode(s).byteLength)) return;
 	ws.send(framed ? frameText(s) : s);
 }
 function post(m: FromWorker, transfer: Transferable[] = []) {

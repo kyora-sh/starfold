@@ -96,6 +96,9 @@ struct Listen {
 }
 
 fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
+    if a.contains_key("listen-unix") && cfg!(not(target_os = "linux")) {
+        return Err("--listen-unix is not available on this platform yet".into());
+    }
     let tcp = truthy(a.get("listen-tcp"), true);
     let mode = match a.get("listen-unix-mode") {
         None => 0o600,
@@ -109,9 +112,6 @@ fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
     let unix = match a.get("listen-unix").map(String::as_str) {
         None => None,
         Some("" | "true") => return Err("--listen-unix needs a path".into()),
-        Some(_) if cfg!(not(target_os = "linux")) => {
-            return Err("--listen-unix is not available on this platform yet".into())
-        }
         Some(p) => Some((p.into(), mode)),
     };
     if !tcp && unix.is_none() {
@@ -132,21 +132,97 @@ pub fn main() {
     if args.first().map(String::as_str) == Some(encoder::HELPER_FLAG) {
         std::process::exit(encoder::helper_main(&args[1..]));
     }
+    let prebound = prebind(&args);
     encoder::isolate::enable();
-    run(args);
+    run_with(args, prebound);
+}
+
+/// The socket --listen-unix binds before the server starts, and what removes it.
+#[cfg(target_os = "linux")]
+type Prebound = (std::os::unix::net::UnixListener, server::SocketFile);
+#[cfg(not(target_os = "linux"))]
+type Prebound = std::convert::Infallible;
+
+/// --listen-unix's socket, bound first thing, while this is the process's only thread:
+/// the bind changes the process's working directory and umask for a moment (see
+/// [`server::bind_in`]). SIGTERM and SIGINT wait (blocked) from here until the server
+/// takes them, so one that comes meanwhile still removes the socket. A bad flag, or a
+/// bind that fails, ends the process here, before any desktop is touched.
+fn prebind(args: &[String]) -> Option<Prebound> {
+    if help::asked(args) {
+        return None;
+    }
+    let listen = listen_config(&parse_args(args.iter().cloned())).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    #[cfg(target_os = "linux")]
+    if let Some((path, mode)) = listen.unix {
+        let threads = std::fs::read_dir("/proc/self/task").map(|d| d.count());
+        if !matches!(threads, Ok(1)) {
+            eprintln!(
+                "--listen-unix {}: it binds while this is the process's only thread, and \
+                 this process has {}",
+                path.display(),
+                match threads {
+                    Ok(n) => format!("{n} threads"),
+                    Err(e) => format!("threads that can't be counted ({e})"),
+                }
+            );
+            std::process::exit(1);
+        }
+        shutdown_signals(libc::SIG_BLOCK);
+        return match server::bind_unix_std(&path, mode) {
+            Ok(bound) => Some(bound),
+            Err(e) => {
+                eprintln!("--listen-unix {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = listen;
+    None
+}
+
+/// Blocks or unblocks SIGTERM and SIGINT on the calling thread (and the threads it starts).
+#[cfg(target_os = "linux")]
+fn shutdown_signals(how: libc::c_int) {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+    }
 }
 
 /// Runs the server with these command-line flags (without the program name) until it's
 /// told to stop. Takes over the calling thread, which on macOS has to be the main thread.
 /// Called directly (not through [`main`]), it probes the hardware encoders in-process, so
-/// a driver that crashes there takes the server with it.
+/// a driver that crashes there takes the server with it; and it refuses --listen-unix,
+/// which binds before any thread starts, something only [`main`] can promise.
 pub fn run(args: impl IntoIterator<Item = String>) {
-    let args: Vec<String> = args.into_iter().collect();
+    run_with(args.into_iter().collect(), None);
+}
+
+fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
     // --help and --version print and return instead of starting the server.
     if help::print_if_asked(&args) {
         return;
     }
     let a = parse_args(args);
+    let listen = listen_config(&a).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    if listen.unix.is_some() && prebound.is_none() {
+        eprintln!(
+            "--listen-unix needs the starfold binary: it binds before any thread starts, \
+             which a program that embeds the server can't promise"
+        );
+        std::process::exit(2);
+    }
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
     // A panic on any thread ends the process, as in starfold's own release build (panic = "abort"),
@@ -168,14 +244,14 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     // main dispatch queue and the server runs beside it.
     #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(move || rt.block_on(serve(a)));
+        std::thread::spawn(move || rt.block_on(serve(a, listen, prebound)));
         dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a));
+    rt.block_on(serve(a, listen, prebound));
 }
 
-async fn serve(a: HashMap<String, String>) {
+async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Prebound>) {
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
     let display = std::env::var("DISPLAY")
@@ -199,10 +275,6 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| default_addr.into());
     let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
-    let listen = listen_config(&a).unwrap_or_else(|e| {
-        log::error!("{e}");
-        std::process::exit(2);
-    });
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -526,8 +598,8 @@ async fn serve(a: HashMap<String, String>) {
         ),
         false => None,
     };
-    // Taken before the unix socket is bound: a SIGTERM or SIGINT from here on waits for the
-    // shutdown below, which removes the socket, instead of ending the process with it left.
+    // From here SIGTERM and SIGINT lead to the shutdown below, which removes the unix socket;
+    // one that came since the socket was bound (blocked until now) is taken now.
     #[cfg(unix)]
     let (mut term, mut int) = {
         use tokio::signal::unix::{signal, SignalKind};
@@ -537,20 +609,25 @@ async fn serve(a: HashMap<String, String>) {
         )
     };
     #[cfg(target_os = "linux")]
-    let (unix, socket_file) = match &listen.unix {
-        Some((path, mode)) => {
-            let (l, file) = server::bind_unix(path, *mode).unwrap_or_else(|e| {
+    shutdown_signals(libc::SIG_UNBLOCK);
+    #[cfg(target_os = "linux")]
+    let (unix, socket_file) = match (prebound, &listen.unix) {
+        (Some((l, file)), Some((path, mode))) => {
+            let l = server::register(l, &file).unwrap_or_else(|e| {
                 log::error!("--listen-unix {}: {e}", path.display());
                 std::process::exit(1);
             });
             log::info!(
-                "listening on unix:{} (mode {mode:o})",
-                server::unix_socket_path(path).display()
+                "listening on unix:{} (mode {mode:o}; only uid {} is let in)",
+                server::unix_socket_path(path).display(),
+                unsafe { libc::geteuid() }
             );
-            (Some(l), Some(file))
+            (Some(server::PeerChecked(l)), Some(file))
         }
-        None => (None, None),
+        _ => (None, None),
     };
+    #[cfg(not(target_os = "linux"))]
+    let _ = prebound;
     if tcp.is_some() {
         log::info!("listening on http://{addr}:{port}");
     }
@@ -660,6 +737,21 @@ mod tests {
                 listen(&["--listen-unix=/s", &format!("--listen-unix-mode={mode}")]).is_err(),
                 "{mode}"
             );
+        }
+    }
+
+    /// Off Linux the platform refusal comes before anything else said about --listen-unix:
+    /// a bare flag, a bad mode or TCP off all get it.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_the_refusal_comes_first() {
+        let refused = Err("--listen-unix is not available on this platform yet".to_string());
+        for args in [
+            &["--listen-unix"][..],
+            &["--listen-unix=/s", "--listen-unix-mode=rw"],
+            &["--listen-unix=/s", "--listen-tcp=false"],
+        ] {
+            assert_eq!(listen(args), refused, "{args:?}");
         }
     }
 }

@@ -16,7 +16,9 @@ Server:
                                 this directory, which must not exist yet, for
                                 this user alone and listens on the socket s in
                                 it; removes both on exit; the host and origin
-                                checks still apply. Its parent must not let
+                                checks still apply. Only a peer with this
+                                process's uid is let in (SO_PEERCRED); the same
+                                uid is not separated. Its parent must not let
                                 other users rename entries: e.g. /tmp (sticky)
                                 or a directory only you can write
   --listen-unix-mode            the socket's permissions (default 0600); group
@@ -281,6 +283,11 @@ fn request(args: &[String]) -> Option<Request> {
     } else {
         None
     }
+}
+
+/// The arguments ask for the help or the version (which [`print_if_asked`] prints).
+pub fn asked(args: &[String]) -> bool {
+    request(args).is_some()
 }
 
 /// Prints the help or the version if the arguments ask for either, and says whether it did.

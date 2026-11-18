@@ -226,20 +226,38 @@ curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901
 
 `--listen-unix DIR` serves the same routes, with the same login and host checks, on a
 unix socket: starfold makes `DIR` (which must not exist yet) for its user alone and
-listens on `DIR/s`; `--listen-tcp=false` turns TCP off. `DIR`'s parent must not let other
-users rename entries in it: owned by you or root, writable by no one else unless sticky
-(as `/tmp` is), and with no ACL entry that lets anyone else write. On other platforms the
-flag is refused: `--listen-unix is not available on this platform yet`.
+listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
+refused: `--listen-unix is not available on this platform yet`. It needs the `starfold`
+binary (it binds before any thread starts); a program that embeds the server gets an
+error for it.
+
+What keeps other users out: the server lets in only a peer with its own uid. The kernel
+records each connecting process's credentials at `connect`, and starfold reads them
+(`SO_PEERCRED`) before it reads or writes a byte, closing any other connection; the uid
+an unmapped user reads as (65534) is never let in. What isn't claimed:
+
+- **The same uid is not separated.** In a sandbox where other code runs as starfold's
+  uid, that code can reach starfold.
+- A peer that is let in can hand its connection to another process; the connection keeps
+  the credentials it was opened with.
+- root can do anything.
+
+The rest is hygiene, which keeps an honest setup tidy and fails early, not what keeps
+other users out: `DIR`'s parent must not let other users rename entries in it (owned by
+you or root, writable by no one else unless sticky as `/tmp` is, and no ACL entry that
+lets anyone else write); `DIR` is made fresh for this user alone and removed on exit;
+and starfold checks that it is the process's only thread when it binds, since the bind
+sets the working directory and umask for a moment.
 
 `--framed` sends every WebSocket message as binary with a kind byte, for hops that carry
-binary messages only; the page then needs `?framed=1`. A message from the page is at most
-64 MiB framed (kind byte included) and 16 MiB otherwise (one WebSocket frame); the page
-doesn't send a larger one.
+binary messages only; the page then needs `?framed=1`. Framed, a message from the page is
+at most 64 MiB, kind byte included; the page doesn't send a larger one.
 
 ### macOS
 
-starfold also streams a Mac's own screen, with every feature of the Linux version
-(ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
+starfold also streams a Mac's own screen, with every feature of the Linux version but
+`--listen-unix` (ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system
+audio).
 
 ```sh
 brew install opus pkgconf esbuild
@@ -268,7 +286,7 @@ rounded-corner flags don't apply.
 ### Windows
 
 starfold also streams a Windows desktop (Windows 10 or later), with every feature of the
-Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
+Linux version but `--listen-unix` (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
 WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
