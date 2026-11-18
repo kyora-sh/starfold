@@ -44,7 +44,12 @@ export function createVideo(
 	canvas: HTMLCanvasElement,
 	useVideo: boolean,
 	onLayout: () => void,
-	onFirstPaint: () => void
+	onFirstPaint: () => void,
+	/** The CSS pixels the desktop is fitted into: the window, unless embedded. */
+	viewport: () => { w: number; h: number } = () => ({
+		w: window.innerWidth,
+		h: window.innerHeight,
+	})
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
@@ -137,8 +142,7 @@ export function createVideo(
 	function layout() {
 		const { w: dw, h: dh } = app.desk;
 		if (!dw) return;
-		const vw = window.innerWidth,
-			vh = window.innerHeight;
+		const { w: vw, h: vh } = viewport();
 		const dpr = window.devicePixelRatio || 1;
 		// Snap the height so every stripe boundary lands on a whole device pixel;
 		// otherwise the stacked stripe layers show hairline seams.

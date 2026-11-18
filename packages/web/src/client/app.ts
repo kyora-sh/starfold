@@ -24,6 +24,19 @@ export interface App {
 	view: { scale: number };
 }
 
+/**
+ * Commands a read-only viewer sends: acks, video and audio on/off, keyframe requests
+ * and ping replies. Anything else would act on the desktop (input, clipboard,
+ * microphone, resizing). The server accepts only these from read-only viewers too
+ * (READ_ONLY_COMMANDS in server.rs), so a page that ignores the hello flag cannot
+ * drive the desktop either; this keeps it from sending what would be dropped.
+ */
+const READ_ONLY_COMMANDS = new Set(['a', 'v', 'au', 'kf', 'po']);
+
+export function blocksInput(app: App, command: string): boolean {
+	return app.readOnly && !READ_ONLY_COMMANDS.has(command.split(',')[0]);
+}
+
 export function el<T extends HTMLElement = HTMLElement>(id: string): T {
 	const e = document.getElementById(id);
 	if (!e) throw new Error(`starfold: #${id} is missing from index.html`);

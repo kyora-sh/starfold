@@ -2,7 +2,8 @@
 // over a MessageChannel, so audio never waits on the main thread.
 import type { App } from './app';
 
-export function createAudio(app: App) {
+/** `worklet`: the player's script, beside the page unless embedded. */
+export function createAudio(app: App, worklet: string | URL = 'audio.js') {
 	let started = false;
 	let ac: AudioContext | null = null;
 
@@ -16,7 +17,7 @@ export function createAudio(app: App) {
 		started = true;
 		try {
 			ac = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
-			await ac.audioWorklet.addModule('audio.js');
+			await ac.audioWorklet.addModule(worklet);
 			const node = new AudioWorkletNode(ac, 'pcm-player', {
 				outputChannelCount: [2],
 			});

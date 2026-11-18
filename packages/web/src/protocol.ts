@@ -215,7 +215,11 @@ export type FromWorker =
 	| { t: 'surface'; s: 'video' | 'canvas' }
 	/** The worker painted its first frame onto the canvas. */
 	| { t: 'painted' }
-	| { t: 'status'; s: 'open' | 'closed' }
+	| { t: 'status'; s: 'open' }
+	/** The socket closed, with the close frame's code and reason. */
+	| { t: 'status'; s: 'closed'; code: number; reason: string }
+	/** Embedded: the worker is about to connect and needs the page's preamble. */
+	| { t: 'preamble' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
 	| { t: 'log'; s: string }
@@ -224,7 +228,22 @@ export type FromWorker =
 
 /** Page -> worker. */
 export type ToWorker =
-	| { t: 'init'; canvas: OffscreenCanvas; url: string; presentToMain: boolean }
+	| {
+			t: 'init';
+			canvas: OffscreenCanvas;
+			url: string;
+			presentToMain: boolean;
+			/** Embedded (`mount`): connect only when asked, with `protocols`, and never again on its own. */
+			embed?: { protocols?: string[] };
+	  }
+	/** Embedded: connect now (the worker asks for the preamble first). */
+	| { t: 'connect' }
+	/** Embedded: the preamble's messages, sent first on the socket opened next. */
+	| { t: 'preamble'; msgs: string[] }
+	/** Embedded: the preamble failed; nothing opens. */
+	| { t: 'preambleFailed' }
+	/** Embedded: close the socket (unmount). */
+	| { t: 'disconnect' }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }

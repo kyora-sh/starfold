@@ -14,6 +14,8 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { Link } from './link';
+import type { LinkMode } from './link';
 import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
@@ -58,6 +60,7 @@ let surface: 'video' | 'canvas' | null = null;
 let painted = false;
 let ws: WebSocket | null = null;
 let url = '';
+let link: Link | null = null;
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let audioDecoder: AudioDecoder | null = null;
@@ -152,46 +155,50 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
 }
 
-function connect() {
-	const sock = new WebSocket(url);
-	ws = sock;
-	conn++;
-	rate = new StreamRate();
-	behind = new FellBehind();
-	hzOwed = false;
-	sock.binaryType = 'arraybuffer';
-	sock.addEventListener('open', () => {
-		post({ t: 'status', s: 'open' });
-		send(cmd.audio(wantAudio));
-	});
-	sock.addEventListener('close', () => {
-		post({ t: 'status', s: 'closed' });
-		proto = 0;
-		videoSent = false;
-		epoch = 0;
-		ready = false;
-		encoder = null;
-		resetDecoder();
-		setTimeout(connect, 1000);
-	});
-	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
-		if (typeof e.data === 'string') return onText(e.data);
-		const b = new Uint8Array(e.data);
-		switch (b[0]) {
-			case Bin.Video:
-			case Bin.VideoV2:
-				onVideo(b);
-				break;
-			case Bin.Audio:
-				onAudio(b);
-				break;
-			case Bin.Cursor:
-				post({ t: 'cursor', buf: e.data }, [e.data]);
-				break;
-			case Bin.ClipImage:
-				post({ t: 'clipImage', buf: e.data }, [e.data]);
-				break;
-		}
+function makeLink(mode: LinkMode) {
+	return new Link(url, mode, {
+		opening(sock) {
+			ws = sock;
+			conn++;
+			rate = new StreamRate();
+			behind = new FellBehind();
+			hzOwed = false;
+		},
+		open() {
+			post({ t: 'status', s: 'open' });
+			send(cmd.audio(wantAudio));
+		},
+		closed(code, reason) {
+			post({ t: 'status', s: 'closed', code, reason });
+			proto = 0;
+			videoSent = false;
+			epoch = 0;
+			ready = false;
+			encoder = null;
+			resetDecoder();
+		},
+		askPreamble() {
+			post({ t: 'preamble' });
+		},
+		message(data) {
+			if (typeof data === 'string') return onText(data);
+			const b = new Uint8Array(data);
+			switch (b[0]) {
+				case Bin.Video:
+				case Bin.VideoV2:
+					onVideo(b);
+					break;
+				case Bin.Audio:
+					onAudio(b);
+					break;
+				case Bin.Cursor:
+					post({ t: 'cursor', buf: data }, [data]);
+					break;
+				case Bin.ClipImage:
+					post({ t: 'clipImage', buf: data }, [data]);
+					break;
+			}
+		},
 	});
 }
 
@@ -658,7 +665,22 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			url = m.url;
 			presentToMain = m.presentToMain;
 			ctx = get2dContext(canvas);
-			connect();
+			link = makeLink(
+				m.embed ? { embed: true, protocols: m.embed.protocols } : { embed: false }
+			);
+			link.start();
+			break;
+		case 'connect':
+			link?.request();
+			break;
+		case 'preamble':
+			link?.preamble(m.msgs);
+			break;
+		case 'preambleFailed':
+			link?.refused();
+			break;
+		case 'disconnect':
+			ws?.close(1000);
 			break;
 		case 'send':
 			send(m.d);
