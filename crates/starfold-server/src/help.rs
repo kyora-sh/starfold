@@ -16,10 +16,12 @@ Server:
                                 this directory, which must not exist yet, for
                                 this user alone and listens on the socket s in
                                 it; removes both on exit; the host and origin
-                                checks still apply
+                                checks still apply. Its parent must not let
+                                other users rename entries: e.g. /tmp (sticky)
+                                or a directory only you can write
   --listen-unix-mode            the socket's permissions (default 0600); group
-                                or other access also lets that class search
-                                the directory
+                                or other write access also lets that class
+                                search the directory
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1

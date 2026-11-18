@@ -215,6 +215,151 @@ fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
     }
 }
 
+/// The --listen-unix parent's contract, checked on the parent as opened: no other user can
+/// rename or replace entries in it. That is a parent owned by this user or by root,
+/// writable by no one else unless it is sticky (as /tmp is), and with no ACL entry that
+/// lets anyone else add to it, delete from it, or (on macOS) gets inherited with such
+/// rights. With such a parent, nobody else can move the new directory aside or put
+/// something in its place while it is set up.
+#[cfg(unix)]
+fn check_parent(parent: &std::os::fd::OwnedFd, path: &Path) -> std::io::Result<()> {
+    let st = fstat(parent)?;
+    let refuse = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: {why}; --listen-unix needs a parent where no other user can rename \
+                 entries, e.g. /tmp (sticky) or a directory only you can write",
+                path.display()
+            ),
+        ))
+    };
+    let me = unsafe { libc::geteuid() };
+    if st.st_uid != me && st.st_uid != 0 {
+        return refuse(&format!("its parent belongs to user {}", st.st_uid));
+    }
+    let sticky = st.st_mode as u32 & libc::S_ISVTX as u32 != 0;
+    if st.st_mode as u32 & 0o022 != 0 && !sticky {
+        return refuse("its parent is writable by other users and not sticky");
+    }
+    if acl_lets_others_write(parent)? {
+        return refuse("its parent has an ACL entry that lets other users add or remove entries");
+    }
+    Ok(())
+}
+
+/// The parent's access ACL has a named user or group entry with write permission that
+/// its mask doesn't take away.
+#[cfg(target_os = "linux")]
+fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let name = c"system.posix_acl_access";
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe {
+        libc::fgetxattr(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENODATA | libc::EOPNOTSUPP) => Ok(false),
+            _ => Err(e),
+        };
+    }
+    let entries: Vec<(u16, u16)> = buf[4.min(n as usize)..n as usize]
+        .chunks_exact(8)
+        .map(|e| {
+            (
+                u16::from_le_bytes([e[0], e[1]]),
+                u16::from_le_bytes([e[2], e[3]]),
+            )
+        })
+        .collect();
+    const USER: u16 = 0x02;
+    const GROUP: u16 = 0x08;
+    const MASK: u16 = 0x10;
+    const WRITE: u16 = 0x02;
+    let mask_writes = entries
+        .iter()
+        .find(|e| e.0 == MASK)
+        .is_none_or(|e| e.1 & WRITE != 0);
+    Ok(mask_writes
+        && entries
+            .iter()
+            .any(|e| (e.0 == USER || e.0 == GROUP) && e.1 & WRITE != 0))
+}
+
+/// The parent's extended ACL has an allow entry that lets someone add to it or delete from
+/// it, or one inherited by a new directory that would let someone delete it or add to it
+/// before its ACL is cleared. Such an entry may name this user too; it is refused all the
+/// same.
+#[cfg(target_os = "macos")]
+fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_void};
+    extern "C" {
+        fn acl_get_fd(fd: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
+        fn acl_get_perm_np(permset: *mut c_void, perm: c_int) -> c_int;
+        fn acl_get_flagset_np(entry: *mut c_void, flagset: *mut *mut c_void) -> c_int;
+        fn acl_get_flag_np(flagset: *mut c_void, flag: c_int) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    const ACL_ADD_FILE: c_int = 1 << 2;
+    const ACL_DELETE: c_int = 1 << 4;
+    const ACL_ADD_SUBDIRECTORY: c_int = 1 << 5;
+    const ACL_DELETE_CHILD: c_int = 1 << 6;
+    const ACL_ENTRY_DIRECTORY_INHERIT: c_int = 1 << 6;
+    unsafe {
+        let acl = acl_get_fd(dir.as_raw_fd());
+        if acl.is_null() {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                _ => Err(e),
+            };
+        }
+        let mut found = false;
+        let mut entry = std::ptr::null_mut();
+        let mut which = ACL_FIRST_ENTRY;
+        while !found && acl_get_entry(acl, which, &mut entry) == 0 {
+            which = ACL_NEXT_ENTRY;
+            let mut tag = 0;
+            if acl_get_tag_type(entry, &mut tag) != 0 || tag != ACL_EXTENDED_ALLOW {
+                continue;
+            }
+            let (mut perms, mut flags) = (std::ptr::null_mut(), std::ptr::null_mut());
+            if acl_get_permset(entry, &mut perms) != 0 || acl_get_flagset_np(entry, &mut flags) != 0
+            {
+                found = true;
+                break;
+            }
+            let has = |p| acl_get_perm_np(perms, p) == 1;
+            let inherited = acl_get_flag_np(flags, ACL_ENTRY_DIRECTORY_INHERIT) == 1;
+            found = has(ACL_ADD_FILE)
+                || has(ACL_ADD_SUBDIRECTORY)
+                || has(ACL_DELETE_CHILD)
+                || (inherited && has(ACL_DELETE));
+        }
+        acl_free(acl);
+        Ok(found)
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn acl_lets_others_write(_: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn clear_acl(_: &std::os::fd::OwnedFd) -> std::io::Result<()> {
     Err(std::io::Error::new(
@@ -262,6 +407,7 @@ pub fn bind_unix(
         &cname(parent_path.as_os_str())?,
         libc::O_RDONLY | libc::O_DIRECTORY,
     )?;
+    check_parent(&parent, path)?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
         let e = Error::last_os_error();
         return Err(match e.raw_os_error() {
@@ -346,20 +492,20 @@ pub fn bind_unix(
     let bound = (|| {
         clear_acl(&file.dir)?;
         set_mode(&file, 0o700)?;
-        let listener = tokio::net::UnixListener::bind(&socket)?;
+        #[cfg(test)]
+        if let Some(race) = BEFORE_BIND.with(|h| h.take()) {
+            race();
+        }
+        let listener = tokio::net::UnixListener::bind(bind_path(&file.dir, &socket))?;
         // Only this user can add to the directory, so a socket in it is the one just bound.
         let st = stat_at(&file.dir, SOCKET)
             .ok()
             .filter(is_socket)
             .ok_or_else(moved)?;
         file.socket_id = Some(id(&st));
-        cvt(unsafe {
-            libc::fchmodat(
-                file.dir.as_raw_fd(),
-                SOCKET.as_ptr(),
-                mode as libc::mode_t,
-                0,
-            )
+        chmod_socket(&file.dir, id(&st), mode).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => moved(),
+            _ => e,
         })?;
         set_mode(&file, 0o700 | reach)?;
         Ok(listener)
@@ -371,6 +517,83 @@ pub fn bind_unix(
             Err(e)
         }
     }
+}
+
+/// Gives the socket `s` in `dir`, the one with identity `want`, permissions `mode`, and
+/// reads them back. On Linux through an O_PATH descriptor of that socket, checked to be it
+/// before the change (a socket can't be fchmod'ed); elsewhere by name without following a
+/// symlink, checked to be it after. A same-user process swapping `s` in between is out of
+/// scope.
+#[cfg(target_os = "linux")]
+fn chmod_socket(
+    dir: &std::os::fd::OwnedFd,
+    want: (libc::dev_t, libc::ino_t),
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = open_at(Some(dir), SOCKET, libc::O_PATH)?;
+    let is_it = |st: &libc::stat| is_socket(st) && id(st) == want;
+    let replaced = || {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the socket was replaced while it was set up",
+        )
+    };
+    if !is_it(&fstat(&fd)?) {
+        return Err(replaced());
+    }
+    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+    cvt(unsafe { libc::chmod(proc.as_ptr(), mode as libc::mode_t) })?;
+    let st = fstat(&fd)?;
+    if !is_it(&st) || st.st_mode as u32 & 0o7777 != mode {
+        return Err(replaced());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn chmod_socket(
+    dir: &std::os::fd::OwnedFd,
+    want: (libc::dev_t, libc::ino_t),
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    cvt(unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            SOCKET.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    let st = stat_at(dir, SOCKET)?;
+    if !is_socket(&st) || id(&st) != want || st.st_mode as u32 & 0o7777 != mode {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the socket was replaced while it was set up",
+        ));
+    }
+    Ok(())
+}
+
+/// Where `bind` puts the socket. On Linux, through the directory as opened
+/// (`/proc/self/fd/N/s`), so the socket lands in it whatever happened to its path since;
+/// elsewhere the path itself, which the parent's contract keeps pointing at it.
+#[cfg(target_os = "linux")]
+fn bind_path(dir: &std::os::fd::OwnedFd, _path: &Path) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd;
+    std::path::PathBuf::from(format!("/proc/self/fd/{}/s", dir.as_raw_fd()))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bind_path(_dir: &std::os::fd::OwnedFd, path: &Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    /// Runs on this thread just before `bind_unix` binds, once: what a race would do there.
+    pub static BEFORE_BIND: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
 }
 
 /// Removes what `bind_unix` made, each only if it is still the entry that was made (type,
@@ -1715,8 +1938,9 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("modes");
-            // Whoever can write the parent: the directory made in it is private all the same.
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+            // Whoever can write the (sticky) parent: the directory made in it is private all
+            // the same.
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1777)).unwrap();
             for (mode, dir_mode) in [
                 (0o600, 0o700),
                 (0o660, 0o710),
@@ -1779,6 +2003,114 @@ mod tests {
             assert_eq!(meta(&at).mode() & 0o7777, 0o710);
             drop(l);
             remove_unix(&file);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A parent in which other users could rename entries is refused before anything
+        /// is made in it: writable by group or other without the sticky bit. A sticky
+        /// world-writable one (as /tmp) is taken.
+        #[test]
+        fn a_parent_others_can_rename_in_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("contract");
+            for mode in [0o770, 0o707, 0o777, 0o730] {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+                let e = bind_unix(&d.join("sf"), 0o600).unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{mode:o}");
+                assert!(e.to_string().contains("not sticky"), "{mode:o}: {e}");
+                assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "{mode:o}");
+            }
+            for mode in [0o1777, 0o1770, 0o755, 0o700] {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+                let at = d.join("sf");
+                let (l, file) = bind_unix(&at, 0o600).unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+                drop(l);
+                remove_unix(&file);
+            }
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A parent whose access ACL lets a named user write is refused, whatever its mode
+        /// bits say.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_parent_with_a_write_acl_entry_is_refused() {
+            use std::os::unix::ffi::OsStrExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("acl-parent");
+            let c = std::ffi::CString::new(d.as_os_str().as_bytes()).unwrap();
+            // user::rwx, user:nobody:rwx, group::---, mask::rwx, other::---.
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (0x01u16, 7u16, u32::MAX),
+                (0x02, 7, 65534),
+                (0x04, 0, u32::MAX),
+                (0x10, 7, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ] {
+                acl.extend(tag.to_le_bytes());
+                acl.extend(perm.to_le_bytes());
+                acl.extend(id.to_le_bytes());
+            }
+            let set = unsafe {
+                libc::setxattr(
+                    c.as_ptr(),
+                    c"system.posix_acl_access".as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            };
+            if set != 0 {
+                let e = std::io::Error::last_os_error();
+                assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{e}");
+                eprintln!("skipped: no ACLs on this filesystem");
+                std::fs::remove_dir_all(&d).unwrap();
+                return;
+            }
+            let e = bind_unix(&d.join("sf"), 0o600).unwrap_err();
+            assert!(e.to_string().contains("ACL entry"), "{e}");
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// The directory is renamed away just before the bind and another put at its path:
+        /// the socket still lands in the directory that was made and opened, never in the
+        /// replacement.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_bind_lands_in_the_opened_directory_after_a_rename() {
+            use std::os::unix::fs::FileTypeExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("rename");
+            let at = d.join("sf");
+            let aside = d.join("aside");
+            let (from, to) = (at.clone(), aside.clone());
+            BEFORE_BIND.with(|h| {
+                h.set(Some(Box::new(move || {
+                    std::fs::rename(&from, &to).unwrap();
+                    std::fs::create_dir(&from).unwrap();
+                })))
+            });
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            assert!(
+                std::fs::symlink_metadata(aside.join("s"))
+                    .unwrap()
+                    .file_type()
+                    .is_socket(),
+                "the socket isn't in the directory that was made"
+            );
+            assert!(
+                !at.join("s").exists(),
+                "the socket landed in the replacement"
+            );
+            drop(l);
+            remove_unix(&file);
+            assert!(at.exists(), "the replacement was removed");
             std::fs::remove_dir_all(&d).unwrap();
         }
 
@@ -2042,9 +2374,11 @@ mod tests {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("acl");
+            // Inherited, but adding nothing: the parent's contract takes it, and the new
+            // directory's copy is cleared.
             let granted = std::process::Command::new("/bin/chmod")
                 .arg("+a")
-                .arg("everyone allow list,search,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit")
+                .arg("everyone allow list,search,readattr,file_inherit,directory_inherit")
                 .arg(&d)
                 .status()
                 .unwrap();
@@ -2067,6 +2401,34 @@ mod tests {
             assert!(!acl(&unix_socket_path(&at)), "the socket has an ACL");
             drop((l, file));
             std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A parent with an entry that lets anyone add to it or delete from it (and so
+        /// rename in it), or an inherited one that would let them into the new directory
+        /// before its ACL is cleared, is refused before anything is made in it.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn a_parent_with_an_ace_that_adds_or_deletes_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            for ace in [
+                "everyone allow add_file",
+                "everyone allow add_subdirectory",
+                "everyone allow delete_child",
+                "everyone allow delete,directory_inherit",
+            ] {
+                let d = dir("ace");
+                let granted = std::process::Command::new("/bin/chmod")
+                    .args(["+a", ace])
+                    .arg(&d)
+                    .status()
+                    .unwrap();
+                assert!(granted.success(), "{ace}");
+                let e = bind_unix(&d.join("sf"), 0o600).unwrap_err();
+                assert!(e.to_string().contains("ACL entry"), "{ace}: {e}");
+                assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "{ace}");
+                std::fs::remove_dir_all(&d).unwrap();
+            }
         }
     }
 }
