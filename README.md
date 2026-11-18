@@ -108,7 +108,8 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
-| `--enable-recording`                                           | `false`                                                               | allow `/record`; clips are held in memory and are not yet bounded: do not enable it for viewers you do not trust                                                                                          |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 recordings at once, each written to `--recording-dir` as it runs; with no H.264 viewer a recording runs an H.264 encode of its own, up to `--framerate` (see below)              |
+| `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                  | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
 ### File transfer
@@ -193,22 +194,43 @@ is returned once, to the caller of start, over the same authenticated channel; i
 from the OS and compared in constant time. Treat the id like a secret: anyone who has it and
 can reach the server can stop the recording and take the clip.
 
-With `--enable-recording` the recorder is as it was before the flag: clips are held in memory
-and are not yet bounded; do not enable it for viewers you do not trust. Under `--read-only`
-the three routes are refused even with it.
+Under `--read-only` the three routes are refused even with `--enable-recording`.
 
-A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
-encoding with any viewers taking H.264, and with none it starts an H.264 encoding of its
-own. It needs `--stripes=1` (otherwise 409), and a resize ends it. It doesn't include the
+A recording is the H.264 stream starfold sends to viewers, saved as MP4. It takes each
+encoded frame beside the viewers, never as one of them, so it has no part in their flow
+control, their frame rate or their bitrate. With viewers taking H.264 it shares their encode
+and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer would get
+running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
+own: that encode's CPU is the cost of recording an unwatched screen. It needs `--stripes=1`
+(otherwise 409), and a frame of another size (a resize) ends it. It doesn't include the
 cursor, which viewers draw, except on macOS when the cursor is in the video: with
 `--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
+
+While it runs, a recording's video goes to a file with no name in `--recording-dir`, and the
+answer is read back from that file:
+
+- At most 2 recordings run at once (`/record` and `/record/start` alike, each until its
+  answer is sent or dropped); a third gets 429.
+- A recording holds at most 2 GiB of video (`size_limit`) and at most 120 frames a second of
+  its length (`frame_cap`).
+- It starts only with at least min(1 GiB, 10 %) of the filesystem free (otherwise 507), and
+  ends with `disk_space` below that; it looks again after half the room that was left, at
+  most 64 MiB later.
+- In memory it holds the frames waiting for the disk (at most 4 MiB, or one frame of up to
+  8 MiB when nothing else waits), the writer's 256 KiB buffer, and 16 bytes a frame for 120
+  frames a second of its length (576 KB at 300 s): at most 10 MiB per recording at the
+  default length. A disk that falls further behind ends it with `disk_slow`; a frame over
+  8 MiB ends it with `large_frame`.
+- An answer whose client takes no bytes for 30 s is dropped, and the recording's file and
+  place with it. A started recording nobody stops is dropped 60 s after its length limit.
 
 If another encoder takes over mid-recording (a hardware encoder failing over to the
 software one, say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
-`segment_lost` or `closed`). Without it you get the first MP4, with `x-starfold-segments` and
+`segment_lost`, `closed`, `size_limit`, `frame_cap`, `large_frame`, `disk_slow`,
+`disk_space` or `disk_error`). Without it you get the first MP4, with `x-starfold-segments` and
 `x-starfold-record-end` headers when there were more.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep

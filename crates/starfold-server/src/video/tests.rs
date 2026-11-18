@@ -4352,3 +4352,128 @@ fn a_recording_takes_the_h264_cohorts_frames_at_its_encoders_size_without_a_view
     assert!(got[0].1);
     assert_eq!(got[0].0, (800, 600));
 }
+
+/// What one viewer of the H.264 cohort gets over 30 captures, acking each frame, with a
+/// recording beside it whose disk never takes a frame (`recording`) or none: (frames,
+/// bytes, encodes, the cohort's target and rate, what the tap got).
+fn a_viewer_beside(recording: bool) -> (usize, usize, usize, u32, u32, usize) {
+    let hub = Hub::new();
+    let encodes = Encodes::default();
+    let mut eng = engine(
+        &hub,
+        &[H264_HW],
+        Opts {
+            h264_hw_encodes: Some(encodes.clone()),
+            ..Opts::default()
+        },
+    );
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    // Never read: a recording whose writer is stuck on its disk.
+    let tap = recording.then(|| hub.taps.add());
+    let (mut frames, mut bytes) = (0, 0);
+    for _ in 0..30 {
+        push(&mut eng);
+        while let Ok(m) = rx.try_recv() {
+            if let Out::Bin(b) = m {
+                frames += 1;
+                bytes += b.len();
+                assert!(c.ack(None, u32::from_be_bytes([b[2], b[3], b[4], b[5]])));
+            }
+        }
+    }
+    let h264 = eng
+        .cohorts
+        .iter()
+        .find(|k| k.shared.cand == H264_HW)
+        .unwrap();
+    let tapped = tap.map_or(0, |(_, rx)| tapped(&rx).len());
+    let n = encodes.lock().unwrap().len();
+    (
+        frames,
+        bytes,
+        n,
+        h264.shared.target.load(Ordering::Relaxed),
+        h264.fps(),
+        tapped,
+    )
+}
+
+#[test]
+fn a_recording_on_a_stuck_disk_changes_nothing_a_viewer_gets() {
+    let (frames, bytes, encodes, target, fps, _) = a_viewer_beside(false);
+    let (r_frames, r_bytes, r_encodes, r_target, r_fps, tapped) = a_viewer_beside(true);
+    assert_eq!(frames, 30);
+    assert_eq!((r_frames, r_bytes), (frames, bytes), "the same frames");
+    assert_eq!(r_encodes, encodes, "no encode of its own");
+    assert_eq!(
+        (r_target, r_fps),
+        (target, fps),
+        "the same rate and bitrate"
+    );
+    assert_eq!(tapped, 30, "the recording took the frames the viewer got");
+}
+
+#[test]
+fn a_tap_is_none_of_the_cohorts_viewers() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (_tap, _rx) = hub.taps.add();
+    hub.replan();
+    push(&mut eng);
+    let views = eng.views();
+    assert!(views[0].recorded && views[0].clients.is_empty());
+    assert!(hub.cohort_clients(eng.cohorts[0].shared.id).is_empty());
+    assert!(hub.video_clients().is_empty(), "not routed, not in deliver");
+    assert!(flow_ok(&views[0].clients, 33.0));
+}
+
+#[test]
+fn a_cohort_only_a_recording_takes_runs_at_the_framerate_and_its_own_bitrate() {
+    let hub = Hub::new();
+    let cfg = VideoConfig {
+        high_fps: true,
+        ..config()
+    };
+    let mut eng = Engine::new(
+        cfg.clone(),
+        hub.clone(),
+        W,
+        H,
+        &[HEVC, H264_HW],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    // A viewer on HEVC, whose cohort's bitrate is its own.
+    let (v, mut rv) = client(&hub);
+    join_v2(&hub, &v, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&v, &drain(&mut rv));
+    push(&mut eng);
+    let hevc = |eng: &Engine| {
+        let c = eng.cohorts.iter().find(|k| k.shared.cand == HEVC).unwrap();
+        c.shared.target.load(Ordering::Relaxed)
+    };
+    let before = (hevc(&eng), hub.target_kbps.load(Ordering::Relaxed));
+    let (_tap, rx) = hub.taps.add();
+    hub.replan();
+    // A capture every 100 ms: slower than any cap, so each is the H.264 cohort's to take.
+    let mut t = Instant::now();
+    for _ in 0..5 {
+        t += Duration::from_millis(100);
+        capture(&mut eng, W, H, Some(Band { y0: 0, y1: H }), t);
+    }
+    assert_eq!(tapped(&rx).len(), 5, "the H.264 cohort encodes for it");
+    let h264 = eng
+        .cohorts
+        .iter()
+        .find(|k| k.shared.cand == H264_HW)
+        .unwrap();
+    assert!(fps_cap(&cfg, H264_HW) > cfg.fps, "a cap above --framerate");
+    assert_eq!(h264.fps(), cfg.fps, "held to --framerate");
+    assert_eq!(
+        (hevc(&eng), hub.target_kbps.load(Ordering::Relaxed)),
+        before,
+        "the viewer's bitrate is untouched"
+    );
+}

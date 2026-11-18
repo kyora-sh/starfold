@@ -132,9 +132,14 @@ Files and recordings:
                                 (default Downloads)
   --max-upload-mb               largest upload, 0 for no limit (default 0)
   --max-record-seconds          longest recording (default 300)
-  --enable-recording            allow /record; recordings are held in memory and
-                                not bounded beyond --max-record-seconds
-                                (default false)
+  --enable-recording            allow /record; at most 2 recordings at once, each
+                                written to --recording-dir as it runs; with no
+                                H.264 viewer a recording runs an H.264 encode of
+                                its own, up to --framerate (default false)
+  --recording-dir               where recordings are written, in files with no
+                                name; not memory (tmpfs), not inside --files-root
+                                (default /var/tmp on Linux, else the system
+                                temporary folder)
 
   -h, --help                    print this and exit
   -V, --version                 print the version and exit
