@@ -55,14 +55,28 @@ pub fn platform_file() -> Option<&'static str> {
     file_for(std::env::consts::ARCH).filter(|_| cfg!(openh264_cisco_loadable))
 }
 
+/// The pins the loader checks against: this target's build only, so another architecture's
+/// authentic file is refused at the hash check.
+pub fn platform_pins() -> Vec<(&'static str, &'static str)> {
+    PINS.iter()
+        .copied()
+        .filter(|(_, f)| Some(*f) == platform_file())
+        .collect()
+}
+
 pub type Create = unsafe extern "C" fn(*mut *mut openh264_sys2::ISVCEncoder) -> c_int;
 pub type Destroy = unsafe extern "C" fn(*mut openh264_sys2::ISVCEncoder);
 pub type Version = unsafe extern "C" fn() -> openh264_sys2::OpenH264Version;
 
-/// Cisco's library as the starfold binary loaded it: its entry points, what it is (Cisco's
-/// attribution, file and sha256), and where it came from.
+/// Cisco's library as the starfold binary loaded it: the loader's handle and the memfd it was
+/// loaded from, which keep its code mapped; its entry points; what it is (Cisco's attribution,
+/// file and sha256); and where it came from. [`install`] keeps all of it for the life of the
+/// process.
+#[cfg(openh264_cisco_loadable)]
 #[doc(hidden)]
-pub struct Library {
+pub struct Handoff {
+    pub library: libloading::Library,
+    pub memfd: std::os::fd::OwnedFd,
     pub create: Create,
     pub destroy: Destroy,
     pub version: Version,
@@ -74,23 +88,67 @@ struct Loaded {
     api: Api,
     what: String,
     from: String,
+    /// What keeps the library mapped. In a static, so never dropped.
+    #[cfg(openh264_cisco_loadable)]
+    _keep: Option<(libloading::Library, std::os::fd::OwnedFd)>,
 }
 
 static LIBRARY: OnceLock<Result<Loaded, String>> = OnceLock::new();
+static HANDED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The starfold binary's hand-over: what its `main` loaded, or why nothing was. The first call
-/// counts; any later one, or one after the encoders have looked, changes nothing.
+/// The starfold binary's hand-over: what its `main` loaded, or why nothing was. The library and
+/// memfd move into a static here and are never unloaded or closed.
+///
+/// # Safety
+///
+/// Only the `starfold` binary's `main` calls this, once, first thing, before any encoder
+/// exists. In `Ok(h)`, `h.create`, `h.destroy` and `h.version` are `WelsCreateSVCEncoder`,
+/// `WelsDestroySVCEncoder` and `WelsGetCodecVersion` of `h.library`, and `h.library` is Cisco's
+/// OpenH264 2.6, loaded from `h.memfd`, whose encoders have the vtable openh264-sys2 0.9.9 binds.
+/// The encoders call these pointers and that vtable with no further check.
+///
+/// A second call, or one after the encoders have looked, is refused: nothing is installed and
+/// the `Handoff` given is dropped.
+#[cfg(openh264_cisco_loadable)]
 #[doc(hidden)]
-pub fn install(loaded: Result<Library, String>) {
-    let _ = LIBRARY.set(loaded.map(|l| Loaded {
+pub unsafe fn install(handoff: Result<Handoff, String>) -> Result<(), String> {
+    let loaded = handoff.map(|h| Loaded {
         api: Api {
-            create: l.create,
-            destroy: l.destroy,
-            version: l.version,
+            create: h.create,
+            destroy: h.destroy,
+            version: h.version,
         },
-        what: l.what,
-        from: l.from,
-    }));
+        what: h.what,
+        from: h.from,
+        _keep: Some((h.library, h.memfd)),
+    });
+    LIBRARY
+        .set(loaded)
+        .map_err(|_| "OpenH264: a library was already handed over, or the encoders already looked".into())?;
+    HANDED_OVER.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Whether the starfold binary's `main` handed over a library, or the reason it has none.
+/// Without that (a program that embeds the library), `--version` and `--help` don't offer
+/// Cisco's OpenH264.
+pub fn handed_over() -> bool {
+    #[cfg(test)]
+    if let Some(v) = PRETEND.with(std::cell::Cell::get) {
+        return v;
+    }
+    HANDED_OVER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRETEND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// For this test thread, what [`handed_over`] says.
+#[cfg(test)]
+pub(crate) fn pretend_handed_over(v: bool) {
+    PRETEND.with(|p| p.set(Some(v)));
 }
 
 fn library() -> &'static Result<Loaded, String> {
@@ -157,6 +215,8 @@ fn not_installed() -> Result<Loaded, String> {
             api: super::openh264::SOURCE,
             what: "OpenH264 compiled from source (tests only)".into(),
             from: "the dev-dependency".into(),
+            #[cfg(openh264_cisco_loadable)]
+            _keep: None,
         })
     };
     let Some(path) = lib_path(&[]) else {
@@ -164,15 +224,17 @@ fn not_installed() -> Result<Loaded, String> {
     };
     #[cfg(openh264_cisco_loadable)]
     {
-        let kept = cisco_load::open_checked(&path, PINS, platform_file().unwrap(), || {})?.keep();
+        let o =
+            cisco_load::open_checked(&path, &platform_pins(), platform_file().unwrap(), || {})?;
         Ok(Loaded {
             api: Api {
-                create: kept.create,
-                destroy: kept.destroy,
-                version: kept.version,
+                create: o.create,
+                destroy: o.destroy,
+                version: o.version,
             },
-            what: format!("{ATTRIBUTION} ({}, sha256 {})", kept.file, kept.sha256),
-            from: format!("{}, loaded as {}", path.display(), kept.name),
+            what: format!("{ATTRIBUTION} ({}, sha256 {})", o.file, o.sha256),
+            from: format!("{}, loaded as {}", path.display(), o.name),
+            _keep: Some((o.library, o.memfd)),
         })
     }
     #[cfg(not(openh264_cisco_loadable))]
@@ -238,9 +300,25 @@ mod tests {
     #[test]
     fn the_library_tests_run_on() {
         let v = unsafe { (api().unwrap().version)() };
-        let cisco = std::env::var_os(LIB_ENV).is_some();
+        let cisco = std::env::var_os(LIB_ENV).is_some() && cfg!(openh264_cisco_loadable);
         let want = if cisco { (2, 6) } else { (2, 7) };
         assert_eq!((v.uMajor, v.uMinor), want);
+    }
+
+    /// The loader is given this architecture's pin only: on x86-64 the authentic arm64 file's
+    /// sha256 is no pin, and the other way round.
+    #[test]
+    fn the_loader_gets_this_architectures_pin_only() {
+        let pins = platform_pins();
+        match platform_file() {
+            Some(f) => {
+                assert_eq!(pins.len(), 1, "{pins:?}");
+                assert_eq!(pins[0].1, f);
+                let other = PINS.iter().find(|p| p.1 != f).unwrap();
+                assert!(!pins.iter().any(|p| p.0 == other.0), "{pins:?}");
+            }
+            None => assert!(pins.is_empty(), "{pins:?}"),
+        }
     }
 
     /// Each architecture starfold loads Cisco's binary on has exactly one pin.

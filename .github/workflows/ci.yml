@@ -250,13 +250,21 @@ jobs:
           cat "$RUNNER_TEMP/embed.log"
           [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
           grep -q "available only in the starfold binary" "$RUNNER_TEMP/embed.log"
+          # Its --version and --help don't offer Cisco's OpenH264: nothing was handed over.
+          "$bin" --version > "$RUNNER_TEMP/embed-version.txt"
+          cat "$RUNNER_TEMP/embed-version.txt"
+          grep -qF "openh264 [OpenH264 (Cisco) is available only in the starfold binary]" "$RUNNER_TEMP/embed-version.txt" || { echo "::error::the embedding application's --version"; exit 1; }
+          "$bin" --help > "$RUNNER_TEMP/embed-help.txt"
+          if grep -q -- "--openh264-lib" "$RUNNER_TEMP/embed-help.txt"; then echo "::error::the embedding application's --help offers --openh264-lib"; exit 1; fi
       # Cisco's own file, fetched from Cisco and checked against the pin: every library test
       # runs on it (the_library_tests_run_on asserts 2.6), and the loader's own tests with it.
       # Then the server starts with it, from a plain build of the feature: the binary
       # `cargo test` builds also links the tests' OpenH264 (the dev-dependency's source
       # feature), so this step builds its own and checks that one: the load's own log line,
       # the registry /stats serves, and that the library is mapped from the sealed memfd, not
-      # from the file. The embedding application, given the same file, still refuses it.
+      # from the file. The load line must come from the one-thread-checked path. The embedding
+      # application, given the same file, still refuses it, and the authentic arm64 file is
+      # refused at the hash check (this runner is x86-64).
       - name: On Cisco's OpenH264
         run: |
           lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
@@ -282,7 +290,8 @@ jobs:
           ok=1
           loaded='OpenH264 loaded: OpenH264 Video Codec provided by Cisco Systems, Inc. (libopenh264-2.6.0-linux64.8.so, sha256 2f0cde7c6a6abcf5cae76942894ea42897fa677bce4ed6c91a24dd1b041d5f04), from '
           up && kill -0 $pid 2>/dev/null || ok=0
-          grep -qF "$loaded" "$log" || { echo "::error::no log line of the load itself"; ok=0; }
+          grep -qF "$loaded$lib, loaded as /proc/self/fd/" "$log" || { echo "::error::no log line of the load itself"; ok=0; }
+          grep -qE "OpenH264 loaded: .*, loaded as /proc/self/fd/[0-9]+ with one thread$" "$log" || { echo "::error::the load did not come from the one-thread check"; ok=0; }
           cat "/proc/$pid/maps" > "$RUNNER_TEMP/maps.txt" || ok=0
           grep -q '/memfd:starfold-openh264' "$RUNNER_TEMP/maps.txt" || { echo "::error::no mapping of the sealed memfd"; ok=0; }
           if grep -qF "$lib" "$RUNNER_TEMP/maps.txt"; then echo "::error::$lib itself is mapped"; ok=0; fi
@@ -304,6 +313,17 @@ jobs:
           cat "$RUNNER_TEMP/embed-lib.log"
           [ "$rc" = 2 ] || { echo "::error::the embedding application: exit $rc, not 2"; exit 1; }
           grep -q "available only in the starfold binary" "$RUNNER_TEMP/embed-lib.log"
+          # Cisco's authentic arm64 build, refused on this x86-64 runner at the hash check.
+          arm=$RUNNER_TEMP/libopenh264-2.6.0-linux-arm64.8.so
+          curl -fsSL --max-time 60 -o "$arm.bz2" https://ciscobinary.openh264.org/libopenh264-2.6.0-linux-arm64.8.so.bz2
+          bunzip2 -f "$arm.bz2"
+          sha256sum "$arm" > "$RUNNER_TEMP/arm.sha"
+          grep -q '^12e7b33623667cdab0e575170c147b1b36eadb77d0d2aa7ceb5afd3e58902140 ' "$RUNNER_TEMP/arm.sha" || { cat "$RUNNER_TEMP/arm.sha"; echo "::error::not Cisco's arm64 file"; exit 1; }
+          rc=0
+          timeout 60 target/debug/starfold --openh264-lib="$arm" --enable-basic-auth=false --audio-enabled=false --port=6905 > "$RUNNER_TEMP/arm.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/arm.log"
+          [ "$rc" = 2 ] || { echo "::error::the arm64 file: exit $rc, not 2"; exit 1; }
+          grep -qF "sha256 12e7b33623667cdab0e575170c147b1b36eadb77d0d2aa7ceb5afd3e58902140 is not Cisco's libopenh264-2.6.0-linux64.8.so" "$RUNNER_TEMP/arm.log" || { echo "::error::the arm64 file was not refused at the hash check"; exit 1; }
 
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)

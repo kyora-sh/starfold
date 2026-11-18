@@ -34,8 +34,8 @@ pub type Create = unsafe extern "C" fn(*mut *mut sys::ISVCEncoder) -> c_int;
 pub type Destroy = unsafe extern "C" fn(*mut sys::ISVCEncoder);
 pub type Version = unsafe extern "C" fn() -> sys::OpenH264Version;
 
-/// Cisco's library, loaded from its checked bytes: its entry points, what it is, and what keeps
-/// it loaded.
+/// Cisco's library, loaded from its checked bytes: its entry points, what it is, the loader's
+/// handle and the memfd it was loaded from.
 pub struct Opened {
     pub create: Create,
     pub destroy: Destroy,
@@ -45,43 +45,41 @@ pub struct Opened {
     pub sha256: String,
     /// The name it was loaded under, `/proc/self/fd/N`.
     pub name: String,
-    held: Held,
+    /// The threads the process ran right before the load, as [`load_alone`] counted them; `None`
+    /// when nothing counted them (the library's tests).
+    pub threads: Option<usize>,
+    pub library: libloading::Library,
+    pub memfd: OwnedFd,
 }
 
-/// Cisco's library, kept loaded for the life of the process.
-pub struct Kept {
-    pub create: Create,
-    pub destroy: Destroy,
-    pub version: Version,
-    pub file: &'static str,
-    pub sha256: String,
-    pub name: String,
-}
-
-impl Opened {
-    /// Keeps the library and its memfd for the life of the process: neither is ever closed.
-    pub fn keep(self) -> Kept {
-        std::mem::forget(self.held);
-        Kept {
-            create: self.create,
-            destroy: self.destroy,
-            version: self.version,
-            file: self.file,
-            sha256: self.sha256,
-            name: self.name,
-        }
-    }
-}
-
-/// The loader's handle and the memfd the library was loaded from.
-struct Held {
-    _lib: libloading::Library,
-    fd: OwnedFd,
-}
-
-/// The number of threads this process runs, from `/proc/self/task`.
+/// The number of threads this process runs: the entries of `/proc/self/task`. Any error opening
+/// or reading the directory is an error, never a count.
 pub fn threads() -> std::io::Result<usize> {
-    Ok(std::fs::read_dir("/proc/self/task")?.count())
+    count(std::fs::read_dir("/proc/self/task")?)
+}
+
+fn count<T>(entries: impl Iterator<Item = std::io::Result<T>>) -> std::io::Result<usize> {
+    let mut n = 0;
+    for e in entries {
+        e?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Whether a load may go ahead, given the thread count: exactly one, or it refuses.
+fn alone(path: &Path, threads: std::io::Result<usize>) -> Result<(), String> {
+    let shown = path.display();
+    match threads {
+        Ok(1) => Ok(()),
+        Ok(n) => Err(format!(
+            "OpenH264 library {shown}: {ONE_THREAD} ({n} threads)"
+        )),
+        Err(e) => Err(format!(
+            "OpenH264 library {shown}: not loading OpenH264 without a thread count: \
+             /proc/self/task: {e}"
+        )),
+    }
 }
 
 /// Loads the pinned build at `path`, but only while this process runs exactly one thread.
@@ -90,17 +88,10 @@ pub fn load_alone(
     pins: &[(&'static str, &'static str)],
     expected: &str,
 ) -> Result<Opened, String> {
-    let shown = path.display();
-    match threads() {
-        Ok(1) => {}
-        Ok(n) => {
-            return Err(format!(
-                "OpenH264 library {shown}: {ONE_THREAD} ({n} threads)"
-            ))
-        }
-        Err(e) => return Err(format!("OpenH264 library {shown}: /proc/self/task: {e}")),
-    }
-    open_checked(path, pins, expected, || {})
+    alone(path, threads())?;
+    let mut opened = open_checked(path, pins, expected, || {})?;
+    opened.threads = Some(1);
+    Ok(opened)
 }
 
 /// Reads `path` once, checks its sha256 against `pins`, and loads those bytes from a sealed
@@ -348,7 +339,9 @@ fn load_memfd(fd: OwnedFd, file: &'static str, sha256: String) -> Result<Opened,
         file,
         sha256,
         name,
-        held: Held { _lib: lib, fd },
+        threads: None,
+        library: lib,
+        memfd: fd,
     })
 }
 
@@ -417,6 +410,23 @@ mod tests {
         assert!(e.contains(ONE_THREAD), "{e}");
         tx.send(()).unwrap();
         other.join().unwrap();
+    }
+
+    /// An error reading `/proc/self/task`, before or among its entries, is no count: the load is
+    /// refused. Only a count of exactly one lets it go ahead.
+    #[test]
+    fn a_thread_count_that_cannot_be_read_refuses_the_load() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(count([Err::<(), _>(denied())].into_iter()).is_err());
+        assert!(count([Ok(()), Err(denied())].into_iter()).is_err());
+        assert_eq!(count([Ok(())].into_iter()).unwrap(), 1);
+        let p = Path::new("/x/lib.so");
+        assert!(alone(p, Err(denied()))
+            .unwrap_err()
+            .contains("without a thread count"));
+        assert!(alone(p, Ok(0)).unwrap_err().contains(ONE_THREAD));
+        assert!(alone(p, Ok(2)).unwrap_err().contains(ONE_THREAD));
+        assert!(alone(p, Ok(1)).is_ok());
     }
 
     #[test]
@@ -543,7 +553,7 @@ mod tests {
         assert_eq!((v.uMajor, v.uMinor), (2, 6));
         assert_eq!(
             mapping_of(opened.create as usize).unwrap(),
-            Some(file_id(&opened.held.fd).unwrap())
+            Some(file_id(&opened.memfd).unwrap())
         );
         let maps = std::fs::read("/proc/self/maps").unwrap();
         let dir_bytes = dir.as_os_str().as_encoded_bytes();

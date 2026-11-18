@@ -176,19 +176,17 @@ fn encoder_entries(usage: &str) -> String {
             arms.join(", ")
         ),
     };
-    let not_here = |name: &str| build_facts::not_on_this_platform(name);
-    let fallback = match not_here(sw) {
-        true => format!(
-            "{sw}, which is not available on this platform yet, so without a usable hardware \
-             H.264 encoder starfold exits at startup"
+    let fallback = match build_facts::unavailable_note(sw) {
+        Some(why) => format!(
+            "{sw} ({why}), so without a usable hardware H.264 encoder starfold exits at startup"
         ),
-        false => sw.to_string(),
+        None => sw.to_string(),
     };
     let pinnable: Vec<String> = build_facts::h264_encoders()
         .into_iter()
-        .map(|name| match not_here(name) {
-            true => format!("{name} ({})", build_facts::CISCO_NOT_YET),
-            false => name.to_string(),
+        .map(|name| match build_facts::unavailable_note(name) {
+            Some(why) => format!("{name} ({why})"),
+            None => name.to_string(),
         })
         .collect();
     let encoder = format!(
@@ -243,22 +241,24 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
+    // In a program that embeds the library nothing was handed over, and the flag does nothing.
     #[cfg(feature = "openh264-cisco")]
     let openh264 = {
         use crate::encoder::cisco;
-        entry(
-            "--openh264-lib",
-            &match cisco::platform_file() {
-                Some(f) => format!(
+        match cisco::platform_file() {
+            Some(_) if !cisco::handed_over() => String::new(),
+            Some(f) => entry(
+                "--openh264-lib",
+                &format!(
                     "Cisco's OpenH264 binary ({f}), loaded by the starfold binary at startup \
                      only if its sha256 is the build starfold pins (default ${}); without it \
                      there is no OpenH264. {}",
                     cisco::LIB_ENV,
                     cisco::ATTRIBUTION
                 ),
-                None => format!("{}.", cisco::NOT_AVAILABLE),
-            },
-        )
+            ),
+            None => entry("--openh264-lib", &format!("{}.", cisco::NOT_AVAILABLE)),
+        }
     };
     #[cfg(not(feature = "openh264-cisco"))]
     let openh264 = String::new();
@@ -364,23 +364,29 @@ mod tests {
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
         assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
         let sw = build_facts::software_h264();
-        let fallback = match build_facts::not_on_this_platform(sw) {
-            true => format!("H.264 from {sw}, which is not available on this platform yet,"),
-            false => format!("H.264 from {sw} where there is none"),
+        let fallback = match build_facts::unavailable_note(sw) {
+            Some(why) => format!("H.264 from {sw} ({why}), so without"),
+            None => format!("H.264 from {sw} where there is none"),
         };
         assert!(words.contains(&fallback), "{text}");
         assert!(!text.contains("_ENTRY"), "{text}");
     }
 
-    /// A build that loads Cisco's binary shows `--openh264-lib` with Cisco's attribution
-    /// exactly; the feature on a target starfold doesn't load it on says it is not available
-    /// there yet; no other build mentions either.
-    #[test]
-    fn help_shows_ciscos_attribution_only_with_its_binary() {
-        let words = help_text("1.2.3", "0.0.0.0")
+    fn help_words() -> String {
+        help_text("1.2.3", "0.0.0.0")
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+    }
+
+    /// The starfold binary that loads Cisco's binary shows `--openh264-lib` with Cisco's
+    /// attribution exactly; the feature on a target starfold doesn't load it on says it is not
+    /// available there yet; no other build mentions either.
+    #[test]
+    fn help_shows_ciscos_attribution_only_with_its_binary() {
+        #[cfg(feature = "openh264-cisco")]
+        crate::encoder::cisco::pretend_handed_over(true);
+        let words = help_words();
         let attribution = "OpenH264 Video Codec provided by Cisco Systems, Inc.";
         let not_yet = "OpenH264 (Cisco) is not available on this platform yet";
         let cisco = cfg!(feature = "openh264-cisco");
@@ -395,6 +401,28 @@ mod tests {
         );
         #[cfg(feature = "openh264-cisco")]
         assert_eq!(crate::encoder::cisco::ATTRIBUTION, attribution);
+    }
+
+    /// A program that embeds the library (nothing handed over) offers neither the flag nor
+    /// Cisco's attribution where the binary would load it, and says why OpenH264 is unavailable.
+    #[test]
+    fn help_in_a_program_that_embeds_the_library_offers_no_cisco_openh264() {
+        #[cfg(feature = "openh264-cisco")]
+        crate::encoder::cisco::pretend_handed_over(false);
+        let words = help_words();
+        let loadable = cfg!(openh264_cisco_loadable);
+        if loadable {
+            assert!(!words.contains("--openh264-lib"), "{words}");
+            assert!(
+                !words.contains("OpenH264 Video Codec provided by Cisco Systems, Inc."),
+                "{words}"
+            );
+        }
+        assert_eq!(
+            words.contains("OpenH264 (Cisco) is available only in the starfold binary"),
+            loadable,
+            "{words}"
+        );
     }
 
     #[test]

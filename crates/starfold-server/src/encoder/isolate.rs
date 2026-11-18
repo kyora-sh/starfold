@@ -111,6 +111,12 @@ pub struct Report {
 
 /// The child's side, given the arguments after [`FLAG`]; returns the exit code.
 pub fn child_main(args: &[String]) -> i32 {
+    // A probe child probes hardware encoders only; Cisco's OpenH264 is the server's alone.
+    #[cfg(feature = "openh264-cisco")]
+    if super::cisco::handed_over() {
+        eprintln!("{FLAG}: a probe child must not have Cisco's OpenH264 handed over");
+        return 3;
+    }
     if let Some(i) = args.iter().position(|a| a == SESSION) {
         return session_main(args.first().map(String::as_str), args.get(i + 1));
     }

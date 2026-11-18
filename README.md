@@ -350,7 +350,8 @@ neither contains nor downloads. The binary stays under starfold's MIT licence.
 Cisco's OpenH264 is a property of the `starfold` binary, not of the crate. The binary loads it
 first thing in its `main`, before starfold starts its logger, its panic hook or any thread. A
 program that embeds starfold's library with this feature doesn't load it: OpenH264 is then
-unavailable there, with "OpenH264 (Cisco) is available only in the starfold binary".
+unavailable there, with "OpenH264 (Cisco) is available only in the starfold binary". Its
+`--version` says so too, and its `--help` doesn't offer `--openh264-lib`.
 
 - **Loading it:** pass the file's path with `--openh264-lib PATH` or `STARFOLD_OPENH264_LIB`.
   - Cisco publishes the file at `https://ciscobinary.openh264.org/<file>.bz2`;
@@ -374,11 +375,14 @@ unavailable there, with "OpenH264 (Cisco) is available only in the starfold bina
   - Each entry point it takes from the library must lie in that mapping too, and the library must
     report version 2.6.
 - **What this protects against:** an attacker who can replace the file at the given path, before
-  or after the check, is in scope. One who controls starfold's environment (`LD_PRELOAD`, for
-  one) or its process is not.
-- **Other platforms:** not yet. On macOS, Windows, musl (static or not), x32 and any other
-  target, `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the
-  startup log say "OpenH264 (Cisco) is not available on this platform yet".
+  or after the check, is in scope. Two things are outside what starfold checks:
+  - starfold's environment (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`) or its process;
+  - the system libraries Cisco's file needs (`libstdc++`, `libm`, `libgcc_s`, `libc`). The
+    system's dynamic loader loads those from the usual library paths, as it does starfold's own
+    libraries, and starfold doesn't hash them.
+- **Other platforms:** not yet. On macOS, Windows, Linux with musl (static or not) and x32,
+  `openh264-cisco` builds, and OpenH264 is unavailable. `--version`, `--help` and the startup
+  log say "OpenH264 (Cisco) is not available on this platform yet".
   - `/stats` says so too when another encoder serves H.264 and starfold starts.
   - Without one, as in a build without x264 and with no usable hardware H.264 encoder, starfold
     exits 2 at startup with that reason, and there is no `/stats`; `--help` says so.

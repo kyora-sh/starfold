@@ -16,6 +16,20 @@ fn unknown_backend_is_refused() {
     assert!(s.stdout.is_empty());
 }
 
+/// A probe child loads no OpenH264, even with a library path in its environment: a library
+/// handed over in a probe child makes it exit 3, and the binary skips the load there.
+#[test]
+fn a_probe_child_loads_no_openh264() {
+    let s = starfold()
+        .args([FLAG, "bogus"])
+        .env("STARFOLD_OPENH264_LIB", "/nonexistent/libopenh264.so")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&s.stderr);
+    assert_eq!(s.status.code(), Some(2), "{err}");
+    assert!(!err.contains("must not have Cisco's OpenH264"), "{err}");
+}
+
 #[test]
 fn experimental_probe_is_refused_without_the_flag() {
     let s = starfold().args([FLAG, "nvenc"]).output().unwrap();
