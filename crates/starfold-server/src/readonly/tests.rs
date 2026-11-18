@@ -46,7 +46,13 @@ fn raw_string(t: &[u8], i: usize) -> Option<(usize, usize, usize)> {
     let hashes = j - hashes_from;
     let mut k = j + 1;
     while k < t.len() {
-        if t[k] == b'"' && t[k + 1..].iter().take(hashes).filter(|h| **h == b'#').count() == hashes
+        if t[k] == b'"'
+            && t[k + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|h| **h == b'#')
+                .count()
+                == hashes
         {
             return Some((j + 1 - i, hashes, k + 1 + hashes));
         }
@@ -221,10 +227,16 @@ fn calls(blank: &str) -> Vec<Call> {
         let (macro_call, turbofish, open) = match b.get(k) {
             Some(b'!') => {
                 let k = skip_ws(blank, k + 1);
-                (true, false, matches!(b.get(k), Some(b'(' | b'[' | b'{')).then_some(k + 1))
+                (
+                    true,
+                    false,
+                    matches!(b.get(k), Some(b'(' | b'[' | b'{')).then_some(k + 1),
+                )
             }
             Some(b'(') => (false, false, Some(k + 1)),
-            Some(b':') if blank[k..].starts_with("::") && b.get(skip_ws(blank, k + 2)) == Some(&b'<') => {
+            Some(b':')
+                if blank[k..].starts_with("::") && b.get(skip_ws(blank, k + 2)) == Some(&b'<') =>
+            {
                 (false, true, None)
             }
             _ => {
@@ -284,8 +296,7 @@ fn method_of(f: &str) -> Option<&'static str> {
 
 fn is_path(s: &str) -> bool {
     !s.is_empty()
-        && s
-            .split("::")
+        && s.split("::")
             .all(|seg| !seg.is_empty() && seg.bytes().all(is_ident))
 }
 
@@ -375,7 +386,8 @@ fn registering_uses(blank: &str) -> Vec<(usize, &'static str)> {
         for at in words(blank, name) {
             let before = blank[..at].trim_end();
             let after = blank[at + name.len()..].trim_start();
-            let method = before.ends_with('.') && (after.starts_with('(') || after.starts_with("::"));
+            let method =
+                before.ends_with('.') && (after.starts_with('(') || after.starts_with("::"));
             if method || before.ends_with("::") {
                 out.push((at, *name));
             }
@@ -489,9 +501,12 @@ fn commands(text: &str) -> (BTreeSet<String>, Vec<String>) {
     for at in words(&blank, "cmd").filter(|at| (from..to).contains(at)) {
         let before = blank[from..at].trim_end();
         let after = blank[at + 3..to].trim_start();
-        if before.ends_with("let (") && after.starts_with(", rest)") {
-        } else if before.ends_with("crate::readonly::command(") && after.starts_with(')') {
-        } else if before.ends_with("match") && after.starts_with('{') && matched.is_none() {
+        let bound = before.ends_with("let (") && after.starts_with(", rest)");
+        let decided = before.ends_with("crate::readonly::command(") && after.starts_with(')');
+        if bound || decided {
+            continue;
+        }
+        if before.ends_with("match") && after.starts_with('{') && matched.is_none() {
             matched = Some(to - after.len());
         } else {
             refused.push(format!("cmd used at byte {at}: {}", snippet(&code, at)));
@@ -702,11 +717,11 @@ fn routes_are_only_registered_where_the_table_is_checked() {
             continue;
         }
         let Src { code, blank } = lex(&text);
-        for (at, name) in registering_uses(&blank) {
+        if let Some((at, name)) = registering_uses(&blank).first() {
             panic!(
                 "{} uses {name} at byte {at} ({}): routes are added in server.rs's router(), before the read-only layer",
                 path.display(),
-                snippet(&code, at)
+                snippet(&code, *at)
             );
         }
         for word in ["Router", "MethodRouter"] {
