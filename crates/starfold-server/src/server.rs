@@ -281,15 +281,26 @@ pub fn bind_unix(
             format!("{} changed while it was set up", path.display()),
         )
     };
-    let dir =
-        open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|e| {
-            match e.raw_os_error() {
-                Some(libc::ELOOP | libc::ENOTDIR) => moved(),
-                _ => e,
-            }
-        })?;
-    let st = fstat(&dir)?;
-    let made = stat_at(&parent, &name)?;
+    // Until the directory is open, what can't be set up takes back the empty directory just
+    // made (an empty directory of ours under that name; a umask of 0777, say, makes one
+    // even its owner can't open), so the next start isn't refused for it.
+    let unmake = |e: Error| {
+        let ours = stat_at(&parent, &name).is_ok_and(|s| {
+            s.st_mode & libc::S_IFMT == libc::S_IFDIR && s.st_uid == unsafe { libc::geteuid() }
+        });
+        if ours {
+            let _ = unlink_at(&parent, &name, libc::AT_REMOVEDIR);
+        }
+        e
+    };
+    let dir = open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => moved(),
+            _ => e,
+        })
+        .map_err(unmake)?;
+    let st = fstat(&dir).map_err(unmake)?;
+    let made = stat_at(&parent, &name).map_err(unmake)?;
     if st.st_uid != unsafe { libc::geteuid() }
         || st.st_mode & libc::S_IFMT != libc::S_IFDIR
         || id(&st) != id(&made)
@@ -303,8 +314,28 @@ pub fn bind_unix(
         dir_id: id(&st),
         socket_id: None,
     };
+    // Connecting takes write permission on the socket, so only a class that has it gets
+    // search permission on the directory.
     let reach =
-        (if mode & 0o070 != 0 { 0o010 } else { 0 }) | (if mode & 0o007 != 0 { 0o001 } else { 0 });
+        (if mode & 0o020 != 0 { 0o010 } else { 0 }) | (if mode & 0o002 != 0 { 0o001 } else { 0 });
+    // The directory's group is the one the socket gets (this process's), whatever a setgid
+    // parent gave it, so the group that may connect is the group that may search.
+    let egid = unsafe { libc::getegid() };
+    if st.st_gid != egid {
+        let set = cvt(unsafe { libc::fchown(file.dir.as_raw_fd(), libc::uid_t::MAX, egid) })
+            .is_ok()
+            && fstat(&file.dir).is_ok_and(|s| s.st_gid == egid);
+        if !set {
+            remove_unix(&file);
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{}: its group can't be this process's ({egid}), as the socket's will be",
+                    path.display()
+                ),
+            ));
+        }
+    }
     let set_mode = |file: &SocketFile, m: u32| -> std::io::Result<()> {
         cvt(unsafe { libc::fchmod(file.dir.as_raw_fd(), m as libc::mode_t) })?;
         match fstat(&file.dir)?.st_mode as u32 & 0o7777 == m {
@@ -1691,6 +1722,11 @@ mod tests {
                 (0o660, 0o710),
                 (0o606, 0o701),
                 (0o666, 0o711),
+                // Read alone doesn't let a class connect, so it doesn't let it search.
+                (0o640, 0o700),
+                (0o604, 0o700),
+                (0o620, 0o710),
+                (0o602, 0o701),
             ] {
                 let at = d.join(format!("m{mode:o}"));
                 let (l, file) = bind_unix(&at, mode).unwrap();
@@ -1702,6 +1738,77 @@ mod tests {
                 assert!(!at.exists());
             }
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// Under a setgid parent of another group the directory would take that group; it
+        /// gets this process's instead, the socket's, so the group that may connect is the
+        /// one that may search. Needs a supplementary group other than the effective one.
+        #[test]
+        fn a_setgid_parent_leaves_the_directory_in_the_sockets_group() {
+            use std::os::unix::fs::MetadataExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let egid = unsafe { libc::getegid() };
+            let mut groups = vec![0 as libc::gid_t; 256];
+            let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+            let Some(other) = groups[..n.max(0) as usize]
+                .iter()
+                .copied()
+                .find(|&g| g != egid)
+            else {
+                eprintln!("skipped: no supplementary group other than {egid}");
+                return;
+            };
+            let d = dir("setgid");
+            let c = std::ffi::CString::new(d.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), libc::uid_t::MAX, other) }, 0);
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2700)).unwrap();
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o660).unwrap();
+            let meta = |p: &std::path::Path| std::fs::metadata(p).unwrap();
+            assert_eq!(meta(&at).gid(), egid, "the directory's group");
+            assert_eq!(meta(&unix_socket_path(&at)).gid(), egid, "the socket's group");
+            assert_eq!(meta(&at).mode() & 0o7777, 0o710);
+            drop(l);
+            remove_unix(&file);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// Under a umask of 0777 the directory comes out mode 000, which even its owner
+        /// can't open: the setup fails, and takes the directory back so the next start can
+        /// make it. The umask is the process's, so this runs in a child process of its own.
+        #[test]
+        fn a_directory_its_owner_cant_open_is_taken_back() {
+            const CHILD: &str = "STARFOLD_TEST_UMASK_CHILD";
+            if let Some(at) = std::env::var_os(CHILD) {
+                if unsafe { libc::geteuid() } == 0 {
+                    eprintln!("skipped: root opens a mode-000 directory");
+                    return;
+                }
+                unsafe { libc::umask(0o777) };
+                let rt = runtime();
+                let _guard = rt.enter();
+                let at = std::path::PathBuf::from(at);
+                let e = bind_unix(&at, 0o600).unwrap_err();
+                assert!(!at.exists(), "{} left behind ({e})", at.display());
+                return;
+            }
+            let d = dir("umask");
+            let at = d.join("sf");
+            let name = "server::tests::socket::a_directory_its_owner_cant_open_is_taken_back";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, &at)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+            assert!(!at.exists());
             std::fs::remove_dir_all(&d).unwrap();
         }
 
