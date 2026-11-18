@@ -1160,22 +1160,30 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
-/// How far a refining pass may come out below the one before and still count as no worse: at
-/// one thread x264 gives the same PSNR on every run, but sliced threads under VBV code rows by
-/// timing. Alone, 200 runs of the test below gave 200 different motion PSNRs (33.62 to 35.61
-/// dB); under the full suite's load its first budgeted step came out 6e-5 dB lower, twice. The
-/// smallest real step measured is +3.35 dB.
+/// How far a refining pass with sliced threads may come out below the one before and still
+/// count as no worse. At one thread x264 gives the same PSNR on every run, so a step there is
+/// held to no loss at all. Sliced threads under VBV code rows by timing: alone, 200 runs of the
+/// test below gave 200 different motion PSNRs (33.62 to 35.61 dB) and a first budgeted step
+/// between 0 and +0.0053 dB; under the full suite's load that step came out 6.06e-5 dB lower,
+/// twice. Every other step either gained nothing (one thread's first budgeted step) or at least
+/// +3.35 dB.
 #[cfg(feature = "x264")]
 const REFINE_NOISE_DB: f64 = 0.01;
 
-/// x264 under VBV, as it streams: no pass leaves the picture worse (by more than
-/// [`REFINE_NOISE_DB`]) and the ladder ends far sharper than motion left it, with or without a
-/// byte budget, at one thread or sliced. A budgeted first step may change nothing: motion counts
-/// as QP 51 until a pass proves better.
+/// x264 under VBV, as it streams: no pass leaves the picture worse (sliced, by more than
+/// [`REFINE_NOISE_DB`]) and the ladder ends far sharper than motion left it, at one thread and
+/// sliced, each with and without a byte budget. A budgeted first step may change nothing: motion
+/// records its blocks at QP 52, above any QP a pass aims for, until a pass proves better.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
-    for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, Some(60_000))] {
+    for (threads, max_bytes) in [
+        (1, None),
+        (1, Some(60_000)),
+        (4, None),
+        (4, Some(60_000)),
+    ] {
+        let noise = if threads > 1 { REFINE_NOISE_DB } else { 0.0 };
         let mut s = Refining::on(Backend::X264, threads, 30);
         s.enc.set_rate(RateConfig::new(24.0, 3000, 30)).unwrap();
         s.scroll(30);
@@ -1187,7 +1195,7 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
             assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
             assert!(
-                s.last_psnr >= prev - REFINE_NOISE_DB,
+                s.last_psnr >= prev - noise,
                 "{at}: {} after {prev}",
                 s.last_psnr
             );
