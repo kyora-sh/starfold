@@ -26,7 +26,8 @@ function frame(kind: number, payload: Uint8Array): Uint8Array<ArrayBuffer> {
 /** The most bytes one message from the page may carry, as the server takes it: framed, the
  * cap less the kind byte (in one frame or several); plain, one 16 MiB WebSocket frame,
  * which is how a browser sends a message. */
-export const sendLimit = (framed: boolean) => (framed ? MAX_MESSAGE - 1 : 16 << 20);
+export const sendLimit = (framed: boolean) =>
+	framed ? MAX_MESSAGE - 1 : 16 << 20;
 
 export const frameText = (s: string) => frame(Kind.Text, encoder.encode(s));
 
