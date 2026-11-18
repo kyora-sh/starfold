@@ -398,8 +398,13 @@ fn registering_uses(blank: &str) -> Vec<(usize, &'static str)> {
 
 fn snippet(code: &str, at: usize) -> String {
     let end = (at + 60).min(code.len());
-    let end = (end..=code.len()).find(|e| code.is_char_boundary(*e)).unwrap();
-    code[at..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    let end = (end..=code.len())
+        .find(|e| code.is_char_boundary(*e))
+        .unwrap();
+    code[at..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What router() in `text` registers, as (method, path), and every form the scan does not
@@ -426,10 +431,13 @@ fn registrations(text: &str) -> (BTreeSet<(String, String)>, Vec<String>) {
         let inside = (from..to).contains(&c.at);
         let what = format!("{} at byte {}: {}", c.path, c.at, snippet(&code, c.at));
         if REGISTERING.contains(&c.name.as_str()) {
-            let Some(open) = c.open.filter(|_| {
-                inside && c.method && !c.turbofish && !c.macro_call && c.at < layer
-            }) else {
-                refused.push(format!("a registration outside router()'s chain before the read-only layer: {what}"));
+            let Some(open) = c
+                .open
+                .filter(|_| inside && c.method && !c.turbofish && !c.macro_call && c.at < layer)
+            else {
+                refused.push(format!(
+                    "a registration outside router()'s chain before the read-only layer: {what}"
+                ));
                 continue;
             };
             let close = closing(&blank, open, b'(', b')');
@@ -454,7 +462,10 @@ fn registrations(text: &str) -> (BTreeSet<(String, String)>, Vec<String>) {
                             && !p.contains('\\');
                         ok.then(|| p[1..p.len() - 1].to_string())
                     });
-                    match (path, comma.and_then(|comma| chain(&blank, comma + 1, close))) {
+                    match (
+                        path,
+                        comma.and_then(|comma| chain(&blank, comma + 1, close)),
+                    ) {
                         (Some(path), Some(methods)) => {
                             accepted.insert(c.at);
                             for m in methods {
@@ -464,7 +475,9 @@ fn registrations(text: &str) -> (BTreeSet<(String, String)>, Vec<String>) {
                         _ => refused.push(format!("a route the scan cannot read: {what}")),
                     }
                 }
-                "merge" if is_path(blank[open..close].trim()) && !blank[open..close].contains("::") => {
+                "merge"
+                    if is_path(blank[open..close].trim()) && !blank[open..close].contains("::") =>
+                {
                     accepted.insert(c.at);
                 }
                 _ => refused.push(format!("a registration the scan does not parse: {what}")),
@@ -483,7 +496,11 @@ fn registrations(text: &str) -> (BTreeSet<(String, String)>, Vec<String>) {
         }
     }
     for (at, name) in registering_uses(&blank) {
-        if !accepted.contains(&at) && !refused.iter().any(|r| r.contains(&format!("at byte {at}:"))) {
+        if !accepted.contains(&at)
+            && !refused
+                .iter()
+                .any(|r| r.contains(&format!("at byte {at}:")))
+        {
             refused.push(format!("{name} used at byte {at}: {}", snippet(&code, at)));
         }
     }
@@ -531,7 +548,9 @@ fn commands(text: &str) -> (BTreeSet<String>, Vec<String>) {
             refused.push(format!("an arm without =>: {}", snippet(&code, i)));
             break;
         };
-        let guard = words(&blank[..arrow], "if").find(|g| *g >= i).unwrap_or(arrow);
+        let guard = words(&blank[..arrow], "if")
+            .find(|g| *g >= i)
+            .unwrap_or(arrow);
         let mut alt = i;
         for end in (i..guard).filter(|e| b[*e] == b'|').chain([guard]) {
             let lit = code[alt..end].trim();
@@ -544,7 +563,10 @@ fn commands(text: &str) -> (BTreeSet<String>, Vec<String>) {
             if plain {
                 out.insert(lit[1..lit.len() - 1].to_string());
             } else if lit != "_" {
-                refused.push(format!("an arm the scan does not read: {}", snippet(&code, alt)));
+                refused.push(format!(
+                    "an arm the scan does not read: {}",
+                    snippet(&code, alt)
+                ));
             }
             alt = end + 1;
         }
@@ -668,12 +690,18 @@ fn the_scan_reads_what_it_knows_and_refuses_the_rest() {
         assert!(!refused.is_empty(), "not refused: {chain}");
     }
     let late = router_with("").replace("\n}", "\n    .route(\"/late\", get(a))\n}");
-    assert!(!registrations(&late).1.is_empty(), "a route after the layer");
+    assert!(
+        !registrations(&late).1.is_empty(),
+        "a route after the layer"
+    );
     let local = router_with("").replace(
         "    Router::new()\n",
         "    let h = axum::routing::head(x);\n    Router::new()\n",
     );
-    assert!(!registrations(&local).1.is_empty(), "a method router in a local");
+    assert!(
+        !registrations(&local).1.is_empty(),
+        "a method router in a local"
+    );
     let (commands_found, refused) = commands(&handle_text_with(""));
     assert!(refused.is_empty(), "{refused:#?}");
     let want = ["a", "b", "c", "d", "e", "f"].map(String::from);

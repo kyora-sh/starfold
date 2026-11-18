@@ -1086,10 +1086,7 @@ mod tests {
 
     /// The width and height an MP4's avc1 sample entry gives its samples.
     fn dims(mp4: &[u8]) -> (u16, u16) {
-        let stsd = find(
-            mp4,
-            &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
-        );
+        let stsd = find(mp4, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]);
         assert_eq!(&stsd[12..16], b"avc1");
         let at = 16 + 24;
         (
@@ -1099,8 +1096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_frame_read_after_the_hub_has_a_new_size_keeps_the_size_the_recording_started_with()
-    {
+    async fn a_frame_read_after_the_hub_has_a_new_size_keeps_the_size_the_recording_started_with() {
         // A capture rebuild sets the hub's new size and says hello while a frame captured at
         // the old size is still queued for the recorder.
         let hub = Hub::new();
@@ -1143,7 +1139,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         stop_tx.send(()).unwrap();
         let c = done.await.unwrap().unwrap();
-        assert_eq!(c.end, End::Stopped, "the hello is for the size it started with");
+        assert_eq!(
+            c.end,
+            End::Stopped,
+            "the hello is for the size it started with"
+        );
         assert_eq!(c.segments[0].frames, 2);
         assert_eq!(dims(&c.segments[0].mp4), (800, 600));
     }
