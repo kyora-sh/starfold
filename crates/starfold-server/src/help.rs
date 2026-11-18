@@ -250,8 +250,9 @@ fn encoder_entries(usage: &str) -> String {
             "--openh264-lib",
             &match cisco::platform_file() {
                 Some(f) => format!(
-                    "Cisco's OpenH264 binary ({f}), loaded only if its sha256 is the build \
-                     starfold pins (default ${}); without it there is no OpenH264. {}",
+                    "Cisco's OpenH264 binary ({f}), loaded by the starfold binary at startup \
+                     only if its sha256 is the build starfold pins (default ${}); without it \
+                     there is no OpenH264. {}",
                     cisco::LIB_ENV,
                     cisco::ATTRIBUTION
                 ),

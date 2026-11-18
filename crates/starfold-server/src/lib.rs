@@ -174,10 +174,14 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(2);
         }
     };
-    // --openh264-lib: Cisco's OpenH264 binary, loaded once before the encoders are probed.
+    // Cisco's OpenH264, as the starfold binary's main loaded it before anything else.
     #[cfg(feature = "openh264-cisco")]
-    if let Err(e) = encoder::cisco::load(a.get("openh264-lib").map(std::path::Path::new)) {
-        log::warn!("OpenH264 unavailable: {e}");
+    match encoder::cisco::status() {
+        Ok(what) => log::info!(
+            "OpenH264 loaded: {what}, from {}",
+            encoder::cisco::origin().unwrap_or("")
+        ),
+        Err(e) => log::warn!("OpenH264 unavailable: {e}"),
     }
     #[cfg(not(feature = "openh264-cisco"))]
     if a.contains_key("openh264-lib") {

@@ -195,7 +195,9 @@ jobs:
           if grep -Eq ' [A-Za-z] WelsCreateSVCEncoder$' "$RUNNER_TEMP/syms.txt"; then
             echo "::error::the binary contains OpenH264"; exit 1
           fi
-          target/debug/starfold --version
+          target/debug/starfold --version > "$RUNNER_TEMP/version.txt"
+          cat "$RUNNER_TEMP/version.txt"
+          grep -qF "(encoders: openh264 [Cisco's binary, loaded at run time]; licence: MIT)" "$RUNNER_TEMP/version.txt" || { echo "::error::--version does not name Cisco's binary"; exit 1; }
           rc=0
           timeout 60 target/debug/starfold --enable-basic-auth=false --audio-enabled=false --port=6902 > "$RUNNER_TEMP/nolib.log" 2>&1 || rc=$?
           cat "$RUNNER_TEMP/nolib.log"
@@ -207,8 +209,9 @@ jobs:
       # never refers to it. In the debug build each function keeps its own calls, and
       # referrers.awk follows calls, jumps and addresses taken in code, named or through GOT
       # slots, back from OpenH264's C entry points (not references held only in other data). The
-      # application's own call must show up, or the check sees nothing. Without a library,
-      # starfold in that binary still does not start.
+      # application's own call must show up, or the check sees nothing. Cisco's OpenH264 is the
+      # starfold binary's alone: started from the application, starfold refuses it ("available
+      # only in the starfold binary") and, with no other H.264 encoder, does not start.
       - name: Embedded beside OpenH264 from source
         run: |
           cp Cargo.lock .github/fixtures/embed-source/Cargo.lock
@@ -246,16 +249,20 @@ jobs:
           timeout 60 "$bin" --enable-basic-auth=false --audio-enabled=false --port=6903 > "$RUNNER_TEMP/embed.log" 2>&1 || rc=$?
           cat "$RUNNER_TEMP/embed.log"
           [ "$rc" = 2 ] || { echo "::error::exit $rc, not 2"; exit 1; }
-          grep -q "no OpenH264 library" "$RUNNER_TEMP/embed.log"
+          grep -q "available only in the starfold binary" "$RUNNER_TEMP/embed.log"
       # Cisco's own file, fetched from Cisco and checked against the pin: every library test
-      # runs on it (the_library_tests_run_on asserts 2.6), with the swap and name-reuse tests.
+      # runs on it (the_library_tests_run_on asserts 2.6), and the loader's own tests with it.
       # Then the server starts with it, from a plain build of the feature: the binary
       # `cargo test` builds also links the tests' OpenH264 (the dev-dependency's source
-      # feature), so this step builds its own and checks that one, and that the library is
-      # mapped from the sealed memfd, not from the file.
+      # feature), so this step builds its own and checks that one: the load's own log line,
+      # the registry /stats serves, and that the library is mapped from the sealed memfd, not
+      # from the file. The embedding application, given the same file, still refuses it.
       - name: On Cisco's OpenH264
         run: |
           lib=$(scripts/fetch-openh264.sh "$RUNNER_TEMP/openh264")
+          # What the system loader resolves for Cisco's file (not hash-checked, like starfold's own libraries).
+          readelf -d "$lib" > "$RUNNER_TEMP/cisco-dynamic.txt"
+          grep NEEDED "$RUNNER_TEMP/cisco-dynamic.txt"
           STARFOLD_OPENH264_LIB="$lib" cargo test --no-default-features --features openh264-cisco --locked
           cargo build --no-default-features --features openh264-cisco --locked
           nm --defined-only target/debug/starfold > "$RUNNER_TEMP/syms.txt"
@@ -273,13 +280,30 @@ jobs:
           sleep 3
           cut -c1-240 "$log" || true
           ok=1
-          up && grep -qF 'OpenH264 Video Codec provided by Cisco Systems, Inc.' "$log" && kill -0 $pid 2>/dev/null || ok=0
+          loaded='OpenH264 loaded: OpenH264 Video Codec provided by Cisco Systems, Inc. (libopenh264-2.6.0-linux64.8.so, sha256 2f0cde7c6a6abcf5cae76942894ea42897fa677bce4ed6c91a24dd1b041d5f04), from '
+          up && kill -0 $pid 2>/dev/null || ok=0
+          grep -qF "$loaded" "$log" || { echo "::error::no log line of the load itself"; ok=0; }
           cat "/proc/$pid/maps" > "$RUNNER_TEMP/maps.txt" || ok=0
           grep -q '/memfd:starfold-openh264' "$RUNNER_TEMP/maps.txt" || { echo "::error::no mapping of the sealed memfd"; ok=0; }
           if grep -qF "$lib" "$RUNNER_TEMP/maps.txt"; then echo "::error::$lib itself is mapped"; ok=0; fi
+          curl -fsS --max-time 10 -o "$RUNNER_TEMP/stats.json" http://127.0.0.1:6901/stats || { echo "::error::no /stats"; ok=0; }
+          python3 - "$RUNNER_TEMP/stats.json" <<'EOF' || ok=0
+          import json, sys
+          reg = json.load(open(sys.argv[1]))["encoders"]["encoders"]
+          e = [c for c in reg if c["backend"] == "openh264" and c["codec"] == "h264"]
+          want = "cpu, OpenH264 Video Codec provided by Cisco Systems, Inc. (libopenh264-2.6.0-linux64.8.so, sha256 2f0cde7c6a6abcf5cae76942894ea42897fa677bce4ed6c91a24dd1b041d5f04)"
+          ok = len(e) == 1 and e[0]["device_id"] == want and e[0]["status"] == {"state": "verified"}
+          print("/stats openh264:", e)
+          sys.exit(0 if ok else 1)
+          EOF
           kill $pid 2>/dev/null || true
           wait $pid 2>/dev/null || true
           [ $ok = 1 ] || { echo "::error::starfold did not start on Cisco's OpenH264"; exit 1; }
+          rc=0
+          timeout 60 .github/fixtures/embed-source/target/debug/embed-source --openh264-lib="$lib" --enable-basic-auth=false --audio-enabled=false --port=6904 > "$RUNNER_TEMP/embed-lib.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/embed-lib.log"
+          [ "$rc" = 2 ] || { echo "::error::the embedding application: exit $rc, not 2"; exit 1; }
+          grep -q "available only in the starfold binary" "$RUNNER_TEMP/embed-lib.log"
 
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
