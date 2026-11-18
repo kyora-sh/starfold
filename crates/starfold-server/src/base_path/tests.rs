@@ -26,7 +26,12 @@ fn routes() -> Router {
 fn app(base: Option<&str>) -> Router {
     let login = Arc::new(crate::login::Login::new(None, PASSWORD.into()));
     let access = Arc::new(crate::access::Access::new(None, None));
-    compose(routes(), base, Some(login), access)
+    let base = base.map(|p| BasePath::parse(p).expect("a valid prefix"));
+    compose(routes(), base.as_ref(), Some(login), access)
+}
+
+fn prefix(p: &str) -> BasePath {
+    BasePath::parse(p).expect("a valid prefix")
 }
 
 /// Serves `router` on a loopback port and returns the port.
@@ -110,35 +115,80 @@ async fn ask(port: u16, method: &str, target: &str, asking: Asking, extra: &str)
 
 #[test]
 fn every_prefix_shape_has_one_normal_form_or_is_refused() {
-    let accepted: &[(Option<&str>, Option<&str>)] = &[
-        (None, None),
-        (Some(""), None),
-        (Some("/"), None),
-        (Some("/desk"), Some("/desk")),
-        (Some("/desk/"), Some("/desk")),
-        (Some("/a/b-c_d.e~f/9"), Some("/a/b-c_d.e~f/9")),
-        (Some("/a/b/"), Some("/a/b")),
-    ];
-    for &(given, normal) in accepted {
-        assert_eq!(parse(given), Ok(normal.map(String::from)), "{given:?}");
+    for (given, normal) in [
+        ("/desk", "/desk"),
+        ("/desk/", "/desk"),
+        ("/a/b-c_d.e~f/9", "/a/b-c_d.e~f/9"),
+        ("/a/b/", "/a/b"),
+    ] {
+        assert_eq!(
+            BasePath::parse(given).map(|b| b.as_str().to_string()),
+            Ok(normal.to_string()),
+            "{given:?}"
+        );
     }
-    let longest = format!("/{}", "a".repeat(MAX_LEN - 1));
-    assert_eq!(parse(Some(&longest)), Ok(Some(longest.clone())));
-    assert_eq!(
-        parse(Some(&format!("{longest}/"))),
-        Ok(Some(longest.clone()))
+    let bytes_1024 = format!("/{}", "a".repeat(1023));
+    assert_eq!(bytes_1024.len(), 1024);
+    assert_eq!(prefix(&bytes_1024).as_str(), bytes_1024);
+    assert_eq!(prefix(&format!("{bytes_1024}/")).as_str(), bytes_1024);
+    assert!(
+        BasePath::parse(&format!("{bytes_1024}a")).is_err(),
+        "1025 bytes"
     );
-    assert!(parse(Some(&format!("{longest}a"))).is_err());
-    assert!(parse(Some(&format!("/{}", "a".repeat(65_533)))).is_err());
+    assert!(BasePath::parse(&format!("/{}", "a".repeat(65_533))).is_err());
     for refused in [
-        "desk", "desk/", "//", "///", "/desk//", "//desk", "/a//b", "/a/b//", "/%2F", "/a%2Fb",
-        "/%2e", "/.", "/..", "/a/./b", "/a/../b", "/a/.", "/a b", "/a?b", "/a#b", "/ä", "/a\\b",
+        "", "/", "desk", "desk/", "//", "///", "/desk//", "//desk", "/a//b", "/a/b//", "/%2F",
+        "/a%2Fb", "/%2e", "/.", "/..", "/a/./b", "/a/../b", "/a/.", "/a b", "/a?b", "/a#b", "/ä",
+        "/a\\b", "-h", "--help",
     ] {
         assert!(
-            parse(Some(refused)).is_err(),
+            BasePath::parse(refused).is_err(),
             "{refused:?}: {:?}",
-            parse(Some(refused))
+            BasePath::parse(refused)
         );
+    }
+}
+
+#[test]
+fn the_command_line_gives_one_prefix_or_is_refused() {
+    let read = |v: &[&str]| {
+        from_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .map(|b| b.map(|b| b.as_str().to_string()))
+    };
+    for (args, want) in [
+        (&[][..], None),
+        (&["--port", "6901", "--read-only"], None),
+        (&["--title=--base-path=/x"], None),
+        (&["--title", "base-path"], None),
+        (&["--base-path", "/d"], Some("/d")),
+        (&["--base-path=/d/"], Some("/d")),
+        (&["--base_path", "/d"], Some("/d")),
+        (&["--base_path=/d"], Some("/d")),
+        (
+            &["--port", "6901", "--base-path", "/a/b", "--read-only"],
+            Some("/a/b"),
+        ),
+    ] {
+        assert_eq!(read(args), Ok(want.map(String::from)), "{args:?}");
+    }
+    for refused in [
+        &["--base-path"][..],
+        &["--base-path="],
+        &["--base-path", ""],
+        &["--base-path", "/"],
+        &["--base-path=/"],
+        &["--base-path=//"],
+        &["--base-path", "-h"],
+        &["--base-path", "--help"],
+        &["--base-path", "desk"],
+        &["--base-path=/d", "--base-path=/d"],
+        &["--base-path=/d", "--base_path", "/e"],
+        &["--base-path=/desk", "--base-path="],
+        &["--base-path=//", "--base_path", "/desk"],
+        &["--base-path", "--base-path=/d"],
+        &["--title", "--base-path"],
+    ] {
+        assert!(read(refused).is_err(), "{refused:?}: {:?}", read(refused));
     }
 }
 
@@ -301,27 +351,6 @@ async fn the_query_reaches_the_route_under_the_prefix() {
     assert_eq!(status, 101, "{head}");
 }
 
-#[test]
-fn the_flag_reaches_the_prefix_as_the_server_reads_it() {
-    let read = |v: &[&str]| from_args(&crate::parse_args(v.iter().map(|s| s.to_string())));
-    assert_eq!(read(&[]), Ok(None));
-    assert_eq!(read(&["--base-path", "/d"]), Ok(Some("/d".into())));
-    assert_eq!(read(&["--base-path=/d/"]), Ok(Some("/d".into())));
-    assert_eq!(read(&["--base_path", "/d"]), Ok(Some("/d".into())));
-    assert_eq!(
-        read(&["--port", "6901", "--base-path", "/a/b", "--read-only"]),
-        Ok(Some("/a/b".into()))
-    );
-    for refused in [
-        &["--base-path"][..],
-        &["--base-path", "-h"],
-        &["--base-path", "desk"],
-        &["--base-path=//"],
-    ] {
-        assert!(read(refused).is_err(), "{refused:?}: {:?}", read(refused));
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn an_argument_that_is_not_utf8_is_refused_not_a_panic() {
@@ -347,17 +376,15 @@ fn the_startup_lines_carry_the_prefix_and_are_unchanged_without_one() {
         "listening on http://0.0.0.0:6901"
     );
     assert_eq!(listening("::1", 80, None), "listening on http://::1:80");
+    let d = prefix("/d");
     assert_eq!(
-        listening("0.0.0.0", 6901, Some("/d")),
+        listening("0.0.0.0", 6901, Some(&d)),
         "listening on http://0.0.0.0:6901/d/"
     );
     assert_eq!(page("0.0.0.0", 6901, None), "http://localhost:6901/");
     assert_eq!(page("::", 6901, None), "http://localhost:6901/");
     assert_eq!(page("::1", 6901, None), "http://[::1]:6901/");
     assert_eq!(page("10.0.0.2", 6901, None), "http://10.0.0.2:6901/");
-    assert_eq!(
-        page("0.0.0.0", 6901, Some("/d")),
-        "http://localhost:6901/d/"
-    );
-    assert_eq!(page("::1", 6901, Some("/d")), "http://[::1]:6901/d/");
+    assert_eq!(page("0.0.0.0", 6901, Some(&d)), "http://localhost:6901/d/");
+    assert_eq!(page("::1", 6901, Some(&d)), "http://[::1]:6901/d/");
 }

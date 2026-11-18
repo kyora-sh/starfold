@@ -169,6 +169,13 @@ are not found. A proxy that strips the prefix before forwarding needs no flag, b
 send `/desktop` on to `/desktop/` itself: the page's URLs are relative, so from
 `/desktop` they would resolve at the site's root.
 
+Give `--base-path` once, with a prefix such as `/desktop` (letters, digits, `.`, `_`, `~`
+or `-` between single slashes, at most 1024 bytes; one trailing slash is dropped). Given
+twice, without a value, empty, `/` or in any other shape, starfold stops with exit code 2
+and says why on stderr, even beside `--help` or `--version`; leave the flag out to serve
+at the root. The prefix is part of every request line, so it counts against the length a
+request line may have (64 KiB in starfold, often less in a proxy).
+
 ### For agents and scripts
 
 Screenshots and recordings (start starfold with `STARFOLD_PASSWORD` set, and send it along):

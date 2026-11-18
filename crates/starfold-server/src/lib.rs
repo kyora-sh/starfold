@@ -129,6 +129,15 @@ pub fn main() {
 /// a driver that crashes there takes the server with it.
 pub fn run(args: impl IntoIterator<Item = String>) {
     let args: Vec<String> = args.into_iter().collect();
+    // The one place --base-path is read and checked, before --help and --version: asking
+    // for a prefix that can't be served stops here, to stderr whatever the log filter.
+    let base = match base_path::from_args(&args) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("starfold: --base-path: {e}");
+            std::process::exit(2);
+        }
+    };
     // --help and --version print and return instead of starting the server.
     if help::print_if_asked(&args) {
         return;
@@ -155,14 +164,14 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     // main dispatch queue and the server runs beside it.
     #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(move || rt.block_on(serve(a)));
+        std::thread::spawn(move || rt.block_on(serve(a, base)));
         dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a));
+    rt.block_on(serve(a, base));
 }
 
-async fn serve(a: HashMap<String, String>) {
+async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
     let display = std::env::var("DISPLAY")
@@ -186,13 +195,6 @@ async fn serve(a: HashMap<String, String>) {
         .cloned()
         .unwrap_or_else(|| default_addr.into());
     let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
-    let base = match base_path::from_args(&a) {
-        Ok(b) => b,
-        Err(e) => {
-            log::error!("--base-path: {e}");
-            std::process::exit(2);
-        }
-    };
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -497,15 +499,15 @@ async fn serve(a: HashMap<String, String>) {
         login::Login::from_args(&a).map(|(l, generated)| (std::sync::Arc::new(l), generated));
     let app = base_path::compose(
         server::router(state),
-        base.as_deref(),
+        base.as_ref(),
         login.as_ref().map(|(l, _)| l.clone()),
         access,
     );
     let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
         .await
         .expect("bind");
-    log::info!("{}", base_path::listening(&addr, port, base.as_deref()));
-    let page = base_path::page(&addr, port, base.as_deref());
+    log::info!("{}", base_path::listening(&addr, port, base.as_ref()));
+    let page = base_path::page(&addr, port, base.as_ref());
     match &login {
         Some((l, true)) => log::info!(
             "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",

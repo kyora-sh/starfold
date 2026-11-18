@@ -18,8 +18,8 @@ Server:
                                 localhost (.example.com covers subdomains, * any)
   --allowed-origins             other sites whose pages may connect (* any)
   --base-path                   serve under this path prefix (such as /desktop),
-                                for a reverse proxy that forwards it unchanged
-                                (default: none)
+                                for a reverse proxy that forwards it unchanged;
+                                given once, never empty or / (default: none)
 
 Login:
   --enable-basic-auth           ask for a password (default true)
@@ -262,21 +262,9 @@ enum Request {
 }
 
 fn request(args: &[String]) -> Option<Request> {
-    // What follows --base-path is its value whenever the server would read it so (anything
-    // not starting with --): `--base-path -h` is a prefix to refuse, not a request for help.
-    let flags: Vec<&str> = args
-        .iter()
-        .enumerate()
-        .filter(|&(i, a)| {
-            i == 0
-                || a.starts_with("--")
-                || !matches!(args[i - 1].as_str(), "--base-path" | "--base_path")
-        })
-        .map(|(_, a)| a.as_str())
-        .collect();
-    if flags.iter().any(|a| *a == "--help" || *a == "-h") {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         Some(Request::Help)
-    } else if flags.iter().any(|a| *a == "--version" || *a == "-V") {
+    } else if args.iter().any(|a| a == "--version" || a == "-V") {
         Some(Request::Version)
     } else {
         None
@@ -324,40 +312,6 @@ mod tests {
         );
         assert_eq!(
             request(&args(&["--version", "--help"])),
-            Some(Request::Help)
-        );
-    }
-
-    #[test]
-    fn a_base_path_value_is_never_a_help_or_version_request() {
-        for value in ["-h", "-V", "--base-path=-h", "--base-path=--help"] {
-            let given = match value.starts_with("--") {
-                true => args(&[value]),
-                false => args(&["--base-path", value]),
-            };
-            assert_eq!(request(&given), None, "{given:?}");
-            assert!(
-                crate::base_path::parse(
-                    crate::parse_args(given)
-                        .get("base-path")
-                        .map(|s| s.as_str())
-                )
-                .is_err(),
-                "{value}"
-            );
-        }
-        assert_eq!(
-            request(&args(&["--base_path", "-h"])),
-            None,
-            "the underscore spelling"
-        );
-        assert_eq!(
-            request(&args(&["--base-path", "--help"])),
-            Some(Request::Help),
-            "--help is a flag of its own there, as the server reads it"
-        );
-        assert_eq!(
-            request(&args(&["-h", "--base-path", "/d"])),
             Some(Request::Help)
         );
     }
