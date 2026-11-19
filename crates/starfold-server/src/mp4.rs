@@ -284,7 +284,7 @@ fn open_full(out: &mut Vec<u8>, name: &[u8; 4], flags: u32) -> usize {
 }
 
 /// Patches the size of the box opened at `at`, which ends here.
-fn close(out: &mut Vec<u8>, at: usize) {
+fn close(out: &mut [u8], at: usize) {
     let len = (out.len() - at) as u32;
     out[at..at + 4].copy_from_slice(&len.to_be_bytes());
 }
