@@ -74,7 +74,7 @@ fn cvt(r: libc::c_int) -> std::io::Result<libc::c_int> {
 }
 
 #[cfg(target_os = "linux")]
-fn cname(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+pub(crate) fn cname(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(s.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the path"))
@@ -82,7 +82,7 @@ fn cname(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
 
 /// Opens `name` in `dir` (or a path, with `dir` None), refusing a symlink.
 #[cfg(target_os = "linux")]
-fn open_at(
+pub(crate) fn open_at(
     dir: Option<&std::os::fd::OwnedFd>,
     name: &std::ffi::CStr,
     flags: libc::c_int,
@@ -109,7 +109,10 @@ fn fstat(fd: &std::os::fd::OwnedFd) -> std::io::Result<libc::stat> {
 
 /// `name` in `dir`, not following a symlink.
 #[cfg(target_os = "linux")]
-fn stat_at(dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+pub(crate) fn stat_at(
+    dir: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> std::io::Result<libc::stat> {
     use std::os::fd::AsRawFd;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     cvt(unsafe {
@@ -180,7 +183,7 @@ fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
 /// passes, nobody else can move the new directory, or any directory above it, aside or put
 /// something in its place.
 #[cfg(target_os = "linux")]
-fn check_dir(
+pub(crate) fn check_dir(
     dir: &std::os::fd::OwnedFd,
     shown: &Path,
     path: &Path,
@@ -2261,7 +2264,11 @@ mod tests {
                 .await
                 .expect("the relay outlived the server's end of the socket");
             assert_eq!(ended.unwrap(), Ok(()));
-            drained.await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drained)
+                .await
+                .expect("the relay's output never ended")
+                .unwrap()
+                .unwrap();
             server.abort();
             std::fs::remove_dir_all(&d).unwrap();
         }

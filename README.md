@@ -319,8 +319,11 @@ the uid the client expects.
 process of their own (a pod exec stream with no tty, say): it connects to `DIR/s` and
 relays bytes between it and its stdin and stdout, unchanged, one connection per run.
 Before a byte goes either way it checks its own side as the server does (the identity
-uid map, and the walk from `/` to `DIR` by the rules above) and reads the listener's uid,
-refusing unless it is its own. It never takes a socket path, never retries and never
+uid map, and the walk from `/` to `DIR` by the rules above; `DIR` itself and `DIR/s`
+must not be symlinks) and reads the listener's uid, refusing unless it is its own. That
+uid is the one the kernel recorded when the listener called `listen` (`SO_PEERCRED`): a
+process that listens and then hands the socket to another uid isn't caught by it. A full
+backlog is an error, not a wait. It never takes a socket path, never retries and never
 connects anywhere else. It doesn't parse or authenticate what it relays: the server's
 login and host checks apply to the relayed request, so a host relaying a browser's
 requests sends `Host: localhost` (or a name in `--allowed-hosts`). stdout carries only

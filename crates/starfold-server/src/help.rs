@@ -37,8 +37,9 @@ Server:
   attach DIR                    a command, not a flag: relays stdin and stdout
                                 to the socket --listen-unix DIR serves, one
                                 connection per run, after the same uid-map
-                                and path checks, and only if the listener has
-                                this uid (starfold attach --help)
+                                and path checks, and only if the listener had
+                                this uid when it called listen (SO_PEERCRED;
+                                starfold attach --help)
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1
