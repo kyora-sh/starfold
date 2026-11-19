@@ -3,8 +3,8 @@
 ## Unreleased
 
 The first release of kyora starfold. Prebuilt binaries for Linux (x86_64, aarch64), macOS (Apple
-silicon) and Windows (x86_64) are attached to each release, each as an MIT build with OpenH264 and a
-GPL-2.0-or-later build with x264; see [Install](README.md#install).
+silicon) and Windows (x86_64) are attached to each release, each as a GPL-2.0-or-later build with
+x264 and an OpenH264 build distributed under MIT; see [Install](README.md#install).
 
 ### Features
 
@@ -17,7 +17,7 @@ GPL-2.0-or-later build with x264; see [Install](README.md#install).
 - A server warning when a recording response drops segments (#10)
 - Refinement state kept per encoder cohort (#12)
 - Benchmark harness against noVNC, with the November 2026 results (#13)
-- Benchmark key-delivery check; a key press is never painted as a frame of its own (#17)
+- Benchmark key-delivery check, and a count of the keys not painted as a frame of their own (#17)
 - Software encoder arms for the benchmark: libvpx, libaom, SVT-AV1, Kvazaar and x265 (#16)
 - Encoder frame budget at the frame rate actually taken, and the full rate while typing (#20)
 - Hardware encoder probes run in child processes, so a crashing driver can't take the server down (#21)
@@ -30,14 +30,15 @@ GPL-2.0-or-later build with x264; see [Install](README.md#install).
 - New names for the flags and environment variables inherited from upstream, with the old ones as deprecated aliases (#38)
 - macOS: a flag to show the host cursor in the video (#47)
 - Touch: a double tap double-clicks on the same spot (#50)
-- x264 is the default H.264 encoder again; OpenH264 is optional and gives an MIT-only build (#3, #36)
+- x264 is the default H.264 encoder again; OpenH264 is optional and gives a build without x264, distributed under MIT (#3, #36)
 - x264 refines a frozen picture by QP (#41)
 - Intel Quick Sync on Windows, in a helper process the server can kill (experimental) (#56)
 - The Quick Sync helper logs the mode it opens its session with (#61)
 - Embeddable web client: `mount()` with a per-connect preamble (#77)
-- Recording is off by default and recording ids are visible only to their owner; `--read-only` is decided in one place (#79)
+- Recording is off by default (`--enable-recording`), with owner-only recording ids; `--read-only` is decided in one place (#79)
 - The embeddable client works end to end over an exec-style byte bridge (#80)
-- A unix socket listener and a framed WebSocket mode (Linux) (#85)
+- A unix socket listener, `--listen-unix` (Linux), and a framed WebSocket mode, `--framed` (#85)
+- `starfold attach DIR`: a per-connection relay to the unix socket listener (Linux) (#88)
 
 ### Fixes
 
@@ -47,7 +48,7 @@ GPL-2.0-or-later build with x264; see [Install](README.md#install).
 - Refinement works through the padding wrapper for odd capture sizes (#18)
 - Refinement ladder passes stay at the 200 ms size; only tail passes grow (#19)
 - Web client reuses its canvas 2D context instead of requesting it again (#46)
-- Windows loads its DLLs from System32 only (#54)
+- Windows loads the system DLLs the encoders open (NVENC, CUDA, Media Foundation) from System32, not from the executable's or the current directory (#54)
 - VA-API encoding works on AMD radeonsi (#55)
 - No filler data in VA-API constant-bitrate streams (#57)
 - Quick Sync gives up through one path on every missed deadline (#58)
