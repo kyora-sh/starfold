@@ -343,23 +343,87 @@ async fn without_a_root_every_endpoint_is_off() {
 
 #[test]
 fn the_command_line_decides_whether_files_are_shared() {
-    let off = Files::new(None, "upload,download", false, "Downloads", 0).unwrap();
+    let off = Files::new(None, Some("upload,download"), false, "Downloads", 0).unwrap();
     assert!(off.root.is_none());
     assert_eq!(off.hello()["upload"], false);
     assert_eq!(off.hello()["download"], false);
     let t = Tmp::new();
     let root = t.root();
-    let on = Files::new(root.to_str(), "upload,download", false, "/Downloads/", 0).unwrap();
+    let on = Files::new(
+        root.to_str(),
+        Some("upload,download"),
+        false,
+        "/Downloads/",
+        0,
+    )
+    .unwrap();
     assert_eq!(on.hello()["upload"], true);
     assert_eq!(on.hello()["download"], true);
     assert_eq!(on.hello()["dir"], "Downloads");
-    let viewer = Files::new(root.to_str(), "upload,download", true, "Downloads", 0).unwrap();
+    let viewer = Files::new(root.to_str(), Some("upload,download"), true, "Downloads", 0).unwrap();
     assert_eq!(viewer.hello()["upload"], false);
     let missing = t.0.join("missing");
-    assert!(Files::new(missing.to_str(), "upload", false, "Downloads", 0).is_err());
+    assert!(Files::new(missing.to_str(), Some("upload"), false, "Downloads", 0).is_err());
     std::fs::write(t.0.join("file"), "f").unwrap();
     let file = t.0.join("file");
-    assert!(Files::new(file.to_str(), "upload", false, "Downloads", 0).is_err());
+    assert!(Files::new(file.to_str(), Some("upload"), false, "Downloads", 0).is_err());
+}
+
+#[tokio::test]
+async fn read_only_shares_files_only_when_download_is_named() {
+    let t = Tmp::new();
+    let root = t.root();
+    // (--read-only, --file-transfers, upload, download), as the hello reports them.
+    for (read_only, transfers, upload, download) in [
+        (false, None, true, true),
+        (true, None, false, false),
+        (true, Some("download"), false, true),
+        (true, Some("upload,download"), false, true),
+        (true, Some("upload"), false, false),
+        (false, Some("upload"), true, false),
+        (true, Some("none"), false, false),
+    ] {
+        let f = Files::new(root.to_str(), transfers, read_only, "Downloads", 0).unwrap();
+        let what = format!("read-only {read_only}, --file-transfers {transfers:?}");
+        assert_eq!(f.hello()["upload"], upload, "{what}");
+        assert_eq!(f.hello()["download"], download, "{what}");
+        let f = Arc::new(f);
+        let listed = get_list(&f, "").await.0;
+        assert_eq!(
+            listed == StatusCode::FORBIDDEN,
+            !upload && !download,
+            "{what}"
+        );
+        let fetched = get_file(&f, "nothing").await.0;
+        assert_eq!(fetched == StatusCode::FORBIDDEN, !download, "{what}");
+        let uploaded = put(&f, &[("name", "a")], "x").await.0;
+        assert_eq!(uploaded == StatusCode::FORBIDDEN, !upload, "{what}");
+    }
+}
+
+#[test]
+fn the_server_shares_no_files_under_read_only_unless_download_is_named() {
+    let t = Tmp::new();
+    let root = t.root();
+    let root = root.to_str().unwrap();
+    // (the command line after --files-root, read-only, upload, download)
+    for (args, read_only, upload, download) in [
+        (&[][..], true, false, false),
+        (&["--file-transfers=download"][..], true, false, true),
+        (&["--file-transfers=upload,download"][..], true, false, true),
+        (&[][..], false, true, true),
+        (&["--file-transfers=upload"][..], false, true, false),
+    ] {
+        let a = crate::parse_args(
+            ["--files-root", root]
+                .iter()
+                .chain(args)
+                .map(|s| s.to_string()),
+        );
+        let f = crate::files_from_args(&a, read_only).unwrap();
+        let what = format!("{args:?}, read-only {read_only}");
+        assert_eq!((f.upload, f.download), (upload, download), "{what}");
+    }
 }
 
 #[tokio::test]

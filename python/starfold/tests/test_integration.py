@@ -105,6 +105,7 @@ def desktop(tmp_path, server_args):
                 f"--port={port}",
                 "--addr=127.0.0.1",
                 "--audio-enabled=false",
+                "--enable-recording",
                 f"--files-root={files}",
                 *server_args,
             ]

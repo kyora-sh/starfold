@@ -36,10 +36,15 @@ pub struct Files {
 
 impl Files {
     /// From the command line: no `root`, no file transfer; a `root` that can't be
-    /// opened as a folder is an error. `transfers` is `upload,download` or a part of it.
+    /// opened as a folder is an error. `transfers` is `--file-transfers` as given
+    /// (`upload,download` or a part of it, or `none`); not given, both.
+    ///
+    /// `--read-only` refuses uploads whatever `transfers` says (they write), and downloads
+    /// and listing unless `transfers` names `download` explicitly: an operator who wants a
+    /// read-only session that hands out files says so.
     pub fn new(
         root: Option<&str>,
-        transfers: &str,
+        transfers: Option<&str>,
         read_only: bool,
         default_dir: &str,
         max_upload_bytes: u64,
@@ -48,12 +53,12 @@ impl Files {
             .map(|r| Root::open(Path::new(r)).map_err(|e| format!("--files-root {r}: {e}")))
             .transpose()?;
         let shared = root.is_some();
-        let on = |t: &str| shared && transfers.split(',').any(|x| x.trim() == t);
+        let named = |t: &str| transfers.is_some_and(|v| v.split(',').any(|x| x.trim() == t));
+        let on = |t: &str| shared && (transfers.is_none() || named(t));
         Ok(Files {
             root,
-            // Uploading writes to the desktop, so a read-only viewer does not get it.
             upload: on("upload") && !read_only,
-            download: on("download"),
+            download: on("download") && (!read_only || named("download")),
             default_dir: default_dir.trim_matches('/').to_string(),
             max_upload_bytes,
         })
