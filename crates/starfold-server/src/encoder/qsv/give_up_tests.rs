@@ -48,7 +48,7 @@ fn says(r: &Reply) -> String {
 
 fn opened() -> String {
     let opened = says(&Reply::Opened {
-        low_power: true,
+        low_power: Some(true),
         holds_cap: true,
         name: "fake-gen".into(),
     });

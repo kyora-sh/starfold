@@ -182,6 +182,43 @@ fn layouts_match_the_libvpl_headers() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// mfxExtCodingOption against the same headers (sizeof/offsetof compiled from them with
+/// x86_64-w64-mingw32-gcc), and the fake's raw view of it.
+#[test]
+fn the_coding_option_matches_the_libvpl_headers() {
+    use super::ffi::ExtCodingOption;
+    let got = [
+        size!(ExtCodingOption, 64),
+        off!(ExtCodingOption, nal_hrd_conformance, 34),
+        off!(ExtCodingOption, vui_vcl_hrd_parameters, 38),
+        off!(ExtCodingOption, vui_nal_hrd_parameters, 62),
+        (
+            "MFX_EXTBUFF_CODING_OPTION",
+            ffi::EXTBUFF_CODING_OPTION as usize,
+            1347372099,
+        ),
+        ("MFX_CODINGOPTION_OFF", ffi::CODINGOPTION_OFF as usize, 32),
+        (
+            "the fake's coding option id",
+            CODING_OPTION as usize,
+            1347372099,
+        ),
+        ("the fake's NalHrdConformance", NAL_HRD_CONFORMANCE, 34),
+        ("the fake's VuiNalHrdParameters", VUI_NAL_HRD_PARAMETERS, 62),
+        (
+            "the fake's INCOMPATIBLE_VIDEO_PARAM (mfxdefs.h)",
+            (-INCOMPATIBLE_VIDEO_PARAM) as usize,
+            14,
+        ),
+    ];
+    let wrong: Vec<String> = got
+        .iter()
+        .filter(|(_, rust, c)| rust != c)
+        .map(|(name, rust, c)| format!("{name}: {rust} here, {c} in the headers"))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 const H264_SPS: &[u8] = &[0x67, 0x42, 0xc0, 0x1f, 0xda];
 const H264_PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
 const HEVC_VPS: &[u8] = &[0x40, 0x01, 0x0c];
@@ -209,14 +246,27 @@ pub(super) fn bitstream(codec: Codec, idr: bool, sets: bool) -> Vec<u8> {
     }
 }
 
+/// mfxExtCodingOption's buffer id and its HRD fields' offsets, from the libvpl headers (the
+/// layout test checks them), and MFX_ERR_INCOMPATIBLE_VIDEO_PARAM: the fake reads them raw.
+const CODING_OPTION: u32 = u32::from_le_bytes(*b"CDOP");
+const NAL_HRD_CONFORMANCE: usize = 34;
+const VUI_NAL_HRD_PARAMETERS: usize = 62;
+pub(super) const INCOMPATIBLE_VIDEO_PARAM: Status = -14;
+/// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: the runtime took the call and changed what it asked.
+const WRN_INCOMPATIBLE_VIDEO_PARAM: Status = 5;
+
 #[derive(Default)]
 pub(super) struct Log {
     pub(super) queried: Vec<VideoParam>,
     pub(super) inited: Vec<VideoParam>,
     signal: Vec<ExtVideoSignalInfo>,
     pub(super) reset: Vec<VideoParam>,
+    /// Each Init's NalHrdConformance and VuiNalHrdParameters, if it set them.
+    pub(super) hrd: Vec<Option<(u16, u16)>>,
+    /// How many extension buffers each GetVideoParam call carried.
+    pub(super) read_with: Vec<u16>,
     /// The frame type asked of each encode call, if it asked for one.
-    frame_types: Vec<Option<u16>>,
+    pub(super) frame_types: Vec<Option<u16>>,
     waits: Vec<u32>,
     surfaces: Vec<u64>,
     pub(super) live: i32,
@@ -235,12 +285,34 @@ pub(super) struct Fake {
     log: Arc<Mutex<Log>>,
     pub(super) query: VecDeque<Status>,
     pub(super) init: VecDeque<Status>,
-    reset: VecDeque<Status>,
+    pub(super) reset: VecDeque<Status>,
     encode: VecDeque<Status>,
     pub(super) sync: VecDeque<Status>,
     surface: VecDeque<Option<Fault>>,
-    /// What GetVideoParam says; else what Init was given.
-    got: Option<VideoParam>,
+    /// What GetVideoParam says; else what the encoder runs with.
+    pub(super) got: Option<VideoParam>,
+    /// What the encoder runs with: the last Init or Reset it took.
+    running: Option<VideoParam>,
+    /// A Reset above this TargetKbps runs at it instead, answered
+    /// MFX_WRN_INCOMPATIBLE_VIDEO_PARAM.
+    pub(super) correct: Option<u16>,
+    /// The frame rate Init sets up, as FrameRateExtN/FrameRateExtD, whatever it was asked.
+    pub(super) frame_rate: Option<(u32, u32)>,
+    /// What GetVideoParam calls answer, in turn (MFX_ERR_NONE once it runs out).
+    pub(super) video_param: VecDeque<Status>,
+    /// GetVideoParam reports the smallest BRCParamMultiplier that holds the rates, as
+    /// Intel's H.264 runtime does, rather than the one it was given.
+    pub(super) normalize: bool,
+    /// Its Init turned NalHrdConformance off.
+    hrd_off: bool,
+    /// What GetVideoParam reads back as NalHrdConformance, over what Init set.
+    pub(super) hrd_report: Option<u16>,
+    /// A Reset it takes leaves NalHrdConformance reading back as this.
+    pub(super) hrd_after_reset: Option<u16>,
+    /// From its n-th GetVideoParam call on (the first is Init's), it says this, over `got`.
+    pub(super) got_from: Option<(usize, VideoParam)>,
+    /// GetVideoParam calls so far.
+    video_params: usize,
     /// IDRs after the first come without parameter sets.
     sets_once: bool,
     idrs: usize,
@@ -263,6 +335,16 @@ impl Fake {
                 sync: VecDeque::new(),
                 surface: VecDeque::new(),
                 got: None,
+                running: None,
+                correct: None,
+                frame_rate: None,
+                video_param: VecDeque::new(),
+                normalize: false,
+                hrd_off: false,
+                hrd_report: None,
+                hrd_after_reset: None,
+                got_from: None,
+                video_params: 0,
                 sets_once: false,
                 idrs: 0,
             },
@@ -287,22 +369,116 @@ impl Runtime for Fake {
     fn init(&mut self, par: &mut VideoParam) -> Status {
         let mut log = self.call();
         log.inited.push(*par);
-        if par.num_ext_param == 1 {
-            let s = unsafe { *(*par.ext_param as *const ExtVideoSignalInfo) };
-            log.signal.push(s);
+        let mut hrd = None;
+        for i in 0..par.num_ext_param as usize {
+            let b = unsafe { *par.ext_param.add(i) };
+            match unsafe { (*b).buffer_id } {
+                ffi::EXTBUFF_VIDEO_SIGNAL_INFO => {
+                    log.signal
+                        .push(unsafe { *(b as *const ExtVideoSignalInfo) });
+                }
+                CODING_OPTION => {
+                    let at = |off: usize| unsafe { *((b as *const u8).add(off) as *const u16) };
+                    hrd = Some((at(NAL_HRD_CONFORMANCE), at(VUI_NAL_HRD_PARAMETERS)));
+                }
+                _ => {}
+            }
         }
+        log.hrd.push(hrd);
         drop(log);
-        self.init.pop_front().unwrap_or(0)
+        let r = self.init.pop_front().unwrap_or(0);
+        if r >= 0 {
+            let mut runs = *par;
+            if let Some((n, d)) = self.frame_rate {
+                runs.mfx.frame_info.frame_rate_ext_n = n;
+                runs.mfx.frame_info.frame_rate_ext_d = d;
+            }
+            self.running = Some(runs);
+            self.hrd_off = hrd.is_some_and(|h| h.0 == ffi::CODINGOPTION_OFF);
+        }
+        r
     }
 
+    /// As the runtime documents ("Dynamic Bitrate Change"): a constant-bitrate encoder held
+    /// to HRD conformance can't change its bitrate through Reset.
     fn reset(&mut self, par: &mut VideoParam) -> Status {
         self.call().reset.push(*par);
-        self.reset.pop_front().unwrap_or(0)
+        if let Some(r) = self.reset.pop_front() {
+            return r;
+        }
+        let Some(now) = self.running else {
+            return -8;
+        };
+        let kbps = |p: &VideoParam| {
+            let m = p.mfx.brc_param_multiplier.max(1) as u32;
+            (p.mfx.target_kbps as u32 * m, p.mfx.max_kbps as u32 * m)
+        };
+        let cbr = now.mfx.rate_control_method == ffi::RATECONTROL_CBR;
+        if cbr && kbps(par) != kbps(&now) && !self.hrd_off {
+            return INCOMPATIBLE_VIDEO_PARAM;
+        }
+        let mut runs = *par;
+        let corrected = self.correct.filter(|&c| runs.mfx.target_kbps > c);
+        if let Some(c) = corrected {
+            runs.mfx.target_kbps = c;
+            runs.mfx.max_kbps = c;
+        }
+        self.running = Some(runs);
+        if let Some(v) = self.hrd_after_reset {
+            self.hrd_report = Some(v);
+        }
+        if corrected.is_some() {
+            WRN_INCOMPATIBLE_VIDEO_PARAM
+        } else {
+            0
+        }
     }
 
+    /// Fills what the encoder runs with into `par`, and NalHrdConformance into a coding
+    /// option attached to it, as the runtime does.
     fn video_param(&mut self, par: &mut VideoParam) -> Status {
-        let last = self.call().inited.last().copied();
-        *par = self.got.or(last).unwrap_or_default();
+        self.call().read_with.push(par.num_ext_param);
+        self.video_params += 1;
+        let r = self.video_param.pop_front().unwrap_or(0);
+        if r < 0 {
+            return r;
+        }
+        let (ext, n) = (par.ext_param, par.num_ext_param);
+        let hrd = self.hrd_report.unwrap_or(if self.hrd_off {
+            ffi::CODINGOPTION_OFF
+        } else {
+            ffi::CODINGOPTION_ON
+        });
+        for i in 0..n as usize {
+            let b = unsafe { *ext.add(i) };
+            if unsafe { (*b).buffer_id } == CODING_OPTION {
+                unsafe { *((b as *mut u8).add(NAL_HRD_CONFORMANCE) as *mut u16) = hrd };
+            }
+        }
+        let later = self
+            .got_from
+            .filter(|(from, _)| self.video_params >= *from)
+            .map(|(_, p)| p);
+        *par = later.or(self.got).or(self.running).unwrap_or_default();
+        if self.normalize && par.mfx.rate_control_method == ffi::RATECONTROL_CBR {
+            let m = &mut par.mfx;
+            let k = m.brc_param_multiplier.max(1) as u32;
+            let [t, x, b, d] = [
+                m.target_kbps,
+                m.max_kbps,
+                m.buffer_size_in_kb,
+                m.initial_delay_in_kb,
+            ]
+            .map(|v| v as u32 * k);
+            let n = t.max(x).max(b).max(d).div_ceil(u16::MAX as u32).max(1);
+            m.brc_param_multiplier = n as u16;
+            [
+                m.target_kbps,
+                m.max_kbps,
+                m.buffer_size_in_kb,
+                m.initial_delay_in_kb,
+            ] = [t, x, b, d].map(|v| (v / n) as u16);
+        }
         par.ext_param = std::ptr::null_mut();
         par.num_ext_param = 0;
         0
@@ -433,13 +609,18 @@ fn h264_cbr_with_an_idr_on_request() {
         assert_eq!((m.gop_ref_dist, m.num_ref_frame), (1, 1), "no B frames");
         assert_eq!((m.gop_pic_size, m.idr_interval), (u16::MAX, 0));
         assert_eq!(m.rate_control_method, ffi::RATECONTROL_CBR);
-        let rate = (m.target_kbps, m.max_kbps, m.buffer_size_in_kb);
+        let mult = m.brc_param_multiplier as u32;
+        let k = |v: u16| v as u32 * mult;
+        let rate = (k(m.target_kbps), k(m.max_kbps), k(m.buffer_size_in_kb));
         assert_eq!(
             rate,
-            (6000, 6000, 800),
+            (6000, 6000, 798),
             "the buffer an IDR at 4x the cap needs"
         );
-        assert_eq!(m.brc_param_multiplier, 1);
+        assert_eq!(
+            mult, 3,
+            "room for a Reset to a keyframe's boost of a stripe's 2x share at 10 fps"
+        );
         let fi = m.frame_info;
         assert_eq!((fi.width, fi.height), (1920, 1088), "16-aligned");
         assert_eq!((fi.crop_w, fi.crop_h), (1920, 1080));
@@ -694,11 +875,12 @@ fn rate_changes_reset_the_encoder() {
     assert_eq!(resets, 0, "the same rate is no reset");
     enc.set_rate(RateConfig::new(24.0, 1000, 30)).unwrap();
     assert!(!encode(enc.as_mut(), 640, 480, false)[0].keyframe);
-    enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
+    enc.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
     assert!(
-        encode(enc.as_mut(), 640, 480, false)[0].keyframe,
-        "a raised peak goes out at an IDR"
+        !encode(enc.as_mut(), 640, 480, false)[0].keyframe,
+        "a raised rate needs no IDR"
     );
+    enc.set_rate(RateConfig::new(24.0, 100_000, 30)).unwrap();
     let l = log.lock().unwrap();
     let m = |p: &VideoParam| p.mfx;
     let r: Vec<(u16, u16, u16)> = l
@@ -707,8 +889,12 @@ fn rate_changes_reset_the_encoder() {
         .map(m)
         .map(|m| (m.target_kbps, m.max_kbps, m.brc_param_multiplier))
         .collect();
-    assert_eq!(r, vec![(1000, 1000, 1), (50_000, 50_000, 2)]);
-    assert!(l.reset.iter().all(|p| p.num_ext_param == 1));
+    assert_eq!(
+        r,
+        vec![(1000, 1000, 1), (40_000, 40_000, 1), (48_000, 48_000, 1)],
+        "100 Mbit/s clamped to what a 2 Mbit/s cap at 30 fps was sized for"
+    );
+    assert!(l.reset.iter().all(|p| p.num_ext_param == 2));
 }
 
 #[test]

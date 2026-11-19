@@ -1735,6 +1735,170 @@ fn a_failed_session_is_reopened() {
     assert!(!eng.cohorts[0].shared.degraded());
 }
 
+/// An encoder holding one of the few sessions a backend has, as a GPU's encoder slots: it
+/// gives its slot back when it is dropped.
+struct Slot {
+    inner: Box<dyn VideoEncoder>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl VideoEncoder for Slot {
+    fn set_rate(&mut self, r: RateConfig) -> Result<(), EncodeError> {
+        self.inner.set_rate(r)
+    }
+
+    fn encode(
+        &mut self,
+        f: &FrameView<'_>,
+        o: EncodeOptions<'_>,
+    ) -> Result<Vec<AccessUnit>, EncodeError> {
+        self.inner.encode(f, o)
+    }
+
+    fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {
+        self.inner.drain()
+    }
+}
+
+/// `open` with `slots` sessions at most open at once, and `opens` opens in all: past
+/// either, an open fails. `live` counts the sessions open.
+fn slotted(open: Open, slots: usize, opens: usize, live: Arc<AtomicUsize>) -> Open {
+    let opened = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |c: &EncoderConfig| {
+        if live.load(Ordering::SeqCst) >= slots {
+            return Err(EncodeError("no encoder slot free".into()));
+        }
+        if opened.fetch_add(1, Ordering::SeqCst) >= opens {
+            return Err(EncodeError("the backend opens no more sessions".into()));
+        }
+        let inner = open(c)?;
+        live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Slot {
+            inner,
+            live: live.clone(),
+        }) as Box<dyn VideoEncoder>)
+    })
+}
+
+/// A failed session is closed before its replacement opens: on a backend with no slot to
+/// spare, the replacement still opens.
+#[test]
+fn a_failed_session_is_closed_before_its_replacement_opens() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        h264_reopen_heals: true,
+        ..Default::default()
+    };
+    let live = Arc::new(AtomicUsize::new(0));
+    let open = slotted(fakes(o), 2, usize::MAX, live.clone());
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], open).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    assert!(
+        videos(&drain(&mut rx)).is_empty(),
+        "the bottom stripe failed"
+    );
+    push_band(&mut eng, W, H, None);
+    let v = videos(&drain(&mut rx));
+    assert_eq!(
+        v.len(),
+        2,
+        "both stripes, the bottom one from its new session: {v:?}"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 2, "the two stripes' sessions");
+}
+
+/// A failed session is closed even when no replacement opens: it holds nothing on.
+#[test]
+fn a_failed_session_is_closed_when_no_replacement_opens() {
+    let o = Opts {
+        h264_second_stripe_dead: true,
+        ..Default::default()
+    };
+    let live = Arc::new(AtomicUsize::new(0));
+    // The sample's session and the two stripes' open; nothing after them.
+    let open = slotted(fakes(o), 2, 3, live.clone());
+    let hub = Hub::new();
+    let mut eng = Engine::new(two_stripes(), hub.clone(), W, H, &[H264], open).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    drain(&mut rx);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "only the stripe that works holds a session"
+    );
+    push_band(&mut eng, W, H, None);
+    drain(&mut rx);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "and no retry leaves one behind"
+    );
+}
+
+/// A reopen, the governor's (another thread count) as a failed session's, closes the old
+/// encoder before it opens the new one: on a backend with one slot the new one opens. If none
+/// opens, the stripe holds no session.
+#[test]
+fn a_reopen_closes_the_old_encoder_before_opening_the_new_one() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let open = slotted(fakes(Opts::default()), 1, 2, live.clone());
+    let cfg = encoder_config(&config(), H264, W, H, 1);
+    let enc = open(&cfg).unwrap();
+    let mut s = Stripe {
+        y: 0,
+        h: H as usize,
+        enc,
+        cfg,
+        max_threads: 4,
+        applied_kbps: Some(1000),
+        applied_crf: -1.0,
+        applied_fps: 0,
+        open: open.clone(),
+    };
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reopen(&mut s, 4),
+        None,
+        "the one slot, which the old encoder held"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    assert_eq!(s.applied_kbps, None, "the new encoder gets its rate");
+    let why = reopen(&mut s, 1).expect("the backend opens no more sessions");
+    assert!(why.contains("no more sessions"), "{why}");
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "the old one is closed all the same"
+    );
+}
+
+/// Only an encoder that codes with a thread count gets the governor: a hardware one would
+/// be reopened, at a keyframe's cost, for a thread count it never receives.
+#[test]
+fn only_an_encoder_that_takes_a_thread_count_adapts_it() {
+    assert!(Backend::OpenH264.takes_threads());
+    for b in [
+        Backend::VideoToolbox,
+        Backend::Vaapi,
+        Backend::Nvenc,
+        Backend::MediaFoundation,
+        Backend::Qsv,
+    ] {
+        assert!(!b.takes_threads(), "{b:?}");
+    }
+}
+
 #[test]
 fn announcements_carry_the_cohorts_current_configuration() {
     let hub = Hub::new();
@@ -2437,7 +2601,7 @@ fn hevc_nal_types(d: &[u8]) -> Vec<u8> {
 #[test]
 fn videotoolbox_hevc_negotiated() {
     use crate::encoder::caps::{host_providers, Registry, PROBE_TIMEOUT};
-    let reg = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let reg = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     let cands = negotiate::candidates(&reg, encoder::SOFTWARE_H264);
     if !cands.iter().any(|c| c.codec == Codec::Hevc) {
         assert!(

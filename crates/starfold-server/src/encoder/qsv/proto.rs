@@ -67,22 +67,18 @@ pub struct Unit {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reply {
     Opened {
-        low_power: bool,
+        /// LowPower as the session read it back after Init (None: the runtime didn't say).
+        low_power: Option<bool>,
         /// The session holds its cap ([`crate::encoder::VideoEncoder::holds_cap`]).
         holds_cap: bool,
         name: String,
     },
     /// The frame in `slot` is coded; its units, none if it was skipped.
-    Done {
-        slot: u8,
-        units: Vec<Unit>,
-    },
+    Done { slot: u8, units: Vec<Unit> },
+    /// The rate change went through, and the session read back what it requires.
     RateSet,
     /// The request failed; `stopped`: the device hung, failed or was lost.
-    Error {
-        stopped: bool,
-        reason: String,
-    },
+    Error { stopped: bool, reason: String },
 }
 
 fn codec_byte(c: Codec) -> u8 {
@@ -191,7 +187,11 @@ impl Reply {
                 name,
             } => {
                 b.push(OPENED);
-                b.push(*low_power as u8);
+                b.push(match low_power {
+                    Some(false) => 0,
+                    Some(true) => 1,
+                    None => 2,
+                });
                 b.push(*holds_cap as u8);
                 put_text(&mut b, name);
             }
@@ -220,7 +220,7 @@ impl Reply {
         let mut c = Cursor::new(body);
         let r = match c.u8()? {
             OPENED => Reply::Opened {
-                low_power: c.flag()?,
+                low_power: c.maybe_flag()?,
                 holds_cap: c.flag()?,
                 name: c.text()?,
             },
@@ -309,6 +309,16 @@ impl<'a> Cursor<'a> {
             0 => Ok(false),
             1 => Ok(true),
             v => Err(format!("{v} where a flag belongs")),
+        }
+    }
+
+    /// A flag that may be unknown: 0 false, 1 true, 2 not known.
+    fn maybe_flag(&mut self) -> Result<Option<bool>, String> {
+        match self.u8()? {
+            0 => Ok(Some(false)),
+            1 => Ok(Some(true)),
+            2 => Ok(None),
+            v => Err(format!("{v} where a flag or unknown belongs")),
         }
     }
 

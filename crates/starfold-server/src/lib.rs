@@ -425,9 +425,11 @@ async fn serve(
             std::process::exit(2);
         }
     };
+    let capped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 > 0;
     let encoders = std::sync::Arc::new(encoder::caps::host_probe(
         truthy(a.get("encoder-probe"), true),
         truthy(a.get("experimental-hw-probes"), false),
+        capped,
     ));
     encoders.log();
     let encoder = match negotiate::h264_backend(&encoders, selection) {
