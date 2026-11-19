@@ -220,7 +220,10 @@ jobs:
           .github/release/no-x264-override.sh
           echo "ARCHIVE=$(.github/release/expected-files.sh archive "$VERSION" '${{ matrix.flavour.name }}' aarch64-linux | sed 's/\.tar\.gz$//')" >> "$GITHUB_ENV"
       # Ubuntu's arm64 packages (ports.ubuntu.com) beside the amd64 ones, the aarch64 GCC, and
-      # qemu to run the binary's --version.
+      # qemu to run the binary's --version. A library both architectures install, such as
+      # libsystemd0, must be the same version in both, so the runner's amd64 copy is brought up
+      # to the archive's in the same install: a runner whose copy is older than the archive's
+      # could otherwise not take the arm64 one.
       - name: Native libraries (arm64)
         run: |
           src=/etc/apt/sources.list.d/ubuntu.sources
@@ -236,7 +239,7 @@ jobs:
           SRC
           sudo dpkg --add-architecture arm64
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64 libxcb1-dev:arm64; }
+          deps() { aptq 180 update && apt-cache policy libsystemd0 libsystemd0:arm64 && aptq 720 install -y libsystemd0 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64 libxcb1-dev:arm64; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
