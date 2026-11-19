@@ -29,6 +29,9 @@ impl Track {
             Codec::Av1 => {
                 let sequence = av1::sequence_header_obu(keyframe)
                     .ok_or("keyframe without a sequence header")?;
+                if sequence[0] & 2 == 0 {
+                    return Err("a sequence header OBU without a size field".into());
+                }
                 let config = av1::sequence_header(sequence)
                     .and_then(av1::av1c)
                     .ok_or("bad sequence header")?;
@@ -60,82 +63,143 @@ impl Unit<'_> {
     }
 }
 
-/// The pieces of a frame's MP4 sample. H.264: its NAL units without parameter sets and
-/// delimiters, each after its length (4 bytes, big-endian). AV1 (AV1-ISOBMFF section
-/// 2.4): its OBUs without temporal delimiters and padding, each with a size field.
-pub fn sample_units(codec: Codec, data: &[u8]) -> Result<Vec<Unit<'_>>, String> {
-    match codec {
-        Codec::H264 => Ok(units(data)
-            .into_iter()
-            .map(|n| {
-                let mut prefix = [0u8; 10];
-                prefix[..4].copy_from_slice(&(n.len() as u32).to_be_bytes());
-                Unit {
-                    prefix,
-                    prefix_len: 4,
-                    body: n,
-                }
-            })
-            .collect()),
-        Codec::Av1 => Ok(av1::obus(data)
-            .ok_or("an AV1 frame whose OBUs run past its end")?
-            .into_iter()
-            .filter(|o| !matches!(o.kind, 2 | 15))
-            .map(|o| {
-                let mut prefix = [0u8; 10];
-                let mut len = o.header.len();
-                prefix[..len].copy_from_slice(o.header);
-                prefix[0] |= 2;
-                let mut size = o.payload.len() as u64;
-                loop {
-                    let b = (size & 0x7f) as u8;
-                    size >>= 7;
-                    prefix[len] = if size == 0 { b } else { b | 0x80 };
-                    len += 1;
-                    if size == 0 {
-                        break;
-                    }
-                }
-                Unit {
-                    prefix,
-                    prefix_len: len as u8,
-                    body: o.payload,
-                }
-            })
-            .collect()),
-        c => Err(format!("a recording holds H.264 or AV1, not {c:?}")),
+fn h264_unit(n: &[u8]) -> Unit<'_> {
+    let mut prefix = [0u8; 10];
+    prefix[..4].copy_from_slice(&(n.len() as u32).to_be_bytes());
+    Unit {
+        prefix,
+        prefix_len: 4,
+        body: n,
     }
+}
+
+fn av1_unit(o: av1::Obu<'_>) -> Unit<'_> {
+    let mut prefix = [0u8; 10];
+    let mut len = o.header.len();
+    prefix[..len].copy_from_slice(o.header);
+    prefix[0] |= 2;
+    let mut size = o.payload.len() as u64;
+    loop {
+        let b = (size & 0x7f) as u8;
+        size >>= 7;
+        prefix[len] = if size == 0 { b } else { b | 0x80 };
+        len += 1;
+        if size == 0 {
+            break;
+        }
+    }
+    Unit {
+        prefix,
+        prefix_len: len as u8,
+        body: o.payload,
+    }
+}
+
+/// A temporal unit's OBUs but its temporal delimiters, tile lists and padding.
+fn kept_obus(data: &[u8]) -> impl Iterator<Item = Result<av1::Obu<'_>, &'static str>> {
+    av1::obus(data).filter(|o| !matches!(o, Ok(o) if matches!(o.kind, 2 | 8 | 15)))
+}
+
+/// A frame's MP4 sample, read from the frame in place. H.264: its NAL units without
+/// parameter sets and delimiters, each after its length (4 bytes, big-endian). AV1
+/// (AV1-ISOBMFF section 2.4): its OBUs without temporal delimiters, tile lists and padding,
+/// each with a size field.
+pub struct SampleUnits<'a> {
+    codec: Codec,
+    data: &'a [u8],
+    /// The sample's bytes.
+    pub size: u64,
+}
+
+impl<'a> SampleUnits<'a> {
+    /// The sample's pieces, in order.
+    pub fn iter(&self) -> impl Iterator<Item = Unit<'a>> + 'a {
+        let (codec, data) = (self.codec, self.data);
+        let h264 = (codec == Codec::H264).then(|| units(data).map(h264_unit));
+        let obus =
+            (codec == Codec::Av1).then(|| kept_obus(data).map_while(Result::ok).map(av1_unit));
+        h264.into_iter().flatten().chain(obus.into_iter().flatten())
+    }
+}
+
+/// Reads a frame's sample without copying it or listing its pieces: an error for an AV1
+/// frame with a malformed OBU or none to keep.
+pub fn sample_units(codec: Codec, data: &[u8]) -> Result<SampleUnits<'_>, String> {
+    let size = match codec {
+        Codec::H264 => units(data).map(|n| 4 + n.len() as u64).sum(),
+        Codec::Av1 => {
+            let (mut size, mut any) = (0, false);
+            for o in kept_obus(data) {
+                size += av1_unit(o?).size();
+                any = true;
+            }
+            if !any {
+                return Err("an AV1 frame with no OBU to record".into());
+            }
+            size
+        }
+        c => return Err(format!("a recording holds H.264 or AV1, not {c:?}")),
+    };
+    Ok(SampleUnits { codec, data, size })
 }
 
 const TIMESCALE: u32 = 1000;
 /// The least a recording's last frame lasts (ms).
 pub const LAST_FRAME_MS: u64 = 17;
 
-/// NAL units of an Annex-B stream (start codes removed).
-pub fn nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = None;
-    let mut i = 0;
+/// NAL units of an Annex-B stream (start codes removed), read in place.
+pub fn nals(data: &[u8]) -> Nals<'_> {
+    Nals {
+        data,
+        start: start_code(data, 0).map(|i| i + 3),
+    }
+}
+
+/// Where the first start code at or after `from` is.
+fn start_code(data: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
     while i + 3 <= data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if let Some(s) = start {
-                // A 4-byte start code leaves a zero at the end of the previous unit.
-                let mut end = i;
-                while end > s && data[end - 1] == 0 {
-                    end -= 1;
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+pub struct Nals<'a> {
+    data: &'a [u8],
+    /// Where the next unit starts, after its start code.
+    start: Option<usize>,
+}
+
+impl<'a> Iterator for Nals<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.data;
+        loop {
+            let s = self.start?;
+            let n = match start_code(data, s) {
+                Some(i) => {
+                    self.start = Some(i + 3);
+                    // A 4-byte start code leaves a zero at the end of the previous unit.
+                    let mut end = i;
+                    while end > s && data[end - 1] == 0 {
+                        end -= 1;
+                    }
+                    &data[s..end]
                 }
-                out.push(&data[s..end]);
+                None => {
+                    self.start = None;
+                    &data[s..]
+                }
+            };
+            if !n.is_empty() {
+                return Some(n);
             }
-            i += 3;
-            start = Some(i);
-        } else {
-            i += 1;
         }
     }
-    if let Some(s) = start {
-        out.push(&data[s..]);
-    }
-    out.into_iter().filter(|n| !n.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -174,11 +238,8 @@ pub struct Sample {
 
 /// The NAL units of a frame's MP4 sample: parameter sets and delimiters left out. The
 /// sample is each of them after its length (4 bytes, big-endian).
-pub fn units(data: &[u8]) -> Vec<&[u8]> {
-    nals(data)
-        .into_iter()
-        .filter(|n| !matches!(n[0] & 0x1f, 7..=9))
-        .collect()
+pub fn units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    nals(data).filter(|n| !matches!(n[0] & 0x1f, 7..=9))
 }
 
 /// A keyframe's first SPS and PPS.
@@ -221,7 +282,7 @@ pub fn write(
     let mut index = Vec::with_capacity(frames.len());
     for f in frames {
         let at = body.len();
-        for u in sample_units(codec, &f.data)? {
+        for u in sample_units(codec, &f.data)?.iter() {
             body.extend_from_slice(u.prefix());
             body.extend_from_slice(u.body);
         }
@@ -756,13 +817,14 @@ mod tests {
         assert_eq!(len, 8 + 4 + seq.len());
         assert_eq!(&out[at + 8..at + 12], &[0x81, 1, 0x0c, 0], "av01.0.01M.08");
         assert_eq!(&out[at + 12..at + len], seq);
-        assert_eq!(&out[find(&out, b"av01") + 4..][..4], b"av01");
+        let stsd = find(&out, b"stsd");
+        assert_eq!(&out[stsd + 20..stsd + 24], b"av01", "the sample entry");
         // The samples: every OBU but the temporal delimiters, each with its size field.
         let stco = find(&out, b"stco");
         let off = u32::from_be_bytes(out[stco + 16..stco + 20].try_into().unwrap()) as usize;
         let mut want = Vec::new();
         for tu in &tus {
-            for o in av1::obus(tu).unwrap() {
+            for o in av1::obus(tu).map(Result::unwrap) {
                 if o.kind != 2 {
                     assert_ne!(o.header[0] & 2, 0, "the fixture's OBUs carry sizes");
                     want.extend_from_slice(o.whole);
@@ -776,15 +838,63 @@ mod tests {
     fn an_obu_without_a_size_field_gets_one_and_padding_is_left_out() {
         // A temporal delimiter, padding, then a frame OBU (kind 6) with no size field.
         let tu = [0x12, 0x00, 0x7a, 0x01, 0xff, 0x30, 0xaa, 0xbb, 0xcc];
-        let units = sample_units(Codec::Av1, &tu).unwrap();
+        let sample = sample_units(Codec::Av1, &tu).unwrap();
+        let units: Vec<_> = sample.iter().collect();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].prefix(), &[0x32, 3]);
         assert_eq!(units[0].body, &[0xaa, 0xbb, 0xcc]);
         assert_eq!(units[0].size(), 5);
+        assert_eq!(sample.size, 5);
         let long = [&[0x32u8, 0x80, 0x01][..], &[7u8; 128][..]].concat();
-        let units = sample_units(Codec::Av1, &long).unwrap();
-        assert_eq!(units[0].prefix(), &[0x32, 0x80, 0x01]);
+        let sample = sample_units(Codec::Av1, &long).unwrap();
+        assert_eq!(sample.iter().next().unwrap().prefix(), &[0x32, 0x80, 0x01]);
+        assert_eq!(sample.size, 131);
         assert!(sample_units(Codec::Av1, &[0x32, 0x05, 0x00]).is_err());
+    }
+
+    /// A sample's bytes, as the recorder writes them.
+    fn sample_bytes(codec: Codec, data: &[u8]) -> Vec<u8> {
+        let sample = sample_units(codec, data).unwrap();
+        let mut out = Vec::new();
+        for u in sample.iter() {
+            out.extend_from_slice(u.prefix());
+            out.extend_from_slice(u.body);
+        }
+        assert_eq!(out.len() as u64, sample.size);
+        out
+    }
+
+    #[test]
+    fn an_obu_with_an_extension_keeps_it_before_its_new_size_field() {
+        assert_eq!(
+            sample_bytes(Codec::Av1, &[0x34, 0x48, 0xaa, 0xbb]),
+            [0x36, 0x48, 0x02, 0xaa, 0xbb]
+        );
+        assert!(
+            sample_units(Codec::Av1, &[0x34]).is_err(),
+            "no extension byte"
+        );
+        assert!(sample_units(Codec::Av1, &[0x12, 0x00, 0x36]).is_err());
+    }
+
+    #[test]
+    fn tile_lists_are_left_out_and_a_frame_with_nothing_else_is_an_error() {
+        let tu = [0x12, 0x00, 0x42, 0x01, 0x00, 0x32, 0x01, 0xaa, 0x7a, 0x00];
+        assert_eq!(sample_bytes(Codec::Av1, &tu), [0x32, 0x01, 0xaa]);
+        for tu in [
+            &[0x12, 0x00][..],
+            &[0x12, 0x00, 0x7a, 0x01, 0xff, 0x42, 0x00][..],
+            &[][..],
+        ] {
+            assert!(sample_units(Codec::Av1, tu).is_err(), "{tu:?}");
+        }
+    }
+
+    #[test]
+    fn an_obu_with_the_forbidden_bit_is_an_error() {
+        assert!(sample_units(Codec::Av1, &[0xb2, 0x01, 0x00]).is_err());
+        assert!(sample_units(Codec::Av1, &[0x32, 0x01, 0x00, 0xb2, 0x01, 0x00]).is_err());
+        assert!(av1::obus(&[0x92, 0x00]).next().unwrap().is_err());
     }
 
     #[test]
@@ -794,6 +904,47 @@ mod tests {
             Err("keyframe without a sequence header".into())
         );
         assert!(Track::of(Codec::Hevc, &[0, 0, 0, 1, 0x40]).is_err());
+    }
+
+    #[test]
+    fn a_sequence_header_without_a_size_field_or_too_long_opens_no_track() {
+        let tus = fixture_av1();
+        let payload = av1::sequence_header(&tus[0]).unwrap();
+        assert!(Track::of(Codec::Av1, &tus[0]).is_ok());
+        let sizeless = [&[0x12, 0x00, 0x08][..], payload].concat();
+        assert_eq!(
+            Track::of(Codec::Av1, &sizeless),
+            Err("a sequence header OBU without a size field".into())
+        );
+        let mut padded = payload.to_vec();
+        padded.resize(av1::MAX_SEQUENCE_HEADER, 0);
+        assert!(av1::av1c(&padded).is_some());
+        padded.push(0);
+        assert_eq!(av1::av1c(&padded), None);
+        let n = padded.len();
+        let long = [
+            &[0x12, 0x00, 0x0a, (n & 0x7f) as u8 | 0x80, (n >> 7) as u8][..],
+            &padded,
+        ]
+        .concat();
+        assert_eq!(av1::sequence_header(&long), Some(&padded[..]));
+        assert_eq!(
+            Track::of(Codec::Av1, &long),
+            Err("bad sequence header".into())
+        );
+    }
+
+    #[test]
+    fn h264_samples_are_their_units_after_their_lengths() {
+        let d = [
+            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 4, 5, 0,
+            0, 1, 0x65, 6,
+        ];
+        assert_eq!(
+            sample_bytes(Codec::H264, &d),
+            [0, 0, 0, 3, 0x65, 4, 5, 0, 0, 0, 2, 0x65, 6]
+        );
+        assert_eq!(sample_bytes(Codec::H264, &[1, 2, 3]), [] as [u8; 0]);
     }
 
     #[test]
@@ -818,7 +969,7 @@ mod tests {
         let d = [
             0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5,
         ];
-        let n = nals(&d);
+        let n: Vec<_> = nals(&d).collect();
         assert_eq!(
             n,
             vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4, 5][..]]

@@ -378,6 +378,191 @@ fn av1_that_cant_start_a_segment_or_be_a_sample_ends_the_recording() {
     ]);
     assert_eq!(c.end, End::BadFrame);
     assert_eq!(c.segments[0].frames, 1);
+    // One with nothing but a temporal delimiter and padding.
+    let c = collected(vec![
+        av1_frame(true, &tus[0], (640, 360)),
+        av1_frame(false, &[0x12, 0x00, 0x7a, 0x01, 0xff], (640, 360)),
+    ]);
+    assert_eq!(c.end, End::BadFrame);
+    assert_eq!(c.segments[0].frames, 1);
+}
+
+/// An H.264 keyframe with a PPS but no SPS.
+fn keyframe_without_sps(size: (u32, u32)) -> Msg {
+    let mut b = vec![0x01, 1, 0, 0, 0, 2];
+    b.resize(16, 0);
+    b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
+    Msg::Frame(Tapped {
+        size,
+        codec: Codec::H264,
+        key: true,
+        captured_at: Instant::now(),
+        data: Bytes::from(b),
+        charge: 0,
+    })
+}
+
+#[test]
+fn a_switch_from_av1_to_h264_needs_a_keyframe_with_its_parameter_sets() {
+    let tus = av1_units();
+    let av1 = || {
+        vec![
+            av1_frame(true, &tus[0], (64, 32)),
+            av1_frame(false, &tus[1], (64, 32)),
+        ]
+    };
+    let mut msgs = av1();
+    msgs.push(unit(None));
+    let c = collected(msgs);
+    assert_eq!(c.end, End::BadFrame, "a delta of the other codec");
+    assert_eq!(c.segments.len(), 1);
+    assert_eq!(c.segments[0].frames, 2);
+    let mut msgs = av1();
+    msgs.push(keyframe_without_sps((64, 32)));
+    let c = collected(msgs);
+    assert_eq!(c.end, End::BadParameterSets);
+    assert_eq!(c.segments.len(), 1);
+    assert_eq!(c.segments[0].frames, 2);
+    assert_eq!(&sample_entry(&mp4_of(&c, 0)).0, b"av01");
+    let mut msgs = av1();
+    msgs.extend([unit(Some((100, 40))), unit(None), stopped()]);
+    let c = collected(msgs);
+    assert_eq!(c.end, End::Stopped);
+    assert_eq!(c.segments.len(), 2);
+    assert_eq!(&sample_entry(&mp4_of(&c, 0)).0, b"av01");
+    assert_eq!(c.segments[0].frames, 2);
+    assert_eq!(&sample_entry(&mp4_of(&c, 1)).0, b"avc1");
+    assert_eq!(check(&mp4_of(&c, 1)).0, 2);
+    let (a, b) = (&c.segments[0], &c.segments[1]);
+    assert!(b.start_ms <= a.start_ms + a.duration_ms, "no gap");
+}
+
+/// `tu` with `payload` as its sequence header OBU's.
+fn with_sequence_header(tu: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for o in av1::obus(tu).map(Result::unwrap) {
+        if o.kind != 1 {
+            out.extend_from_slice(o.whole);
+            continue;
+        }
+        out.push(0x0a);
+        let mut n = payload.len();
+        while n >= 0x80 {
+            out.push((n & 0x7f) as u8 | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+#[test]
+fn av1_keyframes_keep_or_start_a_segment_by_their_sequence_header() {
+    let tus = av1_units();
+    let key = |tu: &[u8]| av1_frame(true, tu, (640, 360));
+    let delta = || av1_frame(false, &tus[1], (640, 360));
+    let c = collected(vec![
+        key(&tus[0]),
+        delta(),
+        key(&tus[0]),
+        delta(),
+        stopped(),
+    ]);
+    assert_eq!(c.end, End::Stopped);
+    assert_eq!(c.segments.len(), 1, "the same sequence header");
+    let mp4 = mp4_of(&c, 0);
+    let stss = find(
+        &mp4,
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stss"],
+    );
+    assert_eq!(be32(&stss[4..]), 2, "two keyframes");
+    assert_eq!((be32(&stss[8..]), be32(&stss[12..])), (1, 3));
+    let payload = av1::sequence_header(&tus[0]).unwrap();
+    let other = with_sequence_header(&tus[0], &[payload, &[0]].concat());
+    let c = collected(vec![key(&tus[0]), delta(), key(&other), delta(), stopped()]);
+    assert_eq!(c.end, End::Stopped);
+    assert_eq!(c.segments.len(), 2, "a new sequence header");
+    for (i, s) in c.segments.iter().enumerate() {
+        assert_eq!(&sample_entry(&mp4_of(&c, i)).0, b"av01");
+        assert_eq!(s.frames, 2);
+    }
+    let (_, config) = sample_entry(&mp4_of(&c, 1));
+    assert_eq!(&config[4..], av1::sequence_header_obu(&other).unwrap());
+    let mut long = payload.to_vec();
+    long.resize(av1::MAX_SEQUENCE_HEADER + 1, 0);
+    for (what, bad) in [
+        ("unreadable", with_sequence_header(&tus[0], &[0xff])),
+        ("too long", with_sequence_header(&tus[0], &long)),
+        ("no size field", [&[0x12, 0x00, 0x08][..], payload].concat()),
+    ] {
+        let c = collected(vec![key(&tus[0]), delta(), key(&bad), delta()]);
+        assert_eq!(c.end, End::BadParameterSets, "{what}");
+        assert_eq!(c.segments.len(), 1, "{what}");
+        assert_eq!(c.segments[0].frames, 2, "{what}");
+    }
+    let first = key(&with_sequence_header(&tus[0], &long));
+    let e = collected_with(vec![first], Limits::default())
+        .err()
+        .unwrap();
+    assert_eq!(e.end, End::BadParameterSets, "a first keyframe too");
+}
+
+/// A frame of `len` bytes, its 16-byte header and then `piece` over and over, allocated
+/// once.
+fn of_pieces(codec: Codec, piece: &[u8], len: usize) -> Msg {
+    let mut b = Vec::with_capacity(len);
+    b.extend_from_slice(&[0x01, 0, 0, 0, 0, 1]);
+    b.resize(16, 0);
+    while b.len() + piece.len() <= len {
+        b.extend_from_slice(piece);
+    }
+    assert_eq!(b.capacity(), len);
+    Msg::Frame(Tapped {
+        size: (64, 32),
+        codec,
+        key: false,
+        captured_at: Instant::now(),
+        data: Bytes::from(b),
+        charge: 0,
+    })
+}
+
+/// The largest frame, made of the smallest OBUs (AV1) or NAL units (H.264), is recorded
+/// with the process's memory, the frame included, within what one recording may hold:
+/// its sample is written from the frame in place.
+#[test]
+fn a_largest_frame_of_tiny_units_is_recorded_within_the_bound() {
+    const NAME: &str = "record::tests::a_largest_frame_of_tiny_units_is_recorded_within_the_bound";
+    if std::env::var("STARFOLD_ALONE").as_deref() != Ok(NAME) {
+        return alone(NAME);
+    }
+    let len = tap::LARGEST_FRAME;
+    let tus = av1_units();
+    for (what, codec, piece, sample) in [
+        ("AV1", Codec::Av1, &[0x2a, 0x00][..], (len - 16) as u64),
+        (
+            "H.264",
+            Codec::H264,
+            &[0, 0, 1, 0x41][..],
+            (len - 16) as u64 / 4 * 5,
+        ),
+    ] {
+        let key = match codec {
+            Codec::Av1 => av1_frame(true, &tus[0], (64, 32)),
+            _ => unit(Some((100, 40))),
+        };
+        let base = crate::counting::reset();
+        let msgs = vec![key, of_pieces(codec, piece, len), stopped()];
+        let c = collected(msgs);
+        let peak = crate::counting::peak() - base;
+        println!("{what}: peak above the start {peak} B, a frame of {len} B");
+        assert_eq!(c.end, End::Stopped, "{what}");
+        assert_eq!(c.segments.len(), 1, "{what}");
+        assert_eq!(c.segments[0].frames, 2, "{what}");
+        assert!(c.segments[0].len > sample, "{what}");
+        assert!(peak <= BOUND, "{what}: {peak}");
+    }
 }
 
 #[test]

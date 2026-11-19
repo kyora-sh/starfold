@@ -40,7 +40,7 @@ pub(crate) mod tap;
 pub use spool::default_dir;
 pub use tap::Taps;
 
-use crate::encoder::Codec;
+use crate::encoder::{av1, Codec};
 use crate::hub::Hub;
 use crate::mp4;
 use axum::body::Body;
@@ -483,7 +483,7 @@ impl Writer {
         let ms = self.ms(f.captured_at);
         let ms = self.last_ms.map_or(ms, |l| ms.max(l + 1));
         if f.key {
-            let p = params(f.codec, d);
+            let p = params(f.codec, d).ok_or(End::BadParameterSets)?;
             match &self.first {
                 None => {
                     self.first = Some(p);
@@ -516,11 +516,11 @@ impl Writer {
                 end_ms: None,
             });
         }
-        let units = mp4::sample_units(f.codec, d).map_err(|e| {
+        let sample = mp4::sample_units(f.codec, d).map_err(|e| {
             log::warn!("recording: {e}");
             End::BadFrame
         })?;
-        let size: u64 = units.iter().map(mp4::Unit::size).sum();
+        let size = sample.size;
         if self.written + size > self.limit() {
             return Err(End::SizeLimit);
         }
@@ -531,7 +531,7 @@ impl Writer {
                 hook(self.written).map_err(disk_error)?;
             }
             // Straight from the stream's buffer into the writer's: the frame is not copied.
-            for u in &units {
+            for u in sample.iter() {
                 self.out.write_all(u.prefix()).map_err(disk_error)?;
                 self.out.write_all(u.body).map_err(disk_error)?;
             }
@@ -1341,11 +1341,11 @@ async fn begin(r: &Arc<Recorder>, max: Duration) -> Result<Rec, Response> {
 
 /// A keyframe's codec and what describes its stream: H.264's SPS and PPS, the level left
 /// out (an MP4 track keeps the first keyframe's, which still describe a stream that only
-/// changed level); AV1's sequence header.
-fn params(codec: Codec, d: &[u8]) -> (Codec, Vec<Vec<u8>>) {
+/// changed level); AV1's sequence header. None for an AV1 sequence header OBU an MP4 can't
+/// take: without a size field, or longer than [`av1::MAX_SEQUENCE_HEADER`].
+fn params(codec: Codec, d: &[u8]) -> Option<(Codec, Vec<Vec<u8>>)> {
     let p = match codec {
         Codec::H264 => mp4::nals(d)
-            .into_iter()
             .filter(|n| matches!(n[0] & 0x1f, 7 | 8))
             .map(|n| {
                 let mut v = n.to_vec();
@@ -1355,12 +1355,19 @@ fn params(codec: Codec, d: &[u8]) -> (Codec, Vec<Vec<u8>>) {
                 v
             })
             .collect(),
-        Codec::Av1 => crate::encoder::av1::sequence_header(d)
-            .map(|s| vec![s.to_vec()])
-            .unwrap_or_default(),
+        Codec::Av1 => match av1::sequence_header_obu(d) {
+            None => Vec::new(),
+            Some(obu) => {
+                let s = av1::sequence_header(obu)?;
+                if obu[0] & 2 == 0 || s.len() > av1::MAX_SEQUENCE_HEADER {
+                    return None;
+                }
+                vec![s.to_vec()]
+            }
+        },
         _ => Vec::new(),
     };
-    (codec, p)
+    Some((codec, p))
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
