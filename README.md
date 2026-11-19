@@ -43,6 +43,23 @@ toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm),
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
 
+The AV1 encoder libaom (BSD-2-Clause) is optional: `--features libaom` adds it
+(`--encoder libaom`). It is built from source, libaom v3.15.3 at commit
+`b141d9c45db236335351c8a4b2a14b3ade27c937`, which is the git submodule
+`crates/starfold-aom-sys/aom`, and is linked statically, so no system libaom is used. That build
+also needs cmake, perl and, on x86_64, nasm (or yasm); the build stops before compiling and names
+any that are missing:
+
+| System | Install |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt install cmake perl nasm libclang-dev` |
+| Fedora | `sudo dnf install cmake perl nasm clang-devel` |
+| macOS | `brew install cmake nasm` (perl and libclang come with `xcode-select --install`) |
+
+Clone with the submodule (`git clone --recursive`, or `git submodule update --init` in an existing
+clone). GitHub's "Download ZIP" and its automatic source archives do not contain submodules, so
+they can't build libaom.
+
 ```sh
 nix-shell --arg withRust true
 cargo build --release

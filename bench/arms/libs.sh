@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Native libraries for the software encoder arms, for a throwaway VM only: builds the pinned
 # releases into $ARM_PREFIX (default ~/arm-libs). Then: source <(libs.sh --env).
-# Usage: libs.sh <libvpx|libaom|svt-av1|kvazaar|x265>...
+# Usage: libs.sh <libvpx|svt-av1|kvazaar|x265>...
+# (libaom needs nothing here: the `libaom` feature builds it from crates/starfold-aom-sys/aom.)
 set -euo pipefail
 prefix=${ARM_PREFIX:-$HOME/arm-libs}
 if [[ ${1:-} == --env ]]; then
@@ -16,7 +17,7 @@ src=$(mktemp -d)
 trap 'rm -rf "$src"' EXIT
 jobs=$(nproc)
 # Each release is pinned to the commit of its tag at the project's own repository, so a mirror
-# on a host the VM's proxy allows gives exactly the same tree (libaom: m-ab-s/aom on GitHub).
+# on a host the VM's proxy allows gives exactly the same tree.
 fetch() {
 	git clone -q --depth 1 -b "$2" "$1" "$src/$4"
 	[[ $(git -C "$src/$4" rev-parse HEAD) == "$3" ]] || { echo "$4 $2 is not commit $3" >&2; exit 1; }
@@ -33,10 +34,6 @@ for lib in "$@"; do
 		libvpx)
 			fetch https://github.com/webmproject/libvpx.git v1.17.0 6df3ec34557879fff673706f4a1d9fbd0f3a6f0e libvpx
 			(cd "$src/libvpx" && ./configure --prefix="$prefix" --enable-shared --disable-static --enable-pic --disable-examples --disable-tools --disable-docs --disable-unit-tests >/dev/null && make -j "$jobs" >/dev/null && make install >/dev/null)
-			;;
-		libaom)
-			fetch https://github.com/m-ab-s/aom.git v3.15.3 b141d9c45db236335351c8a4b2a14b3ade27c937 aom
-			cmake_install "$src/aom" -DCONFIG_REALTIME_ONLY=1 -DENABLE_TESTS=0 -DENABLE_DOCS=0 -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=0
 			;;
 		svt-av1)
 			fetch https://github.com/AOMediaCodec/SVT-AV1.git v4.3.0 e3d63405f9ba8219913a7276c2c47d10e5d022fe svt

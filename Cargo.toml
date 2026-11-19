@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# starfold-aom-sys builds libaom (cmake, a few minutes) only when something needs it.
+default-members = ["crates/starfold-server"]
 resolver = "2"
 
 [profile.release]

@@ -72,12 +72,6 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             "(vpx|vp8|vp9|VPX|VP8|VP9|STARFOLD).*",
         ),
         (
-            cfg!(feature = "libaom"),
-            "aom",
-            "#include <aom/aom_encoder.h>\n#include <aom/aomcx.h>\nstatic const int STARFOLD_AOM_ABI = AOM_ENCODER_ABI_VERSION;\n",
-            "(aom|aome|av1|AOM|AV1|STARFOLD).*",
-        ),
-        (
             cfg!(feature = "svt-av1"),
             "SvtAv1Enc",
             "#include <EbSvtAv1Enc.h>\n",

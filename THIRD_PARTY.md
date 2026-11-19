@@ -15,6 +15,18 @@
 - **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
   feature. `--no-default-features --features openh264` builds without x264, and that binary stays
   under starfold's MIT licence.
+- **libaom** (BSD-2-Clause, Copyright Alliance for Open Media, with the Alliance for Open Media
+  Patent License 1.0), [aomedia.googlesource.com/aom](https://aomedia.googlesource.com/aom)
+  v3.15.3, commit b141d9c45db236335351c8a4b2a14b3ade27c937: the AV1 encoder, built from that
+  source (the git submodule `crates/starfold-aom-sys/aom`) and linked statically only by a build
+  with the `libaom` feature. Licence and patent licence:
+  [third_party/libaom/LICENSE](third_party/libaom/LICENSE) and
+  [third_party/libaom/PATENTS](third_party/libaom/PATENTS); a binary distribution must carry both.
+  The library starfold builds also contains three components libaom bundles in its
+  `third_party/`: **fastfeat** (BSD-3-Clause, Edward Rosten,
+  [LICENSE-fastfeat](third_party/libaom/LICENSE-fastfeat)), **vector** (MIT, Peter Goldsborough,
+  [LICENSE-vector](third_party/libaom/LICENSE-vector)) and, in x86 builds, **x86inc.asm** (ISC,
+  the x264 project, [LICENSE-x86inc](third_party/libaom/LICENSE-x86inc)).
 - **Intel libvpl API headers** (MIT, Copyright Intel Corporation,
   [intel/libvpl](https://github.com/intel/libvpl) v2.17.0, commit
   d77f9195cf495b937631607333288fd917ae8939): the Windows Quick Sync encoder's struct layouts and

@@ -74,7 +74,7 @@ pub const ENCODERS: &[Encoder] = &[
         hardware: false,
         h264: false,
         crf: Some("lowest quantizer"),
-        preset: Some("a speed, 10 by default"),
+        preset: Some("a speed, 9 by default"),
         paintover_crf: true,
         refines_to_paintover_crf: false,
         uncapped_only: false,

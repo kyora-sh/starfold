@@ -100,6 +100,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: x264 source hashes
         working-directory: third_party/x264
         run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
@@ -140,6 +142,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       # As above, plus nasm for OpenH264.
       - name: Native libraries
         run: |
@@ -177,6 +181,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       # The Rust job's libraries, plus the arms' build tools, x265 as bench/arms/libs.sh takes it
       # (Ubuntu's package) and Xvfb for the startup check.
       - name: Native libraries
@@ -238,12 +244,90 @@ jobs:
             [ $ok = 1 ] || { echo "::error::--encoder=$enc --preset=$preset did not start"; exit 1; }
           done
 
+  libaom:
+    name: Rust with libaom (clippy, test, startup, aarch64 and Windows builds)
+    runs-on: kyora-8x16
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: libaom's commit
+        run: test "$(git -C crates/starfold-aom-sys/aom rev-parse HEAD)" = b141d9c45db236335351c8a4b2a14b3ade27c937
+      # The Rust job's libraries, libaom's build tools, and for the cross builds the aarch64 and
+      # MinGW compilers and qemu to run the aarch64 tests.
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild cmake nasm perl xvfb bindfs gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user mingw-w64; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-unknown-linux-gnu, x86_64-pc-windows-gnu
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-libaom-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-libaom-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        run: |
+          cargo clippy -p starfold-aom-sys --all-targets --locked -- -D warnings
+          cargo clippy --features libaom --all-targets --locked -- -D warnings
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
+      - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
+        run: |
+          cargo test -p starfold-aom-sys --locked
+          cargo test --features libaom --locked
+      # The binary carries libaom's encoder, statically, and no decoder.
+      - name: libaom linked statically
+        run: |
+          cargo build --features libaom --locked
+          if ldd target/debug/starfold | grep -i aom; then echo "::error::a shared libaom is linked"; exit 1; fi
+          nm target/debug/starfold | grep ' T aom_codec_av1_cx$'
+          if nm target/debug/starfold | grep aom_codec_av1_dx; then echo "::error::libaom's decoder is linked"; exit 1; fi
+      # --encoder libaom must open its encoder and reach "listening on".
+      - name: Startup on Xvfb
+        run: |
+          BENCH_DISPLAY=:99 bench/env/xvfb.sh >/dev/null 2>&1 &
+          for _ in $(seq 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done
+          log=$RUNNER_TEMP/libaom.log
+          DISPLAY=:99 RUST_LOG=info target/debug/starfold --encoder=libaom --port=6901 --enable-basic-auth=false --audio-enabled=false > "$log" 2>&1 &
+          pid=$!
+          up() { grep -q 'listening on' "$log" && grep -q "offering .* from libaom:" "$log"; }
+          for _ in $(seq 60); do up && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+          sleep 3
+          cut -c1-240 "$log" || true
+          ok=1
+          up && kill -0 $pid 2>/dev/null || ok=0
+          kill $pid 2>/dev/null || true
+          wait $pid 2>/dev/null || true
+          [ $ok = 1 ] || { echo "::error::--encoder=libaom did not start"; exit 1; }
+      # libaom cross-compiled with its own toolchain files; the aarch64 tests run under qemu.
+      - name: aarch64 (cross-compiled)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: cargo test -p starfold-aom-sys --target aarch64-unknown-linux-gnu --locked
+      - name: Windows x86_64 (cross-compiled, linked)
+        run: cargo test -p starfold-aom-sys --target x86_64-pc-windows-gnu --locked --no-run
+
   musl:
     name: Linux musl (clippy)
     runs-on: kyora-8x16
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       # Checked, not linked: musl-gcc for the C dependencies, the host g++ for OpenH264's C++,
       # x264's headers and libclang for its bindings.
       - name: Native libraries
@@ -283,6 +367,8 @@ jobs:
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: MinGW, NASM and vcpkg's build tools
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
@@ -326,6 +412,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -344,9 +432,10 @@ jobs:
             echo "HOMEBREW_REPOSITORY=$("$brew" --repository)"
           } >> "$GITHUB_ENV"
           printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
-      # x264 and Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only).
+      # x264 and Opus for linking, esbuild for build.rs (libyuv and PulseAudio are Linux-only),
+      # cmake and nasm for libaom.
       - run: |
-          brew install x264 opus pkgconf esbuild
+          brew install x264 opus pkgconf esbuild cmake nasm
           [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
       - uses: actions/cache@v4
         with:
@@ -362,6 +451,12 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      # libaom built from the submodule for arm64, and the server with it.
+      - name: libaom
+        run: |
+          cargo test -p starfold-aom-sys --locked
+          cargo clippy --features libaom --all-targets --locked -- -D warnings
+          cargo test --features libaom --locked --lib encoder
       # What the startup probe finds on this host's hardware encoders.
       - name: Encoder probe
         run: cargo test --locked --lib videotoolbox_probe -- --nocapture
