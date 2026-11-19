@@ -333,13 +333,13 @@ async function pasteMount() {
 				reject: () => fail(new Error('unreadable')),
 			};
 		},
-		/** Uploaded images, clipboard text and V key events, in the order posted. */
+		/** Uploaded images, clipboard text, and V and left Control key events, in the order posted. */
 		sent: () =>
 			(w.posted as unknown as { t: string; d: string | ArrayBuffer }[]).flatMap(
 				({ t, d }) => {
 					if (t === 'sendBin')
 						return [`img:${new Uint8Array(d as ArrayBuffer).slice(1).join()}`];
-					if (t === 'send' && /^(k,118,|c,)/.test(d as string))
+					if (t === 'send' && /^(k,118,|k,65507,|c,)/.test(d as string))
 						return [d as string];
 					return [];
 				}
@@ -451,29 +451,25 @@ describe('mount', () => {
 		rig.ctrlV();
 		const first = rig.pasteImage();
 		rig.blur();
-		rig.ctrlV();
-		const second = rig.pasteImage();
 		first.resolve(1);
 		await sleep(20);
 		expect(rig.sent()).toEqual([]);
+		rig.ctrlV();
+		const second = rig.pasteImage();
 		second.resolve(2);
 		await sleep(20);
 		expect(rig.sent()).toEqual(['img:2', 'k,118,1']);
 		h.unmount();
 		await tick();
 	});
-
-	test("a replaced paste shortcut's timer does not fire a later paste early", async () => {
+	test("a replaced paste shortcut's 150 ms timer does not fire a later paste early", async () => {
 		const { h, rig } = await pasteMount();
 		rig.ctrlV();
-		const first = rig.pasteImage();
 		rig.ctrlV();
 		rig.blur();
 		rig.ctrlV();
 		const last = rig.pasteImage();
-		await sleep(200);
-		first.resolve(1);
-		await sleep(20);
+		await sleep(250);
 		expect(rig.sent()).toEqual([]);
 		last.resolve(3);
 		await sleep(20);
@@ -482,23 +478,48 @@ describe('mount', () => {
 		await tick();
 	});
 
-	test('a paste shortcut released while its image converts is sent after the image', async () => {
+	test("a replaced image paste's 3 s timer does not fire a later paste early", async () => {
+		const { h, rig } = await pasteMount();
+		rig.ctrlV();
+		const first = rig.pasteImage();
+		rig.ctrlV();
+		rig.blur();
+		await sleep(1500);
+		rig.ctrlV();
+		const last = rig.pasteImage();
+		await sleep(1750);
+		expect(rig.sent()).toEqual([]);
+		last.resolve(3);
+		first.resolve(1);
+		await sleep(20);
+		expect(rig.sent()).toEqual(['img:3', 'k,118,1']);
+		h.unmount();
+		await tick();
+	}, 10000);
+	test('a paste shortcut released while its image converts is sent after the image, with its modifier', async () => {
 		const { h, rig } = await pasteMount();
 		rig.key('keydown', 'ControlLeft', 'Control');
-		rig.key('keydown', 'MetaLeft', 'Meta');
 		rig.ctrlV();
 		const img = rig.pasteImage();
 		rig.key('keydown', 'KeyV', 'v', true);
 		rig.key('keyup', 'KeyV', 'v');
+		rig.key('keyup', 'ControlLeft', 'Control');
 		await sleep(200);
-		expect(rig.sent()).toEqual([]);
+		expect(rig.sent()).toEqual(['k,65507,1', 'k,65507,0']);
 		img.resolve(1);
 		await sleep(20);
-		expect(rig.sent()).toEqual(['img:1', 'k,118,1', 'k,118,0']);
+		expect(rig.sent()).toEqual([
+			'k,65507,1',
+			'k,65507,0',
+			'img:1',
+			'k,65507,1',
+			'k,118,1',
+			'k,118,0',
+			'k,65507,0',
+		]);
 		h.unmount();
 		await tick();
 	});
-
 	test('an image still converting when a newer paste arrives is never sent', async () => {
 		const { h, rig } = await pasteMount();
 		rig.ctrlV();
@@ -511,17 +532,16 @@ describe('mount', () => {
 		await tick();
 	});
 
-	test('a paste shortcut whose image fails to convert is not sent', async () => {
+	test('a paste shortcut whose image fails to convert is not sent, not even by its 3 s timer', async () => {
 		const { h, rig } = await pasteMount();
 		rig.ctrlV();
 		const img = rig.pasteImage();
 		img.reject();
-		await sleep(200);
+		await sleep(3200);
 		expect(rig.sent()).toEqual([]);
 		h.unmount();
 		await tick();
-	});
-
+	}, 10000);
 	test('an unmount in the same task as a worker error still reports one close', async () => {
 		const { o, calls } = recording();
 		const h = mount(container() as never, o);
