@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+	<body style="margin: 0; background: #f4f4f5; font: 14px sans-serif">
+		<div id="desk" style="position: absolute; left: 0; top: 0; width: 1280px; height: 720px"></div>
+		<script type="module">
+			// The integrator's page: the packed embed client, mounted with the gateway's socket URL
+			// and a preamble that fetches a fresh ticket per connect. `window.ticketMode` lets the
+			// test make the preamble reuse the last ticket or send one never issued.
+			import { mount } from '/pkg/index.js';
+			const t = (window.embedTest = { statuses: [], closes: [], preambles: 0, tickets: [] });
+			window.ticketMode = 'fresh';
+			const ticket = async () => {
+				t.preambles++;
+				if (window.ticketMode === 'reuse') return t.tickets[t.tickets.length - 1];
+				if (window.ticketMode === 'bad') return 'not-a-ticket-' + t.preambles;
+				const r = await fetch('/mint', { method: 'POST' });
+				const { ticket } = await r.json();
+				t.tickets.push(ticket);
+				return ticket;
+			};
+			t.handle = mount(document.getElementById('desk'), {
+				connect: { url: `ws://${location.host}/ws`, preamble: ticket },
+				onClose: (code, reason) => t.closes.push({ code, reason }),
+				onStatus: (status, detail) => t.statuses.push(detail ? `${status}:${detail.kind}` : status),
+			});
+		</script>
+	</body>
+</html>
