@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # pack.sh <commit> [out dir]: the embeddable client as an npm-style tarball,
-# starfold-web-embed-<commit>.tgz. The worker, dav1d and worklet bundles are built with the
-# same esbuild flags as the server's own (crates/starfold-server/build.rs); the entry
-# (`mount`) is an ES module beside them. The served page's build is not touched.
+# starfold-web-embed-<commit>.tgz at version 0.0.0-<commit>; with PACK_VERSION set (a release),
+# starfold-web-embed-<PACK_VERSION>.tgz at that version. The worker, dav1d and worklet bundles
+# are built with the same esbuild flags as the server's own (crates/starfold-server/build.rs);
+# the entry (`mount`) is an ES module beside them. The served page's build is not touched.
 # Needs esbuild on PATH (or ESBUILD) and bun.
 set -euo pipefail
 sha=${1:?usage: pack.sh <commit> [out dir]}
+version=${PACK_VERSION:-0.0.0-$sha}
+label=${PACK_VERSION:-$sha}
 dest=$(cd "${2:-.}" && pwd)
 cd "$(dirname "$0")/.."
 esbuild=${ESBUILD:-esbuild}
@@ -42,7 +45,7 @@ cp dav1d/COPYING-dav1d dav1d/COPYING-wasi-libc "$pkg/"
 cat >"$pkg/package.json" <<EOF
 {
 	"name": "@starfold/web-embed",
-	"version": "0.0.0-${sha}",
+	"version": "${version}",
 	"description": "starfold's browser client, to mount in another page",
 	"type": "module",
 	"main": "index.js",
@@ -51,5 +54,5 @@ cat >"$pkg/package.json" <<EOF
 	"sideEffects": false
 }
 EOF
-tar -czf "$dest/starfold-web-embed-${sha}.tgz" -C "$work" package
-echo "$dest/starfold-web-embed-${sha}.tgz"
+tar -czf "$dest/starfold-web-embed-${label}.tgz" -C "$work" package
+echo "$dest/starfold-web-embed-${label}.tgz"
