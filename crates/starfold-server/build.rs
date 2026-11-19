@@ -182,7 +182,11 @@ fn x264_archive() -> Option<Vec<std::path::PathBuf>> {
     let lib = std::path::Path::new(&lib)
         .canonicalize()
         .unwrap_or_else(|e| panic!("STARFOLD_X264_LIB={lib:?}: {e}"));
-    assert!(lib.is_file(), "STARFOLD_X264_LIB={} is not a file", lib.display());
+    assert!(
+        lib.is_file(),
+        "STARFOLD_X264_LIB={} is not a file",
+        lib.display()
+    );
     println!("cargo:rerun-if-changed={}", lib.display());
     println!("cargo:rustc-link-arg={}", lib.display());
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
