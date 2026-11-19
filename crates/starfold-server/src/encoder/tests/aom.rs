@@ -89,6 +89,13 @@ impl Stream {
     }
 }
 
+/// 150 / 75 / 90 ms: a link that drops keeps scroll's tail near x264's (1000 / 500 / 600
+/// doubled it).
+#[test]
+fn the_rate_buffer_is_150_ms() {
+    assert_eq!(Stream::new(4000).enc.rate_buffer(), (150, 75, 90));
+}
+
 #[test]
 fn only_slot_0_is_refreshed_and_unused_names_are_on_the_spare_slot() {
     const LAST: usize = 0;

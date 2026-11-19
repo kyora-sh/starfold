@@ -20,6 +20,13 @@ use std::ptr;
 
 const MAX_Q: u32 = 63;
 const UNCAPPED_KBPS: u32 = 200_000;
+/// The rate buffer (ms): its size, its fill at the start, and the fill rate control aims at.
+/// A larger one lets frames run above a link that just got thinner for up to its length:
+/// at 1000 ms, scroll's key-to-paint p95 after a drop from 2 to 1 Mbit/s was 1060 ms, at
+/// 150 ms 582 (x264 544), with the median and the rate unchanged.
+const BUF_MS: u32 = 150;
+const BUF_INITIAL_MS: u32 = 75;
+const BUF_OPTIMAL_MS: u32 = 90;
 const SPEED: c_int = 9;
 /// The quantizer of the ladder's last rung (H.264 QP 12 and below): on video, the one that
 /// settles where x264's paint-over does.
@@ -139,9 +146,9 @@ impl Aom {
             cfg.rc_resize_mode = 0;
             cfg.rc_superres_mode = 0;
             cfg.rc_max_quantizer = MAX_Q;
-            cfg.rc_buf_sz = 1000;
-            cfg.rc_buf_initial_sz = 500;
-            cfg.rc_buf_optimal_sz = 600;
+            cfg.rc_buf_sz = BUF_MS;
+            cfg.rc_buf_initial_sz = BUF_INITIAL_MS;
+            cfg.rc_buf_optimal_sz = BUF_OPTIMAL_MS;
             cfg.kf_mode = ffi::aom_kf_mode_AOM_KF_DISABLED;
             apply(&mut cfg, c.rate);
             let mut ctx: Box<ffi::aom_codec_ctx_t> = Box::new(std::mem::zeroed());
@@ -238,6 +245,16 @@ impl Aom {
                 }
             })
             .collect())
+    }
+
+    /// The rate buffer it opened with (ms): size, initial fill, optimal fill.
+    #[cfg(test)]
+    pub(super) fn rate_buffer(&self) -> (u32, u32, u32) {
+        (
+            self.cfg.rc_buf_sz,
+            self.cfg.rc_buf_initial_sz,
+            self.cfg.rc_buf_optimal_sz,
+        )
     }
 
     /// Back to the stream's rate control after a refinement's fixed quantizer, which also
