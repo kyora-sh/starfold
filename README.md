@@ -27,12 +27,12 @@ instead; see [macOS](#macos) and [Windows](#windows).
 
 ### Prebuilt binaries
 
-Each [release](https://github.com/kyora-sh/starfold/releases) attaches binaries for Linux, macOS
-and Windows (`<version>` is the release's, e.g. `0.3.2`). The `starfold-x264-*` binaries are the
-default build: they encode H.264 in software with x264, which is GPL-2.0-or-later, so the binary
-is GPL-2.0-or-later too, as a combined work, and the release attaches x264's source beside them.
-The `starfold-*` binaries use OpenH264 (BSD-2-Clause) instead and stay MIT. The hardware encoders
-are the same in both. See [Licensing](#licensing).
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches two builds per platform
+(`<version>` is the release's, e.g. `0.3.2`; [Licensing](#licensing) has the details):
+
+- **x264, recommended** (`starfold-x264-<version>-<platform>`): GPL-2.0-or-later as a combined work
+  with x264, whose source the release attaches beside it.
+- **OpenH264** (`starfold-<version>-<platform>`): works out of the box with no x264 library, and is MIT.
 
 | Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
 | --------------------- | ---------------------------------------------- | ----------------------------------------- |
@@ -72,7 +72,7 @@ Ubuntu 24.04:
 
 ```sh
 sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
-  libx264-dev libyuv-dev libopus-dev libpulse-dev
+  libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev
 cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
 ```
 
