@@ -357,7 +357,11 @@ fn a_directory_another_user_made_first_is_refused() {
     let (code, said) = refused_start(&at);
     assert_eq!(code, Some(1), "{said}");
     assert!(
-        said.contains(&format!("exists (owner uid {}, mode 0755)", user.uid)),
+        said.contains(&format!(
+            "{} is in the way (a directory, owner uid {}, mode 0755)",
+            at.display(),
+            user.uid
+        )),
         "{said}"
     );
     let meta = std::fs::metadata(&at).unwrap();
