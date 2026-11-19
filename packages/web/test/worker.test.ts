@@ -10,6 +10,7 @@ import { fakeServer, sleep, until } from './server';
 
 const WORKER = new URL('../src/worker.ts', import.meta.url).href;
 const PRELOAD = new URL('./worker-preload.ts', import.meta.url).href;
+const SLOW_DECODER = new URL('./worker-slow-decoder.ts', import.meta.url).href;
 
 let cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -18,9 +19,15 @@ afterEach(() => {
 });
 
 /** The real worker on the lifecycle port, as mount() starts it, and the page's side. */
-function start(o: LifeOptions, onReplyPosted?: (w: Worker) => void) {
+function start(
+	o: LifeOptions,
+	onReplyPosted?: (w: Worker) => void,
+	preload: string[] = []
+) {
 	const s = fakeServer();
-	const worker = new Worker(WORKER, { preload: [PRELOAD] } as WorkerOptions);
+	const worker = new Worker(WORKER, {
+		preload: [PRELOAD, ...preload],
+	} as WorkerOptions);
 	const ch = new MessageChannel();
 	const seen = {
 		status: [] as Status[],
@@ -101,5 +108,33 @@ describe('the production worker', () => {
 		await until(() => replied === 1, 5000);
 		await sleep(1500);
 		expect(s.conns.length).toBe(0);
+	});
+
+	test("a hello's negotiation that fails after its socket closed leaves the next socket open", async () => {
+		const { s, page, seen } = start({ preamble: () => 'ticket' }, undefined, [
+			SLOW_DECODER,
+		]);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && seen.status.includes('open'), 5000);
+		const config = { codec: 'avc1.640028', codedWidth: 640, codedHeight: 360 };
+		s.conns[0].ws!.send(
+			JSON.stringify({
+				t: 'hello',
+				protocol: 2,
+				w: 640,
+				h: 360,
+				videoOffers: [
+					{ codec: 'h264', stripes: [{ y: 0, h: 360, config }] },
+					{ codec: 'h264', stripes: '' },
+				],
+			})
+		);
+		s.conns[0].ws!.close(4401, 'ticket expired');
+		await until(() => seen.closes.length === 1, 5000);
+		page.connect();
+		await until(() => !!s.conns[1]?.ws && seen.status.includes('open'), 5000);
+		await sleep(1000);
+		expect(seen.closes).toEqual([[4401, 'ticket expired']]);
+		expect(s.conns[1].closed).toBe(false);
 	});
 });

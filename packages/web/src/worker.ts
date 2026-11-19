@@ -174,6 +174,12 @@ function protocolFailure(e: unknown) {
 	link?.abort(PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason);
 }
 
+/** protocolFailure for work started on connection `c`: once a newer socket exists, it is dropped. */
+const failureOf = (c: number) => (e: unknown) => {
+	if (life && c !== conn) return;
+	protocolFailure(e);
+};
+
 function makeLink(mode: LinkMode) {
 	return new Link(url, mode, {
 		opening(sock) {
@@ -289,7 +295,7 @@ function onHello(m: Hello) {
 	// Each hello (the first, and one per new screen size) is answered with what decodes
 	// at its sizes; the last picture stays up until the server's next `codec`.
 	proto = 2;
-	answer(conn, ++helloSeq, m.offer, m.videoOffers).catch(protocolFailure);
+	answer(conn, ++helloSeq, m.offer, m.videoOffers).catch(failureOf(conn));
 }
 
 async function supported(c: VideoDecoderConfig): Promise<boolean> {
@@ -351,7 +357,7 @@ function onCodec(m: CodecMessage) {
 		post(m);
 		return;
 	}
-	configure(conn, m).catch(protocolFailure);
+	configure(conn, m).catch(failureOf(conn));
 }
 
 async function plan(m: Extract<CodecMessage, { w: number }>) {

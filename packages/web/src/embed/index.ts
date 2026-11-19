@@ -109,6 +109,8 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	// Before anything is added to the page: a worker that can't be created leaves nothing behind.
 	const worker = new Worker(new URL('worker.js', base));
 
+	/** Set first thing in unmount(); every later continuation checks it before acting. */
+	let disposed = false;
 	const disposers = new Disposers();
 	disposers.add('worker', () => worker.terminate());
 	const lifeChannel = new MessageChannel();
@@ -129,8 +131,9 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		kbd.remove();
 	});
 
-	const post = (m: ToWorker, transfer: Transferable[] = []) =>
-		worker.postMessage(m, transfer);
+	const post = (m: ToWorker, transfer: Transferable[] = []) => {
+		if (!disposed) worker.postMessage(m, transfer);
+	};
 	const app: App = {
 		worker,
 		post,
@@ -158,6 +161,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	const stamps: number[] = [];
 	let tickFrame = 0;
 	const tick = (t: number) => {
+		if (disposed) return;
 		stamps.push(t);
 		if (t - stamps[0] < 500) {
 			tickFrame = requestAnimationFrame(tick);
@@ -215,6 +219,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		}
 	};
 	const onVisibility = () => {
+		if (disposed) return;
 		updateVisibility();
 		if (document.hidden) app.send(cmd.releaseAll);
 	};
@@ -223,6 +228,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		document.removeEventListener('visibilitychange', onVisibility)
 	);
 	const resized = new ResizeObserver(() => {
+		if (disposed) return;
 		video.layout();
 		updateVisibility();
 	});
@@ -236,6 +242,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		opened: () => updateVisibility(true),
 	});
 	const onWorkerError = (e: Event) => {
+		if (disposed) return;
 		e.preventDefault();
 		life.workerFailed();
 	};
@@ -243,7 +250,8 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	disposers.add('worker error listener', () =>
 		worker.removeEventListener('error', onWorkerError)
 	);
-	const onWorkerMessage = (e: MessageEvent<FromWorker>) =>
+	const onWorkerMessage = (e: MessageEvent<FromWorker>) => {
+		if (disposed) return;
 		onStream(e.data, {
 			frames: (m) => video.present(m.parts),
 			surface: (m) => video.setSurface(m.s),
@@ -264,6 +272,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 			},
 			cursor: (m) => cursor.set(m.buf),
 		});
+	};
 	worker.addEventListener('message', onWorkerMessage);
 	disposers.add('worker message listener', () =>
 		worker.removeEventListener('message', onWorkerMessage)
@@ -289,14 +298,13 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	);
 	updateVisibility();
 
-	let mounted = true;
 	const handle: Handle = {
 		connect() {
-			if (mounted) life.connect();
+			if (!disposed) life.connect();
 		},
 		unmount() {
-			if (!mounted) return;
-			mounted = false;
+			if (disposed) return;
+			disposed = true;
 			// The worker goes first: once terminated it processes nothing more, so a preamble
 			// reply already posted never opens a socket. Then the lifecycle ends, which drops
 			// every queued callback but the unmounted close.

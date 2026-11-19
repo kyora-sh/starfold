@@ -220,6 +220,61 @@ describe('unmount ends everything at once', () => {
 		await sleep(700);
 		expect(env.vibrated).toBe(0);
 	});
+
+	test('the removed elements keep no listener: a touch on a kept surface starts no long press', async () => {
+		const { o } = recording();
+		const box = container();
+		const h = mount(box as never, o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const [surface, kbd] = box.children;
+
+		h.unmount();
+
+		expect(surface.active.size).toBe(0);
+		expect(kbd.active.size).toBe(0);
+		surface.dispatchEvent(
+			Object.assign(new Event('pointerdown', { cancelable: true }), {
+				pointerType: 'touch',
+				pointerId: 1,
+				clientX: 5,
+				clientY: 5,
+				button: 0,
+			})
+		);
+		await sleep(700);
+		expect(env.vibrated).toBe(0);
+		expect(w.late).toEqual([]);
+	});
+
+	test('an image paste whose bytes arrive after unmount posts nothing', async () => {
+		const { o } = recording();
+		const box = container();
+		const h = mount(box as never, o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const kbd = box.children[1];
+		let bytes: ((b: ArrayBuffer) => void) | undefined;
+		const file = {
+			type: 'image/png',
+			arrayBuffer: () => new Promise<ArrayBuffer>((r) => (bytes = r)),
+		};
+		kbd.dispatchEvent(
+			Object.assign(new Event('paste', { cancelable: true }), {
+				clipboardData: {
+					getData: () => '',
+					items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }],
+				},
+			})
+		);
+
+		expect(bytes).toBeDefined();
+		h.unmount();
+		bytes?.(new Uint8Array([1, 2, 3]).buffer);
+		await sleep(50);
+
+		expect(w.late).toEqual([]);
+	});
 });
 
 describe('mount', () => {

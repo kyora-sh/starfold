@@ -3,6 +3,7 @@
 import { Bin, cmd } from '../protocol';
 import type { App } from './app';
 import type { Clipboard } from './clipboard';
+import { listeners } from './listeners';
 
 const NAMED: Record<string, number> = {
 	Backspace: 0xff08,
@@ -53,6 +54,8 @@ export function setupKeyboard(
 	onInteract: () => void
 ) {
 	const { kbd, surface, send, isMac } = app;
+	const ls = listeners();
+	let disposed = false;
 	const XK_CONTROL_L = 0xffe3,
 		XK_CONTROL_R = 0xffe4,
 		XK_SUPER_L = 0xffeb,
@@ -156,11 +159,11 @@ export function setupKeyboard(
 		}
 	}
 	for (const target of [kbd, surface]) {
-		target.addEventListener('keydown', onKeyDown);
-		target.addEventListener('keyup', onKeyUp);
+		ls.on(target, 'keydown', onKeyDown);
+		ls.on(target, 'keyup', onKeyUp);
 	}
 
-	kbd.addEventListener('paste', (e) => {
+	ls.on<ClipboardEvent>(kbd, 'paste', (e) => {
 		e.preventDefault();
 		const dt = e.clipboardData;
 		const text = dt?.getData('text/plain');
@@ -185,7 +188,9 @@ export function setupKeyboard(
 			pendingPaste.timer = setTimeout(flushPaste, 3000);
 		}
 		toPng(file)
-			.then((png) => app.sendBin(Bin.ClipImageUp, new Uint8Array(png)))
+			.then((png) =>
+				disposed ? undefined : app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
+			)
 			.catch((err) => console.warn('[starfold] image paste failed', err))
 			.finally(flushPaste);
 	});
@@ -196,11 +201,11 @@ export function setupKeyboard(
 		for (const ch of text)
 			tap(ch === '\n' ? XK_RETURN : charKeysym(ch.codePointAt(0)!));
 	}
-	kbd.addEventListener('compositionend', (e) => {
+	ls.on<CompositionEvent>(kbd, 'compositionend', (e) => {
 		if (e.data) typeText(e.data);
 		kbd.value = '';
 	});
-	kbd.addEventListener('input', (e) => {
+	ls.on(kbd, 'input', (e) => {
 		const ie = e as InputEvent;
 		if (ie.isComposing) return;
 		// On-screen keyboards often deliver text and edits only as input events.
@@ -214,15 +219,16 @@ export function setupKeyboard(
 			tap(XK_RETURN);
 		kbd.value = '';
 	});
-	window.addEventListener('blur', releaseAll);
-	surface.addEventListener('focus', () => kbd.focus({ preventScroll: true }));
+	ls.on(window, 'blur', releaseAll);
+	ls.on(surface, 'focus', () => kbd.focus({ preventScroll: true }));
 	if (!app.inIframe) kbd.focus({ preventScroll: true });
 
 	return {
 		releaseAll,
-		/** Removes the window listener and a pending paste's timer (the rest live on elements the caller removes). */
+		/** Removes every listener and a pending paste's timer; a paste still converting sends nothing. */
 		dispose() {
-			window.removeEventListener('blur', releaseAll);
+			disposed = true;
+			ls.off();
 			if (pendingPaste) clearTimeout(pendingPaste.timer);
 			pendingPaste = null;
 		},

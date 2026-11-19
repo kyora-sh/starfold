@@ -1,6 +1,7 @@
 // Mouse, wheel/trackpad and touch input on the desktop surface.
 import { cmd } from '../protocol';
 import type { App } from './app';
+import { listeners } from './listeners';
 import { createTouch } from './touch';
 
 /** DOM button -> X button (left, middle, right, back, forward). */
@@ -8,6 +9,7 @@ const BUTTONS = [1, 2, 3, 8, 9];
 
 export function setupPointer(app: App, onInteract: () => void) {
 	const { surface, send } = app;
+	const ls = listeners();
 
 	function toDesk(p: { clientX: number; clientY: number }): [number, number] {
 		const r = surface.getBoundingClientRect();
@@ -56,11 +58,11 @@ export function setupPointer(app: App, onInteract: () => void) {
 		deskPerPx,
 	});
 
-	surface.addEventListener('pointermove', (e) => {
+	ls.on<PointerEvent>(surface, 'pointermove', (e) => {
 		if (e.pointerType === 'touch') touch.move(e);
 		else move(e);
 	});
-	surface.addEventListener('pointerdown', (e) => {
+	ls.on<PointerEvent>(surface, 'pointerdown', (e) => {
 		e.preventDefault();
 		onInteract();
 		if (e.pointerType === 'touch') {
@@ -74,7 +76,7 @@ export function setupPointer(app: App, onInteract: () => void) {
 		} catch {}
 		send(cmd.button(BUTTONS[e.button] || 1, true));
 	});
-	surface.addEventListener('pointerup', (e) => {
+	ls.on<PointerEvent>(surface, 'pointerup', (e) => {
 		e.preventDefault();
 		if (e.pointerType === 'touch') {
 			touch.up(e);
@@ -83,12 +85,13 @@ export function setupPointer(app: App, onInteract: () => void) {
 		move(e);
 		send(cmd.button(BUTTONS[e.button] || 1, false));
 	});
-	surface.addEventListener('pointercancel', (e) => {
+	ls.on<PointerEvent>(surface, 'pointercancel', (e) => {
 		if (e.pointerType === 'touch') touch.cancel(e);
 		else send(cmd.releaseAll);
 	});
-	surface.addEventListener('contextmenu', (e) => e.preventDefault());
-	surface.addEventListener(
+	ls.on(surface, 'contextmenu', (e) => e.preventDefault());
+	ls.on<WheelEvent>(
+		surface,
 		'wheel',
 		(e) => {
 			e.preventDefault();
@@ -100,8 +103,9 @@ export function setupPointer(app: App, onInteract: () => void) {
 		{ passive: false }
 	);
 	return {
-		/** Cancels the queued scroll and the touch timer (the listeners go with the surface). */
+		/** Removes every listener and cancels the queued scroll and the touch timer. */
 		dispose() {
+			ls.off();
 			if (queued) cancelAnimationFrame(frame);
 			queued = false;
 			touch.dispose();
