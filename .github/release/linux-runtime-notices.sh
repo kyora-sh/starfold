@@ -14,14 +14,23 @@ fail() {
 	exit 1
 }
 copyright() { # copyright <object> <file to write>: its package's copyright file
-	local obj pkg doc
+	local obj pkg doc base
 	obj=$(realpath "$("$cc" -print-file-name="$1")")
 	[ -f "$obj" ] || fail "$cc has no $1"
 	pkg=$(dpkg -S "$obj" | head -n1 | cut -d: -f1)
 	[ -n "$pkg" ] || fail "no package installed $obj"
 	doc=/usr/share/doc/$pkg/copyright
-	[ -f "$doc" ] || fail "$pkg (which installed $1) has no $doc"
-	echo "$1: $obj from $pkg"
+	# GCC's library packages keep their copyright in the -base package they depend on.
+	if [ ! -f "$doc" ]; then
+		for base in $(dpkg-query -W -f '${Depends}' "$pkg" | tr ',|' '\n\n' | awk '{ print $1 }' | grep -E -- '-base(:[a-z0-9]+)?$'); do
+			if [ -f "/usr/share/doc/${base%%:*}/copyright" ]; then
+				doc=/usr/share/doc/${base%%:*}/copyright
+				break
+			fi
+		done
+	fi
+	[ -f "$doc" ] || fail "neither $pkg (which installed $1) nor a -base package it depends on has a copyright file"
+	echo "$1: $obj from $pkg, licence from $doc"
 	cp "$doc" "$out/$2"
 }
 copyright Scrt1.o glibc-copyright.txt

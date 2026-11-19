@@ -32,10 +32,13 @@ Each [release](https://github.com/kyora-sh/starfold/releases) attaches two build
 
 - **x264, recommended** (`starfold-x264-<version>-<platform>`): GPL-2.0-or-later as a combined work
   with x264, whose source the release attaches beside it.
-- **OpenH264** (`starfold-<version>-<platform>`): works out of the box with no x264 library, and is
-  distributed under MIT. The Windows one also includes GCC's C++ runtime libraries, which are
-  GPL-3.0-or-later with the GCC Runtime Library Exception; the exception is what lets the binary be
-  distributed under MIT, and both texts are in its `licenses/`.
+- **OpenH264** (`starfold-<version>-<platform>`): needs no x264 library, and is distributed under
+  MIT. Like any program built with GCC, the Linux and Windows binaries include GCC's runtime code
+  (its startup files on Linux; also the C++ runtime libraries on Windows), which is
+  GPL-3.0-or-later with the GCC Runtime Library Exception: the exception is what lets the binary be
+  distributed under MIT. Linux binaries also include glibc's startup files, which are
+  LGPL-2.1-or-later with permission to link them into any program. The texts are in each
+  archive's `licenses/`.
 
 | Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
 | --------------------- | ---------------------------------------------- | ----------------------------------------- |
@@ -56,9 +59,10 @@ tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
 distributed under: `starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
 `starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
 `THIRD_PARTY.md` and `licenses/`: the licence texts of the Rust crates and Rust standard library
-compiled into the binary, of what `THIRD_PARTY.md` lists, and of each library linked in
-statically (OpenH264; Opus on macOS and Windows; libyuv, the MinGW-w64 runtime and GCC's runtime
-libraries on Windows). The x264 archives add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
+compiled into the binary, of what `THIRD_PARTY.md` lists, and of each library or runtime object
+linked in statically (OpenH264; glibc's and GCC's startup files on Linux; Opus on macOS and
+Windows; libyuv, the MinGW-w64 runtime and GCC's runtime libraries on Windows). The x264 archives
+add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
 
 What each platform needs at run time:
 
@@ -67,7 +71,7 @@ What each platform needs at run time:
   one. On Ubuntu 24.04: `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for
   `starfold-x264-*` or `libstdc++6` for `starfold-*` (most systems have it already). Plus an X
   server to stream, such as Xvfb (see [Usage](#usage)).
-- **macOS**: nothing beyond the system; Opus and x264 are linked in. The binary is not notarized,
+- **macOS**: nothing beyond the system; Opus is linked in, and x264 in the x264 build. The binary is not notarized,
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
 
@@ -465,9 +469,9 @@ at most 64 MiB, kind byte included; the page doesn't send a larger one.
 ### macOS
 
 starfold also streams a Mac's own screen (ScreenCaptureKit capture, CGEvent input,
-NSPasteboard clipboard, system audio), with the Linux version's features except
-`--listen-unix` and `starfold attach`, which are Linux-only; the microphone plays into a
-loopback device instead of a FIFO (below).
+NSPasteboard clipboard, system audio). Not on a Mac: `--listen-unix` and `starfold attach`
+(Linux-only), the VA-API and NVENC encoders (a Mac has VideoToolbox), rounded corners (X11 only),
+and the microphone FIFO (the microphone plays into a loopback device instead, below).
 
 ```sh
 brew install x264 opus pkgconf esbuild
@@ -496,10 +500,10 @@ rounded-corner flags don't apply.
 ### Windows
 
 starfold also streams a Windows desktop (Windows 10 or later; DXGI Desktop Duplication capture,
-SendInput, clipboard text and images, WASAPI system audio), with the Linux version's features
-except `--listen-unix` and `starfold attach`, which are Linux-only; the microphone plays into a
-virtual audio cable instead of a FIFO (below). Build it with Rust, [vcpkg](https://vcpkg.io),
-nasm and esbuild:
+SendInput, clipboard text and images, WASAPI system audio). Not on Windows: `--listen-unix` and
+`starfold attach` (Linux-only), the VA-API encoder (Windows has NVENC, Media Foundation and Quick
+Sync), rounded corners (X11 only), and the microphone FIFO (the microphone plays into a virtual
+audio cable instead, below). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
 vcpkg install x264 libyuv opus --triplet x64-windows-static-md
@@ -578,7 +582,9 @@ work. Each release attaches the exact x264 source its builds link
 ([third_party/x264](third_party/x264/README.md)). A build with
 `--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead, so the
 binary is distributed under starfold's MIT licence; `starfold --version` lists the encoders a
-binary includes and that licence. A binary that links GCC's runtime libraries statically, as the
-prebuilt Windows ones do, includes code under GPL-3.0-or-later with the GCC Runtime Library
-Exception, which permits distributing it under MIT; its archive carries both texts.
+binary includes and that licence. A binary built with GCC includes GCC's runtime code (on Linux
+its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under
+GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary
+under MIT; a Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with
+permission to link them into any program. Each release archive carries these texts.
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.

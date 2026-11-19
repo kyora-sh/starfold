@@ -26,7 +26,7 @@ x264 and an OpenH264 build distributed under MIT; see [Install](README.md#instal
 - Experimental NVENC H.264, HEVC and AV1 encoders (#25)
 - Display rate, a time-based decoder queue and slow-viewer handling for `--high-fps` (#24)
 - Experimental Media Foundation H.264, HEVC and AV1 encoders on Windows (#26)
-- File endpoints hardened: paths resolve beneath the root by file descriptor, with an explicit `--files-root` (#35)
+- File endpoints hardened, with an explicit `--files-root`: on Linux and macOS paths resolve beneath the root by file descriptor; Windows checks a path and then opens it by name (#35)
 - New names for the flags and environment variables inherited from upstream, with the old ones as deprecated aliases (#38)
 - macOS: a flag to show the host cursor in the video (#47)
 - Touch: a double tap double-clicks on the same spot (#50)
@@ -62,11 +62,13 @@ x264 and an OpenH264 build distributed under MIT; see [Install](README.md#instal
 - A paint-over doubles the bitrate cap only on an encoder that doesn't hold it (#70)
 - The embeddable client signals when there is no common codec, ends the session on a worker error and keeps the host page's focus (#81)
 - A paste in the embeddable client that a blur drops sends nothing; unmounting after a worker error still reports a close (#83)
+- Capture reads an Xvfb `-shmem` framebuffer directly only when `STARFOLD_DIRECT_FB=1` asks for it, and only its own X server's (#82)
 
 ### Documentation, benchmarks and CI
 
 - Monorepo layout, fork attribution, CI and the upstream sync (#1)
-- An A/A arm in every benchmark set by default (#27)
+- An A/A arm by default in the sets of the starfold-vs-noVNC benchmark (#27)
+- Tests change the system's FUSE settings only when `STARFOLD_TEST_SYSTEM_FUSE=1` asks for it (#87)
 - vcpkg download cache and bounded retries in the Windows cross-check (#30)
 - Benchmark results refreshed against main (#29)
 - Steal share in the benchmark's quality rows (#31)
