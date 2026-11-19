@@ -40,10 +40,11 @@ function chromeCpu() {
 	return j / 100;
 }
 const offset = link === 'wan' ? WAN.portOffset : 0;
-const portOf = (arm) => (armOf(arm).kind === 'novnc' ? NOVNC_PORT : STARFOLD_PORT) + offset;
+const portOf = (arm) => (armOf(arm).kind === 'starfold' ? STARFOLD_PORT : NOVNC_PORT) + offset;
 const urlOf = (arm) => {
 	const a = armOf(arm);
 	if (a.kind === 'starfold') return `http://127.0.0.1:${portOf(arm)}/?token=${token}${a.query}`;
+	if (a.kind === 'rfb') return `http://127.0.0.1:${portOf(arm)}/kyora-viewer.html?control=${a.control ? 1 : 0}`;
 	const { quality, compression } = NOVNC_PROFILES[a.profile];
 	return `http://127.0.0.1:${portOf(arm)}/novnc-viewer.html?quality=${quality}&compression=${compression}`;
 };
@@ -203,6 +204,7 @@ async function typeKeys(p, wl, until) {
 	return sent;
 }
 async function run(arm, wl, readback = true) {
+	if (armOf(arm).viewOnly) throw new Error('view only: quality rounds alone');
 	await ctl(`/start?arm=${arm}&wl=${wl}`);
 	const port = portOf(arm);
 	const ctx = await b.newContext({ viewport: { width: WIDTH, height: HEIGHT } });
@@ -212,9 +214,7 @@ async function run(arm, wl, readback = true) {
 		p.on('pageerror', (e) => errs.push(String(e)));
 		await p.addInitScript(reader, { cell: CELL, w: STRIP_W, h: STRIP_H, readback, wsTs: !!process.env.WS_TS });
 		await p.goto(urlOf(arm), { waitUntil: 'commit', timeout: 20000 });
-		const ready = armOf(arm).kind === 'starfold'
-			? () => window.vs?.firstFrame !== undefined || window.starfoldFirstFrame !== undefined
-			: () => window.novncConnected === true;
+		const ready = { starfold: () => window.vs?.firstFrame !== undefined || window.starfoldFirstFrame !== undefined, novnc: () => window.novncConnected === true, rfb: () => window.rfbReady === true }[armOf(arm).kind];
 		await p.waitForFunction(ready, null, { timeout: 15000 }).catch((e) => { throw new Error(`${String(e.message).split('\n')[0]}${errs.length ? ` page: ${errs[0]}` : ''}`); });
 		if (readback) await p.waitForFunction(() => window.vs.seen, null, { timeout: 15000 });
 		else await sleep(1000);
