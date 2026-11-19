@@ -147,7 +147,19 @@ impl Capturer {
             .map_err(|e| e.to_string())?;
         let mut stride = width as usize * 4;
         let seg = conn.generate_id().map_err(|e| e.to_string())?;
-        let (buf, offset, direct) = match find_xvfb_framebuffer(&conn, root, width, height) {
+        let wanted = direct_fb_wanted(
+            std::env::var("STARFOLD_DIRECT_FB").ok().as_deref(),
+            crate::compat::is_set("STARFOLD_NO_DIRECT_FB"),
+        );
+        let found = match wanted {
+            Ok(()) => find_xvfb_framebuffer(&conn, root, screen_num, width, height)
+                .map_err(|why| log::warn!("direct framebuffer not used: {why}; using GetImage")),
+            Err(why) => {
+                log::info!("{why}; using GetImage");
+                Err(())
+            }
+        };
+        let (buf, offset, direct) = match found {
             Ok((buf, offset, fb_stride)) => {
                 log::info!(
                     "capturing directly from the Xvfb framebuffer (shmid {})",
@@ -156,20 +168,17 @@ impl Capturer {
                 stride = fb_stride;
                 (buf, offset, true)
             }
-            Err(why) => {
-                log::warn!("direct framebuffer not used: {why}; using GetImage");
+            Err(()) => {
                 let buf = ShmBuf::new(stride * height as usize)?;
                 conn.shm_attach(seg, buf.shmid as u32, false)
                     .map_err(|e| e.to_string())?
                     .check()
                     .map_err(|e| {
-                        format!(
-                            "the X server refused MIT-SHM Attach ({e}): MIT-SHM needs a local X \
-                             connection (DISPLAY=:N) to a server in the same IPC namespace"
-                        )
+                        format!("the X server refused MIT-SHM Attach ({e}). {SHM_CAUSES}")
                     })?;
                 // Mark for removal now; it stays alive while attached.
                 unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+                check_server_writes(&conn, root, seg, &buf, width)?;
                 log::info!("capturing via MIT-SHM GetImage");
                 (buf, 0, false)
             }
@@ -369,6 +378,70 @@ impl Capturer {
     }
 }
 
+/// Why MIT-SHM may not reach starfold's own segment, for the start-up error.
+const SHM_CAUSES: &str = "MIT-SHM needs the X server to attach starfold's own 0600 segment, which \
+    it cannot over a TCP connection (use DISPLAY=:N), from another IPC namespace, or as \
+    another user";
+
+const DIRECT_FB_OFF: &str =
+    "direct framebuffer off (set STARFOLD_DIRECT_FB=1 to read Xvfb's framebuffer directly)";
+
+/// Xvfb's framebuffer is read in place only on request; `STARFOLD_NO_DIRECT_FB` wins.
+fn direct_fb_wanted(direct: Option<&str>, no_direct: bool) -> Result<(), String> {
+    if no_direct {
+        return Err("direct framebuffer off (STARFOLD_NO_DIRECT_FB is set)".into());
+    }
+    match direct {
+        Some("1") => Ok(()),
+        _ => Err(DIRECT_FB_OFF.into()),
+    }
+}
+
+/// The server must write into the segment starfold made: from another IPC namespace the
+/// same id can name a different segment, and GetImage would land there.
+fn check_server_writes(
+    conn: &RustConnection,
+    root: u32,
+    seg: u32,
+    buf: &ShmBuf,
+    width: u32,
+) -> Result<(), String> {
+    let row = width as usize * 4;
+    let mut seen = [Vec::new(), Vec::new()];
+    for (i, fill) in [0xA5u8, 0x5A].into_iter().enumerate() {
+        unsafe { std::ptr::write_bytes(buf.ptr, fill, row) };
+        conn.shm_get_image(
+            root,
+            0,
+            0,
+            width as u16,
+            1,
+            !0,
+            ImageFormat::Z_PIXMAP.into(),
+            seg,
+            0,
+        )
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| format!("MIT-SHM GetImage failed ({e}). {SHM_CAUSES}"))?;
+        seen[i] = buf.as_slice()[..row].to_vec();
+    }
+    if written_by_server(&seen[0], &seen[1]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the X server accepted MIT-SHM Attach but did not write into starfold's segment \
+             (its id names another segment on the server's side). {SHM_CAUSES}"
+        ))
+    }
+}
+
+/// A row filled with 0xA5, then 0x5A, before each GetImage: left as filled both times,
+/// the server wrote somewhere else.
+fn written_by_server(after_a5: &[u8], after_5a: &[u8]) -> bool {
+    !(after_a5.iter().all(|&b| b == 0xA5) && after_5a.iter().all(|&b| b == 0x5A))
+}
+
 /// Pid of the X server at the other end of the connection, from the socket's peer
 /// credentials: the kernel records them at the server's `listen()`, so no lock file or
 /// display name can point at another process.
@@ -510,20 +583,74 @@ fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
 }
 
+/// The screen number in the window name Xvfb writes after the 100 fixed bytes of its
+/// XWD header: "Xvfb <host>:<display>.<screen>", NUL-padded.
+fn xwd_screen(name: &[u8]) -> Option<usize> {
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let name = std::str::from_utf8(&name[..end]).ok()?;
+    let (_, place) = name.strip_prefix("Xvfb ")?.rsplit_once(':')?;
+    let (display, screen) = place.split_once('.')?;
+    display.parse::<u32>().ok()?;
+    screen.parse().ok()
+}
+
+/// Where the pixels start in an Xvfb XWD segment of `size` bytes and its row stride, if
+/// the header is screen `screen`'s and holds `width`x`height` 32-bit pixels inside the
+/// segment. All arithmetic on header fields is checked: a header that overflows is refused.
+fn xwd_layout(b: &[u8], screen: usize, width: u32, height: u32) -> Result<(usize, usize), String> {
+    if b.len() < 100 {
+        return Err("too small for an XWD header".into());
+    }
+    let header_size = be32(b, 0) as usize;
+    let (w, h, bpp, bpl, ncolors) = (
+        be32(b, 4),
+        be32(b, 5),
+        be32(b, 11),
+        be32(b, 12) as usize,
+        be32(b, 19) as usize,
+    );
+    if be32(b, 1) != 7 || bpp != 32 {
+        return Err("not a 32-bit XWD image".into());
+    }
+    let name = b
+        .get(100..header_size)
+        .ok_or("the XWD header's size is out of range")?;
+    if xwd_screen(name) != Some(screen) {
+        return Err(format!(
+            "its header names {:?}, not screen {screen}",
+            String::from_utf8_lossy(name).trim_end_matches('\0')
+        ));
+    }
+    let row = (w as usize).checked_mul(4).ok_or("width overflows")?;
+    if w < width || h < height || bpl < row {
+        return Err("smaller than the screen".into());
+    }
+    let offset = ncolors
+        .checked_mul(12)
+        .and_then(|c| c.checked_add(header_size))
+        .ok_or("colour map overflows")?;
+    let end = bpl
+        .checked_mul(h as usize)
+        .and_then(|p| p.checked_add(offset))
+        .ok_or("image size overflows")?;
+    if end > b.len() {
+        return Err("the image runs past the segment".into());
+    }
+    Ok((offset, bpl))
+}
+
 /// Xvfb started with `-shmem` keeps each screen as an XWD image in a SysV segment.
-/// Find the one of the X server we are connected to, check the header and verify pixels
-/// against the server before trusting it. After a RandR resize the header still
-/// describes the size Xvfb started with: the screen is the top-left `width`x`height` of
-/// it, at the header's stride.
+/// Find screen `screen`'s of the X server we are connected to, check the header and
+/// verify pixels against the server before trusting it. After a RandR resize the header
+/// still describes the size Xvfb started with: the screen is the top-left
+/// `width`x`height` of it, at the header's stride.
 fn find_xvfb_framebuffer(
     conn: &RustConnection,
     root: u32,
+    screen: usize,
     width: u32,
     height: u32,
 ) -> Result<(ShmBuf, usize, usize), String> {
-    if crate::compat::is_set("STARFOLD_NO_DIRECT_FB") {
-        return Err("STARFOLD_NO_DIRECT_FB is set".into());
-    }
     let pid = x_server_pid(conn)
         .map_err(|why| format!("the X server's pid is not known from the connection ({why})"))?;
     let self_link = std::fs::read_link("/proc/self")
@@ -534,7 +661,8 @@ fn find_xvfb_framebuffer(
         .map_err(|e| format!("/proc/sysvipc/shm: {e}"))?;
     let server_maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok();
     let mut refused = None;
-    for (shmid, size) in candidates(&table, Some(pid), (width * height * 4) as usize) {
+    let min_size = width as usize * height as usize * 4;
+    for (shmid, size) in candidates(&table, Some(pid), min_size) {
         let Some(buf) = ShmBuf::attach_readonly(shmid, size) else {
             continue;
         };
@@ -555,21 +683,13 @@ fn find_xvfb_framebuffer(
             continue;
         }
         let b = buf.as_slice();
-        let header_size = be32(b, 0) as usize;
-        let (w, h, bpp, bpl, ncolors) = (
-            be32(b, 4),
-            be32(b, 5),
-            be32(b, 11),
-            be32(b, 12) as usize,
-            be32(b, 19) as usize,
-        );
-        if be32(b, 1) != 7 || w < width || h < height || bpp != 32 || bpl < (w * 4) as usize {
-            continue;
-        }
-        let offset = header_size + ncolors * 12;
-        if offset + bpl * h as usize > size {
-            continue;
-        }
+        let (offset, bpl) = match xwd_layout(b, screen, width, height) {
+            Ok(l) => l,
+            Err(why) => {
+                refused = Some(format!("; shmid {shmid} refused: {why}"));
+                continue;
+            }
+        };
         // Compare a strip of real pixels with what the server reports. The screen may be
         // animating between the two reads, so retry and accept a near-total match.
         let (sy, sh) = (height / 2, 16u32.min(height / 2));
@@ -589,11 +709,19 @@ fn find_xvfb_framebuffer(
             else {
                 break;
             };
+            let (row, total) = (width as usize * 4, width as usize * sh as usize);
             let mut same = 0usize;
-            let total = (width * sh) as usize;
             for r in 0..sh as usize {
-                let fb = &b[offset + (sy as usize + r) * bpl..][..width as usize * 4];
-                let im = &img.data[r * width as usize * 4..][..width as usize * 4];
+                let at = |base: usize, stride: usize, y: usize| {
+                    let start = y.checked_mul(stride)?.checked_add(base)?;
+                    start.checked_add(row).map(|end| start..end)
+                };
+                let (Some(fb), Some(im)) = (
+                    at(offset, bpl, sy as usize + r).and_then(|s| b.get(s)),
+                    at(0, row, r).and_then(|s| img.data.get(s)),
+                ) else {
+                    break;
+                };
                 same += fb
                     .chunks_exact(4)
                     .zip(im.chunks_exact(4))
@@ -718,6 +846,103 @@ mod tests {
             ..seg(3195, Some(SERVER_MAPS))
         };
         assert!(check_segment(3195, &s).is_err());
+    }
+
+    #[test]
+    fn the_direct_path_is_off_unless_asked_and_no_direct_wins() {
+        assert!(direct_fb_wanted(None, false).is_err());
+        assert!(direct_fb_wanted(Some("0"), false).is_err());
+        assert!(direct_fb_wanted(Some(""), false).is_err());
+        assert_eq!(direct_fb_wanted(Some("1"), false), Ok(()));
+        assert!(direct_fb_wanted(Some("1"), true).is_err());
+        assert!(direct_fb_wanted(None, true).is_err());
+    }
+
+    #[test]
+    fn a_row_left_as_filled_twice_was_not_written_by_the_server() {
+        let (a5, x5a) = (vec![0xA5; 8], vec![0x5A; 8]);
+        assert!(!written_by_server(&a5, &x5a));
+        let screen = [0x10, 0x20, 0x30, 0, 0x10, 0x20, 0x30, 0];
+        assert!(written_by_server(&screen, &screen));
+        assert!(written_by_server(&a5, &a5), "a screen of exactly 0xA5A5A5");
+        assert!(
+            written_by_server(&x5a, &x5a),
+            "a screen of exactly 0x5A5A5A"
+        );
+    }
+
+    /// An XWD segment of `len` bytes as Xvfb writes it, with these header fields.
+    fn xwd(
+        name: &str,
+        w: u32,
+        h: u32,
+        bpl: u32,
+        ncolors: u32,
+        header_size: u32,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        let mut put = |i: usize, v: u32| b[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        put(0, header_size);
+        put(1, 7);
+        put(4, w);
+        put(5, h);
+        put(11, 32);
+        put(12, bpl);
+        put(19, ncolors);
+        b[100..100 + name.len()].copy_from_slice(name.as_bytes());
+        b
+    }
+
+    const LEN: usize = 160 + 256 * 12 + 2560 * 480;
+
+    #[test]
+    fn the_screen_number_comes_from_the_name_xvfb_writes() {
+        assert_eq!(xwd_screen(b"Xvfb sb-fcecb167cfed33d6:6.1\0\0\0"), Some(1));
+        assert_eq!(xwd_screen(b"Xvfb host:17.0"), Some(0));
+        assert_eq!(xwd_screen(b"Xvfb host:17"), None);
+        assert_eq!(xwd_screen(b"Xephyr host:1.0"), None);
+        assert_eq!(xwd_screen(b""), None);
+    }
+
+    #[test]
+    fn a_header_is_taken_only_for_the_screen_it_names() {
+        let s1 = xwd("Xvfb vm:6.1", 640, 480, 2560, 256, 160, LEN);
+        assert_eq!(xwd_layout(&s1, 1, 640, 480), Ok((160 + 256 * 12, 2560)));
+        assert!(xwd_layout(&s1, 0, 640, 480).is_err());
+        let s0 = xwd("Xvfb vm:6.0", 640, 480, 2560, 256, 160, LEN);
+        assert!(xwd_layout(&s0, 1, 640, 480).is_err());
+        assert!(
+            xwd_layout(&s1, 1, 800, 480).is_err(),
+            "smaller than the screen"
+        );
+        let short = xwd("Xvfb vm:6.1", 640, 480, 2560, 256, 160, LEN - 1);
+        assert!(
+            xwd_layout(&short, 1, 640, 480).is_err(),
+            "runs past the segment"
+        );
+    }
+
+    #[test]
+    fn a_hostile_header_is_refused_without_a_panic() {
+        let m = u32::MAX;
+        for (w, h, bpl, ncolors, hs) in [
+            (m, 480, 2560, 256, 160),
+            (640, m, 2560, 256, 160),
+            (640, 480, m, 256, 160),
+            (640, 480, 2560, m, 160),
+            (640, 480, 2560, 256, m),
+            (640, 480, 2560, 256, 20),
+            (m, m, m, m, 160),
+            (0x4000_0000, 480, 0, 256, 160),
+        ] {
+            let b = xwd("Xvfb vm:6.1", w, h, bpl, ncolors, hs, LEN);
+            assert!(
+                xwd_layout(&b, 1, 640, 480).is_err(),
+                "w {w} h {h} bpl {bpl} ncolors {ncolors} header {hs}"
+            );
+        }
+        assert!(xwd_layout(&[0; 99], 0, 1, 1).is_err());
     }
 
     #[test]
