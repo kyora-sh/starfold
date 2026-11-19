@@ -107,7 +107,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
-| `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`); at most 3600 with `--enable-recording`                                                                                                                                     |
+| `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`); at most 600 with `--enable-recording`                                                                                                                                      |
 | `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 45 % of a core on a 6-vCPU VM (see below)                |
 | `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                 | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
@@ -229,12 +229,12 @@ answer is read back from that file:
   program writing there can: a recording looks again after half the room that was left (at
   most 64 MiB later) and ends with `disk_space` below the floor. A recording also ends at 120
   frames a second of its length (`frame_cap`).
-- `--max-record-seconds` is at most 3600 with `--enable-recording` (the server refuses to
+- `--max-record-seconds` is at most 600 with `--enable-recording` (the server refuses to
   start above it). In memory a recording holds the frames waiting for the disk (at most
   4 MiB, or one frame of up to 8 MiB when nothing else waits), the writer's 256 KiB buffer,
   and 16 bytes a frame, as frames come, up to 120 frames a second of its length (576 KB at
-  300 s, 6.9 MB at 3600 s); its answer's MP4 header holds up to as much again for its tables.
-  At most 10 MiB per recording at the default length. A disk that falls further behind ends
+  300 s, 1.15 MB at 600 s); its answer's MP4 header holds up to as much again for its
+  tables. At most 10 MiB per recording at any length. A disk that falls further behind ends
   it with `disk_slow`; a frame over 8 MiB ends it with `large_frame`.
 - A write that takes 10 s ends the recording with `disk_slow` and gives its place back at
   once. The stuck write keeps its file, the space that file reserved, its buffer and its

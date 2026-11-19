@@ -69,9 +69,11 @@ pub const MAX_RECORDING_BYTES: u64 = 2 << 30;
 /// The most frames a second a recording indexes (the fastest cohort, `--high-fps`).
 pub const MAX_FPS: u64 = crate::video::HIGH_FPS as u64;
 /// The longest `--max-record-seconds` the server starts with. A recording's index is 16
-/// bytes a frame for [`MAX_FPS`] frames a second of its length, at most 6,912,000 bytes at
-/// this bound, and its MP4 header's sample tables at most as much again.
-pub const MAX_RECORD_SECONDS: u64 = 3600;
+/// bytes a frame for [`MAX_FPS`] frames a second of its length, at most 1,152,000 bytes at
+/// this bound, and its MP4 header's sample tables at most as much again. It keeps one
+/// recording within 10 MiB while it records: its queue (8 MiB at most), its buffer and its
+/// index.
+pub const MAX_RECORD_SECONDS: u64 = 600;
 /// What the writer gathers before each write; a sample this large or larger is written
 /// directly.
 pub const BUFFER: usize = 256 << 10;

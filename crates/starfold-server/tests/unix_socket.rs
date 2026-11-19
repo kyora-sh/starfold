@@ -1536,7 +1536,7 @@ fn recording_start(cwd: &Path, args: &[&str]) -> (Option<i32>, String) {
 #[test]
 fn recording_flags_are_checked_at_startup() {
     let d = scratch("record-flags", 0o700);
-    for secs in ["3601", "10000000000000000", "0"] {
+    for secs in ["601", "10000000000000000", "0"] {
         let (code, said) = recording_start(&d, &[&format!("--max-record-seconds={secs}")]);
         assert_eq!(code, Some(2), "{secs}: {said}");
         assert!(said.contains("--max-record-seconds"), "{secs}: {said}");
@@ -1559,7 +1559,7 @@ fn recording_flags_are_checked_at_startup() {
         &[
             "--listen-tcp=false",
             "--enable-recording",
-            "--max-record-seconds=3600",
+            "--max-record-seconds=600",
             &rec_arg,
         ],
     );

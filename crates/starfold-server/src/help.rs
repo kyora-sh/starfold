@@ -164,7 +164,7 @@ Files and recordings:
   --upload-dir                  folder under the root that uploads go to
                                 (default Downloads)
   --max-upload-mb               largest upload, 0 for no limit (default 0)
-  --max-record-seconds          longest recording, at most 3600 with
+  --max-record-seconds          longest recording, at most 600 with
                                 --enable-recording (default 300)
   --enable-recording            allow /record; at most 2 recordings at once, each
                                 written to --recording-dir as it runs; with no

@@ -503,7 +503,7 @@ fn the_longest_recording_is_bounded_at_startup() {
         Duration::from_secs(MAX_RECORD_SECONDS)
     );
     assert_eq!(on("300").unwrap().max, Duration::from_secs(300));
-    for bad in ["3601", "86400", "10000000000000000", "1e300", "inf", "0"] {
+    for bad in ["601", "3600", "10000000000000000", "1e300", "inf", "0"] {
         let e = on(bad).err().unwrap_or_else(|| panic!("{bad} was taken"));
         assert!(e.contains("--max-record-seconds"), "{bad}: {e}");
     }
@@ -512,7 +512,7 @@ fn the_longest_recording_is_bounded_at_startup() {
     assert!(!off.on);
     assert_eq!(off.max, Duration::from_secs(MAX_RECORD_SECONDS));
     // The index at the bound: 16 bytes a frame, 120 frames a second.
-    assert_eq!(16 * MAX_FPS * MAX_RECORD_SECONDS, 6_912_000);
+    assert_eq!(16 * MAX_FPS * MAX_RECORD_SECONDS, 1_152_000);
 }
 
 /// Cohort 1's encode thread hands out a frame of a `size` picture, as `encode_loop` does.
@@ -999,15 +999,17 @@ async fn drain(r: Response) -> usize {
     n
 }
 
-/// What one recording may hold at its worst at the default length (300 s): the largest
-/// frame queued (8 MiB), the writer's buffer (256 KiB), an index of 16 bytes for 120 frames
-/// a second (576 KB), the MP4 header built from it (its tables up to as much again, with
-/// the copies made while it is built), and the answer's chunks in flight.
+/// What one recording may hold at its worst, at any length the server takes (at most
+/// [`MAX_RECORD_SECONDS`]): while it records, the largest frame queued (8 MiB), the
+/// writer's buffer (256 KiB) and an index of 16 bytes for 120 frames a second (1,152,000 B
+/// at 600 s); once it ends, the index and the MP4 header written from it (its tables up to
+/// as much again), then the header and the answer's chunks in flight.
 const BOUND: usize = 10 << 20;
 
-/// The same at the longest length the server takes ([`MAX_RECORD_SECONDS`]): the index and
-/// the header grow 12 times.
-const BOUND_MAX: usize = 48 << 20;
+// The parts of BOUND there at once while it records, at the longest length: they fit.
+const _: () = assert!(
+    tap::LARGEST_FRAME + BUFFER + 16 * MAX_FPS as usize * MAX_RECORD_SECONDS as usize <= BOUND
+);
 
 /// Records every frame a recording of `secs` may take, each a keyframe a few ms after the
 /// last with no two durations alike in a row (the MP4's largest tables), then its answer as
@@ -1083,7 +1085,7 @@ fn a_recordings_memory_stays_within_its_bound() {
         );
         assert!(stalled <= BOUND, "{stalled}");
         assert!(full <= BOUND, "{full}");
-        assert!(longest <= BOUND_MAX, "{longest}");
+        assert!(longest <= BOUND, "{longest}");
     });
 }
 
