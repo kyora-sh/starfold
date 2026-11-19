@@ -165,7 +165,7 @@ impl Capturer {
                     .map_err(|e| {
                         format!(
                             "the X server refused MIT-SHM Attach ({e}): MIT-SHM needs a local X \
-                             connection, so connect through the local socket (DISPLAY=:N)"
+                             connection (DISPLAY=:N) to a server in the same IPC namespace"
                         )
                     })?;
                 // Mark for removal now; it stays alive while attached.
