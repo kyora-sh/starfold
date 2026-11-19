@@ -37,8 +37,9 @@ Each [release](https://github.com/kyora-sh/starfold/releases) attaches two build
   (its startup files on Linux; also the C++ runtime libraries on Windows), which is
   GPL-3.0-or-later with the GCC Runtime Library Exception: the exception is what lets the binary be
   distributed under MIT. Linux binaries also include glibc's startup files, which are
-  LGPL-2.1-or-later with permission to link them into any program. The texts are in each
-  archive's `licenses/`.
+  LGPL-2.1-or-later with permission to link them into any program. These texts are in the
+  `licenses/` of the archives they apply to: GCC's in the Linux and Windows ones, glibc's in the
+  Linux ones.
 
 | Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
 | --------------------- | ---------------------------------------------- | ----------------------------------------- |
@@ -59,7 +60,7 @@ tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
 distributed under: `starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
 `starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
 `THIRD_PARTY.md` and `licenses/`: the licence texts of the Rust crates and Rust standard library
-compiled into the binary, of what `THIRD_PARTY.md` lists, and of each library or runtime object
+compiled into the binary, of what `THIRD_PARTY.md` lists for that platform, and of each library or runtime object
 linked in statically (OpenH264; glibc's and GCC's startup files on Linux; Opus on macOS and
 Windows; libyuv, the MinGW-w64 runtime and GCC's runtime libraries on Windows). The x264 archives
 add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.

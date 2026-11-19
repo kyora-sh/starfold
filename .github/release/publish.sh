@@ -23,7 +23,8 @@ now=$("$here/tag-commit.sh" "$tag")
 	echo "::error::$tag names $now on the remote, not $commit (the commit built); no release was created"
 	exit 1
 }
-args=(--verify-tag --title "starfold $v" --generate-notes --notes-file "$notes")
+# --target: should the tag vanish before GitHub publishes, the tag it recreates names the commit built.
+args=(--verify-tag --target "$commit" --title "starfold $v" --generate-notes --notes-file "$notes")
 prev=$(git describe --tags --abbrev=0 --match 'v*' "$commit^" 2>/dev/null || true)
 if [ -n "$prev" ]; then
 	args+=(--notes-start-tag "$prev")

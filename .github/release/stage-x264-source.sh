@@ -41,6 +41,9 @@ for f in $("$here/expected-files.sh" x264-source); do
 done
 dsc=$(cd "$out" && echo x264_*.dsc)
 listed=$(python3 -I "$here/versions.py" dsc-sha256 "$out/$dsc") || fail "$dsc has no readable Checksums-Sha256"
+# Every Ubuntu file attached has a row, and every row a file.
+[ "$(cut -d' ' -f3 <<<"$listed" | sort)" = "$("$here/expected-files.sh" x264-source | grep '^x264_' | grep -v '\.dsc$' | sort)" ] ||
+	fail "$dsc's Checksums-Sha256 names $(cut -d' ' -f3 <<<"$listed" | tr '\n' ' '), not exactly the attached Ubuntu files"
 while read -r sum size name; do
 	[ -f "$out/$name" ] || fail "$dsc names $name, which isn't staged"
 	[ "$(sha256sum "$out/$name" | cut -d' ' -f1)" = "$sum" ] && [ "$(wc -c <"$out/$name" | tr -d ' ')" = "$size" ] ||

@@ -43,6 +43,8 @@ linux)
 	echo "libx264-dev:$arch from source $got; attached: $src $want"
 	[ "$got" = "$src $want" ] || fail "libx264-dev:$arch is built from $got, the release attaches $src $want"
 	listed=$(python3 -I "$root/.github/release/versions.py" dsc-sha256 "$dsc") || fail "$dsc has no readable Checksums-Sha256"
+	[ "$(cut -d' ' -f3 <<<"$listed" | sort)" = "$("$root/.github/release/expected-files.sh" x264-source | grep '^x264_' | grep -v '\.dsc$' | sort)" ] ||
+		fail "the .dsc's Checksums-Sha256 names $(cut -d' ' -f3 <<<"$listed" | tr '\n' ' '), not exactly the attached Ubuntu files"
 	while read -r sum size name; do
 		[ -f "$x264/$name" ] && [ "$(sha256sum "$x264/$name" | cut -d' ' -f1)" = "$sum" ] &&
 			[ "$(wc -c <"$x264/$name" | tr -d ' ')" = "$size" ] || fail "$name doesn't match the .dsc's Checksums-Sha256"
@@ -65,6 +67,15 @@ print(s["url"], s["revision"], len(f["patches"]), len(f["local_patch_checksums"]
 	[ "$revision" = "$commit" ] || fail "Homebrew builds x264 commit $revision, the release attaches $commit"
 	[ "$patches" = 0 ] && [ "$local_patches" = 0 ] || fail "Homebrew patches x264 ($patches + $local_patches patches)"
 	[ "$checksum" = "$formula_sha256" ] || fail "Homebrew's x264 formula is $checksum, not the reviewed $formula_sha256"
+	# The keg's archive must be the one in the formula's bottle: brew fetch checks the bottle against
+	# the formula's sha256, and the archive inside it must equal the keg's, byte for byte (a keg
+	# built or patched locally under the same version doesn't).
+	brew fetch --force-bottle x264 >/dev/null || fail "can't fetch Homebrew's x264 bottle"
+	bottle=$(brew --cache --force-bottle x264 2>/dev/null || brew --cache x264)
+	in_bottle=$(tar -xOzf "$bottle" "x264/$(basename "$keg")/lib/libx264.a" | shasum -a 256 | cut -d' ' -f1)
+	in_keg=$(shasum -a 256 "$keg/lib/libx264.a" | cut -d' ' -f1)
+	echo "libx264.a: keg $in_keg, bottle $(basename "$bottle") $in_bottle"
+	[ "$in_keg" = "$in_bottle" ] || fail "the keg's libx264.a isn't the one in Homebrew's x264 bottle"
 	tarball_sha512
 	;;
 windows)

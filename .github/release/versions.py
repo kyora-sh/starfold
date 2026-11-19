@@ -33,10 +33,10 @@ def fail(message):
 
 
 def header_version(text, where):
-    version = HeaderParser().parsestr(text).get("Version")
-    if not version:
-        fail(f"{where} has no Version header")
-    return version
+    versions = HeaderParser().parsestr(text).get_all("Version") or []
+    if len(versions) != 1:
+        fail(f"{where} has {len(versions)} Version headers, not one")
+    return versions[0]
 
 
 def one(names, where):
@@ -86,15 +86,24 @@ def version(kind, path):
 
 
 def dsc_sha256(path):
-    lines, field = [], None
+    """The Checksums-Sha256 rows, which must name exactly the files the Files field lists, once each."""
+    rows, fields, field = {"checksums-sha256": [], "files": []}, {}, None
     for line in dsc_paragraph(path):
         if line[:1] in (" ", "\t"):
-            if field == "checksums-sha256" and line.strip():
-                lines.append(line.split())
+            if field in rows and line.strip():
+                rows[field].append(line.split())
         else:
             field = line.split(":", 1)[0].strip().lower()
+            fields[field] = fields.get(field, 0) + 1
+    lines = rows["checksums-sha256"]
     if not lines or any(len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]) for parts in lines):
         fail(f"{path}: no well-formed Checksums-Sha256 field")
+    if fields.get("checksums-sha256") != 1 or fields.get("files") != 1:
+        fail(f"{path}: Checksums-Sha256 and Files must each appear once")
+    named = [parts[2] for parts in lines]
+    files = [parts[-1] for parts in rows["files"]]
+    if len(set(named)) != len(named) or sorted(named) != sorted(files):
+        fail(f"{path}: Checksums-Sha256 names {sorted(named)}, Files lists {sorted(files)}")
     return lines
 
 

@@ -117,6 +117,7 @@ jobs:
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
+          .github/release/no-x264-override.sh
           echo "ARCHIVE=$(.github/release/expected-files.sh archive "$VERSION" '${{ matrix.flavour.name }}' x86_64-linux | sed 's/\.tar\.gz$//')" >> "$GITHUB_ENV"
       - name: Native libraries
         run: |
@@ -214,6 +215,7 @@ jobs:
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
+          .github/release/no-x264-override.sh
           echo "ARCHIVE=$(.github/release/expected-files.sh archive "$VERSION" '${{ matrix.flavour.name }}' aarch64-linux | sed 's/\.tar\.gz$//')" >> "$GITHUB_ENV"
       # Ubuntu's arm64 packages (ports.ubuntu.com) beside the amd64 ones, the aarch64 GCC, and
       # qemu to run the binary's --version.
@@ -452,6 +454,7 @@ jobs:
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
+          .github/release/no-x264-override.sh
           echo "ARCHIVE=$(.github/release/expected-files.sh archive "$VERSION" '${{ matrix.flavour.name }}' x86_64-windows | sed 's/\.zip$//')" >> "$GITHUB_ENV"
       - name: MinGW, NASM and vcpkg's build tools
         run: |
@@ -672,17 +675,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      # Staged outside dist/; check-release.sh checks the downloads first, then joins it.
+      # The downloads are checked as a set first; then x264's source is staged outside dist/ and
+      # joins for the full check.
+      - name: The downloaded set
+        env:
+          RELEASE_LOOKUP: '0'
+        run: .github/release/check-release.sh "v${{ needs.version.outputs.version }}" dist --downloads-only ${{ needs.version.outputs.flavour_names }}
       - name: x264's source
         run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       - name: Check the release files
         env:
           RELEASE_LOOKUP: '0'
         run: .github/release/check-release.sh "v${{ needs.version.outputs.version }}" dist "$RUNNER_TEMP/x264-source" ${{ needs.version.outputs.flavour_names }}
-      # A dry run's download is the whole release set: x264's source too. (A tag's run doesn't
-      # upload it, so the release job's download holds only the build artifacts.)
+      # Whenever the release job won't run (anything but a pushed tag), x264's source is uploaded
+      # too, so the run's download is the whole release set; on a pushed tag the release job's
+      # download holds only the build artifacts.
       - uses: actions/upload-artifact@v4
-        if: github.ref_type != 'tag'
+        if: github.event_name != 'push' || github.ref_type != 'tag'
         with:
           name: dry-run-x264-source-${{ needs.version.outputs.version }}
           path: ${{ runner.temp }}/x264-source/
@@ -707,6 +716,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: The downloaded set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist --downloads-only ${{ needs.version.outputs.flavour_names }}
       - name: x264's source
         run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml declares

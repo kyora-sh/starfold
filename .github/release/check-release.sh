@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check-release.sh <tag> <dist dir> <staged x264 source dir> <flavour...>: everything checked before
-# a release is created. <dist dir> holds the downloaded workflow artifacts, one directory each
+# a release is created. With --downloads-only in place of the staged directory, it stops after the
+# versions and the downloaded set: run that before staging x264's source. <dist dir> holds the downloaded workflow artifacts, one directory each
 # (never merged); x264's source is staged elsewhere (stage-x264-source.sh) and joins only after
 # the downloaded set has passed. Fails unless:
 #   - Cargo.toml's version (tomllib) names the tag, v<version>, and pyproject.toml declares it;
@@ -43,6 +44,10 @@ dupes=$(sed 's|.*/||' <<<"$expected" | sort | uniq -d)
 [ ! -e "$dist/x264-source" ] || fail "a downloaded artifact is named x264-source"
 [ "$(links "$dist")" = 0 ] || fail "$dist holds a symbolic link"
 same "the downloaded artifacts in $dist" "$(grep -v '^x264-source/' <<<"$expected")" "$(listing "$dist")"
+if [ "$staged" = --downloads-only ]; then
+	echo "downloads of $tag: the expected set, $(listing "$dist" | wc -l | tr -d ' ') files"
+	exit 0
+fi
 [ "$(links "$staged")" = 0 ] || fail "$staged holds a symbolic link"
 same "the staged x264 source in $staged" "$(grep '^x264-source/' <<<"$expected" | sed 's|^x264-source/||')" "$(listing "$staged")"
 mkdir "$dist/x264-source"

@@ -11,7 +11,7 @@ x264 and an OpenH264 build distributed under MIT; see [Install](README.md#instal
 - `POST /input` for keyboard and mouse input, and the Python SDK (#2)
 - Encoder capability registry with startup probes, and VideoToolbox H.264 and HEVC on macOS (#5)
 - Codec negotiation between server and browser, encoder cohorts and switching codec mid-session (#6)
-- `--encoder auto`: a hardware encoder by default where the host has one that isn't experimental (VideoToolbox); the experimental VA-API, NVENC, Media Foundation and Quick Sync encoders run only when pinned with `--encoder` (#7)
+- `--encoder auto`: a hardware encoder by default where the host has one that isn't experimental (VideoToolbox); the experimental VA-API, NVENC, Media Foundation and Quick Sync encoders stream only when pinned with `--encoder`, and `--experimental-hw-probes` opens them at startup to probe them (#7)
 - Decoding in a web worker, with a dav1d (WebAssembly) fallback for AV1 (#8)
 - Recordings as MP4 segments that survive encoder changes (#9)
 - A server warning when a recording response drops segments (#10)
