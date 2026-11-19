@@ -44,13 +44,28 @@ export function createVideo(
 	canvas: HTMLCanvasElement,
 	useVideo: boolean,
 	onLayout: () => void,
-	onFirstPaint: () => void
+	onFirstPaint: () => void,
+	/** The CSS pixels the desktop is fitted into: the window, unless embedded. */
+	viewport: () => { w: number; h: number } = () => ({
+		w: window.innerWidth,
+		h: window.innerHeight,
+	}),
+	/** Inline styles for each stripe <video>; the served page styles `.stripe` in its CSS. */
+	stripeStyle: Partial<Record<keyof CSSStyleDeclaration, string>> = {},
+	/**
+	 * Never larger than the viewport (embedded): when even the smallest seam-free height
+	 * doesn't fit, the picture fits exactly instead.
+	 */
+	contain = false
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
 	/** Waiting for the first presented frame of a stripe <video> (re-armed if it is removed first). */
 	let armed = false;
 	let painted = false;
+	/** The pending first-paint callback, for dispose(). */
+	let paintWait: { v: HTMLVideoElement; id: number; frame: boolean } | null =
+		null;
 	/** Where the worker presents: <video> stripes, or the canvas (always for dav1d-wasm). */
 	let surface: 'video' | 'canvas' = useVideo ? 'video' : 'canvas';
 	const show = () => {
@@ -85,6 +100,7 @@ export function createVideo(
 			const gen = new MediaStreamTrackGenerator({ kind: 'video' });
 			const video = document.createElement('video');
 			video.className = 'stripe';
+			Object.assign(video.style, stripeStyle);
 			video.muted = true;
 			video.autoplay = true;
 			video.playsInline = true;
@@ -118,8 +134,9 @@ export function createVideo(
 				painted = true;
 				onFirstPaint();
 			};
-			if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(done);
-			else requestAnimationFrame(done);
+			if ('requestVideoFrameCallback' in v)
+				paintWait = { v, id: v.requestVideoFrameCallback(done), frame: false };
+			else paintWait = { v, id: requestAnimationFrame(done), frame: true };
 		}
 		for (const p of parts) {
 			const o = outs[p.i];
@@ -137,21 +154,27 @@ export function createVideo(
 	function layout() {
 		const { w: dw, h: dh } = app.desk;
 		if (!dw) return;
-		const vw = window.innerWidth,
-			vh = window.innerHeight;
+		const { w: vw, h: vh } = viewport();
 		const dpr = window.devicePixelRatio || 1;
 		// Snap the height so every stripe boundary lands on a whole device pixel;
 		// otherwise the stacked stripe layers show hairline seams.
 		const q = dh / stripes.reduce((g, [y]) => gcd(g, y), dh);
-		const devH = Math.max(
-			q,
-			Math.floor(((Math.min(vw / dw, vh / dh) || 1) * dh * dpr) / q) * q
-		);
+		const fit = (Math.min(vw / dw, vh / dh) || 1) * dh * dpr;
+		const snapped = Math.floor(fit / q) * q;
+		const devH = contain && snapped < q ? fit : Math.max(q, snapped);
 		app.view.scale = devH / dpr / dh;
 		app.surface.style.width = `${dw * app.view.scale}px`;
 		app.surface.style.height = `${dh * app.view.scale}px`;
 		onLayout();
 	}
 
-	return { build, present, layout, setSurface };
+	/** Drops the stripes and a pending first-paint callback (embedded: on unmount). */
+	function dispose() {
+		if (paintWait?.frame) cancelAnimationFrame(paintWait.id);
+		else if (paintWait) paintWait.v.cancelVideoFrameCallback(paintWait.id);
+		paintWait = null;
+		clear();
+	}
+
+	return { build, present, layout, setSurface, dispose };
 }

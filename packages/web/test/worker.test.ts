@@ -1,128 +1,140 @@
-// The worker itself (src/worker.ts), loaded with a WebSocket that behaves like a browser's
-// where it matters here: what goes out on each send path, and which close codes it takes.
-import { beforeAll, describe, expect, test } from 'bun:test';
-import { frameBinary, frameText, Kind } from '../src/frame';
+// The production worker (src/worker.ts) in a real Worker, driven over its lifecycle port by the
+// page's PageLife, against a real WebSocket server: the worker's own close and open posts, its
+// handling of what the server sends, and termination with a preamble reply in transit.
+import { afterEach, describe, expect, test } from 'bun:test';
+import { PageLife } from '../src/embed/attempts';
+import type { LifeOptions } from '../src/embed/attempts';
+import { PROTOCOL_ERROR } from '../src/embed/types';
+import type { Status } from '../src/embed/types';
+import { fakeServer, sleep, until } from './server';
 
-type Sent = string | number[];
+const WORKER = new URL('../src/worker.ts', import.meta.url).href;
+const PRELOAD = new URL('./worker-preload.ts', import.meta.url).href;
+const SLOW_DECODER = new URL('./worker-slow-decoder.ts', import.meta.url).href;
 
-class FakeSocket {
-	static OPEN = 1;
-	static all: FakeSocket[] = [];
-	readyState = 0;
-	binaryType = 'blob';
-	sent: Sent[] = [];
-	closes: (number | undefined)[] = [];
-	private on = new Map<string, ((e: unknown) => void)[]>();
-	constructor(public url: string) {
-		FakeSocket.all.push(this);
-	}
-	addEventListener(t: string, f: (e: unknown) => void) {
-		this.on.set(t, [...(this.on.get(t) ?? []), f]);
-	}
-	emit(t: string, e: unknown = {}) {
-		for (const f of this.on.get(t) ?? []) f(e);
-	}
-	open() {
-		this.readyState = 1;
-		this.emit('open');
-	}
-	receive(data: string | ArrayBuffer) {
-		this.emit('message', { data });
-	}
-	send(d: string | ArrayBuffer | ArrayBufferView) {
-		if (typeof d === 'string') this.sent.push(d);
-		else if (d instanceof ArrayBuffer) this.sent.push([...new Uint8Array(d)]);
-		else
-			this.sent.push([...new Uint8Array(d.buffer, d.byteOffset, d.byteLength)]);
-	}
-	close(code?: number) {
-		// As in browsers: any other code throws InvalidAccessError.
-		if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999))
-			throw new DOMException(`close code ${code}`, 'InvalidAccessError');
-		this.closes.push(code);
-		this.readyState = 3;
-		this.emit('close', { code });
-	}
-}
+let cleanup: (() => void)[] = [];
+afterEach(() => {
+	for (const f of cleanup.toReversed()) f();
+	cleanup = [];
+});
 
-const posted: { t: string; [k: string]: unknown }[] = [];
-let toWorker: (e: { data: unknown }) => void = () => {};
-const enc = new TextEncoder();
-const bytes = (s: string) => [...enc.encode(s)];
-const framedText = (s: string) => [Kind.Text, ...bytes(s)];
-const buf = (u: Uint8Array) =>
-	u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
-const hello = JSON.stringify({ t: 'hello', w: 64, h: 32, audio: false });
-const canvas = { width: 0, height: 0, getContext: () => ({}) };
-
-function connect(framed: boolean): FakeSocket {
-	const n = FakeSocket.all.length;
-	toWorker({
-		data: { t: 'init', canvas, url: 'ws://x/ws', presentToMain: false, framed },
+/** The real worker on the lifecycle port, as mount() starts it, and the page's side. */
+function start(
+	o: LifeOptions,
+	onReplyPosted?: (w: Worker) => void,
+	preload: string[] = []
+) {
+	const s = fakeServer();
+	const worker = new Worker(WORKER, {
+		preload: [PRELOAD, ...preload],
+	} as WorkerOptions);
+	const ch = new MessageChannel();
+	const seen = {
+		status: [] as Status[],
+		closes: [] as [number, string][],
+	};
+	if (onReplyPosted) {
+		const post = ch.port1.postMessage.bind(ch.port1);
+		ch.port1.postMessage = (m: { t: string }, t?: Transferable[]) => {
+			post(m, t ?? []);
+			if (m.t === 'preamble') onReplyPosted(worker);
+		};
+	}
+	const page = new PageLife(ch.port1, {
+		...o,
+		onStatus: (st) => seen.status.push(st),
+		onClose: (c, r) => seen.closes.push([c, r]),
 	});
-	expect(FakeSocket.all.length).toBe(n + 1);
-	const s = FakeSocket.all[n];
-	s.open();
-	return s;
-}
-
-beforeAll(async () => {
-	Object.assign(globalThis, {
-		WebSocket: FakeSocket,
-		self: {
-			location: { search: '' },
-			postMessage: (m: { t: string }) => posted.push(m),
-			addEventListener: (t: string, f: typeof toWorker) => {
-				if (t === 'message') toWorker = f;
-			},
+	worker.postMessage(
+		{
+			t: 'init',
+			canvas: {},
+			url: s.url,
+			presentToMain: false,
+			embed: { life: ch.port2 },
 		},
-	});
-	await import('../src/worker');
-});
+		[ch.port2]
+	);
+	cleanup.push(s.stop, () => worker.terminate());
+	return { s, page, seen, worker };
+}
 
-describe('the worker, framed', () => {
-	test('every send path frames, every receive path unframes', () => {
-		const s = connect(true);
-		s.receive(buf(frameText(hello)));
-		expect(posted.some((m) => m.t === 'hello' && m.w === 64)).toBe(true);
-		s.receive(buf(frameText('{"t":"ping","s":5}')));
-		toWorker({ data: { t: 'send', d: 'k,65,1' } });
-		toWorker({ data: { t: 'sendBin', d: new Uint8Array([0x11, 9]).buffer } });
-		s.receive(buf(frameBinary(new Uint8Array([0x03, 7, 8]))));
-		expect(s.sent).toEqual([
-			framedText('au,0'),
-			framedText('v,1'),
-			framedText('po,5'),
-			framedText('k,65,1'),
-			[Kind.Binary, 0x11, 9],
+describe('the production worker', () => {
+	test("sends the preamble first, posts open, and posts the server's close with its code and reason", async () => {
+		const { s, page, seen } = start({ preamble: () => ['t1', 't2'] });
+		page.connect();
+		await until(() => (s.conns[0]?.got.length ?? 0) >= 2, 5000);
+		expect(s.conns[0].got.slice(0, 2)).toEqual(['t1', 't2']);
+		await until(() => seen.status.includes('open'));
+		s.conns[0].ws!.close(4401, 'ticket expired');
+		await until(() => seen.closes.length === 1);
+		expect(seen.closes).toEqual([[4401, 'ticket expired']]);
+	});
+
+	test('a server message that is JSON null ends the attempt with PROTOCOL_ERROR', async () => {
+		const { s, page, seen } = start({ preamble: () => 'ticket' });
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && seen.status.includes('open'), 5000);
+		s.conns[0].ws!.send('null');
+		await until(() => seen.closes.length === 1);
+		expect(seen.closes).toEqual([[PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason]]);
+		await until(() => s.conns[0].closed);
+	});
+
+	test('a malformed video offer ends the attempt with PROTOCOL_ERROR', async () => {
+		const { s, page, seen } = start({ preamble: () => 'ticket' });
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && seen.status.includes('open'), 5000);
+		s.conns[0].ws!.send(
+			JSON.stringify({
+				t: 'hello',
+				protocol: 2,
+				w: 640,
+				h: 360,
+				videoOffers: [null],
+			})
+		);
+		await until(() => seen.closes.length === 1, 5000);
+		expect(seen.closes).toEqual([[PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason]]);
+	});
+
+	test('terminated in the task that posted the preamble reply, it opens no socket', async () => {
+		let replied = 0;
+		const { s, page } = start({ preamble: () => 'ticket' }, (w) => {
+			replied++;
+			w.terminate();
+		});
+		page.connect();
+		await until(() => replied === 1, 5000);
+		await sleep(1500);
+		expect(s.conns.length).toBe(0);
+	});
+
+	test("a hello's negotiation that fails after its socket closed leaves the next socket open", async () => {
+		const { s, page, seen } = start({ preamble: () => 'ticket' }, undefined, [
+			SLOW_DECODER,
 		]);
-		const cursor = posted.find((m) => m.t === 'cursor');
-		expect([...new Uint8Array(cursor?.buf as ArrayBuffer)]).toEqual([
-			0x03, 7, 8,
-		]);
-	});
-
-	test('anything not framed closes the socket with a code browsers take', () => {
-		for (const bad of [
-			'{"t":"ping","s":1}',
-			new Uint8Array([9, 1]).buffer,
-			new Uint8Array([Kind.Text, 0xff]).buffer,
-			new ArrayBuffer(0),
-		]) {
-			const s = connect(true);
-			s.receive(bad);
-			expect(s.closes).toEqual([4003]);
-			expect(posted.at(-1)).toEqual({ t: 'status', s: 'closed' });
-		}
-	});
-});
-
-describe('the worker, unframed', () => {
-	test('text goes out as text and binary as it is', () => {
-		const s = connect(false);
-		s.receive(hello);
-		s.receive('{"t":"ping","s":5}');
-		toWorker({ data: { t: 'sendBin', d: new Uint8Array([0x11, 9]).buffer } });
-		expect(s.sent).toEqual(['au,0', 'v,1', 'po,5', [0x11, 9]]);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && seen.status.includes('open'), 5000);
+		const config = { codec: 'avc1.640028', codedWidth: 640, codedHeight: 360 };
+		s.conns[0].ws!.send(
+			JSON.stringify({
+				t: 'hello',
+				protocol: 2,
+				w: 640,
+				h: 360,
+				videoOffers: [
+					{ codec: 'h264', stripes: [{ y: 0, h: 360, config }] },
+					{ codec: 'h264', stripes: '' },
+				],
+			})
+		);
+		s.conns[0].ws!.close(4401, 'ticket expired');
+		await until(() => seen.closes.length === 1, 5000);
+		page.connect();
+		await until(() => !!s.conns[1]?.ws && seen.status.includes('open'), 5000);
+		await sleep(1000);
+		expect(seen.closes).toEqual([[4401, 'ticket expired']]);
+		expect(s.conns[1].closed).toBe(false);
 	});
 });

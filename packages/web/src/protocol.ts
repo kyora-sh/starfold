@@ -215,6 +215,7 @@ export type FromWorker =
 	| { t: 'surface'; s: 'video' | 'canvas' }
 	/** The worker painted its first frame onto the canvas. */
 	| { t: 'painted' }
+	/** The served page only; embedded, the lifecycle has its own port (life.ts). */
 	| { t: 'status'; s: 'open' | 'closed' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
@@ -231,6 +232,11 @@ export type ToWorker =
 			presentToMain: boolean;
 			/** Every message binary with a kind byte (frame.ts), for binary-only hops. */
 			framed?: boolean;
+			/**
+			 * Embedded (`mount`): connect only when asked over `life` (life.ts), with
+			 * `protocols`, and never again on its own.
+			 */
+			embed?: { protocols?: string[]; life: MessagePort };
 	  }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }

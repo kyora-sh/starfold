@@ -33,6 +33,10 @@ class ReadOnlyError(ForbiddenError):
     """The server runs with --read-only and takes no input."""
 
 
+class RecordingOffError(ForbiddenError):
+    """The server runs without --enable-recording, so it doesn't record."""
+
+
 class NotFoundError(StarfoldError):
     """No such file, folder or recording (404)."""
 
@@ -96,7 +100,10 @@ class InputResult:
 
 @dataclass(frozen=True)
 class Recording:
-    id: int
+    """A started recording. `id` is the string the server returned once, to this caller; any
+    holder of it can stop the recording and obtain its clip, so treat it like a secret."""
+
+    id: str
     max_seconds: int
 
 

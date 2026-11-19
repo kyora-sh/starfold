@@ -1,0 +1,12 @@
+{
+	// The embeddable client's type declarations, for embed/pack.sh.
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"noEmit": false,
+		"declaration": true,
+		"emitDeclarationOnly": true,
+		"rootDir": "src"
+	},
+	"include": ["src/embed", "src/types/dom-extra.d.ts"]
+}

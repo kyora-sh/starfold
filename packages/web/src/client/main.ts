@@ -5,7 +5,7 @@ import { displayHz } from '../pace';
 import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
 import type { App } from './app';
-import { el } from './app';
+import { blocksInput, el } from './app';
 import { createAudio } from './audio';
 import { createClipboard } from './clipboard';
 import { createCursor } from './cursor';
@@ -16,19 +16,6 @@ import { setupPointer } from './pointer';
 import { createResize } from './resize';
 import { setupToolbar } from './toolbar';
 import { createVideo } from './video';
-
-/**
- * Commands a read-only viewer sends: acks, video and audio on/off, keyframe requests
- * and ping replies. Anything else would act on the desktop (input, clipboard,
- * microphone, resizing). The server accepts only these from read-only viewers too
- * (READ_ONLY_COMMANDS in server.rs), so a page that ignores the hello flag cannot
- * drive the desktop either; this keeps it from sending what would be dropped.
- */
-const READ_ONLY_COMMANDS = new Set(['a', 'v', 'au', 'kf', 'po']);
-
-function blocksInput(app: App, command: string): boolean {
-	return app.readOnly && !READ_ONLY_COMMANDS.has(command.split(',')[0]);
-}
 
 function main() {
 	const canvas = el<HTMLCanvasElement>('screen');

@@ -2,8 +2,15 @@
 //!
 //! - `GET /screenshot`: the screen as a PNG.
 //! - `GET /record?seconds=N`: records N seconds, returns an MP4.
-//! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
-//!   of everything in between.
+//! - `POST /record/start` -> `{"id": "..."}`, then `POST /record/stop?id=...`: returns an
+//!   MP4 of everything in between. Only a holder of the id that start returned can stop a
+//!   recording or obtain its clip: the id is returned once, to the caller of start, over
+//!   the same authenticated channel; it is 128 bits from the OS and compared in constant
+//!   time.
+//!
+//! All three answer 403 unless the server runs with `--enable-recording`; then nothing
+//! joins the stream and nothing is held. With it, a recording is held in memory and is
+//! not bounded beyond `--max-record-seconds`.
 //!
 //! Another encoder taking over mid-recording (new SPS/PPS) starts a new MP4 segment at
 //! its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
@@ -19,7 +26,7 @@
 
 use crate::hub::{Client, Hub, Out};
 use crate::mp4;
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
@@ -40,13 +47,68 @@ pub struct Recorder {
     pub hub: Arc<Hub>,
     /// Longest recording; a started one stops on its own after this.
     pub max: Duration,
-    active: Mutex<HashMap<u64, Active>>,
+    /// `--enable-recording`.
+    on: bool,
+    /// Started recordings by their id.
+    active: Mutex<HashMap<String, Active>>,
+    /// Numbers recordings in the log; never an id.
     next: AtomicU64,
 }
 
 struct Active {
     stop: oneshot::Sender<()>,
     done: Recording,
+    /// Its number in the log.
+    n: u64,
+}
+
+/// Whether the command line turns recording on (`--enable-recording`; off by default).
+pub fn enabled(a: &HashMap<String, String>) -> bool {
+    crate::truthy(a.get("enable-recording"), false)
+}
+
+/// A recording's id: 128 random bits from the system, as 32 hex digits.
+fn new_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("random recording id");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const OFF: &str =
+    r#"{"error":"recording is off (start the server with --enable-recording)","recording":false}"#;
+
+/// The answer of every recording route while recording is off, before the request's query
+/// is read.
+fn off() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json")],
+        OFF,
+    )
+        .into_response()
+}
+
+/// A request's query, read once recording is known to be on.
+#[allow(clippy::result_large_err)]
+fn query(req: &Request) -> Result<HashMap<String, String>, Response> {
+    Query::<HashMap<String, String>>::try_from_uri(req.uri())
+        .map(|Query(q)| q)
+        .map_err(IntoResponse::into_response)
+}
+
+/// Whether a text message to the recorder ends a recording of `size`: a hello for another
+/// size (an MP4 track keeps one), or one that names none. A hello for the same size (a
+/// capture rebuilt after a resize the display refused) and other broadcasts (clipboard and
+/// the like, whatever they contain) do not.
+fn resizes(t: &str, size: (u32, u32)) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        return false;
+    };
+    if v.get("t").and_then(|t| t.as_str()) != Some("hello") {
+        return false;
+    }
+    let dim = |k: &str| v.get(k).and_then(|d| d.as_u64());
+    (dim("w"), dim("h")) != (Some(size.0.into()), Some(size.1.into()))
 }
 
 type Recording = tokio::task::JoinHandle<Result<Clip, String>>;
@@ -174,10 +236,12 @@ impl Clip {
 }
 
 impl Recorder {
-    pub fn new(hub: Arc<Hub>, max: Duration) -> Arc<Self> {
+    /// `on`: [`enabled`].
+    pub fn new(hub: Arc<Hub>, max: Duration, on: bool) -> Arc<Self> {
         Arc::new(Recorder {
             hub,
             max,
+            on,
             active: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
@@ -360,8 +424,14 @@ fn begin(
     client.set_video(true);
     r.hub.replan();
     let hub = r.hub.clone();
+    // The size the recording starts with is the size of its MP4 track; a hello for any other
+    // ends it.
+    let size = (
+        hub.width.load(Ordering::Relaxed),
+        hub.height.load(Ordering::Relaxed),
+    );
     Ok(tokio::spawn(async move {
-        let (parts, end) = collect(&hub, &client, rx, stop, max).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, size, max).await;
         // Writing takes a while: nothing acknowledges frames now, so leave first.
         hub.remove_client(client.id);
         tokio::task::spawn_blocking(move || Clip::write(parts, end))
@@ -375,6 +445,7 @@ async fn collect(
     client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
+    size: (u32, u32),
     max: Duration,
 ) -> (Vec<Part>, End) {
     let start = Instant::now();
@@ -382,7 +453,6 @@ async fn collect(
     tokio::pin!(deadline);
     let mut parts: Vec<Part> = Vec::new();
     let mut frames: Vec<mp4::Frame> = Vec::new();
-    let mut size = (0, 0);
     let mut first: Option<Vec<Vec<u8>>> = None;
     let mut last_ms = None;
     let end = loop {
@@ -423,9 +493,6 @@ async fn collect(
                             Some(_) => {}
                         }
                     }
-                    if frames.is_empty() {
-                        size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
-                    }
                     last_ms = Some(ms);
                     frames.push(mp4::Frame {
                         ms,
@@ -433,8 +500,10 @@ async fn collect(
                         data: b.slice(16..),
                     });
                 }
-                // A new size restarts the stream; an MP4 track keeps one size, so stop.
-                Some(Out::Text(t)) if !frames.is_empty() && t.contains("\"hello\"") => {
+                // A new size restarts the stream; an MP4 track keeps the size the recording
+                // started with, so stop. The hub's size is not read here: a frame queued
+                // before a resize can be read after the hub has the new size.
+                Some(Out::Text(t)) if resizes(&t, size) => {
                     break End::Resized
                 }
                 _ => {}
@@ -480,10 +549,14 @@ fn record_len(secs: f64, max: Duration) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs.min(max.as_secs_f64())))
 }
 
-pub async fn record(
-    State(r): State<Arc<Recorder>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
+pub async fn record(State(r): State<Arc<Recorder>>, req: Request) -> Response {
+    if !r.on {
+        return off();
+    }
+    let q = match query(&req) {
+        Ok(q) => q,
+        Err(e) => return e,
+    };
     let secs: f64 = q.get("seconds").and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let Some(len) = record_len(secs, r.max) else {
         return err(StatusCode::BAD_REQUEST, "seconds must be positive");
@@ -501,27 +574,33 @@ pub async fn record(
 }
 
 pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
+    if !r.on {
+        return off();
+    }
     let (stop_tx, stop) = oneshot::channel();
     let done = match begin(&r, stop, r.max) {
         Ok(d) => d,
         Err(e) => return e,
     };
-    let id = r.next.fetch_add(1, Ordering::Relaxed);
+    let id = new_id();
+    let n = r.next.fetch_add(1, Ordering::Relaxed);
     r.active.lock().insert(
-        id,
+        id.clone(),
         Active {
             stop: stop_tx,
             done,
+            n,
         },
     );
-    log::info!("recording {id} started");
+    log::info!("recording {n} started");
     // Nobody may ever stop it: once it has ended on its own, drop it after a grace period
     // instead of holding the clip in memory forever.
     let rec = r.clone();
+    let key = id.clone();
     tokio::spawn(async move {
         tokio::time::sleep(rec.max + UNCLAIMED).await;
-        if rec.active.lock().remove(&id).is_some() {
-            log::info!("recording {id} was never stopped; discarded");
+        if rec.active.lock().remove(&key).is_some() {
+            log::info!("recording {n} was never stopped; discarded");
         }
     });
     (
@@ -531,20 +610,29 @@ pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
         .into_response()
 }
 
-pub async fn stop(
-    State(r): State<Arc<Recorder>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
+pub async fn stop(State(r): State<Arc<Recorder>>, req: Request) -> Response {
+    if !r.on {
+        return off();
+    }
+    let q = match query(&req) {
+        Ok(q) => q,
+        Err(e) => return e,
+    };
     let Some(zip) = wants_zip(&q) else {
         return err(StatusCode::BAD_REQUEST, BAD_FORMAT);
     };
-    let id = q.get("id").and_then(|s| s.parse::<u64>().ok());
-    let Some(a) = id.and_then(|id| r.active.lock().remove(&id)) else {
+    let id = q.get("id").map_or("", String::as_str);
+    let found = {
+        let mut active = r.active.lock();
+        let key = active.keys().find(|k| crate::login::same(k, id)).cloned();
+        key.and_then(|k| active.remove(&k))
+    };
+    let Some(a) = found else {
         return err(StatusCode::NOT_FOUND, "no such recording");
     };
     let _ = a.stop.send(());
-    log::info!("recording {} stopped", id.unwrap_or(0));
-    respond(a.done, zip, "/record/stop", id).await
+    log::info!("recording {} stopped", a.n);
+    respond(a.done, zip, "/record/stop", Some(a.n)).await
 }
 
 #[cfg(test)]
@@ -587,7 +675,7 @@ mod tests {
         tx.send(Out::Text("{\"t\":\"hello\"}".into())).unwrap();
         let (parts, end) = tokio::time::timeout(
             Duration::from_secs(5),
-            collect(&hub, &client, rx, stop, Duration::from_secs(30)),
+            collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)),
         )
         .await
         .expect("the recording ended");
@@ -704,7 +792,7 @@ mod tests {
         b.resize(16, 0);
         b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0x11, 0, 0, 0, 1, 0x65, 0xaa]);
         tx.send(Out::Bin(bytes::Bytes::from(b))).unwrap();
-        let (parts, end) = collect(&hub, &client, rx, stop, Duration::from_secs(30)).await;
+        let (parts, end) = collect(&hub, &client, rx, stop, (0, 0), Duration::from_secs(30)).await;
         let c = Clip::write(parts, end).unwrap();
         assert_eq!(c.end, End::BadParameterSets);
         assert_eq!(c.segments.len(), 1);
@@ -766,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_recorder_leaves_the_hub_when_it_ends() {
-        let r = Recorder::new(Hub::new(), Duration::from_secs(30));
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30), true);
         let (stop_tx, stop) = oneshot::channel();
         let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
         assert_eq!(r.hub.clients.lock().len(), 1);
@@ -831,22 +919,232 @@ mod tests {
 
     #[tokio::test]
     async fn a_bad_format_leaves_the_recording_running() {
-        let r = Recorder::new(Hub::new(), Duration::from_secs(30));
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30), true);
         let started = start(State(r.clone())).await;
-        let id = serde_json::from_slice::<serde_json::Value>(&body(started).await).unwrap()["id"]
-            .as_u64()
-            .unwrap();
-        let q = |f: &str| {
-            Query(HashMap::from([
-                ("id".to_string(), id.to_string()),
-                ("format".to_string(), f.to_string()),
-            ]))
-        };
-        let bad = stop(State(r.clone()), q("avi")).await;
+        let id = json(&body(started).await)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bad = stop(State(r.clone()), with(&[("id", &id), ("format", "avi")])).await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
         assert!(r.active.lock().contains_key(&id));
-        let done = stop(State(r.clone()), q("zip")).await;
+        let done = stop(State(r.clone()), with(&[("id", &id), ("format", "zip")])).await;
         assert_eq!(done.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(r.active.lock().is_empty());
+    }
+
+    fn json(b: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(b).unwrap()
+    }
+
+    /// A request with these query pairs (plain values, no escaping needed).
+    fn with(pairs: &[(&str, &str)]) -> Request {
+        let q: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        Request::builder()
+            .uri(format!("/r?{}", q.join("&")))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recording_is_off_unless_enabled_and_then_nothing_joins() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30), false);
+        for res in [
+            record(State(r.clone()), with(&[("seconds", "1")])).await,
+            start(State(r.clone())).await,
+            stop(State(r.clone()), with(&[("id", "1")])).await,
+        ] {
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            let j = json(&body(res).await);
+            assert_eq!(j["recording"], false);
+            assert!(j["error"].as_str().unwrap().contains("--enable-recording"));
+        }
+        assert!(r.hub.clients.lock().is_empty(), "no viewer joined");
+        assert!(r.active.lock().is_empty());
+    }
+
+    #[test]
+    fn the_command_line_leaves_recording_off_unless_asked() {
+        // As the server builds its recorder from them.
+        let read = |v: &[&str]| {
+            let a = crate::parse_args(v.iter().map(|s| s.to_string()));
+            crate::recorder_from_args(&a, &Hub::new()).on
+        };
+        assert!(!read(&[]));
+        assert!(!read(&["--port", "6901", "--read-only"]));
+        assert!(!read(&["--enable-recording=false"]));
+        assert!(read(&["--enable-recording"]));
+        assert!(read(&["--enable-recording=true"]));
+        assert!(read(&["--enable_recording", "1"]));
+    }
+
+    #[tokio::test]
+    async fn only_the_id_a_recording_was_started_with_stops_it() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30), true);
+        let id = json(&body(start(State(r.clone())).await).await)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        let mut other = id.clone().into_bytes();
+        other[31] = if other[31] == b'0' { b'1' } else { b'0' };
+        let other = String::from_utf8(other).unwrap();
+        for wrong in ["1", "0", "", &id[..31], other.as_str()] {
+            let res = stop(State(r.clone()), with(&[("id", wrong)])).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{wrong:?}");
+        }
+        assert!(r.active.lock().contains_key(&id), "still running");
+        let recorder = r.hub.clients.lock()[0].clone();
+        for u in [Some((100, 40)), None, None] {
+            recorder.send(unit(u));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let res = stop(State(r.clone()), with(&[("id", &id)])).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert!(r.active.lock().is_empty());
+        let mp4 = body(res).await;
+        assert_eq!(check(&mp4).0, 3, "the clip has the three frames");
+        let res = stop(State(r.clone()), with(&[("id", &id)])).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "an id stops once");
+    }
+
+    #[tokio::test]
+    async fn while_off_a_query_is_not_read() {
+        let r = Recorder::new(Hub::new(), Duration::from_secs(30), false);
+        for res in [
+            record(
+                State(r.clone()),
+                with(&[("seconds", "x"), ("format", "avi")]),
+            )
+            .await,
+            stop(State(r.clone()), with(&[("id", "1"), ("format", "avi")])).await,
+        ] {
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            assert_eq!(body(res).await, OFF.as_bytes());
+        }
+    }
+
+    /// Records two frames of an 800x600 screen with `text` sent between them, until stopped.
+    async fn with_a_broadcast(text: &str) -> Clip {
+        let hub = Hub::new();
+        hub.width.store(800, Ordering::Relaxed);
+        hub.height.store(600, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx.clone());
+        let (stop_tx, stop) = oneshot::channel();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        tx.send(Out::Text(text.into())).unwrap();
+        tx.send(unit(None)).unwrap();
+        let recording = collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30));
+        let stopper = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = stop_tx.send(());
+        };
+        let ((parts, end), ()) = tokio::join!(recording, stopper);
+        Clip::write(parts, end).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_that_mentions_hello_does_not_end_a_recording() {
+        for text in [
+            r#"{"t":"clip","d":"\"hello\""}"#,
+            r#"{"t":"clip","d":"hello"}"#,
+            r#"{"t":"cursor","name":"hello"}"#,
+            "not json \"hello\"",
+        ] {
+            let c = with_a_broadcast(text).await;
+            assert_eq!(c.end, End::Stopped, "{text}");
+            assert_eq!(c.segments[0].frames, 2, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_size_ends_a_recording_whoever_asked_for_it() {
+        // A hello is what every viewer gets when the screen changes size, another viewer's
+        // resize included (--enable-resize): the MP4 track keeps one size, so it ends there.
+        for hello in [
+            r#"{"t":"hello","w":1024,"h":600}"#,
+            r#"{"t":"hello","w":800,"h":768}"#,
+            r#"{"t":"hello"}"#,
+        ] {
+            let c = with_a_broadcast(hello).await;
+            assert_eq!(c.end, End::Resized, "{hello}");
+            assert_eq!(c.segments[0].frames, 1, "{hello}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hello_for_the_same_size_does_not_end_a_recording() {
+        // Another viewer's resize that the display refused still rebuilds the capture,
+        // which says hello again at the size the recording already has.
+        let c = with_a_broadcast(r#"{"t":"hello","w":800,"h":600,"offer":3}"#).await;
+        assert_eq!(c.end, End::Stopped);
+        assert_eq!(c.segments[0].frames, 2);
+    }
+
+    /// The width and height an MP4's avc1 sample entry gives its samples.
+    fn dims(mp4: &[u8]) -> (u16, u16) {
+        let stsd = find(mp4, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]);
+        assert_eq!(&stsd[12..16], b"avc1");
+        let at = 16 + 24;
+        (
+            u16::from_be_bytes([stsd[at], stsd[at + 1]]),
+            u16::from_be_bytes([stsd[at + 2], stsd[at + 3]]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_after_the_hub_has_a_new_size_keeps_the_size_the_recording_started_with() {
+        // A capture rebuild sets the hub's new size and says hello while a frame captured at
+        // the old size is still queued for the recorder.
+        let hub = Hub::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx.clone());
+        let (_keep, stop) = oneshot::channel();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        hub.width.store(1024, Ordering::Relaxed);
+        hub.height.store(768, Ordering::Relaxed);
+        tx.send(Out::Text(r#"{"t":"hello","w":1024,"h":768}"#.into()))
+            .unwrap();
+        tx.send(unit(Some((100, 40)))).unwrap();
+        let (parts, end) = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect(&hub, &client, rx, stop, (800, 600), Duration::from_secs(30)),
+        )
+        .await
+        .expect("the recording ended");
+        assert_eq!(end, End::Resized);
+        let c = Clip::write(parts, end).unwrap();
+        assert_eq!(c.segments.len(), 1);
+        assert_eq!(c.segments[0].frames, 1, "only the old-size frame");
+        assert_eq!(dims(&c.segments[0].mp4), (800, 600));
+    }
+
+    #[tokio::test]
+    async fn a_recording_takes_its_size_from_the_hub_when_it_starts() {
+        let hub = Hub::new();
+        hub.width.store(800, Ordering::Relaxed);
+        hub.height.store(600, Ordering::Relaxed);
+        let r = Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let (stop_tx, stop) = oneshot::channel();
+        let done = begin(&r, stop, Duration::from_secs(30)).ok().unwrap();
+        let recorder = hub.clients.lock()[0].clone();
+        recorder.send(unit(Some((100, 40))));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.width.store(1024, Ordering::Relaxed);
+        recorder.send(Out::Text(r#"{"t":"hello","w":800,"h":600}"#.into()));
+        recorder.send(unit(None));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send(()).unwrap();
+        let c = done.await.unwrap().unwrap();
+        assert_eq!(
+            c.end,
+            End::Stopped,
+            "the hello is for the size it started with"
+        );
+        assert_eq!(c.segments[0].frames, 2);
+        assert_eq!(dims(&c.segments[0].mp4), (800, 600));
     }
 }
