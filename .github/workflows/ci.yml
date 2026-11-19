@@ -128,7 +128,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       # Unit tests, including the Linux-only ones (dynamic resolution).
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: cargo test --locked
 
   openh264:
@@ -160,7 +163,10 @@ jobs:
         run: |
           cargo clippy --features openh264 --all-targets --locked -- -D warnings
           cargo clippy --no-default-features --features openh264 --all-targets --locked -- -D warnings
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: |
           cargo test --features openh264 --locked
           cargo test --no-default-features --features openh264 --locked
@@ -203,7 +209,10 @@ jobs:
         run: |
           source <(bash bench/arms/libs.sh --env)
           cargo clippy --features svt-av1,x265 --all-targets --locked -- -D warnings
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: |
           source <(bash bench/arms/libs.sh --env)
           cargo test --features svt-av1,x265 --locked

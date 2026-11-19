@@ -2,7 +2,8 @@
 //! socket, what a startup that fails or is stopped leaves behind, and the signal mask.
 //! Linux only. These tests need Xvfb, python3, unprivileged user namespaces (`unshare
 //! --user`), passwordless `sudo -n` (to make a throwaway user and run as it) and bindfs
-//! (a FUSE mount); without them they fail, they don't skip.
+//! (a FUSE mount); without them they fail, they don't skip. One test also changes system
+//! settings (see [`SYSTEM_FUSE`]) and runs only when that is asked for.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
@@ -17,6 +18,11 @@ use std::time::{Duration, Instant};
 /// Set for a run of this test binary as the second same-uid process of
 /// [`a_second_process_of_the_same_user_gets_ws_and_a_screenshot`]: the socket to use.
 const SAME_UID_CLIENT: &str = "STARFOLD_TEST_SAME_UID_CLIENT";
+
+/// Set to 1 to let [`another_users_fuse_mount_is_refused`] change system settings for its
+/// run: add `user_allow_other` to /etc/fuse.conf and make /dev/fuse 0666 (both put back
+/// after). CI sets it; without it that test is skipped, saying so.
+const SYSTEM_FUSE: &str = "STARFOLD_TEST_SYSTEM_FUSE";
 
 const REFUSAL: &str = "--listen-unix: refusing: /proc/self/uid_map holds ";
 
@@ -492,9 +498,17 @@ fn a_fuse_mount_of_roots_is_taken() {
 /// the mount and its user, and nothing is made in what it mirrors. Letting an ordinary user
 /// mount with allow_other takes `user_allow_other` in /etc/fuse.conf, and opening
 /// /dev/fuse takes a device others may read and write (0666, as distributions set it): the
-/// test makes both so if they aren't and puts them back after. This test needs bindfs.
+/// test makes both so if they aren't and puts them back after, which it does only with
+/// [`SYSTEM_FUSE`] set to 1; otherwise it is skipped. This test needs bindfs.
 #[test]
 fn another_users_fuse_mount_is_refused() {
+    if std::env::var(SYSTEM_FUSE).as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: {SYSTEM_FUSE}=1 lets this test add user_allow_other to /etc/fuse.conf \
+             and make /dev/fuse 0666 for its run (both put back after)"
+        );
+        return;
+    }
     sudo_works();
     let user = Throwaway::create();
     let conf = std::fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
