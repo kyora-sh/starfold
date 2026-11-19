@@ -109,12 +109,15 @@ fn in_memory(_dir: &Path) -> io::Result<bool> {
 /// there already must be a directory (not a link) that only this user can enter.
 fn own_dir(dir: &Path) -> io::Result<PathBuf> {
     let own = dir.join(OWN);
-    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let b = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
         b.mode(0o700);
-    }
+        b
+    };
+    #[cfg(not(unix))]
+    let b = std::fs::DirBuilder::new();
     match b.create(&own) {
         Ok(()) => return Ok(own),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
