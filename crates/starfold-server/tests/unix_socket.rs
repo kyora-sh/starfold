@@ -484,11 +484,12 @@ fn a_fuse_mount_of_roots_is_taken() {
     std::fs::remove_dir_all(&mnt).unwrap();
 }
 
-/// A FUSE mount of another user's (bindfs run by the throwaway user through fusermount3,
+/// A FUSE mount of another user's (bindfs run by the throwaway user,
 /// with allow_other and every owner and mode shown as ours, mode 0700) is refused, naming
 /// the mount and its user, and nothing is made in what it mirrors. Letting an ordinary user
-/// mount with allow_other takes `user_allow_other` in /etc/fuse.conf: the test adds it if
-/// it isn't there and takes it out again. This test needs bindfs (and its fusermount3).
+/// mount with allow_other takes `user_allow_other` in /etc/fuse.conf, and opening
+/// /dev/fuse takes a device others may read and write (0666, as distributions set it): the
+/// test makes both so if they aren't and puts them back after. This test needs bindfs.
 #[test]
 fn another_users_fuse_mount_is_refused() {
     sudo_works();
@@ -505,7 +506,14 @@ fn another_users_fuse_mount_is_refused() {
     if added {
         sh("echo user_allow_other >> /etc/fuse.conf");
     }
-    struct Restore(bool);
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let dev = std::fs::metadata("/dev/fuse").expect("/dev/fuse");
+    assert!(dev.file_type().is_char_device());
+    let dev_mode = dev.mode() & 0o777;
+    if dev_mode != 0o666 {
+        sh("chmod 0666 /dev/fuse");
+    }
+    struct Restore(bool, u32);
     impl Drop for Restore {
         fn drop(&mut self) {
             if self.0 {
@@ -513,9 +521,14 @@ fn another_users_fuse_mount_is_refused() {
                     .args(["-n", "sed", "-i", "/^user_allow_other$/d", "/etc/fuse.conf"])
                     .status();
             }
+            if self.1 != 0o666 {
+                let _ = Command::new("sudo")
+                    .args(["-n", "chmod", &format!("{:o}", self.1), "/dev/fuse"])
+                    .status();
+            }
         }
     }
-    let _restore = Restore(added);
+    let _restore = Restore(added, dev_mode);
     let base = Path::new("/tmp").join(format!("sf-it-their-fuse-{}", std::process::id()));
     let (src, mnt) = (base.with_extension("src"), base.with_extension("mnt"));
     let as_them = |args: &[&str]| {
@@ -546,7 +559,6 @@ fn another_users_fuse_mount_is_refused() {
         mnt.to_str().unwrap(),
     ]);
     let fuse = Fuse(mnt.clone());
-    use std::os::unix::fs::MetadataExt;
     let shown = std::fs::metadata(&mnt).unwrap();
     assert_eq!((shown.uid(), shown.mode() & 0o777), (own_uid(), 0o700), "it looks like ours");
     let (code, said) = refused_start(&mnt.join("sf"));
