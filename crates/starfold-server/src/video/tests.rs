@@ -3641,7 +3641,7 @@ fn typing_keeps_the_full_rate_budget_and_the_wheel_does_not() {
     );
     motion(&mut eng, &mut t, 1);
     assert_eq!(last(&rates), 30, "a key: the full rate's budget");
-    t += Duration::from_secs(3);
+    motion(&mut eng, &mut t, 30);
     for ev in [
         InputEvent::Scroll { dx: 0, dy: 1 },
         InputEvent::ScrollPx { dx: 0.0, dy: 12.0 },
@@ -4463,4 +4463,85 @@ fn no_software_encoders_share_moves() {
         }
     }
     assert!(opened > 0);
+}
+
+/// Feeds `pace` `n` motion frames `gap_ms` apart from `at`, the cohort capped at `max`;
+/// returns the time of the last and the budgeted rate after each.
+fn feed(pace: &mut Pace, at: Instant, gap_ms: f64, n: usize, max: u32) -> (Instant, Vec<u32>) {
+    let mut t = at;
+    let mut seen = Vec::with_capacity(n);
+    for i in 0..n {
+        t = at + Duration::from_secs_f64(gap_ms * i as f64 / 1000.0);
+        pace.took(t, max, 0);
+        seen.push(pace.fps);
+    }
+    (t, seen)
+}
+
+/// What a second of frames delivered at `delivered` fps costs against the cap, each
+/// picture budgeted at `cap / fps`.
+fn spend(delivered: f64, fps: u32) -> f64 {
+    delivered / fps as f64
+}
+
+#[test]
+fn frames_delivered_faster_than_the_cap_are_each_budgeted_for_that_rate() {
+    let mut pace = Pace::new(30);
+    let (_, seen) = feed(&mut pace, Instant::now(), 1000.0 / 35.0, 70, 30);
+    assert!(seen[..3].iter().all(|&f| f == 30), "{seen:?}");
+    assert!(seen[3..].iter().all(|&f| f == 35), "{seen:?}");
+    assert!(spend(35.0, pace.fps) <= 1.0);
+}
+
+#[test]
+fn the_first_frames_are_budgeted_for_the_cap() {
+    let mut pace = Pace::new(60);
+    let (_, seen) = feed(&mut pace, Instant::now(), 1000.0 / 60.0, 3, 60);
+    assert_eq!(seen, [60, 60, 60]);
+}
+
+#[test]
+fn a_slower_delivery_lowers_the_budgeted_rate_within_about_a_second() {
+    let mut pace = Pace::new(30);
+    let (_, seen) = feed(&mut pace, Instant::now(), 1000.0 / 15.0, 30, 30);
+    let at = seen.iter().position(|&f| f != 30).expect("lowered");
+    assert!(at <= 16, "{seen:?}");
+    assert!(
+        seen[at..].iter().all(|&f| (15..=20).contains(&f)),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn a_rate_change_is_budgeted_for_at_the_new_rate() {
+    let mut pace = Pace::new(30);
+    let (end, _) = feed(&mut pace, Instant::now(), 1000.0 / 30.0, 60, 30);
+    let next = end + Duration::from_secs_f64(1.0 / 60.0);
+    let (end, seen) = feed(&mut pace, next, 1000.0 / 60.0, 10, 60);
+    assert!(seen[3..].iter().all(|&f| f == 60), "{seen:?}");
+    let (_, seen) = feed(
+        &mut pace,
+        end + Duration::from_millis(17),
+        1000.0 / 20.0,
+        30,
+        20,
+    );
+    assert!(seen.iter().all(|&f| f <= 40), "{seen:?}");
+    assert!(seen[seen.len() - 5..].iter().all(|&f| f <= 25), "{seen:?}");
+}
+
+#[test]
+fn a_pause_does_not_leave_the_next_frames_budgeted_for_the_trickle_before_it() {
+    let mut pace = Pace::new(30);
+    let (end, seen) = feed(&mut pace, Instant::now(), 200.0, 20, 30);
+    assert_eq!(seen.last(), Some(&FPS_FLOOR));
+    let (_, seen) = feed(
+        &mut pace,
+        end + Duration::from_secs(2),
+        1000.0 / 30.0,
+        30,
+        30,
+    );
+    assert!(seen.iter().all(|&f| f == 30), "{seen:?}");
+    assert!(seen.iter().all(|&f| spend(30.0, f) <= 1.0));
 }

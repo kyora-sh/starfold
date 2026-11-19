@@ -434,12 +434,36 @@ struct Cohort {
 /// second's worth of the cap.
 pub(crate) const FPS_FLOOR: u32 = 10;
 
-/// How often a cohort takes a frame while the picture moves. Flow control and a busy encoder
-/// skip frames, and an encoder that budgets for every capture would starve the ones that go out.
+/// How many of the last gaps between motion frames a raise of the budgeted rate looks at.
+const UP_GAPS: usize = 3;
+
+/// How far above the budgeted rate frames have to come before it is raised.
+const UP_SHARE: f64 = 0.05;
+
+/// A gap between motion frames this long or longer is a pause, not a rate.
+const PAUSE_MS: f64 = 1000.0;
+
+/// The rate a cohort's encoder budgets each picture for: the rate frames are delivered to
+/// it while the picture moves, so the stream spends its target on average, neither more
+/// (frames delivered faster than budgeted, each sized for the slower rate) nor much less.
+///
+/// - Measured: a moving average of the gaps between motion frames (each new gap weighs
+///   0.2, about the last five frames). A gap of a second or more is a pause and isn't
+///   counted.
+/// - Raised at once when the last three gaps run 5% or more faster than the budgeted rate,
+///   to their mean rate, at most twice the cap: frames delivered faster than budgeted
+///   would each spend a slower rate's share.
+/// - Lowered (flow control and a busy encoder skip frames, and an encoder that budgets for
+///   every capture would starve the ones that go out) only by a quarter or more, at most
+///   once a second, and never below the floor.
+/// - Back to the cap after a pause and at the start, so the first pictures after either are
+///   budgeted for the full rate, not for the slow trickle before.
 struct Pace {
     last: Option<Instant>,
-    /// Smoothed interval between frames taken in motion (ms); pauses of a second or more are stills.
+    /// Smoothed interval between frames taken in motion (ms), since the last pause.
     interval_ms: Option<f64>,
+    /// The last [`UP_GAPS`] gaps (ms), since the last pause.
+    recent: std::collections::VecDeque<f64>,
     fps: u32,
     changed: Instant,
 }
@@ -449,35 +473,66 @@ impl Pace {
         Pace {
             last: None,
             interval_ms: None,
+            recent: std::collections::VecDeque::with_capacity(UP_GAPS),
             fps,
             changed: Instant::now(),
         }
     }
 
-    /// A motion frame went to the encoder at `now`. Changes the budgeted rate at most once a
-    /// second, and only by a quarter or more.
+    fn set(&mut self, fps: u32, now: Instant, cohort: u64, why: &str) {
+        log::info!(
+            "cohort {cohort}: encoder rate {} -> {fps} fps ({why})",
+            self.fps
+        );
+        self.fps = fps;
+        self.changed = now;
+    }
+
+    /// A motion frame went to the encoder at `now`, the cohort capped at `max` fps.
     fn took(&mut self, now: Instant, max: u32, cohort: u64) {
-        if let Some(gap) = self
+        let top = max.saturating_mul(2).max(1);
+        let gap = self
             .last
-            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0)
-        {
-            if gap < 1000.0 {
-                self.interval_ms = Some(self.interval_ms.map_or(gap, |i| i * 0.8 + gap * 0.2));
+            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0);
+        self.last = Some(now);
+        if self.fps > top {
+            self.set(top, now, cohort, "the cap went down");
+        }
+        match gap {
+            Some(g) if g < PAUSE_MS => {
+                self.interval_ms = Some(self.interval_ms.map_or(g, |i| i * 0.8 + g * 0.2));
+                if self.recent.len() == UP_GAPS {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(g);
+            }
+            Some(_) => {
+                self.interval_ms = None;
+                self.recent.clear();
+                if self.fps != max {
+                    self.set(max, now, cohort, "after a pause");
+                }
+                return;
+            }
+            None => return,
+        }
+        if self.recent.len() == UP_GAPS {
+            let mean = self.recent.iter().sum::<f64>() / UP_GAPS as f64;
+            let up = ((1000.0 / mean.max(1.0)).round() as u32).min(top);
+            if up as f64 >= self.fps as f64 * (1.0 + UP_SHARE) {
+                let why = format!("frames every {mean:.0} ms");
+                self.set(up, now, cohort, &why);
+                return;
             }
         }
-        self.last = Some(now);
         let Some(interval) = self.interval_ms else {
             return;
         };
-        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), max);
+        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), top);
         let step = (want as f64 - self.fps as f64).abs() >= self.fps as f64 * 0.25;
         if step && now.saturating_duration_since(self.changed) >= Duration::from_secs(1) {
-            log::info!(
-                "cohort {cohort}: encoder rate {} -> {want} fps (a frame every {interval:.0} ms)",
-                self.fps
-            );
-            self.fps = want;
-            self.changed = now;
+            let why = format!("a frame every {interval:.0} ms");
+            self.set(want, now, cohort, &why);
         }
     }
 }
@@ -1533,9 +1588,9 @@ impl Engine {
                 force_idr: force,
                 boost: force && !c.shared.degraded(),
                 fps: if typing {
-                    max_fps
+                    max_fps.max(c.pace.fps)
                 } else {
-                    c.pace.fps.min(max_fps)
+                    c.pace.fps
                 },
             }) {
                 Ok(()) => {
