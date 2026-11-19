@@ -475,7 +475,10 @@ fn a_fuse_mount_of_roots_is_taken() {
         .lines()
         .find(|l| l.contains(&format!(" {} ", mnt.display())))
         .unwrap_or_else(|| panic!("{} isn't in mountinfo", mnt.display()));
-    assert!(line.contains("fuse") && line.contains("user_id=0"), "{line}");
+    assert!(
+        line.contains("fuse") && line.contains("user_id=0"),
+        "{line}"
+    );
     let server = Server::start(&x, &mnt, &["--listen-tcp=false"]);
     assert!(healthy(&server.socket));
     drop(server);
@@ -560,7 +563,11 @@ fn another_users_fuse_mount_is_refused() {
     ]);
     let fuse = Fuse(mnt.clone());
     let shown = std::fs::metadata(&mnt).unwrap();
-    assert_eq!((shown.uid(), shown.mode() & 0o777), (own_uid(), 0o700), "it looks like ours");
+    assert_eq!(
+        (shown.uid(), shown.mode() & 0o777),
+        (own_uid(), 0o700),
+        "it looks like ours"
+    );
     let (code, said) = refused_start(&mnt.join("sf"));
     assert_eq!(code, Some(1), "{said}");
     assert!(

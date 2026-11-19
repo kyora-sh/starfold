@@ -258,7 +258,8 @@ pub fn judge_fuse_mount(
     euid: u32,
 ) -> Result<(), String> {
     let id = id.ok_or("is on FUSE, and the kernel gives no mount id to look it up by (statx STATX_MNT_ID needs Linux 5.8 or later)")?;
-    let info = mountinfo.map_err(|e| format!("is on FUSE, and its mount can't be looked up: {e}"))?;
+    let info =
+        mountinfo.map_err(|e| format!("is on FUSE, and its mount can't be looked up: {e}"))?;
     let key = id.to_string();
     let line = info
         .split(|b| *b == b'\n')
@@ -2978,17 +2979,30 @@ mod tests {
         /// can't be read and a kernel without mount ids are refused, quoting what was read.
         #[test]
         fn a_fuse_type_directory_is_judged_by_its_mount() {
-            let info = |l: &str| Ok(format!("22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/vda rw\n{l}\n30 22 0:5 / /proc rw - proc proc rw\n").into_bytes());
+            let info = |l: &str| {
+                Ok(format!("22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/vda rw\n{l}\n30 22 0:5 / /proc rw - proc proc rw\n").into_bytes())
+            };
             let virtiofs = "29 22 0:27 / /run/kata rw,relatime shared:9 - virtiofs kataShared rw";
             assert_eq!(judge_fuse_mount(Some(29), info(virtiofs), 1000), Ok(()));
             let fuse = |id: u32, ty: &str| {
                 format!("29 22 0:41 / /mnt/x rw,nosuid,nodev,relatime shared:9 - {ty} src rw,user_id={id},group_id={id},allow_other")
             };
             for ty in ["fuse", "fuseblk", "fuse.bindfs", "fuse.sshfs"] {
-                assert_eq!(judge_fuse_mount(Some(29), info(&fuse(0, ty)), 1000), Ok(()), "{ty}");
-                assert_eq!(judge_fuse_mount(Some(29), info(&fuse(1000, ty)), 1000), Ok(()), "{ty}");
+                assert_eq!(
+                    judge_fuse_mount(Some(29), info(&fuse(0, ty)), 1000),
+                    Ok(()),
+                    "{ty}"
+                );
+                assert_eq!(
+                    judge_fuse_mount(Some(29), info(&fuse(1000, ty)), 1000),
+                    Ok(()),
+                    "{ty}"
+                );
                 let e = judge_fuse_mount(Some(29), info(&fuse(1001, ty)), 1000).unwrap_err();
-                assert!(e.starts_with("is on a FUSE mount of user 1001"), "{ty}: {e}");
+                assert!(
+                    e.starts_with("is on a FUSE mount of user 1001"),
+                    "{ty}: {e}"
+                );
                 assert!(e.contains("user_id=1001"), "{ty}: {e}");
             }
             let no_owner = "29 22 0:41 / /mnt/x rw - fuse.x src rw,allow_other";
@@ -2998,11 +3012,21 @@ mod tests {
             let e = judge_fuse_mount(Some(29), info(other), 1000).unwrap_err();
             assert!(e.contains("neither virtiofs nor FUSE"), "{e}");
             let e = judge_fuse_mount(Some(31), info(virtiofs), 1000).unwrap_err();
-            assert!(e.contains("its mount 31 isn't in /proc/self/mountinfo"), "{e}");
+            assert!(
+                e.contains("its mount 31 isn't in /proc/self/mountinfo"),
+                "{e}"
+            );
             let e = judge_fuse_mount(Some(2), info(virtiofs), 1000).unwrap_err();
-            assert!(e.contains("its mount 2 isn't"), "a prefix of an id isn't the id: {e}");
-            let e = judge_fuse_mount(Some(29), Err("/proc: Permission denied".into()), 1000).unwrap_err();
-            assert!(e.contains("can't be looked up: /proc: Permission denied"), "{e}");
+            assert!(
+                e.contains("its mount 2 isn't"),
+                "a prefix of an id isn't the id: {e}"
+            );
+            let e = judge_fuse_mount(Some(29), Err("/proc: Permission denied".into()), 1000)
+                .unwrap_err();
+            assert!(
+                e.contains("can't be looked up: /proc: Permission denied"),
+                "{e}"
+            );
             let e = judge_fuse_mount(None, info(virtiofs), 1000).unwrap_err();
             assert!(e.contains("no mount id"), "{e}");
             let garbled = "29 22 0:41 / /mnt/x rw fuse src";
@@ -3015,10 +3039,15 @@ mod tests {
         #[test]
         fn mountinfo_is_read_from_procfs() {
             let real = std::fs::read("/proc/self/mountinfo").unwrap();
-            assert_eq!(read_proc_self(Path::new("/proc"), "mountinfo", 16 << 20).unwrap(), real);
+            assert_eq!(
+                read_proc_self(Path::new("/proc"), "mountinfo", 16 << 20).unwrap(),
+                real
+            );
             let root = open_at(None, c"/", libc::O_PATH | libc::O_DIRECTORY).unwrap();
             let id = mount_id(&root).expect("a mount id for /").to_string();
-            assert!(real.split(|b| *b == b'\n').any(|l| l.split(|b| *b == b' ').next() == Some(id.as_bytes())));
+            assert!(real
+                .split(|b| *b == b'\n')
+                .any(|l| l.split(|b| *b == b' ').next() == Some(id.as_bytes())));
         }
 
         /// A directory of ours left with mode 02700 (made under a setgid parent and left
