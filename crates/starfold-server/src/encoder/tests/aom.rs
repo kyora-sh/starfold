@@ -147,10 +147,11 @@ fn motion_after_refinements_keeps_its_quantizer() {
     for _ in 0..3 {
         s.frame(None);
         for qp in [20u8, 16, 12] {
-            s.frame(Some(Refine {
+            let n = s.frame(Some(Refine {
                 qp,
                 max_bytes: None,
             }));
+            assert!(n > 0, "qp {qp}: no refinement went out");
         }
         let (q_after, bytes_after) = s.scroll(40);
         eprintln!("motion q {q:.1} -> {q_after:.1}, bytes {bytes:.0} -> {bytes_after:.0}");

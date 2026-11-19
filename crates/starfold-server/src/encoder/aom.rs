@@ -30,6 +30,10 @@ const LAST: usize = 0;
 const GOLDEN: usize = 3;
 /// The buffer slot no frame refreshes, for the reference names a frame doesn't use.
 const SPARE: c_int = 7;
+/// What a frame under rate control records for the blocks it touched: unknown, above any QP a
+/// pass can aim for. libaom skips the blocks whose source didn't change at whatever quantizer
+/// the frame runs, so the frame's own says nothing about them.
+const MOTION_QP: i32 = 52;
 
 pub struct Aom {
     // libaom keeps pointers to the configuration it was given, so neither may move.
@@ -415,11 +419,12 @@ impl VideoEncoder for Aom {
                 return Err(e);
             }
         }
-        let out = self.collect()?;
-        let q = self.last_quantizer()?;
+        let out = self.collect();
+        let q = self.last_quantizer();
         if fixed.is_some() {
             self.restore()?;
         }
+        let (out, q) = (out?, q?);
         self.fresh = false;
         let bytes: usize = out.iter().map(|a| a.data.len()).sum();
         if bytes > 0 {
@@ -429,7 +434,7 @@ impl VideoEncoder for Aom {
                 None => {
                     let whole = out.iter().any(|a| a.keyframe);
                     let map = opts.static_mbs.as_deref().filter(|_| !whole);
-                    self.sharpness.moved(as_qp(q), map.map(|m| &m[..mbs]));
+                    self.sharpness.moved(MOTION_QP, map.map(|m| &m[..mbs]));
                 }
             }
         }
