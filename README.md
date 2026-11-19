@@ -25,35 +25,14 @@ instead; see [macOS](#macos) and [Windows](#windows).
 
 ## Install
 
-Two ways: a prebuilt binary from a release, or a build from source with cargo. Either way there are
-two flavours, which differ only in the software H.264 encoder (the hardware encoders are the same):
-
-- **x264**, the default build: x264 is GPL-2.0-or-later, so the binary is too, as a combined work.
-  Each release attaches x264's source.
-- **OpenH264**: OpenH264 is BSD-2-Clause, so the binary stays MIT.
-
-See [Licensing](#licensing).
-
-### From source
-
-Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on
-Ubuntu 24.04:
-
-```sh
-sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
-  libx264-dev libyuv-dev libopus-dev libpulse-dev
-cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
-```
-
-`--tag v<version>` installs a release instead of main's head. For the MIT build, add
-`--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
-`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
-[Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
-
 ### Prebuilt binaries
 
-Each [release](https://github.com/kyora-sh/starfold/releases) attaches both flavours for each
-platform (`<version>` is the release's, e.g. `0.3.2`):
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches binaries for Linux, macOS
+and Windows (`<version>` is the release's, e.g. `0.3.2`). The `starfold-x264-*` binaries are the
+default build: they encode H.264 in software with x264, which is GPL-2.0-or-later, so the binary
+is GPL-2.0-or-later too, as a combined work, and the release attaches x264's source beside them.
+The `starfold-*` binaries use OpenH264 (BSD-2-Clause) instead and stay MIT. The hardware encoders
+are the same in both. See [Licensing](#licensing).
 
 | Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
 | --------------------- | ---------------------------------------------- | ----------------------------------------- |
@@ -85,6 +64,22 @@ What each platform needs at run time:
 - **macOS**: nothing beyond the system; Opus and x264 are linked in. The binary is not notarized,
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
+
+### From source
+
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on
+Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
+  libx264-dev libyuv-dev libopus-dev libpulse-dev
+cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
+```
+
+That is the x264 build; `--tag v<version>` installs a release instead of main's head. For the MIT
+build, add `--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
+`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
+[Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
 
 ## Benchmarks
 
