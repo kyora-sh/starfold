@@ -2645,7 +2645,9 @@ mod tests {
             std::fs::create_dir(&at).unwrap();
             std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
             drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
-            let dead = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap().ino();
+            let dead = std::fs::symlink_metadata(unix_socket_path(&at))
+                .unwrap()
+                .ino();
             let (l, file) = bind_unix(&at, 0o600).unwrap();
             let now = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap();
             assert_ne!(now.ino(), dead, "the dead socket is still there");
@@ -2677,7 +2679,10 @@ mod tests {
             let e = bind_unix(&at, 0o600).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
             assert!(
-                e.to_string().contains(&format!("{} is in the way (a socket something listens on)", s.display())),
+                e.to_string().contains(&format!(
+                    "{} is in the way (a socket something listens on)",
+                    s.display()
+                )),
                 "{e}"
             );
             std::os::unix::net::UnixStream::connect(&s).expect("the live socket is gone");
@@ -2691,7 +2696,8 @@ mod tests {
                 }
                 let e = bind_unix(&at, 0o600).unwrap_err();
                 assert!(
-                    e.to_string().contains(&format!("{} is in the way ({what}, owner uid", s.display())),
+                    e.to_string()
+                        .contains(&format!("{} is in the way ({what}, owner uid", s.display())),
                     "{what}: {e}"
                 );
                 assert!(std::fs::symlink_metadata(&s).is_ok(), "{what} was removed");
@@ -2714,7 +2720,10 @@ mod tests {
                 std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).unwrap();
                 let e = bind_unix(&at, 0o600).unwrap_err();
                 assert!(
-                    e.to_string().contains(&format!("is in the way (a directory, owner uid {}, mode {mode:04o})", unsafe { libc::geteuid() })),
+                    e.to_string().contains(&format!(
+                        "is in the way (a directory, owner uid {}, mode {mode:04o})",
+                        unsafe { libc::geteuid() }
+                    )),
                     "{mode:o}: {e}"
                 );
                 assert_eq!(std::fs::metadata(&at).unwrap().mode() & 0o7777, mode);
