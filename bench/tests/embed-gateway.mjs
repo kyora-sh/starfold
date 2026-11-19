@@ -120,6 +120,7 @@ export function probeUpgrade(starfoldPort, password, ms = 5000) {
 			child.kill();
 			reject(new Error('no upgrade response'));
 		}, ms);
+		child.on('error', reject);
 		child.stdin.on('error', () => {});
 		child.stdout.on('data', (d) => {
 			got = Buffer.concat([got, d]);
@@ -201,6 +202,7 @@ function session(gw, sock, head) {
 			stdio: ['pipe', 'pipe', 'ignore'],
 		});
 		gw.children.add(child);
+		child.on('error', () => end(1011, 'bridge failed'));
 		// 'close', not 'exit': it comes after the last of stdout has been read.
 		child.on('close', () => {
 			gw.children.delete(child);

@@ -7,7 +7,8 @@
 // Usage: node embed-bridge.mjs   (XVFB, STARFOLD_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES;
 // EMBED_DISPLAY: the X display to start Xvfb on, else Xvfb picks a free one; EMBED_PKG: an
 // unpacked package/ from packages/web/embed/pack.sh, else it packs one, which needs esbuild
-// and bun; needs xev, from x11-utils). CHROMIUM must decode H.264 (Google
+// and bun; needs xev, from x11-utils). CHROMIUM (else google-chrome, google-chrome-stable,
+// chromium or chromium-browser, the first found on PATH) must decode H.264 (Google
 // Chrome, or a Chromium built with its proprietary codecs): Playwright's own Chromium offers
 // no decoder, and starfold answers it with no-common-codec and no frames.
 import { createRequire } from 'module';
@@ -95,7 +96,9 @@ for (const [sig, code] of [
  */
 function startXvfb() {
 	const want = process.env.EMBED_DISPLAY;
-	const args = [...(want ? [want] : []), '-displayfd', '3', '-screen', '0', '1920x1080x24', '-shmem', '-ac', '-nolisten', 'tcp'];
+	// No -shmem: with -displayfd there is no lock file, so starfold could not tell this
+	// server's framebuffer segment from one an earlier Xvfb left behind.
+	const args = [...(want ? [want] : []), '-displayfd', '3', '-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'];
 	const x = group(process.env.XVFB || 'Xvfb', args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe'] });
 	return new Promise((resolve, reject) => {
 		let got = '';
@@ -113,7 +116,22 @@ function startXvfb() {
 	});
 }
 
+/** CHROMIUM, else the first Chrome or Chromium on PATH. */
+function browserPath() {
+	if (process.env.CHROMIUM) return process.env.CHROMIUM;
+	for (const name of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'])
+		for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+			const f = path.join(dir, name);
+			try {
+				fs.accessSync(f, fs.constants.X_OK);
+				return f;
+			} catch {}
+		}
+	throw new Error('no Chrome found: set CHROMIUM to a Chrome that decodes H.264');
+}
+
 try {
+	const chrome = browserPath();
 	work = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-bridge-'));
 	let pkgDir = process.env.EMBED_PKG;
 	if (!pkgDir) {
@@ -149,7 +167,8 @@ try {
 	check(/^HTTP\/1\.1 101 /.test(authed), `with the password the same upgrade answers ${authed}`);
 
 	gw = await startGateway({ page: path.join(HERE, 'embed-bridge.html'), pkgDir, starfoldPort: port, password });
-	b = await chromium.launch({ executablePath: process.env.CHROMIUM || 'chromium', args: ['--no-sandbox'] });
+	// Signals are ours: Playwright's handlers would exit before cleanup has stopped starfold.
+	b = await chromium.launch({ executablePath: chrome, args: ['--no-sandbox'], handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
 	const p = await b.newPage({ viewport: { width: 1280, height: 720 } });
 	const urls = [];
 	p.on('request', (r) => urls.push(r.url()));
@@ -228,8 +247,16 @@ try {
 	check(!!again && s5.preambles === before.preambles + 1, `reconnect: preamble called again (${s5.preambles}), open, ${await presented()} new frames`);
 	check(s5.tickets.length === 2 && s5.tickets[0] !== s5.tickets[1] && gw.firsts.at(-1) === s5.tickets[1] && gw.admitted === 2, `a new ticket (${s5.tickets.length} minted, distinct: ${s5.tickets[0] !== s5.tickets[1]}), sent first and admitted (${gw.admitted})`);
 
-	// 6) No ticket, issued or not, in any URL the page requested or the gateway was asked for,
-	// raw or percent-decoded.
+	// 6) Over the whole run, after one more quiet window: exactly the four upgrade requests the
+	// steps made (first, reused, unknown, reconnect), so no retry came late either, and the
+	// reconnected session is still open, with no close since it opened.
+	await sleep(QUIET_MS);
+	check(gw.upgrades === 4, `${gw.upgrades} upgrade requests over the run, 4 expected`);
+	const s7 = await state();
+	check(s7.closes.length === s5.closes.length && s7.statuses.at(-1) === 'open', `the reconnected session stayed open: ${s7.closes.length - s5.closes.length} closes since, status ${s7.statuses.at(-1)}`);
+
+	// 7) After that window, so a late request counts too: no ticket, issued or not, in any URL
+	// the page requested or the gateway was asked for, raw or percent-decoded.
 	const secrets = [...gw.minted, 'not-a-ticket'];
 	// Each component is decoded on its own, so one malformed escape can't hide another.
 	const decode = (x) => {
@@ -243,11 +270,6 @@ try {
 	const leaked = [...urls, ...gw.access].filter((u) => forms(u).some((f) => secrets.some((s) => f.includes(s))));
 	check(leaked.length === 0 && gw.access.length > 0, `no ticket in ${urls.length} page request URLs or ${gw.access.length} gateway access-log lines${leaked.length ? ': ' + leaked.join(' | ') : ''}`);
 	console.log('gateway access log:\n  ' + gw.access.join('\n  '));
-
-	// 7) Over the whole run, after one more quiet window: exactly the four upgrade requests the
-	// steps made (first, reused, unknown, reconnect), so no retry came late either.
-	await sleep(QUIET_MS);
-	check(gw.upgrades === 4, `${gw.upgrades} upgrade requests over the run, 4 expected`);
 } catch (e) {
 	check(false, `threw ${e && e.stack}`);
 } finally {
