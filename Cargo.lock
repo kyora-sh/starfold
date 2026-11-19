@@ -1424,6 +1424,7 @@ name = "starfold-aom-sys"
 version = "0.1.0+libaom.3.15.3"
 dependencies = [
  "bindgen",
+ "cc",
  "cmake",
 ]
 

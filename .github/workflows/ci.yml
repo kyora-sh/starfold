@@ -285,13 +285,19 @@ jobs:
         run: |
           cargo test -p starfold-aom-sys --locked
           cargo test --features libaom --locked
-      # The binary carries libaom's encoder, statically, and no decoder.
+      # The binary carries libaom's encoder, statically; the library built has no decoder.
       - name: libaom linked statically
         run: |
           cargo build --features libaom --locked
-          if ldd target/debug/starfold | grep -i aom; then echo "::error::a shared libaom is linked"; exit 1; fi
-          nm target/debug/starfold | grep ' T aom_codec_av1_cx$'
-          if nm target/debug/starfold | grep aom_codec_av1_dx; then echo "::error::libaom's decoder is linked"; exit 1; fi
+          ldd target/debug/starfold > "$RUNNER_TEMP/ldd.txt"
+          if grep -i aom "$RUNNER_TEMP/ldd.txt"; then echo "::error::a shared libaom is linked"; exit 1; fi
+          nm target/debug/starfold > "$RUNNER_TEMP/nm.txt"
+          grep ' T aom_codec_av1_cx$' "$RUNNER_TEMP/nm.txt"
+          for a in target/debug/build/starfold-aom-sys-*/out/lib/libstarfold_aom_*.a; do
+            ar t "$a" > "$RUNNER_TEMP/objects.txt"
+            grep -x 'av1_cx_iface.c.o' "$RUNNER_TEMP/objects.txt"
+            if grep -E '^(av1_dx_iface|decodeframe|decodemv|decoder)\.c\.o$' "$RUNNER_TEMP/objects.txt"; then echo "::error::$a has libaom's decoder"; exit 1; fi
+          done
       # --encoder libaom must open its encoder and reach "listening on".
       - name: Startup on Xvfb
         run: |
@@ -404,6 +410,12 @@ jobs:
           restore-keys: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
       - name: Clippy
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
+      # libaom cross-compiled with its MinGW toolchain file, and starfold.exe linked with it.
+      - name: With libaom
+        run: |
+          cargo clippy --target x86_64-pc-windows-gnu --features libaom --all-targets --locked -- -D warnings
+          cargo build --target x86_64-pc-windows-gnu --features libaom --locked
+          x86_64-w64-mingw32-nm target/x86_64-pc-windows-gnu/debug/starfold.exe | grep ' T aom_codec_av1_cx$'
 
   macos:
     name: macOS (rustfmt, clippy, test)

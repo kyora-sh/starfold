@@ -15,6 +15,49 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 /// The libaom commit this crate builds (v3.15.3).
 pub const COMMIT: &str = "b141d9c45db236335351c8a4b2a14b3ade27c937";
 
+extern "C" {
+    fn starfold_aom_layout(out: *mut usize, n: usize) -> usize;
+}
+
+/// Whether the bindings lay out the types starfold passes to libaom as the C compiler that
+/// built libaom does (layout.c): a flag that reaches the C build but not libclang (such as
+/// `-fshort-enums` in CFLAGS) would otherwise move fields under libaom's feet.
+pub fn check_layout() -> Result<(), String> {
+    use std::mem::{offset_of, size_of};
+    let rust = [
+        size_of::<aom_image_t>(),
+        offset_of!(aom_image_t, fmt),
+        offset_of!(aom_image_t, range),
+        offset_of!(aom_image_t, w),
+        offset_of!(aom_image_t, planes),
+        offset_of!(aom_image_t, stride),
+        size_of::<aom_codec_enc_cfg_t>(),
+        offset_of!(aom_codec_enc_cfg_t, g_w),
+        offset_of!(aom_codec_enc_cfg_t, g_timebase),
+        offset_of!(aom_codec_enc_cfg_t, rc_end_usage),
+        offset_of!(aom_codec_enc_cfg_t, rc_target_bitrate),
+        offset_of!(aom_codec_enc_cfg_t, rc_min_quantizer),
+        offset_of!(aom_codec_enc_cfg_t, kf_mode),
+        size_of::<aom_codec_ctx_t>(),
+        size_of::<aom_codec_cx_pkt_t>(),
+        offset_of!(aom_codec_cx_pkt_t, data),
+        size_of::<aom_svc_params_t>(),
+        size_of::<aom_svc_ref_frame_config_t>(),
+        size_of::<aom_active_map_t>(),
+        size_of::<aom_rational_t>(),
+    ];
+    let mut c = [0usize; 20];
+    let n = unsafe { starfold_aom_layout(c.as_mut_ptr(), c.len()) };
+    if n != rust.len() || c != rust {
+        return Err(format!(
+            "libaom's bindings don't match its C build's layout (C {:?}, Rust {rust:?}): \
+             build with the same C flags for both",
+            &c[..n.min(c.len())]
+        ));
+    }
+    Ok(())
+}
+
 /// libaom's version and the cmake line its build recorded.
 pub fn build_info() -> (String, String) {
     let s = |p: *const std::os::raw::c_char| {
@@ -38,6 +81,11 @@ mod tests {
         for flag in ["-DCONFIG_REALTIME_ONLY=1", "-DCONFIG_AV1_DECODER=0"] {
             assert!(config.contains(flag), "{flag} missing from {config}");
         }
+    }
+
+    #[test]
+    fn bindings_match_the_c_layout() {
+        check_layout().unwrap();
     }
 
     fn init(usage: u32) -> aom_codec_err_t {

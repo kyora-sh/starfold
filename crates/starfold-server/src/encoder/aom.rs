@@ -55,6 +55,7 @@ impl Aom {
             return Err(EncodeError(format!("libaom can't encode {:?}", c.codec)));
         }
         let speed = super::arm_speed("libaom", &c.preset, SPEED)?;
+        ffi::check_layout().map_err(EncodeError)?;
         unsafe {
             let iface = ffi::aom_codec_av1_cx();
             let mut cfg: Box<ffi::aom_codec_enc_cfg_t> = Box::new(std::mem::zeroed());

@@ -167,8 +167,14 @@ fn unix_libs(target: &str) -> X264 {
 /// triplet from VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained
 /// starfold.exe). Capture, audio and input use system DLLs.
 fn windows_libs() -> X264 {
-    if cfg!(feature = "sw-arm") {
-        panic!("the bench's software encoders build on Linux and macOS only");
+    // libaom builds from its submodule on every target; the other arms come from pkg-config.
+    if cfg!(any(
+        feature = "libvpx",
+        feature = "svt-av1",
+        feature = "kvazaar",
+        feature = "x265"
+    )) {
+        panic!("the bench's pkg-config encoders (libvpx, svt-av1, kvazaar, x265) build on Linux and macOS only");
     }
     let x264 = cfg!(feature = "x264").then(|| {
         vcpkg::Config::new()
