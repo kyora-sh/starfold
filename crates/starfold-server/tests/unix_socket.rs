@@ -353,22 +353,24 @@ fn a_directory_another_user_made_first_is_refused() {
             .success();
         assert!(ok, "{args:?} as {}", user.name);
     };
-    as_them(&["mkdir", "-m", "0755", at.to_str().unwrap()]);
-    let (code, said) = refused_start(&at);
-    assert_eq!(code, Some(1), "{said}");
-    assert!(
-        said.contains(&format!(
-            "{} is in the way (a directory, owner uid {}, mode 0755)",
-            at.display(),
-            user.uid
-        )),
-        "{said}"
-    );
-    let meta = std::fs::metadata(&at).unwrap();
     use std::os::unix::fs::MetadataExt;
-    assert_eq!((meta.uid(), meta.mode() & 0o7777), (user.uid, 0o755));
-    assert_eq!(std::fs::read_dir(&at).unwrap().count(), 0);
-    as_them(&["rmdir", at.to_str().unwrap()]);
+    // 0700: starfold can't open it, and still names its owner and mode.
+    for mode in [0o755, 0o700] {
+        as_them(&["mkdir", "-m", &format!("{mode:o}"), at.to_str().unwrap()]);
+        let (code, said) = refused_start(&at);
+        assert_eq!(code, Some(1), "{mode:o}: {said}");
+        assert!(
+            said.contains(&format!(
+                "{} is in the way (a directory, owner uid {}, mode {mode:04o})",
+                at.display(),
+                user.uid
+            )),
+            "{mode:o}: {said}"
+        );
+        let meta = std::fs::metadata(&at).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (user.uid, mode));
+        as_them(&["rmdir", at.to_str().unwrap()]);
+    }
 }
 
 /// A symlink on the way that belongs to another user (here in a sticky directory of ours,

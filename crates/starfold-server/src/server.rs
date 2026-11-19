@@ -50,6 +50,8 @@ pub struct SocketFile {
     dir: std::os::fd::OwnedFd,
     dir_id: (libc::dev_t, libc::ino_t),
     socket_id: Option<(libc::dev_t, libc::ino_t)>,
+    /// The listening socket (a duplicate descriptor), shut down before the name goes.
+    listener: Option<std::os::fd::OwnedFd>,
 }
 
 /// The socket's name in the --listen-unix directory.
@@ -182,8 +184,14 @@ fn check_dir(dir: &std::os::fd::OwnedFd, shown: &Path, path: &Path) -> std::io::
     let st = fstat(dir)?;
     let me = unsafe { libc::geteuid() };
     let mode = st.st_mode & 0o7777;
+    let on_procfs = nix::sys::statfs::fstatfs(dir)
+        .map_err(std::io::Error::from)?
+        .filesystem_type()
+        == nix::sys::statfs::PROC_SUPER_MAGIC;
     let why = if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         "is not a directory".to_string()
+    } else if on_procfs {
+        "is on procfs, whose links resolve differently for each process".to_string()
     } else if st.st_uid != me && st.st_uid != 0 {
         format!("belongs to user {} (mode {mode:04o})", st.st_uid)
     } else if st.st_mode & 0o022 != 0 && st.st_mode & libc::S_ISVTX == 0 {
@@ -208,6 +216,46 @@ fn untrusted(path: &Path, shown: &Path, why: &str) -> std::io::Error {
             shown.display()
         ),
     )
+}
+
+/// Whether something listens on the unix socket at `path`: a nonblocking connect, so a
+/// listener with a full backlog answers at once (`EAGAIN`, taken as listening) instead of
+/// holding the start. `Ok` means it listens; `ECONNREFUSED` that nothing does.
+#[cfg(target_os = "linux")]
+fn probe(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let sock = cvt(unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    })?;
+    let sock = unsafe { std::os::fd::OwnedFd::from_raw_fd(sock) };
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    for (d, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *b as libc::c_char;
+    }
+    let r = unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    match r {
+        0 => Ok(()),
+        _ => match std::io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::EAGAIN) => Ok(()),
+            e => Err(e),
+        },
+    }
 }
 
 /// How many symlinks [`open_trusted_dir`] follows on one walk.
@@ -445,6 +493,15 @@ pub fn bind_unix_std(
         }
         e
     };
+    if !fresh {
+        let there = stat_at(&parent, &name)?;
+        if there.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || there.st_uid != me
+            || there.st_mode & 0o7777 != 0o700
+        {
+            return Err(in_the_way(path, describe(&there)));
+        }
+    }
     let dir = open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY)
         .map_err(|e| match e.raw_os_error() {
             Some(libc::ELOOP | libc::ENOTDIR) if fresh => moved(),
@@ -484,20 +541,23 @@ pub fn bind_unix_std(
         match stat_at(&dir, SOCKET) {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
             Err(e) => return Err(e),
-            Ok(s) if is_socket(&s) && s.st_uid == me => {
-                match std::os::unix::net::UnixStream::connect(&socket_path) {
-                    Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
-                        unlink_at(&dir, SOCKET, 0)?;
-                    }
-                    Err(e) => return Err(in_the_way(&socket_path, format!("a socket: {e}"))),
-                    Ok(_) => {
-                        return Err(in_the_way(
-                            &socket_path,
-                            "a socket something listens on".to_string(),
-                        ));
-                    }
+            Ok(s) if is_socket(&s) && s.st_uid == me => match probe(&socket_path) {
+                Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                    unlink_at(&dir, SOCKET, 0)?;
                 }
-            }
+                Ok(()) => {
+                    return Err(in_the_way(
+                        &socket_path,
+                        "a socket something listens on".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(in_the_way(
+                        &socket_path,
+                        format!("a socket that can't be probed: {e}"),
+                    ));
+                }
+            },
             Ok(s) => return Err(in_the_way(&socket_path, describe(&s))),
         }
     }
@@ -507,6 +567,7 @@ pub fn bind_unix_std(
         dir,
         dir_id: id(&st),
         socket_id: None,
+        listener: None,
     };
     // Connecting takes write permission on the socket, so only a class that has it gets
     // search permission on the directory.
@@ -545,6 +606,7 @@ pub fn bind_unix_std(
             race();
         }
         let bound = bind_in(&file.dir, mode, &mut file.socket_id)?;
+        file.listener = Some(std::os::fd::OwnedFd::from(bound.try_clone()?));
         set_mode(&file, 0o700 | reach)?;
         Ok(bound)
     })();
@@ -670,7 +732,8 @@ static AT_EXIT: std::sync::OnceLock<SocketFile> = std::sync::OnceLock::new();
 
 /// Keeps `file` for the rest of the process, and removes what it names when the process
 /// exits through `exit` (a startup error after the bind as much as a shutdown). A crash
-/// or a kill by signal leaves it, and the next start on the path is refused.
+/// or a kill by signal leaves it; the next start on the path takes it back if it can
+/// ([`bind_unix_std`]).
 #[cfg(target_os = "linux")]
 pub fn remove_at_exit(file: SocketFile) -> &'static SocketFile {
     extern "C" fn remove() {
@@ -903,6 +966,12 @@ pub fn bind_unix(
 /// then the directory if nothing else is in it.
 #[cfg(target_os = "linux")]
 pub fn remove_unix(file: &SocketFile) {
+    // No connection is taken from here on (a connect gets ECONNREFUSED), so the name is
+    // never free while this socket still accepts.
+    if let Some(l) = &file.listener {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::shutdown(l.as_raw_fd(), libc::SHUT_RDWR) };
+    }
     let at = |dir: &std::os::fd::OwnedFd, name: &std::ffi::CStr, kind, want| {
         stat_at(dir, name).is_ok_and(|st| st.st_mode & libc::S_IFMT == kind && id(&st) == want)
     };
@@ -2732,6 +2801,69 @@ mod tests {
                 assert_eq!(std::fs::metadata(&at).unwrap().mode() & 0o7777, mode);
             }
             std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// Shutdown stops the socket accepting before its name goes: reached through a
+        /// second name (a hard link) while the server's listener is still open, it refuses
+        /// the connection once the removal has run.
+        #[test]
+        fn removal_stops_the_socket_accepting_before_the_name_goes() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("stop-first");
+            let at = d.join("sf");
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            let held = at.join("held");
+            std::fs::hard_link(unix_socket_path(&at), &held).unwrap();
+            std::os::unix::net::UnixStream::connect(&held).expect("listening before");
+            remove_unix(&file);
+            assert!(!unix_socket_path(&at).exists());
+            let e = std::os::unix::net::UnixStream::connect(&held).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ECONNREFUSED), "{e}");
+            drop(l);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A path through procfs (here /proc/self/cwd, which resolves differently for each
+        /// process) is refused, naming /proc, and nothing is made.
+        #[test]
+        fn a_path_through_procfs_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let name = format!("sf-through-procfs-{}", std::process::id());
+            let at = Path::new("/proc/self/cwd").join(&name);
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert!(e.to_string().contains("/proc is on procfs"), "{e}");
+            assert!(!Path::new(&name).exists(), "{name} was made");
+        }
+
+        /// A socket of ours at `s` that can't be probed (mode 0400: connecting needs
+        /// write permission) is in the way and named, not replaced.
+        #[test]
+        fn a_socket_that_cant_be_probed_is_left_alone() {
+            if unsafe { libc::geteuid() } == 0 {
+                eprintln!("skipped: root connects to a 0400 socket");
+                return;
+            }
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("unprobed");
+            let at = d.join("sf");
+            let s = unix_socket_path(&at);
+            std::fs::create_dir(&at).unwrap();
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(&s).unwrap());
+            std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!(
+                    "{} is in the way (a socket that can't be probed",
+                    s.display()
+                )),
+                "{e}"
+            );
+            assert!(s.exists());
             std::fs::remove_dir_all(&d).unwrap();
         }
 

@@ -30,7 +30,9 @@ Server:
                                 or other write access also lets that class
                                 search the directory and connect, and then
                                 only the peer-uid check keeps them out; with
-                                0600 no other uid can connect at all
+                                0600 no other uid can connect at all, except
+                                root or a process with CAP_DAC_OVERRIDE,
+                                CAP_DAC_READ_SEARCH, CAP_FOWNER or CAP_SYS_ADMIN
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1

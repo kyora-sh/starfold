@@ -288,7 +288,12 @@ What keeps other users out, in three parts:
   nothing of someone else's.
 
 The socket's mode decides who reaches `connect` at all. With the default
-`--listen-unix-mode=0600` no other uid (root aside) can connect: the kernel refuses it.
+`--listen-unix-mode=0600` no other uid can connect: the kernel refuses it. That holds
+for ordinary processes; root, and any process with a capability that overrides file
+permissions (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`, `CAP_SYS_ADMIN`,
+granted directly or by a file), can between them connect anyway and replace or remove
+`DIR/s`; the peer-uid check still closes their connections if their uid isn't
+starfold's.
 `0660` or `0666` let that group or everyone connect; the kernel accepts the connection
 and starfold closes it unread after the peer-uid check, which is then the only thing
 between other users and the server.
@@ -297,7 +302,10 @@ between other users and the server.
 starfold starts, or after it exits, another user who can write to an ancestor (a sticky
 `/tmp` included) can put something else at `DIR/s`. A client that connects by path reads
 the listener's uid (`SO_PEERCRED` on its own end) and sends nothing, a token least of
-all, unless it is the uid it expects.
+all, unless it is the uid it expects. That check can only be relied on from a client
+whose own user namespace maps the expected uid and the would-be impostor's: in a
+namespace that doesn't, an unmapped listener reads as the overflow uid, which can equal
+the uid the client expects.
 
 What isn't claimed:
 
@@ -305,7 +313,13 @@ What isn't claimed:
   uid, that code can reach starfold.
 - A peer that is let in can hand its connection to another process; the connection keeps
   the credentials it was opened with.
-- root can do anything.
+- root can do anything, and so can a process with the capabilities above.
+- **Every mount on the way reports ownership truthfully.** The walk trusts the owner, mode
+  and ACL the kernel reports for each directory. A user FUSE mount (`allow_other`) or an
+  ID-mapped mount controlled by another uid can report what it likes, and that uid can
+  then change what is under it; such mounts on the path are outside what is claimed. A
+  path through procfs (`/proc/self/cwd`, say) is refused, since it resolves differently
+  for each process.
 
 The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` and its
 socket are removed when starfold exits (a stop by SIGTERM or SIGINT, or a startup error
