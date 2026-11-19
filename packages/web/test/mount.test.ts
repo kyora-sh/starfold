@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mount } from '../src/embed/index';
 import type { MountOptions } from '../src/embed/index';
+import { PageLife } from '../src/embed/attempts';
 import { STRIPE } from '../src/embed/styles';
 import { UNMOUNTED, WORKER_FAILED } from '../src/embed/types';
 import type { LifeDown } from '../src/life';
@@ -283,6 +284,70 @@ describe('unmount ends everything at once', () => {
 	});
 });
 
+/** A mounted, open embed and a way to drive its keyboard field's paste input. */
+async function pasteMount() {
+	const box = container();
+	const h = mount(box as never, recording().o);
+	const w = FakeWorker.all[0];
+	await opened(w);
+	const kbd = box.children[1];
+	const key = (type: string, code: string, k: string, repeat = false) =>
+		kbd.dispatchEvent(
+			Object.assign(new Event(type, { cancelable: true }), {
+				code,
+				key: k,
+				ctrlKey: true,
+				metaKey: true,
+				repeat,
+			})
+		);
+	const paste = (getData: () => string, items: unknown[]) =>
+		kbd.dispatchEvent(
+			Object.assign(new Event('paste', { cancelable: true }), {
+				clipboardData: { getData, items },
+			})
+		);
+	const rig = {
+		key,
+		ctrlV: () => key('keydown', 'KeyV', 'v'),
+		blur: () => kbd.dispatchEvent(new Event('blur')),
+		pasteText: (text: string) => paste(() => text, []),
+		/** An image paste whose conversion ends when the test says so. */
+		pasteImage() {
+			let done!: (b: ArrayBuffer) => void;
+			let fail!: (err: Error) => void;
+			const file = {
+				type: 'image/png',
+				arrayBuffer: () =>
+					new Promise<ArrayBuffer>((resolve, reject) => {
+						done = resolve;
+						fail = reject;
+					}),
+			};
+			paste(
+				() => '',
+				[{ kind: 'file', type: 'image/png', getAsFile: () => file }]
+			);
+			return {
+				resolve: (b: number) => done(new Uint8Array([b]).buffer),
+				reject: () => fail(new Error('unreadable')),
+			};
+		},
+		/** Uploaded images, clipboard text and V key events, in the order posted. */
+		sent: () =>
+			(w.posted as unknown as { t: string; d: string | ArrayBuffer }[]).flatMap(
+				({ t, d }) => {
+					if (t === 'sendBin')
+						return [`img:${new Uint8Array(d as ArrayBuffer).slice(1).join()}`];
+					if (t === 'send' && /^(k,118,|c,)/.test(d as string))
+						return [d as string];
+					return [];
+				}
+			),
+	};
+	return { box, w, h, rig };
+}
+
 describe('mount', () => {
 	test('a worker that fails to load ends the attempt with connect-failed', async () => {
 		const { o, calls } = recording();
@@ -382,63 +447,80 @@ describe('mount', () => {
 	});
 
 	test('an image paste dropped by a blur sends nothing, and the next paste sends only its own image first', async () => {
-		const box = container();
-		const h = mount(box as never, recording().o);
-		const w = FakeWorker.all[0];
-		await opened(w);
-		const kbd = box.children[1];
-		const ctrlV = () =>
-			kbd.dispatchEvent(
-				Object.assign(new Event('keydown', { cancelable: true }), {
-					code: 'KeyV',
-					key: 'v',
-					ctrlKey: true,
-					metaKey: true,
-				})
-			);
-		const pasteImage = () => {
-			let bytes!: (b: ArrayBuffer) => void;
-			const file = {
-				type: 'image/png',
-				arrayBuffer: () => new Promise<ArrayBuffer>((r) => (bytes = r)),
-			};
-			kbd.dispatchEvent(
-				Object.assign(new Event('paste', { cancelable: true }), {
-					clipboardData: {
-						getData: () => '',
-						items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }],
-					},
-				})
-			);
-			return (b: number) => bytes(new Uint8Array([b]).buffer);
-		};
-		const sent = () =>
-			(w.posted as unknown as { t: string; d: string | ArrayBuffer }[]).flatMap(
-				({ t, d }) => {
-					if (t === 'sendBin')
-						return [`img:${new Uint8Array(d as ArrayBuffer).slice(1).join()}`];
-					if (t === 'send' && (d as string).startsWith('k,118,'))
-						return [d as string];
-					return [];
-				}
-			);
-
-		ctrlV();
-		const first = pasteImage();
-		kbd.dispatchEvent(new Event('blur'));
-		ctrlV();
-		const second = pasteImage();
-		first(1);
+		const { h, rig } = await pasteMount();
+		rig.ctrlV();
+		const first = rig.pasteImage();
+		rig.blur();
+		rig.ctrlV();
+		const second = rig.pasteImage();
+		first.resolve(1);
 		await sleep(20);
-		expect(sent()).toEqual([]);
-		second(2);
+		expect(rig.sent()).toEqual([]);
+		second.resolve(2);
 		await sleep(20);
-		expect(sent()).toEqual(['img:2', 'k,118,1']);
-		await sleep(3100);
-		expect(sent()).toEqual(['img:2', 'k,118,1']);
+		expect(rig.sent()).toEqual(['img:2', 'k,118,1']);
 		h.unmount();
 		await tick();
-	}, 10000);
+	});
+
+	test("a replaced paste shortcut's timer does not fire a later paste early", async () => {
+		const { h, rig } = await pasteMount();
+		rig.ctrlV();
+		const first = rig.pasteImage();
+		rig.ctrlV();
+		rig.blur();
+		rig.ctrlV();
+		const last = rig.pasteImage();
+		await sleep(200);
+		first.resolve(1);
+		await sleep(20);
+		expect(rig.sent()).toEqual([]);
+		last.resolve(3);
+		await sleep(20);
+		expect(rig.sent()).toEqual(['img:3', 'k,118,1']);
+		h.unmount();
+		await tick();
+	});
+
+	test('a paste shortcut released while its image converts is sent after the image', async () => {
+		const { h, rig } = await pasteMount();
+		rig.key('keydown', 'ControlLeft', 'Control');
+		rig.key('keydown', 'MetaLeft', 'Meta');
+		rig.ctrlV();
+		const img = rig.pasteImage();
+		rig.key('keydown', 'KeyV', 'v', true);
+		rig.key('keyup', 'KeyV', 'v');
+		await sleep(200);
+		expect(rig.sent()).toEqual([]);
+		img.resolve(1);
+		await sleep(20);
+		expect(rig.sent()).toEqual(['img:1', 'k,118,1', 'k,118,0']);
+		h.unmount();
+		await tick();
+	});
+
+	test('an image still converting when a newer paste arrives is never sent', async () => {
+		const { h, rig } = await pasteMount();
+		rig.ctrlV();
+		const stale = rig.pasteImage();
+		rig.pasteText('newer');
+		stale.resolve(1);
+		await sleep(20);
+		expect(rig.sent()).toEqual(['c,newer', 'k,118,1']);
+		h.unmount();
+		await tick();
+	});
+
+	test('a paste shortcut whose image fails to convert is not sent', async () => {
+		const { h, rig } = await pasteMount();
+		rig.ctrlV();
+		const img = rig.pasteImage();
+		img.reject();
+		await sleep(200);
+		expect(rig.sent()).toEqual([]);
+		h.unmount();
+		await tick();
+	});
 
 	test('an unmount in the same task as a worker error still reports one close', async () => {
 		const { o, calls } = recording();
@@ -447,13 +529,40 @@ describe('mount', () => {
 		await opened(w);
 		await until(() => calls.some((c) => c.what === 'status:open'));
 		w.dispatchEvent(new Event('error', { cancelable: true }));
-		h.unmount();
+		guarded(() => h.unmount());
 		await tick();
-		expect(calls.map((c) => c.what)).toEqual([
+		expect(calls).toEqual([
+			{ what: 'status:connecting', inside: false },
+			{ what: 'status:open', inside: false },
+			{ what: `close:${UNMOUNTED.code}:${UNMOUNTED.reason}`, inside: false },
+		]);
+	});
+
+	test('a lifecycle ended right after a worker failure reports one unmounted close', async () => {
+		const calls: string[] = [];
+		const { port1, port2 } = new MessageChannel();
+		const got: LifeDown[] = [];
+		port2.addEventListener('message', (e: MessageEvent<LifeDown>) =>
+			got.push(e.data)
+		);
+		port2.start();
+		const life = new PageLife(port1, {
+			preamble: () => 'ticket',
+			onClose: (c, r) => calls.push(`close:${c}:${r}`),
+			onStatus: (s) => calls.push(`status:${s}`),
+		});
+		life.connect();
+		await until(() => got.some((m) => m.t === 'connect'));
+		port2.postMessage({ t: 'preamble', id: 1 }, []);
+		await until(() => got.some((m) => m.t === 'preamble'));
+		life.workerFailed();
+		life.end();
+		await tick();
+		expect(calls).toEqual([
 			'status:connecting',
-			'status:open',
 			`close:${UNMOUNTED.code}:${UNMOUNTED.reason}`,
 		]);
+		port2.close();
 	});
 
 	test('a touch tap on the surface focuses the keyboard field', async () => {

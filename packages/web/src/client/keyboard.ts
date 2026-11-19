@@ -103,12 +103,20 @@ export function setupKeyboard(
 	}
 
 	const down = new Map<string, number>(); // code -> keysym
-	let pendingPaste: {
+	/**
+	 * A paste shortcut held back until its paste lands on the remote clipboard. `converting`:
+	 * its image is being converted; `released`: its key went up meanwhile, so it is sent whole.
+	 */
+	type PendingPaste = {
 		code: string;
 		ks: number;
 		timer: ReturnType<typeof setTimeout>;
-		dropped?: boolean;
-	} | null = null;
+		converting: boolean;
+		released: boolean;
+	};
+	let pendingPaste: PendingPaste | null = null;
+	/** Bumped by every paste event and every blur: an image converting from before is stale. */
+	let pasteSeq = 0;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
 		send(cmd.key(ks, true));
@@ -127,12 +135,24 @@ export function setupKeyboard(
 		down.clear();
 		send(cmd.releaseAll);
 	}
-	function flushPaste() {
-		if (!pendingPaste) return;
-		const p = pendingPaste;
+	function dropPaste() {
+		if (pendingPaste) clearTimeout(pendingPaste.timer);
+		pendingPaste = null;
+	}
+	function flushPaste(p = pendingPaste) {
+		if (!p || pendingPaste !== p) return;
 		pendingPaste = null;
 		clearTimeout(p.timer);
-		press(p.code, p.ks);
+		if (!p.released) return press(p.code, p.ks);
+		const accelHeld = [...down.keys()].some((c) =>
+			isMac ? /^(Meta|OS)/.test(c) : c.startsWith('Control')
+		);
+		const accel = accelHeld
+			? undefined
+			: modifierKeysym(isMac ? 'MetaLeft' : 'ControlLeft');
+		if (accel) send(cmd.key(accel, true));
+		tap(p.ks);
+		if (accel) send(cmd.key(accel, false));
 	}
 
 	function onKeyDown(e: KeyboardEvent) {
@@ -141,10 +161,22 @@ export function setupKeyboard(
 		const ks = keysymOf(e);
 		if (!ks) return;
 		const accel = isMac ? e.metaKey : e.ctrlKey;
+		if (e.repeat && pendingPaste?.code === e.code) {
+			e.preventDefault();
+			return;
+		}
 		if (accel && !e.altKey && (e.key === 'v' || e.key === 'V') && !e.repeat) {
 			// Let the browser deliver a paste event to the hidden textarea first, so the
 			// remote clipboard holds the local contents before the shortcut lands.
-			pendingPaste = { code: e.code, ks, timer: setTimeout(flushPaste, 150) };
+			dropPaste();
+			const p: PendingPaste = {
+				code: e.code,
+				ks,
+				timer: setTimeout(() => flushPaste(p), 150),
+				converting: false,
+				released: false,
+			};
+			pendingPaste = p;
 			return;
 		}
 		e.preventDefault();
@@ -157,7 +189,10 @@ export function setupKeyboard(
 	}
 	function onKeyUp(e: KeyboardEvent) {
 		e.preventDefault();
-		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
+		if (pendingPaste?.code === e.code) {
+			if (pendingPaste.converting) pendingPaste.released = true;
+			else flushPaste();
+		}
 		release(e.code);
 		// macOS swallows keyups of keys released while Cmd is held.
 		if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
@@ -172,6 +207,7 @@ export function setupKeyboard(
 
 	ls.on<ClipboardEvent>(kbd, 'paste', (e) => {
 		e.preventDefault();
+		const seq = ++pasteSeq;
 		const dt = e.clipboardData;
 		const text = dt?.getData('text/plain');
 		if (text) {
@@ -193,18 +229,20 @@ export function setupKeyboard(
 		const own = pendingPaste;
 		if (own) {
 			clearTimeout(own.timer);
-			own.timer = setTimeout(flushPaste, 3000);
+			own.converting = true;
+			own.timer = setTimeout(() => flushPaste(own), 3000);
 		}
-		toPng(file)
-			.then((png) =>
-				disposed || own?.dropped
-					? undefined
-					: app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
-			)
-			.catch((err) => console.warn('[starfold] image paste failed', err))
-			.finally(() => {
-				if (own && pendingPaste === own) flushPaste();
-			});
+		// Upload and shortcut run in one continuation, so no blur can fall between them.
+		function upload(png: ArrayBuffer) {
+			if (disposed || seq !== pasteSeq) return;
+			app.sendBin(Bin.ClipImageUp, new Uint8Array(png));
+			if (own) flushPaste(own);
+		}
+		function failed(err: unknown) {
+			console.warn('[starfold] image paste failed', err);
+			if (own && pendingPaste === own) dropPaste();
+		}
+		toPng(file).then(upload, failed);
 	});
 
 	// Text that arrives without usable keydowns (IME, dead-key composition, mobile
@@ -234,11 +272,8 @@ export function setupKeyboard(
 	ls.on(window, 'blur', releaseAll);
 	if (embedded)
 		ls.on(kbd, 'blur', () => {
-			if (pendingPaste) {
-				clearTimeout(pendingPaste.timer);
-				pendingPaste.dropped = true;
-			}
-			pendingPaste = null;
+			dropPaste();
+			pasteSeq++;
 			for (const code of down.keys()) release(code);
 		});
 	ls.on(surface, 'focus', () => kbd.focus({ preventScroll: true }));
@@ -250,8 +285,7 @@ export function setupKeyboard(
 		dispose() {
 			disposed = true;
 			ls.off();
-			if (pendingPaste) clearTimeout(pendingPaste.timer);
-			pendingPaste = null;
+			dropPaste();
 		},
 	};
 }
