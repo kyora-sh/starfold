@@ -230,6 +230,8 @@ export type ToWorker =
 			canvas: OffscreenCanvas;
 			url: string;
 			presentToMain: boolean;
+			/** Every message binary with a kind byte (frame.ts), for binary-only hops. */
+			framed?: boolean;
 			/**
 			 * Embedded (`mount`): connect only when asked over `life` (life.ts), with
 			 * `protocols`, and never again on its own.

@@ -5,6 +5,7 @@
 	"include": [
 		"src/worker.ts",
 		"src/protocol.ts",
+		"src/frame.ts",
 		"src/link.ts",
 		"src/life.ts",
 		"src/dav1d"
