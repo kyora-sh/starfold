@@ -108,7 +108,8 @@ caveats and raw cells are in the results file.
 
 Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esbuild;
 `nix-shell --arg withRust true` provides them all (plain `nix-shell` all but Rust, for your own
-toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
+toolchain). The H.264 encoder is x264, on x86_64 and aarch64 only: on other architectures the
+`x264` feature refuses to build. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
 
