@@ -32,6 +32,8 @@ export class PageLife {
 	private phase: 'idle' | 'asking' | 'socket' = 'idle';
 	private live = true;
 	private ended = false;
+	/** An onClose is queued and has not run yet. */
+	private closeQueued = false;
 	private readonly dispatch: Dispatcher;
 	private readonly listener = (e: MessageEvent<LifeUp>) => this.onUp(e.data);
 
@@ -77,7 +79,7 @@ export class PageLife {
 	end() {
 		if (this.ended) return;
 		this.ended = true;
-		const had = this.live && this.phase === 'socket';
+		const had = (this.live && this.phase === 'socket') || this.closeQueued;
 		this.live = false;
 		this.phase = 'idle';
 		this.port.removeEventListener('message', this.listener);
@@ -130,7 +132,13 @@ export class PageLife {
 	/** onClose, then onStatus('closed'), each queued on its own: one throwing can't skip the other. */
 	private closed(code: number, reason: string) {
 		const onClose = this.o.onClose;
-		if (onClose) this.dispatch.call(() => onClose(code, reason));
+		if (onClose) {
+			this.closeQueued = true;
+			this.dispatch.call(() => {
+				this.closeQueued = false;
+				onClose(code, reason);
+			});
+		}
 		this.status('closed');
 	}
 
