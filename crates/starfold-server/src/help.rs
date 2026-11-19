@@ -215,23 +215,30 @@ fn entry(flag: &str, text: &str) -> String {
 
 /// The entries that name software encoders, from what this build includes.
 fn encoder_entries(usage: &str) -> String {
-    let sw = build_facts::software_h264();
+    let sw = build_facts::software_base();
     let arms = build_facts::bench_arms();
     let arms = match arms.is_empty() {
         true => String::new(),
         false => format!(
-            "; or a bench arm, streamed beside {sw}: {}",
+            "; or a bench arm, streamed beside the base stream: {}",
             arms.join(", ")
         ),
     };
+    let fallback = match build_facts::software_h264() {
+        true => format!("H.264 from {sw} where there is no hardware one"),
+        false => format!(
+            "AV1 from {sw} where there is no hardware H.264 one, which protocol 1 viewers \
+             can't decode"
+        ),
+    };
     let encoder = format!(
-        "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
-         (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows), mediafoundation (Windows) or qsv (64-bit Windows, Intel Quick \
-         Sync){arms}; \
+        "auto: each codec from its hardware encoder; the base stream (recordings, protocol 1 \
+         viewers, fallback) as {fallback} (default); or pin the base encoder: {}, videotoolbox \
+         (macOS hardware), vaapi (Linux), nvenc (Linux, Windows), mediafoundation (Windows) or \
+         qsv (64-bit Windows, Intel Quick Sync){arms}; \
          vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
          and auto never picks them; /stats shows what the probe found",
-        build_facts::h264_encoders().join(", ")
+        build_facts::base_encoders().join(", ")
     );
     let crf: Vec<String> = build_facts::readers("crf")
         .into_iter()
@@ -381,10 +388,14 @@ mod tests {
         }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
         assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
+        let codec = match build_facts::software_h264() {
+            true => "H.264",
+            false => "AV1",
+        };
         assert!(
             words.contains(&format!(
-                "H.264 from {} where there is none",
-                build_facts::software_h264()
+                "{codec} from {} where there is no hardware",
+                build_facts::software_base()
             )),
             "{text}"
         );

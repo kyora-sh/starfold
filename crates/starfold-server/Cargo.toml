@@ -22,15 +22,13 @@ name = "starfold"
 path = "src/main.rs"
 
 [features]
-default = ["x264"]
-# libx264 (GPL-2.0-or-later), the software H.264 encoder: a build with it is GPL-2.0-or-later.
-x264 = ["dep:bindgen"]
-# OpenH264 (BSD-2-Clause) built from its bundled source, not Cisco's downloadable binary:
-# the software H.264 encoder of a build without x264 (`--no-default-features --features openh264`).
-openh264 = ["dep:openh264-sys2"]
-# libaom (BSD-2-Clause), the AV1 encoder, `--encoder libaom`: built from the pinned source in
+default = ["libaom"]
+# libaom (BSD-2-Clause), the software AV1 encoder: built from the pinned source in
 # crates/starfold-aom-sys/aom (a git submodule) and linked statically; needs cmake, perl and nasm.
-libaom = ["sw-arm", "dep:starfold-aom-sys"]
+libaom = ["dep:starfold-aom-sys"]
+# libx264 (GPL-2.0-or-later), the software H.264 encoder for protocol 1 viewers and browsers
+# without AV1: a build with it is GPL-2.0-or-later.
+x264 = ["dep:bindgen"]
 # Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
 sw-arm = ["dep:bindgen"]
 libvpx = ["sw-arm"]
@@ -70,9 +68,6 @@ base64 = "0.22"
 getrandom = "0.3"
 zip = { version = "7", default-features = false, features = [
 	"deflate-flate2-zlib-rs",
-] }
-openh264-sys2 = { version = "=0.9.9", optional = true, default-features = false, features = [
-	"source",
 ] }
 starfold-aom-sys = { path = "../starfold-aom-sys", optional = true }
 
@@ -138,9 +133,6 @@ windows-core = "0.61"
 [dev-dependencies]
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
 	"handshake",
-] }
-openh264 = { version = "=0.9.9", default-features = false, features = [
-	"source",
 ] }
 
 [build-dependencies]

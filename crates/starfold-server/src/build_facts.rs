@@ -3,7 +3,7 @@
 //! the startup warnings, the unknown-encoder error) comes from here, so none of them names an
 //! encoder the binary doesn't have.
 
-use crate::encoder::SOFTWARE_H264;
+use crate::encoder::SOFTWARE;
 
 /// One software encoder feature of Cargo.toml, or one hardware encoder: whether this build has
 /// it, and what it makes of the flags the encoders share.
@@ -14,8 +14,9 @@ pub struct Encoder {
     pub built: bool,
     /// A hardware encoder: no cargo feature, found by its probe at startup.
     pub hardware: bool,
-    /// An H.264 encoder `--encoder` can pin and `auto` can fall back to; else a bench arm.
-    pub h264: bool,
+    /// An encoder of the base cohort, which `--encoder` can pin and `auto` can fall back to;
+    /// else a bench arm.
+    pub base: bool,
     /// What `--crf` is to it.
     pub crf: Option<&'static str>,
     /// What `--preset` is to it.
@@ -36,7 +37,7 @@ pub const ENCODERS: &[Encoder] = &[
         name: "x264",
         built: cfg!(feature = "x264"),
         hardware: false,
-        h264: true,
+        base: true,
         crf: Some("base quality"),
         preset: Some("a preset name, ultrafast by default"),
         paintover_crf: true,
@@ -45,22 +46,10 @@ pub const ENCODERS: &[Encoder] = &[
         gpl: true,
     },
     Encoder {
-        name: "openh264",
-        built: cfg!(feature = "openh264"),
-        hardware: false,
-        h264: true,
-        crf: Some("lowest QP in motion"),
-        preset: None,
-        paintover_crf: false,
-        refines_to_paintover_crf: false,
-        uncapped_only: false,
-        gpl: false,
-    },
-    Encoder {
         name: "libvpx",
         built: cfg!(feature = "libvpx"),
         hardware: false,
-        h264: false,
+        base: false,
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 8 by default"),
         paintover_crf: true,
@@ -72,7 +61,7 @@ pub const ENCODERS: &[Encoder] = &[
         name: "libaom",
         built: cfg!(feature = "libaom"),
         hardware: false,
-        h264: false,
+        base: true,
         crf: Some("lowest quantizer"),
         preset: Some("a speed, 9 by default"),
         paintover_crf: true,
@@ -84,7 +73,7 @@ pub const ENCODERS: &[Encoder] = &[
         name: "svt-av1",
         built: cfg!(feature = "svt-av1"),
         hardware: false,
-        h264: false,
+        base: false,
         crf: Some("lowest QP"),
         preset: Some("a preset number, 12 by default"),
         paintover_crf: false,
@@ -96,7 +85,7 @@ pub const ENCODERS: &[Encoder] = &[
         name: "kvazaar",
         built: cfg!(feature = "kvazaar"),
         hardware: false,
-        h264: false,
+        base: false,
         crf: None,
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
@@ -108,7 +97,7 @@ pub const ENCODERS: &[Encoder] = &[
         name: "x265",
         built: cfg!(feature = "x265"),
         hardware: false,
-        h264: false,
+        base: false,
         crf: Some("lowest QP"),
         preset: Some("ultrafast (default), superfast or veryfast"),
         paintover_crf: false,
@@ -151,7 +140,7 @@ const fn hardware(name: &'static str, built: bool, qp: Qp) -> Encoder {
         name,
         built,
         hardware: true,
-        h264: true,
+        base: true,
         crf: match qp {
             Qp::Never => None,
             Qp::Uncapped => Some("constant QP with --max-kbps 0"),
@@ -179,14 +168,14 @@ fn software() -> impl Iterator<Item = &'static Encoder> {
     built().filter(|e| !e.hardware)
 }
 
-/// Every software encoder this binary includes, H.264 and bench arms, by feature name.
+/// Every software encoder this binary includes, base ones and bench arms, by feature name.
 pub fn software_encoders() -> Vec<&'static str> {
     software().map(|e| e.name).collect()
 }
 
-/// The software H.264 encoders `--encoder` can pin.
-pub fn h264_encoders() -> Vec<&'static str> {
-    software().filter(|e| e.h264).map(|e| e.name).collect()
+/// The software encoders of the base cohort `--encoder` can pin.
+pub fn base_encoders() -> Vec<&'static str> {
+    software().filter(|e| e.base).map(|e| e.name).collect()
 }
 
 /// The bench arms `--encoder` can name.
@@ -201,9 +190,9 @@ pub fn bench_arms() -> Vec<&'static str> {
     }
 }
 
-/// The software names `--encoder` takes: the H.264 encoders, then the bench arms.
+/// The software names `--encoder` takes: the base encoders, then the bench arms.
 pub fn encoder_names() -> Vec<&'static str> {
-    [h264_encoders(), bench_arms()].concat()
+    [base_encoders(), bench_arms()].concat()
 }
 
 /// The hardware encoders `--encoder` can name on this platform; each still needs its probe to
@@ -212,9 +201,14 @@ pub fn hardware_encoders() -> Vec<&'static str> {
     built().filter(|e| e.hardware).map(|e| e.name).collect()
 }
 
-/// The software H.264 encoder `--encoder auto` falls back to where there is no hardware one.
-pub fn software_h264() -> &'static str {
-    SOFTWARE_H264.name()
+/// The software encoder `--encoder auto` falls back to where there is no hardware H.264 one.
+pub fn software_base() -> &'static str {
+    SOFTWARE.name()
+}
+
+/// Whether this build has an H.264 encoder without hardware: x264.
+pub fn software_h264() -> bool {
+    cfg!(feature = "x264")
 }
 
 fn meaning(e: &Encoder, flag: &str) -> Option<&'static str> {
@@ -318,7 +312,8 @@ mod tests {
 
     #[test]
     fn facts_follow_the_features() {
-        assert!(h264_encoders().contains(&software_h264()));
+        assert!(base_encoders().contains(&software_base()));
+        assert_eq!(software_h264(), base_encoders().contains(&"x264"));
         assert_eq!(
             licence() == "GPL-2.0-or-later",
             cfg!(any(feature = "x264", feature = "x265"))
@@ -338,7 +333,7 @@ mod tests {
             let parsed = Backend::parse(e.name);
             assert_eq!(parsed.is_ok(), e.built, "{}", e.name);
             assert!(parsed.is_ok_and(|b| b.name() == e.name) || !e.built);
-            assert!(e.h264 && !e.gpl && e.preset.is_none(), "{}", e.name);
+            assert!(e.base && !e.gpl && e.preset.is_none(), "{}", e.name);
         }
         // NVENC, Media Foundation and Quick Sync run CQP exactly when uncapped (a cap is
         // always CBR): --crf, and --paintover-crf while sharpening (set_rate takes its

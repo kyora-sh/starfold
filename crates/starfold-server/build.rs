@@ -10,9 +10,6 @@ fn main() {
     x264_bindings(&x264.expect("x264"), &out);
     #[cfg(not(feature = "x264"))]
     let _ = x264;
-    if cfg!(feature = "openh264") {
-        nasm_check();
-    }
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
 }
@@ -44,20 +41,6 @@ fn x264_bindings(include_paths: &[std::path::PathBuf], out: &std::path::Path) {
         .to_string();
     code.push_str(&format!("\npub use {open} as x264_encoder_open;\n"));
     std::fs::write(out.join("x264.rs"), code).unwrap();
-}
-
-/// openh264-sys2 quietly builds without its x86 assembly (several times slower) when
-/// nasm is missing.
-fn nasm_check() {
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let found = std::process::Command::new(std::env::var("NASM").unwrap_or("nasm".into()))
-        .arg("-v")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if matches!(arch.as_str(), "x86_64" | "x86") && !found {
-        println!("cargo:warning=nasm not found: OpenH264 builds without its assembly (slow)");
-    }
-    println!("cargo:rerun-if-env-changed=NASM");
 }
 
 /// The bench's software encoders this build has: linked, with their bindings in OUT_DIR.

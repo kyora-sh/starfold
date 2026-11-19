@@ -779,7 +779,10 @@ struct Engine {
     cfg: VideoConfig,
     w: u32,
     h: u32,
-    h264: Candidate,
+    /// The base cohort's encoder: recordings, protocol 1 viewers when it is H.264.
+    base: Candidate,
+    /// The encoders the base cohort falls back through, in order ([`negotiate::base_chain`]).
+    chain: Vec<Candidate>,
     offers: Vec<Offer>,
     /// Candidates whose encoders failed to open at this size.
     failed: Vec<Candidate>,
@@ -794,7 +797,7 @@ struct Engine {
 }
 
 impl Engine {
-    /// Offers every candidate that encodes at `w`x`h`, opens the H.264 cohort, and gives
+    /// Offers every candidate that encodes at `w`x`h`, opens the base cohort, and gives
     /// connected clients the new geometry and offers.
     fn new(
         cfg: VideoConfig,
@@ -806,7 +809,8 @@ impl Engine {
     ) -> Result<Engine, String> {
         let mut offers = Vec::new();
         let mut unoffered = Vec::new();
-        let mut h264_err = String::from("no H.264 encoder");
+        let chain = negotiate::base_chain(cands);
+        let mut base_err = String::from("no encoder for the base stream");
         let off = hub.off();
         for &c in cands {
             if let Some((_, why)) = off.iter().find(|(b, _)| *b == c.backend) {
@@ -816,8 +820,8 @@ impl Engine {
                     c.backend.name()
                 );
                 unoffered.push((c, format!("not offered at {w}x{h}: {why}")));
-                if c.codec == Codec::H264 {
-                    h264_err = why.clone();
+                if chain.contains(&c) {
+                    base_err = why.clone();
                 }
                 continue;
             }
@@ -845,23 +849,24 @@ impl Engine {
                         c.backend.name()
                     );
                     unoffered.push((c, format!("not offered at {w}x{h}: {e}")));
-                    if c.codec == Codec::H264 {
-                        h264_err = e;
+                    if chain.contains(&c) {
+                        base_err = e;
                     }
                 }
             }
         }
-        let h264 = offers
+        let base = chain
             .iter()
-            .map(|o| o.cand)
-            .find(|c| c.codec == Codec::H264)
-            .ok_or(h264_err)?;
+            .copied()
+            .find(|c| offers.iter().any(|o| o.cand == *c))
+            .ok_or(base_err)?;
         let mut eng = Engine {
             hub: hub.clone(),
             cfg,
             w,
             h,
-            h264,
+            base,
+            chain,
             offers,
             failed: Vec::new(),
             why: Vec::new(),
@@ -872,12 +877,16 @@ impl Engine {
             last_tick: Instant::now(),
         };
         let c = loop {
-            match eng.open_cohort(eng.h264) {
+            match eng.open_cohort(eng.base) {
                 Ok(c) => break c,
                 Err(e) => {
-                    log::warn!("H264 from {} failed to open: {e}", eng.h264.backend.name());
-                    eng.fail(eng.h264, format!("failed to open: {e}"));
-                    eng.h264 = eng.next_h264().ok_or(e)?;
+                    log::warn!(
+                        "{:?} from {} failed to open: {e}",
+                        eng.base.codec,
+                        eng.base.backend.name()
+                    );
+                    eng.fail(eng.base, format!("failed to open: {e}"));
+                    eng.base = eng.next_base().ok_or(e)?;
                 }
             }
         };
@@ -916,7 +925,7 @@ impl Engine {
         else {
             return Ok(());
         };
-        if self.h264 == pin {
+        if self.base == pin {
             return Ok(());
         }
         let why = self
@@ -934,35 +943,38 @@ impl Engine {
         ))
     }
 
-    /// The H.264 candidate to fall back to from the current one.
-    fn next_h264(&self) -> Option<Candidate> {
-        self.offers
-            .iter()
-            .map(|o| o.cand)
-            .find(|c| c.codec == Codec::H264 && *c != self.h264 && !self.failed.contains(c))
+    /// The base candidate to fall back to from the current one.
+    fn next_base(&self) -> Option<Candidate> {
+        self.chain.iter().copied().find(|c| {
+            *c != self.base
+                && !self.failed.contains(c)
+                && self.offers.iter().any(|o| o.cand == *c)
+        })
     }
 
-    /// The H.264 cohort's encoder failed: the next H.264 encoder that opens takes its
+    /// The base cohort's encoder failed: the next base encoder that opens takes its
     /// viewers. If none does, the failed one stays, as the last resort.
-    fn replace_h264(&mut self) {
-        let old = self.h264;
-        while let Some(n) = self.next_h264() {
+    fn replace_base(&mut self) {
+        let old = self.base;
+        while let Some(n) = self.next_base() {
             if !self.cohorts.iter().any(|c| c.shared.cand == n) {
                 match self.open_cohort(n) {
                     Ok(c) => self.cohorts.push(c),
                     Err(e) => {
-                        log::warn!("H264 from {} failed to open: {e}", n.backend.name());
+                        log::warn!("{:?} from {} failed to open: {e}", n.codec, n.backend.name());
                         self.fail(n, format!("failed to open: {e}"));
                         continue;
                     }
                 }
             }
             log::warn!(
-                "H264 from {} failed; falling back to {}",
+                "{:?} from {} failed; falling back to {:?} from {}",
+                old.codec,
                 old.backend.name(),
+                n.codec,
                 n.backend.name()
             );
-            self.h264 = n;
+            self.base = n;
             self.publish_offers();
             if self.best == Some(n) {
                 self.best = None;
@@ -1008,7 +1020,7 @@ impl Engine {
     fn offered(&self) -> Vec<Offer> {
         self.offers
             .iter()
-            .filter(|o| o.cand == self.h264 || !self.failed.contains(&o.cand))
+            .filter(|o| o.cand == self.base || !self.failed.contains(&o.cand))
             .cloned()
             .collect()
     }
@@ -1144,14 +1156,14 @@ impl Engine {
         }
         self.follow_off();
         // A cohort whose encoder keeps failing: its candidate is off until the next size.
-        // The last H.264 encoder is the last resort and stays.
-        let h264_fallback = self.next_h264().is_some();
+        // The base cohort's last encoder is the last resort and stays.
+        let base_fallback = self.next_base().is_some();
         let failing: Vec<(Candidate, String)> = self
             .cohorts
             .iter()
             .map(|c| &c.shared)
             .filter(|sh| {
-                (sh.cand != self.h264 || h264_fallback)
+                (sh.cand != self.base || base_fallback)
                     && sh.failures.load(Ordering::Acquire) >= FAIL_AFTER
                     && !self.failed.contains(&sh.cand)
             })
@@ -1168,11 +1180,11 @@ impl Engine {
             );
             self.fail(cand, why);
         }
-        if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.h264) {
-            self.fail(self.h264, "failed by /debug/fail-h264".into());
+        if self.hub.fail_h264.swap(false, Ordering::AcqRel) && !self.failed.contains(&self.base) {
+            self.fail(self.base, "failed by /debug/fail-h264".into());
         }
-        if self.failed.contains(&self.h264) {
-            self.replace_h264();
+        if self.failed.contains(&self.base) {
+            self.replace_base();
         }
         let failed = self.failed.clone();
         self.cohorts.retain(|c| !failed.contains(&c.shared.cand));
@@ -1217,7 +1229,7 @@ impl Engine {
                     rejected: &s.rejected,
                 })
                 .collect();
-            let plan = negotiate::plan(&viewers, &offers, self.h264, self.best);
+            let plan = negotiate::plan(&viewers, &offers, self.base, self.best);
             if let Some(b) = plan.best {
                 if !self.cohorts.iter().any(|c| c.shared.cand == b) {
                     match self.open_cohort(b) {
@@ -1239,9 +1251,9 @@ impl Engine {
             self.apply(&clients, &plan.picks);
             break;
         }
-        let (h264, best) = (self.h264, self.best);
+        let (base, best) = (self.base, self.best);
         self.cohorts
-            .retain(|c| c.shared.cand == h264 || Some(c.shared.cand) == best);
+            .retain(|c| c.shared.cand == base || Some(c.shared.cand) == best);
         self.name_recorded();
         self.publish();
     }
@@ -1258,7 +1270,18 @@ impl Engine {
                     .map(|k| (p, &k.shared))
             });
             let Some((p, sh)) = target else {
-                if r.proto == Proto::V2 && r.phase != Phase::NoCodec {
+                if r.proto == Proto::Legacy && pick.is_none() {
+                    r.detach();
+                    c.send(Out::Close(
+                        negotiate::NO_H264_CLOSE,
+                        negotiate::NO_H264_REASON,
+                    ));
+                    log::info!(
+                        "client {}: protocol 1 refused, the base stream is {:?}",
+                        c.id,
+                        self.base.codec
+                    );
+                } else if r.proto == Proto::V2 && r.phase != Phase::NoCodec {
                     r.epoch = r.epoch.wrapping_add(1);
                     r.detach();
                     r.phase = Phase::NoCodec;
@@ -1388,9 +1411,9 @@ impl Engine {
             .collect()
     }
 
-    /// Recordings take the H.264 cohort a protocol 1 viewer gets.
+    /// Recordings take the base cohort.
     fn name_recorded(&self) {
-        if let Some(c) = self.cohorts.iter().find(|c| c.shared.cand == self.h264) {
+        if let Some(c) = self.cohorts.iter().find(|c| c.shared.cand == self.base) {
             self.hub.taps.set_cohort(c.shared.id);
         }
     }

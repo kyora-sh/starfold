@@ -440,24 +440,21 @@ async fn serve(
         capped,
     ));
     encoders.log();
-    let encoder = match negotiate::h264_backend(&encoders, selection) {
+    let base = match negotiate::base_backend(&encoders, selection) {
         Ok(b) => b,
         Err(e) => {
             log::error!("--encoder {}: {e}", selection.name());
             std::process::exit(2);
         }
     };
+    let encoder = base.backend;
     if !selection.is_arm() {
         let uncapped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 == 0;
         for flag in build_facts::FLAGS
             .into_iter()
             .filter(|f| a.contains_key(*f))
         {
-            if flag == "crf" && encoder == encoder::Backend::OpenH264 {
-                log::warn!(
-                    "--crf with OpenH264 is its lowest QP in motion; bitrate follows --max-kbps"
-                );
-            } else if !build_facts::reads(encoder.name(), flag, uncapped) {
+            if !build_facts::reads(encoder.name(), flag, uncapped) {
                 log::warn!("{}", build_facts::flag_ignored(flag, encoder.name()));
             }
         }
@@ -548,12 +545,13 @@ async fn serve(
     #[cfg(windows)]
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
-    let mut candidates = negotiate::candidates(&encoders, encoder);
-    // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 to fall back to.
-    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE_H264 {
+    let mut candidates = negotiate::candidates(&encoders, base);
+    // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 (the base cohort's
+    // encoder) to fall back to.
+    if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE {
         let fallback = negotiate::Candidate {
-            codec: encoder::Codec::H264,
-            backend: encoder::SOFTWARE_H264,
+            codec: encoder::SOFTWARE_CODEC,
+            backend: encoder::SOFTWARE,
             hardware: false,
         };
         if !candidates.contains(&fallback) {

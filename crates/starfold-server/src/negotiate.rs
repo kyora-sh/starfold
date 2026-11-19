@@ -2,13 +2,19 @@
 //! produce, each viewer answers with the exact decoder configurations it tested, and
 //! every viewer is routed to an encoder cohort.
 //!
-//! At most two cohorts run at once: the H.264 one (legacy viewers, recording, and v2
-//! viewers that decode nothing better) and one "best" cohort, which may be the other
-//! H.264 encoder for viewers that can't decode the first. A viewer whose best choice
-//! would need a third joins the closest cohort it can decode.
+//! At most two cohorts run at once: the base one (recording, protocol 1 viewers when it
+//! is H.264, and v2 viewers that decode nothing better) and one "best" cohort, which may
+//! be the other base encoder for viewers that can't decode the first. A viewer whose
+//! best choice would need a third joins the closest cohort it can decode.
+//!
+//! The base cohort is H.264 where there is an H.264 encoder (an eligible hardware one,
+//! or x264), else AV1 from libaom. On a host with an eligible hardware encoder the best
+//! cohort stays hardware; elsewhere it is AV1 from libaom.
 
 use crate::encoder::caps::{Acceleration, Registry};
-use crate::encoder::{Backend, BitstreamFormat, Codec, Selection, StreamConfig, SOFTWARE_H264};
+use crate::encoder::{
+    Backend, BitstreamFormat, Codec, Selection, StreamConfig, SOFTWARE, SOFTWARE_CODEC,
+};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: u32 = 2;
@@ -128,6 +134,12 @@ impl Offer {
     }
 }
 
+/// The close code for a protocol 1 viewer while the base cohort is not H.264.
+pub const NO_H264_CLOSE: u16 = 4406;
+/// Its reason (a close reason holds at most 123 bytes).
+pub const NO_H264_REASON: &str =
+    "this server streams AV1 and protocol 1 decodes only H.264: use a protocol 2 client";
+
 /// The server's answer when nothing it offers decodes on the viewer.
 pub fn no_codec(epoch: u32) -> String {
     serde_json::json!({"t": "codec", "epoch": epoch, "error": "no-common-codec"}).to_string()
@@ -143,31 +155,40 @@ fn codec_rank(c: Codec) -> u8 {
     }
 }
 
-/// The H.264 backend `sel` stands for here: the pinned one, which must be eligible, or
-/// the first eligible hardware one that isn't experimental, else [`SOFTWARE_H264`].
-pub fn h264_backend(reg: &Registry, sel: Selection) -> Result<Backend, String> {
+/// The base cohort's encoder `sel` stands for here: the pinned one, which must be eligible
+/// (for H.264 if it encodes that, else for AV1), or the first eligible hardware H.264 one
+/// that isn't experimental, else [`SOFTWARE`].
+pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String> {
     let b = match sel {
         Selection::Pinned(b) => b,
         Selection::Auto => reg
             .eligible(Codec::H264)
             .find(|e| e.acceleration == Acceleration::Hardware && !e.backend.experimental())
-            .map_or(SOFTWARE_H264, |e| e.backend),
+            .map_or(SOFTWARE, |e| e.backend),
         #[cfg(feature = "sw-arm")]
-        Selection::Arm(..) => SOFTWARE_H264,
+        Selection::Arm(..) => SOFTWARE,
     };
-    reg.check(b, Codec::H264).map(|_| b)
+    let codec = match b.implements(Codec::H264) {
+        true => Codec::H264,
+        false => Codec::Av1,
+    };
+    reg.check(b, codec).map(|e| Candidate {
+        codec,
+        backend: b,
+        hardware: e.acceleration == Acceleration::Hardware,
+    })
 }
 
-/// The encoders a stream may use, best first: eligible AV1, then HEVC (hardware before
-/// software), then the H.264 backend (`h264_backend`), which also serves legacy viewers
-/// and recording, and [`SOFTWARE_H264`] for when a hardware one fails. An experimental backend
-/// takes part only when it is the H.264 one, i.e. pinned with `--encoder`.
-pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
+/// The encoders a stream may use, best first ([`rank`]: hardware before software, then
+/// AV1, HEVC, H.264): the eligible AV1 and HEVC ones and the base one (`base_backend`),
+/// then [`SOFTWARE`] for when a hardware base one fails. An experimental backend takes part only when it is the base one,
+/// i.e. pinned with `--encoder`.
+pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
     for codec in [Codec::Av1, Codec::Hevc] {
         for e in reg
             .eligible(codec)
-            .filter(|e| !e.backend.experimental() || e.backend == h264)
+            .filter(|e| !e.backend.experimental() || e.backend == base.backend)
         {
             let c = Candidate {
                 codec,
@@ -182,36 +203,71 @@ pub fn candidates(reg: &Registry, h264: Backend) -> Vec<Candidate> {
             }
         }
     }
-    v.sort_by_key(|c| (codec_rank(c.codec), !c.hardware));
-    let hardware = reg
-        .eligible(Codec::H264)
-        .any(|e| e.backend == h264 && e.acceleration == Acceleration::Hardware);
-    v.push(Candidate {
-        codec: Codec::H264,
-        backend: h264,
-        hardware,
-    });
-    if hardware
-        && reg
-            .eligible(Codec::H264)
-            .any(|e| e.backend == SOFTWARE_H264)
+    if !v.contains(&base) {
+        v.push(base);
+    }
+    v.sort_by_key(|c| rank(*c));
+    let software = Candidate {
+        codec: SOFTWARE_CODEC,
+        backend: SOFTWARE,
+        hardware: false,
+    };
+    if base.hardware
+        && !v.contains(&software)
+        && reg.eligible(software.codec).any(|e| e.backend == software.backend)
     {
-        v.push(Candidate {
-            codec: Codec::H264,
-            backend: SOFTWARE_H264,
-            hardware: false,
-        });
+        v.push(software);
     }
     v
 }
 
-/// A bench arm's candidates: the arm first, then only the H.264 cohort. Fails if the arm
+/// Whether every eligible hardware candidate (not an experimental one, which only a pin
+/// brings in) ranks before every software one: a CPU encoder ahead of an idle hardware one
+/// costs cores for every viewer. False ranks by codec first, so libaom's AV1 would lead on
+/// a host with hardware H.264 or HEVC.
+const HARDWARE_FIRST: bool = true;
+
+/// A candidate's place in [`candidates`], lowest first.
+fn rank(c: Candidate) -> (bool, u8, bool) {
+    let leads = c.hardware && !c.backend.experimental();
+    (HARDWARE_FIRST && !leads, codec_rank(c.codec), !c.hardware)
+}
+
+/// The base cohort's encoders in the order it falls back through them: the H.264 ones in
+/// `cands`' order, then, where none of them is software, libaom's AV1.
+pub fn base_chain(cands: &[Candidate]) -> Vec<Candidate> {
+    let mut v: Vec<Candidate> = cands
+        .iter()
+        .copied()
+        .filter(|c| c.codec == Codec::H264)
+        .collect();
+    if !v.iter().any(|c| !c.hardware) {
+        v.extend(cands.iter().copied().filter(|c| software_av1(*c)).take(1));
+    }
+    v
+}
+
+/// libaom's AV1, the base encoder of a build without x264.
+fn software_av1(c: Candidate) -> bool {
+    #[cfg(feature = "libaom")]
+    if c.backend == Backend::Libaom && c.codec == Codec::Av1 {
+        return true;
+    }
+    #[cfg(test)]
+    if c.backend == Backend::FakeAv1 {
+        return c.codec == Codec::Av1;
+    }
+    let _ = c;
+    false
+}
+
+/// A bench arm's candidates: the arm first, then only the base cohort's. Fails if the arm
 /// can't encode here, so a bench run never measures the fallback by mistake.
 #[cfg(feature = "sw-arm")]
 pub fn arm_candidates(
     backend: Backend,
     codec: Codec,
-    h264: Vec<Candidate>,
+    cands: Vec<Candidate>,
 ) -> Result<Vec<Candidate>, String> {
     crate::encoder::caps::sample_encode(backend, codec)?;
     let arm = Candidate {
@@ -220,7 +276,7 @@ pub fn arm_candidates(
         hardware: false,
     };
     Ok(std::iter::once(arm)
-        .chain(h264.into_iter().filter(|c| c.codec == Codec::H264))
+        .chain(base_chain(&cands).into_iter().filter(|c| *c != arm))
         .collect())
 }
 
@@ -262,20 +318,22 @@ pub struct Viewer<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// The cohort besides the H.264 one, if any viewer gets it.
+    /// The cohort besides the base one, if any viewer gets it.
     pub best: Option<Candidate>,
-    /// Each viewer's choice; None: nothing the server can stream decodes there.
+    /// Each viewer's choice; None: nothing the server can stream decodes there (for a
+    /// protocol 1 viewer: the base cohort is not H.264).
     pub picks: Vec<(u64, Option<Choice>)>,
 }
 
 /// Routes `viewers` (in the order they joined) to at most two cohorts. The current best
 /// cohort stays while it is still some viewer's first choice, so viewers aren't moved
 /// back and forth as others come and go; otherwise the earliest viewer whose first
-/// choice is another cohort decides it.
+/// choice is another cohort decides it. Protocol 1 viewers get the base cohort if it is
+/// H.264, else nothing.
 pub fn plan(
     viewers: &[Viewer<'_>],
     offers: &[Offer],
-    h264: Candidate,
+    base: Candidate,
     current: Option<Candidate>,
 ) -> Plan {
     let prefs: Vec<Vec<Choice>> = viewers
@@ -293,7 +351,7 @@ pub fn plan(
             .iter()
             .filter_map(|p| p.first())
             .map(|c| c.cand)
-            .filter(|c| *c != h264)
+            .filter(|c| *c != base)
     };
     let best = current
         .filter(|b| firsts().any(|c| c == *b))
@@ -303,13 +361,13 @@ pub fn plan(
         .zip(&prefs)
         .map(|(v, p)| {
             let pick = if v.legacy {
-                Some(Choice {
-                    cand: h264,
+                (base.codec == Codec::H264).then_some(Choice {
+                    cand: base,
                     implementation: None,
                 })
             } else {
                 p.iter()
-                    .find(|c| c.cand == h264 || Some(c.cand) == best)
+                    .find(|c| c.cand == base || Some(c.cand) == best)
                     .copied()
             };
             (v.id, pick)

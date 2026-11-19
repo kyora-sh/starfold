@@ -1410,12 +1410,22 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
                     None => break,
                 },
             };
+            if let Out::Close(code, reason) = m {
+                let _ = sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                break;
+            }
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
             let msg = if framed {
                 let f = match &m {
                     Out::Bin(b) => frame::encode_binary(b),
                     Out::Text(t) => frame::encode_text(t),
+                    Out::Close(..) => continue,
                 };
                 match f {
                     Ok(f) => Message::Binary(f),
@@ -1428,6 +1438,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
                 match m {
                     Out::Bin(b) => Message::Binary(b),
                     Out::Text(t) => Message::Text(t.into()),
+                    Out::Close(..) => continue,
                 }
             };
             if sink.send(msg).await.is_err() {

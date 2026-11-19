@@ -370,10 +370,10 @@ pub fn host_providers(
 ) -> Vec<Box<dyn ProbeProvider>> {
     let _ = capped;
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
+    #[cfg(feature = "libaom")]
+    v.push(Box::new(Software(Backend::Libaom, Codec::Av1)));
     #[cfg(feature = "x264")]
-    v.push(Box::new(Software(Backend::X264)));
-    #[cfg(feature = "openh264")]
-    v.push(Box::new(Software(Backend::OpenH264)));
+    v.push(Box::new(Software(Backend::X264, Codec::H264)));
     if !hardware {
         return v;
     }
@@ -448,8 +448,8 @@ impl ProbeProvider for Disabled {
     }
 }
 
-/// A compiled-in H.264 encoder, verified by encoding one small picture.
-pub(crate) struct Software(pub Backend);
+/// A compiled-in software encoder and its codec, verified by encoding one small picture.
+pub(crate) struct Software(pub Backend, pub Codec);
 
 impl ProbeProvider for Software {
     fn backend(&self) -> Backend {
@@ -457,10 +457,10 @@ impl ProbeProvider for Software {
     }
 
     fn probe(&self) -> Probe {
-        let mut c = EncoderCapability::new(Codec::H264, self.0, Acceleration::Software, "cpu");
-        c.profiles = vec![match self.0 {
-            Backend::OpenH264 => ProfileCapability::new("constrained_baseline", 8, Chroma::Yuv420),
-            _ => ProfileCapability::new("high", 8, Chroma::Yuv420),
+        let mut c = EncoderCapability::new(self.1, self.0, Acceleration::Software, "cpu");
+        c.profiles = vec![match self.1 {
+            Codec::H264 => ProfileCapability::new("high", 8, Chroma::Yuv420),
+            _ => ProfileCapability::new("main", 8, Chroma::Yuv420),
         }];
         c.limits = EncoderLimits {
             min_width: Some(1),
@@ -472,7 +472,7 @@ impl ProbeProvider for Software {
         };
         c.low_latency = Some(true);
         c.keyframe_control = Some(true);
-        c.status = match sample_encode(self.0, Codec::H264) {
+        c.status = match sample_encode(self.0, self.1) {
             Ok(()) => ProbeStatus::Verified,
             Err(e) => ProbeStatus::Unavailable(e),
         };
