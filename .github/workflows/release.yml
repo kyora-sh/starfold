@@ -325,6 +325,7 @@ jobs:
       - name: Library paths
         run: |
           bin=target/release/starfold
+          otool -l "$bin" | grep -A4 LC_BUILD_VERSION
           otool -L "$bin"
           if otool -L "$bin" | tail -n +2 | grep -v -E '^[[:space:]]+/(usr/lib|System/Library)/'; then
             echo "::error::the binary links a library outside the system's"
@@ -384,16 +385,15 @@ jobs:
       VCPKGRS_TRIPLET: x64-mingw-static
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
       # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs:
-      # OpenH264's C++ gets libstdc++ as a static archive instead of the cc crate's -lstdc++.
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-l:libstdc++.a
-      CXXSTDLIB_x86_64_pc_windows_gnu: ''
-      WINEDEBUG: -all
+      # OpenH264's C++ links libstdc++ statically (the cc crate's CXXSTDLIB_STATIC).
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static
+      CXXSTDLIB_STATIC_x86_64_pc_windows_gnu: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: MinGW, NASM, vcpkg's build tools and Wine
+      - name: MinGW, NASM and vcpkg's build tools
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip && aptq 720 install -y --no-install-recommends wine wine64; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
@@ -445,14 +445,15 @@ jobs:
             echo "::error::starfold.exe needs a DLL that isn't Windows' own"
             exit 1
           fi
-      # Ubuntu's `wine` wrapper aborts without the 32-bit Wine, so the 64-bit loader is called directly.
+      # Wine aborts on the runner itself, so it runs in a clean Ubuntu 24.04 container.
       - name: Version and licence (Wine)
-        env:
-          WINEDLLOVERRIDES: mscoree,mshtml=
         run: |
-          wine64=$(command -v wine64 || echo /usr/lib/wine/wine64)
-          "$wine64" wineboot --init
-          .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' "$wine64" target/x86_64-pc-windows-gnu/release/starfold.exe
+          docker run --rm -v "$PWD:/src:ro" -w /src -e WINEDEBUG=-all -e 'WINEDLLOVERRIDES=mscoree,mshtml=' ubuntu:24.04 bash -c '
+            set -e
+            apt-get -q update >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get -q install -y --no-install-recommends wine64 >/dev/null
+            .github/release/check-version.sh "$1" "$2" /usr/lib/wine/wine64 target/x86_64-pc-windows-gnu/release/starfold.exe
+          ' _ "$VERSION" '${{ matrix.licence }}'
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
