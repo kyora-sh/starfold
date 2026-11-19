@@ -1,34 +1,559 @@
 name: Release
 
-# A version tag (v0.4.0, ...) gets a GitHub release with GitHub's generated notes (the
-# pull requests merged since the previous tag). Nothing is published to a registry.
-# A default build links x264 (GPL-2.0-or-later), so each release attaches the exact x264 source of
-# every platform's build, from third_party/x264 (hash-checked, nothing fetched).
+# Builds the release binaries, the Python SDK and the embeddable web client, and on a version tag
+# (v0.4.0, ...) attaches them to a GitHub release with GitHub's generated notes (the pull requests
+# merged since the previous tag). Nothing is published to a registry.
+#
+# Each binary comes in two flavours: starfold-<version>-<platform> links OpenH264 (BSD-2-Clause)
+# and is MIT; starfold-x264-<version>-<platform> links x264 and is GPL-2.0-or-later as a combined
+# work. The release also attaches the exact x264 source of every platform's build, from
+# third_party/x264 (hash-checked, nothing fetched).
+#
+# A pull request that changes this workflow, and a manual run, are dry runs: every build runs and
+# uploads its files as workflow artifacts; only a pushed tag creates the release.
 # Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/release/**
+      - packages/web/embed/pack.sh
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build everything and upload it as workflow artifacts; a manual run never releases
+        type: choice
+        options: ['true']
+        default: 'true'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN: '1.93.0'
+  LIBX264_DEB: 'libx264-dev=2:0.164.3108+git31e19f9-1'
+  BREW_X264: 'x264 r3222'
+  CARGO_ABOUT: '0.9.3'
+  # Symbols stay for backtraces; the line tables of `debug = 1` don't ship.
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
 
 jobs:
+  version:
+    name: Version
+    runs-on: kyora-2x4
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo.toml's version; on a tag, the tag has to name the same one.
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/starfold-server/Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no version in crates/starfold-server/Cargo.toml"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version $version"
+
+  linux:
+    name: Linux x86_64 (${{ matrix.licence }})
+    needs: version
+    runs-on: kyora-8x16
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: starfold
+            features: --no-default-features --features openh264
+            licence: MIT
+            runtime: libyuv0 libopus0 libpulse0 libstdc++6
+          - name: starfold-x264
+            features: ''
+            licence: GPL-2.0-or-later
+            runtime: libyuv0 libopus0 libpulse0 libx264-164
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.name }}-linux-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.name }}-linux-${{ env.RUST_TOOLCHAIN }}-
+      - id: cargo-about
+        uses: actions/cache@v4
+        with:
+          path: ~/cargo-about
+          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+      - name: cargo-about
+        run: |
+          if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+          fi
+          echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
+      # build.rs embeds the library dirs pkg-config reports as an rpath; a released binary may only
+      # carry system ones.
+      - name: Library paths
+        run: |
+          readelf -d target/release/starfold | grep -E 'NEEDED|RPATH|RUNPATH'
+          bad=$(readelf -d target/release/starfold | sed -n 's/.*R\(UN\)\{0,1\}PATH.*\[\(.*\)\]/\2/p' | tr ':' '\n' | grep -v -E '^(/usr)?/lib(/x86_64-linux-gnu)?/?$' | grep . || true)
+          [ -z "$bad" ] || { echo "::error::the binary's rpath names build-only directories: $bad"; exit 1; }
+          ldd target/release/starfold
+      - name: Version and licence
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' target/release/starfold
+      - name: Licences
+        run: |
+          mkdir -p "$RUNNER_TEMP/licenses"
+          cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-unknown-linux-gnu \
+            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          if [ '${{ matrix.licence }}' = MIT ]; then
+            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
+          fi
+          ls -l "$RUNNER_TEMP/licenses"
+      - name: Package
+        run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
+      # The archive on a clean Ubuntu 24.04 with only the runtime packages the README names.
+      - name: Clean Ubuntu 24.04
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src ubuntu:24.04 \
+            .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.licence }}' ${{ matrix.runtime }}
+      - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  linux-arm64:
+    name: Linux aarch64 (${{ matrix.licence }}, cross-compiled)
+    needs: version
+    runs-on: kyora-8x16
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: starfold
+            features: --no-default-features --features openh264
+            licence: MIT
+          - name: starfold-x264
+            features: ''
+            licence: GPL-2.0-or-later
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-aarch64-linux
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      PKG_CONFIG_ALLOW_CROSS: '1'
+      PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu's arm64 packages (ports.ubuntu.com) beside the amd64 ones, the aarch64 GCC, and
+      # qemu to run the binary's --version.
+      - name: Native libraries (arm64)
+        run: |
+          src=/etc/apt/sources.list.d/ubuntu.sources
+          cat "$src"
+          sudo sed -i '/^Architectures:/d; /^Types:/a Architectures: amd64' "$src"
+          sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<'SRC'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SRC
+          sudo dpkg --add-architecture arm64
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-
+      - id: cargo-about
+        uses: actions/cache@v4
+        with:
+          path: ~/cargo-about
+          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+      - name: cargo-about
+        run: |
+          if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+          fi
+          echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.features }}
+      - name: Library paths
+        run: |
+          bin=target/aarch64-unknown-linux-gnu/release/starfold
+          aarch64-linux-gnu-readelf -d "$bin" | grep -E 'NEEDED|RPATH|RUNPATH'
+          bad=$(aarch64-linux-gnu-readelf -d "$bin" | sed -n 's/.*R\(UN\)\{0,1\}PATH.*\[\(.*\)\]/\2/p' | tr ':' '\n' | grep -v -E '^(/usr)?/lib(/aarch64-linux-gnu)?/?$' | grep . || true)
+          [ -z "$bad" ] || { echo "::error::the binary's rpath names build-only directories: $bad"; exit 1; }
+      - name: Version and licence (qemu)
+        env:
+          QEMU_LD_PREFIX: /
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' qemu-aarch64-static target/aarch64-unknown-linux-gnu/release/starfold
+      - name: Licences
+        run: |
+          mkdir -p "$RUNNER_TEMP/licenses"
+          cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-unknown-linux-gnu \
+            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          if [ '${{ matrix.licence }}' = MIT ]; then
+            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
+          fi
+          ls -l "$RUNNER_TEMP/licenses"
+      - name: Package
+        run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/aarch64-unknown-linux-gnu/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
+      - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 (${{ matrix.licence }})
+    needs: version
+    runs-on: kyora-macos
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: starfold
+            features: --no-default-features --features openh264
+            licence: MIT
+            brew: opus pkgconf esbuild
+          - name: starfold-x264
+            features: ''
+            licence: GPL-2.0-or-later
+            brew: x264 opus pkgconf esbuild
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-aarch64-macos
+      # Homebrew's static Opus and x264, so the binary needs nothing from Homebrew at run time.
+      OPUS_STATIC: '1'
+      X264_STATIC: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - run: uname -m && sw_vers
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The runner image may not have Homebrew yet.
+      - name: Homebrew
+        run: |
+          if ! command -v brew >/dev/null; then
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+          brew=$(command -v brew || echo /opt/homebrew/bin/brew)
+          prefix=$("$brew" --prefix)
+          {
+            echo "HOMEBREW_PREFIX=$prefix"
+            echo "HOMEBREW_CELLAR=$prefix/Cellar"
+            echo "HOMEBREW_REPOSITORY=$("$brew" --repository)"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
+      - run: |
+          brew install ${{ matrix.brew }}
+          if [ '${{ matrix.licence }}' != MIT ]; then
+            [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
+          fi
+          brew list --versions opus
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.name }}-macos-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.name }}-macos-${{ env.RUST_TOOLCHAIN }}-
+      - id: cargo-about
+        uses: actions/cache@v4
+        with:
+          path: ~/cargo-about
+          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+      - name: cargo-about
+        run: |
+          if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+          fi
+          echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
+      # Only the system's libraries and frameworks, nothing from Homebrew.
+      - name: Library paths
+        run: |
+          otool -L target/release/starfold
+          otool -l target/release/starfold | grep -A2 LC_RPATH || true
+          if otool -L target/release/starfold | tail -n +2 | grep -v -E '^[[:space:]]+/(usr/lib|System/Library)/'; then
+            echo "::error::the binary links a library outside the system's"
+            exit 1
+          fi
+      - name: Version and licence
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' target/release/starfold
+      - name: Licences
+        run: |
+          mkdir -p "$RUNNER_TEMP/licenses"
+          cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-apple-darwin \
+            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          cp "$(brew --prefix opus)/COPYING" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
+          if [ '${{ matrix.licence }}' = MIT ]; then
+            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
+          fi
+          ls -l "$RUNNER_TEMP/licenses"
+      - name: Package
+        run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
+      - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 (${{ matrix.licence }}, cross-compiled)
+    needs: version
+    runs-on: kyora-8x16
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: starfold
+            features: --no-default-features --features openh264
+            licence: MIT
+          - name: starfold-x264
+            features: ''
+            licence: GPL-2.0-or-later
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-x86_64-windows
+      VCPKG_BASELINE: 2026.10.16
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.vcpkg-downloads
+      VCPKGRS_TRIPLET: x64-mingw-static
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
+      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs.
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static
+      WINEDEBUG: -all
+    steps:
+      - uses: actions/checkout@v4
+      - name: MinGW, NASM, vcpkg's build tools and Wine
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip && aptq 720 install -y --no-install-recommends wine wine64; }
+          deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-x64-mingw-static-${{ env.VCPKG_BASELINE }}-x264-libyuv-opus-v1
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-downloads
+          key: vcpkg-downloads-${{ env.VCPKG_BASELINE }}-v1
+      - name: x264, libyuv and Opus (vcpkg)
+        run: |
+          mkdir -p .vcpkg-cache .vcpkg-downloads
+          retry() { for i in 1 2 3; do "$@" && return; [ "$i" = 3 ] || sleep $((i * 30)); done; return 1; }
+          retry git clone --quiet --depth 1 --branch "$VCPKG_BASELINE" https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          retry "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          retry "$VCPKG_ROOT/vcpkg" install x264 libyuv opus --triplet "$VCPKGRS_TRIPLET"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
+      - id: cargo-about
+        uses: actions/cache@v4
+        with:
+          path: ~/cargo-about
+          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+      - name: cargo-about
+        run: |
+          if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+          fi
+          echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p starfold-server --target x86_64-pc-windows-gnu ${{ matrix.features }}
+      # Windows' own DLLs only: no MinGW runtime beside the .exe.
+      - name: DLLs
+        run: |
+          exe=target/x86_64-pc-windows-gnu/release/starfold.exe
+          x86_64-w64-mingw32-objdump -p "$exe" | grep 'DLL Name'
+          if x86_64-w64-mingw32-objdump -p "$exe" | grep 'DLL Name' | grep -i -E 'libstdc|libgcc|libwinpthread|mingw|opus|yuv|x264'; then
+            echo "::error::starfold.exe needs a DLL that isn't Windows' own"
+            exit 1
+          fi
+      - name: Version and licence (Wine)
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' wine target/x86_64-pc-windows-gnu/release/starfold.exe
+      - name: Licences
+        run: |
+          mkdir -p "$RUNNER_TEMP/licenses"
+          cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-pc-windows-gnu \
+            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          share=$VCPKG_ROOT/installed/$VCPKGRS_TRIPLET/share
+          cp "$share/opus/copyright" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
+          cp "$share/libyuv/copyright" "$RUNNER_TEMP/licenses/libyuv-LICENSE.txt"
+          cp /usr/share/doc/mingw-w64-common/copyright "$RUNNER_TEMP/licenses/MinGW-w64-copyright.txt"
+          cp /usr/share/doc/gcc-mingw-w64-base/copyright "$RUNNER_TEMP/licenses/GCC-runtime-copyright.txt"
+          if [ '${{ matrix.licence }}' = MIT ]; then
+            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
+          fi
+          ls -l "$RUNNER_TEMP/licenses"
+      - name: Package
+        run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/x86_64-pc-windows-gnu/release/starfold.exe zip dist "$RUNNER_TEMP"/licenses/*
+      - run: unzip -l "dist/$ARCHIVE.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  python:
+    name: Python SDK (sdist, wheel)
+    needs: version
+    runs-on: kyora-2x4
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: python/starfold
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.11.8
+      # The release's version in this checkout's pyproject.toml only; the package name and its
+      # classifiers stay as they are.
+      - name: Build
+        run: |
+          uv version --frozen "$VERSION"
+          uv build --out-dir "$GITHUB_WORKSPACE/dist"
+      - name: Check the version
+        working-directory: dist
+        run: |
+          ls -l
+          wheel=starfold-$VERSION-py3-none-any.whl
+          [ -f "$wheel" ] && [ -f "starfold-$VERSION.tar.gz" ] || { echo "::error::expected starfold $VERSION's sdist and wheel"; exit 1; }
+          unzip -p "$wheel" "starfold-$VERSION.dist-info/METADATA" | grep -x "Version: $VERSION"
+          tar -xOzf "starfold-$VERSION.tar.gz" "starfold-$VERSION/PKG-INFO" | grep -x "Version: $VERSION"
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          unzip -l "$wheel"
+          tar -tzf "starfold-$VERSION.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starfold-python-${{ env.VERSION }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  embed:
+    name: Embeddable web client (npm tarball)
+    needs: version
+    runs-on: kyora-8x16
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Pack
+        env:
+          SHA: ${{ github.sha }}
+          PACK_VERSION: ${{ env.VERSION }}
+        run: |
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 update
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 install -y esbuild
+          mkdir -p dist
+          bash packages/web/embed/pack.sh "$SHA" dist
+      - name: Check the version
+        working-directory: dist
+        run: |
+          f=starfold-web-embed-$VERSION.tgz
+          tar -xOzf "$f" package/package.json
+          tar -xOzf "$f" package/package.json | grep -q -F "\"version\": \"$VERSION\"," || { echo "::error::$f doesn't carry version $VERSION"; exit 1; }
+          sha256sum "$f" > "$f.sha256"
+          tar -tzvf "$f"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starfold-web-embed-${{ env.VERSION }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
   release:
     name: GitHub release
+    needs: [version, linux, linux-arm64, macos, windows, python, embed]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: kyora-8x16
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           # History and tags, to find the previous release's tag.
           fetch-depth: 0
-      - name: Check the tag matches Cargo.toml
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the files
+        working-directory: dist
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/starfold-server/Cargo.toml)
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
-            exit 1
-          fi
+          ls -l
+          sha256sum -c *.sha256
       - name: x264's source
         run: |
           (cd third_party/x264 && sha256sum -c SHA256SUMS && sha512sum -c SHA512SUMS)
@@ -40,6 +565,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > x264-notes.md <<'NOTES'
+          ## Downloads
+
+          `starfold-<version>-<platform>` binaries link OpenH264 and are MIT. `starfold-x264-<version>-<platform>`
+          binaries link x264 and are GPL-2.0-or-later as a combined work. Each archive has a `.sha256` beside it, and
+          the README's Install section lists what each platform needs at run time. The Python SDK (sdist and wheel)
+          and the embeddable web client (`starfold-web-embed-<version>.tgz`) are attached too.
+
           ## x264 source
 
           A default build of this release links x264 and is GPL-2.0-or-later as a combined work; an
@@ -56,4 +588,4 @@ jobs:
           if [ -n "$prev" ]; then
             args+=(--notes-start-tag "$prev")
           fi
-          gh release create "$GITHUB_REF_NAME" "${args[@]}" x264-source/*
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" x264-source/* dist/*
