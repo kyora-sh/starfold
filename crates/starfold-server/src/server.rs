@@ -546,7 +546,7 @@ pub fn bind_unix_std(
             .map_err(unmake)?
             .filesystem_type(),
     ) {
-        return Err(unmake(untrusted(path, path, why)));
+        return Err(unmake(untrusted(path, path, why, "--listen-unix")));
     }
     let made = stat_at(&parent, &name).map_err(unmake)?;
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
