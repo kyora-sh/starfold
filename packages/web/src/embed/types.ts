@@ -39,3 +39,21 @@ export const PROTOCOL_ERROR = {
 	code: 4000,
 	reason: 'starfold: protocol error',
 } as const;
+
+/**
+ * What onClose gets when the server finds no codec this browser decodes (its `codec` message
+ * carries an error): nothing could be shown, so the client closes the socket with this code.
+ */
+export const NO_COMMON_CODEC = {
+	code: 4001,
+	reason: 'starfold: no common codec',
+} as const;
+
+/**
+ * What onClose gets when the worker fails at run time after its socket was asked for: the
+ * worker is stopped, so the server sees the socket drop without a close frame.
+ */
+export const WORKER_FAILED = {
+	code: 4002,
+	reason: 'starfold: worker failed',
+} as const;

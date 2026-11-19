@@ -32,7 +32,12 @@ import {
 import type { ConnectFailure, Preamble, Status } from './types.js';
 
 export type { ConnectFailure, Preamble, Status } from './types.js';
-export { PROTOCOL_ERROR, UNMOUNTED } from './types.js';
+export {
+	NO_COMMON_CODEC,
+	PROTOCOL_ERROR,
+	UNMOUNTED,
+	WORKER_FAILED,
+} from './types.js';
 
 export interface ConnectOptions {
 	/** The WebSocket URL, used exactly as given (no query string is added). */
@@ -62,9 +67,12 @@ export interface MountOptions {
 	 * Called once for every connection whose socket was asked for, with the close frame's code
 	 * and reason as the server sent them (a reason is the server's text: a server that echoes a
 	 * ticket there leaks it itself); `PROTOCOL_ERROR` (4000) when the client could not handle
-	 * what the server sent; `UNMOUNTED` (1001) when `unmount()` ended it. `unmount()` stops the
-	 * worker at once, so the server sees the socket drop without a close frame, and a close the
-	 * server sent at the same moment is reported as `UNMOUNTED`.
+	 * what the server sent; `NO_COMMON_CODEC` (4001) when the server found no codec this browser
+	 * decodes, and the client closed the socket; `WORKER_FAILED` (4002) when the worker failed
+	 * at run time, and the client stopped it (no connect follows); `UNMOUNTED` (1001) when
+	 * `unmount()` ended it. `unmount()` stops the worker at once, so the server sees the socket
+	 * drop without a close frame, and a close the server sent at the same moment is reported as
+	 * `UNMOUNTED`.
 	 */
 	onClose?(code: number, reason: string): void;
 	/**
@@ -204,7 +212,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	};
 	const pointer = setupPointer(app, onInteract);
 	disposers.add('pointer', () => pointer.dispose());
-	const keyboard = setupKeyboard(app, clipboard, onInteract);
+	const keyboard = setupKeyboard(app, clipboard, onInteract, true);
 	disposers.add('keyboard', () => keyboard.dispose());
 
 	let videoOn: boolean | null = null;
@@ -244,6 +252,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 	const onWorkerError = (e: Event) => {
 		if (disposed) return;
 		e.preventDefault();
+		worker.terminate();
 		life.workerFailed();
 	};
 	worker.addEventListener('error', onWorkerError);
