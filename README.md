@@ -130,10 +130,42 @@ DISPLAY=:1 ./target/release/starfold --port=6901
 # prints: open http://localhost:6901/?token=4f1c… to sign in
 ```
 
-Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
-(`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for pixel-precise scroll
-input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag with its default, and
-`starfold --version` prints the version.
+Use the patched Xvfb (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for
+pixel-precise scroll input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag
+with its default, and `starfold --version` prints the version.
+
+starfold captures X11 with MIT-SHM GetImage into a 0600 shared-memory segment of its own. The X
+server has to attach that segment, which it can't over TCP (`DISPLAY=host:N`; use `DISPLAY=:N`),
+from another IPC namespace, or as another user: starfold then stops at start and names these
+causes. After the attach it checks that the server writes into its segment, not into another
+one with the same id on the server's side.
+
+With `STARFOLD_DIRECT_FB=1` in its environment and Xvfb started with `-shmem`, starfold reads the
+screen in place from Xvfb's framebuffer instead. On one VM (4 vCPUs, a 1920x1080 full-screen
+animation at 60 fps) that saved about 1 ms per frame and about a tenth of a core; both paths kept
+60 fps. `STARFOLD_NO_DIRECT_FB` turns it off and wins over `STARFOLD_DIRECT_FB=1`. A segment is
+read only if all of these hold, else starfold uses GetImage and logs why once:
+
+- the X connection is a local socket whose peer credentials give the X server's pid, and
+  `/proc/self` is this process;
+- after starfold attaches the segment, it was created by that pid, has the size listed, and that
+  pid maps it now (the same device and inode in `/proc/<pid>/maps` as starfold's own mapping);
+- its XWD header names the screen being served (Xvfb writes `Xvfb <host>:<display>.<screen>`) and
+  the image fits in the segment;
+- a strip of its pixels matches what the X server returns for that screen.
+
+Its known limits:
+
+- A stale segment whose creator's pid number the live X server now holds passes if that server
+  maps it (a client can make it attach one through MIT-SHM).
+- The X server's maps are read before starfold attaches the segment.
+- `/proc` is checked by pid number: an ancestor pid namespace's `/proc` in which this process has
+  the same number passes.
+- Whatever answers on the X connection (a relay, a process holding the socket's name) is trusted,
+  as on every capture path.
+
+Xvfb creates its `-shmem` segments with mode 0777: every local user can read that screen, whether
+starfold reads it or not. On a host with several users, don't start Xvfb with `-shmem`.
 
 | Flag                                                           | Default                                                               |                                                                                                                                                                                                           |
 | -------------------------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
