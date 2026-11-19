@@ -284,8 +284,8 @@ fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::Own
                 if links > MAX_SYMLINKS {
                     return Err(untrusted(path, &here, "is one symlink too many"));
                 }
-                let target = nix::fcntl::readlinkat(&fd, name.as_c_str())
-                    .map_err(std::io::Error::from)?;
+                let target =
+                    nix::fcntl::readlinkat(&fd, name.as_c_str()).map_err(std::io::Error::from)?;
                 push(&mut pending, Path::new(&target));
             }
             Err(e) => {
@@ -402,11 +402,7 @@ pub fn bind_unix_std(
                     path.display(),
                     stat_at(&parent, &name).map_or_else(
                         |e| format!("can't be read: {e}"),
-                        |st| format!(
-                            "owner uid {}, mode {:04o}",
-                            st.st_uid,
-                            st.st_mode & 0o7777
-                        )
+                        |st| format!("owner uid {}, mode {:04o}", st.st_uid, st.st_mode & 0o7777)
                     )
                 ),
             ),
@@ -2133,7 +2129,11 @@ mod tests {
             let refused = |p: &std::path::Path| {
                 let e = bind_unix(p, 0o600).unwrap_err();
                 assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
-                assert!(e.to_string().contains(&format!("owner uid {}", unsafe { libc::geteuid() })), "{e}");
+                assert!(
+                    e.to_string()
+                        .contains(&format!("owner uid {}", unsafe { libc::geteuid() })),
+                    "{e}"
+                );
             };
             let empty = d.join("empty");
             std::fs::create_dir(&empty).unwrap();
@@ -2445,7 +2445,10 @@ mod tests {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
             let said = e.to_string();
             assert!(
-                said.contains(&format!("{} is writable by other users and not sticky", d.display())),
+                said.contains(&format!(
+                    "{} is writable by other users and not sticky",
+                    d.display()
+                )),
                 "{said}"
             );
             assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
@@ -2491,7 +2494,8 @@ mod tests {
             std::fs::write(d.join("f"), "").unwrap();
             let e = bind_unix(&d.join("f").join("sf"), 0o600).unwrap_err();
             assert!(
-                e.to_string().contains(&format!("{} is not a directory", d.join("f").display())),
+                e.to_string()
+                    .contains(&format!("{} is not a directory", d.join("f").display())),
                 "{e}"
             );
             std::fs::remove_dir_all(&d).unwrap();
