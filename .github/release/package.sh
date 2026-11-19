@@ -25,7 +25,7 @@ fail() {
 }
 # shellcheck disable=SC2086
 expected=$("$here/expected-files.sh" "$version" ${RELEASE_FLAVOURS:?set RELEASE_FLAVOURS})
-grep -q -x -F "$name.$format" <<<"$expected" || fail "$name.$format isn't one of the release's files (expected-files.sh)"
+grep -q -x -F "$name/$name.$format" <<<"$expected" || fail "$name.$format isn't one of the release's files (expected-files.sh)"
 case $name in
 *-linux) platform=linux ;;
 *-macos) platform=macos ;;
@@ -60,9 +60,14 @@ for f in "$@"; do
 done
 
 # What each binary compiles in, by platform and flavour: the Rust crates and standard library
-# everywhere; OpenH264 without x264; Opus statically on macOS and Windows; on Windows also libyuv,
-# the MinGW-w64 runtime and GCC's runtime libraries (GPL-3.0 with the GCC Runtime Library Exception).
-required+=(licenses/rust-crates.txt licenses/rust-std/COPYRIGHT-library.html licenses/rust-std/MIT.txt licenses/rust-std/Apache-2.0.txt)
+# everywhere (std's COPYRIGHT and every licence text it refers to); OpenH264 without x264; Opus
+# statically on macOS and Windows; on Linux glibc's and GCC's startup and runtime objects; on
+# Windows libyuv, the MinGW-w64 runtime and GCC's runtime libraries. GCC's are GPL-3.0 with the GCC
+# Runtime Library Exception, glibc's LGPL-2.1 with its own linking permission.
+required+=(licenses/rust-crates.txt licenses/rust-std/COPYRIGHT-library.html)
+for f in Apache-2.0 BSD-2-Clause CC-BY-SA-4.0 GCC-exception-3.1 GPL-2.0-only GPL-3.0-or-later ISC LLVM-exception MIT NCSA OFL-1.1 Unicode-3.0; do
+	required+=("licenses/rust-std/$f.txt")
+done
 if [ $x264 = 1 ]; then
 	src=$(echo "$root"/third_party/x264/x264_*.orig.tar.gz)
 	tar -xOzf "$src" "$(tar -tzf "$src" | grep -m1 '^[^/]*/COPYING$')" >"$dir/COPYING"
@@ -81,6 +86,7 @@ else
 	required+=(licenses/OpenH264-LICENSE.txt)
 fi
 case $platform in
+linux) required+=(licenses/glibc-copyright.txt licenses/LGPL-2.1.txt licenses/GCC-runtime-copyright.txt licenses/GPL-3.0.txt) ;;
 macos) required+=(licenses/Opus-COPYING.txt) ;;
 windows) required+=(licenses/Opus-COPYING.txt licenses/libyuv-LICENSE.txt licenses/MinGW-w64-copyright.txt
 	licenses/GCC-runtime-copyright.txt licenses/GPL-3.0.txt) ;;

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# x264-source.sh linux <dpkg arch> | macos | windows <vcpkg root>: fails unless the x264 this build
-# links is the one whose source third_party/x264 holds (and the release attaches).
-#   linux:   the installed libx264-dev:<arch> was built from the source package version in the .dsc.
-#   macos:   Homebrew's x264 formula builds upstream commit b35605ac (the attached tarball's) with no
-#            patches.
+# x264-source.sh linux <dpkg arch> | macos <libx264.a> | windows <vcpkg root>: fails unless the
+# x264 this build links is the one whose source third_party/x264 holds (and the release attaches).
+#   linux:   the installed libx264-dev:<arch> was built from the source package and version the
+#            attached .dsc names.
+#   macos:   <libx264.a>, the archive the build links (by its explicit path), belongs to Homebrew's
+#            installed x264 keg, and that keg's formula is the one reviewed: its source is upstream
+#            commit b35605ac and it has no patches (the formula file's checksum is pinned below, and
+#            absent patch metadata fails rather than counting as none).
 #   windows: vcpkg's x264 port is byte-identical to vcpkg-2026.10.16-ports-x264, the patch set
 #            attached, and builds the same upstream commit.
+#   macos and windows: the attached upstream tarball's SHA-512 is the one vcpkg's portfile pins
+#   for commit b35605ac.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 x264=$root/third_party/x264
@@ -14,28 +19,46 @@ fail() {
 	exit 1
 }
 commit=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
-case ${1:?usage: x264-source.sh linux <arch> | macos | windows <vcpkg root>} in
+# Homebrew's Formula/x/x264.rb that builds $commit from upstream's git with no patches.
+formula_sha256=4422aa0dc15b342f13ff629d935f377e0e36d84acbe3e2474270899753fd2fb5
+tarball_sha512() {
+	local want got
+	want=$(sed -n 's/^ *SHA512 \([0-9a-f]\{128\}\)$/\1/p' "$x264/vcpkg-2026.10.16-ports-x264/portfile.cmake")
+	if command -v sha512sum >/dev/null; then
+		got=$(sha512sum "$x264/x264-$commit.tar.gz" | cut -d' ' -f1)
+	else
+		got=$(shasum -a 512 "$x264/x264-$commit.tar.gz" | cut -d' ' -f1)
+	fi
+	echo "x264-$commit.tar.gz sha512 $got; vcpkg's portfile pins $want"
+	[ -n "$want" ] && [ "$got" = "$want" ] || fail "the attached x264-$commit.tar.gz isn't the archive vcpkg's portfile pins"
+}
+case ${1:?usage: x264-source.sh linux <arch> | macos <libx264.a> | windows <vcpkg root>} in
 linux)
 	arch=${2:?linux needs the dpkg architecture}
-	want=$(sed -n 's/^Version: //p' "$x264"/x264_*.dsc)
-	src=$(sed -n 's/^Source: //p' "$x264"/x264_*.dsc)
+	dsc=$(echo "$x264"/x264_*.dsc)
+	want=$(python3 -I "$root/.github/release/versions.py" dsc "$dsc")
+	src=$(awk '/^Source: / { print $2; exit }' "$dsc")
 	got=$(dpkg-query -W -f '${source:Package} ${source:Version}' "libx264-dev:$arch")
 	echo "libx264-dev:$arch from source $got; attached: $src $want"
 	[ "$got" = "$src $want" ] || fail "libx264-dev:$arch is built from $got, the release attaches $src $want"
 	;;
 macos)
-	json=$(brew info --json=v2 x264)
-	read -r url revision patches local_patches < <(python3 -I -c '
+	lib=${2:?macos needs the libx264.a the build links}
+	keg=$(cd "$(brew --prefix x264)" && pwd -P)
+	[ "$(cd "$(dirname "$lib")" && pwd -P)/$(basename "$lib")" = "$keg/lib/libx264.a" ] ||
+		fail "the build links $lib, not Homebrew's $keg/lib/libx264.a"
+	read -r url revision patches local_patches checksum < <(brew info --json=v2 x264 | python3 -I -c '
 import json, sys
 f = json.load(sys.stdin)["formulae"][0]
 s = f["urls"]["stable"]
-print(s["url"], s["revision"], len(f.get("patches") or []), len(f.get("local_patch_checksums") or {}))
-' <<<"$json")
-	echo "Homebrew x264: $url at $revision, $patches patches, $local_patches local patches"
+print(s["url"], s["revision"], len(f["patches"]), len(f["local_patch_checksums"]), f["ruby_source_checksum"]["sha256"])
+') || fail "Homebrew's x264 metadata lacks the source, patch or formula checksum fields"
+	echo "Homebrew x264: $url at $revision, $patches patches, $local_patches local patches, formula sha256 $checksum; links $lib"
 	[ "$url" = https://code.videolan.org/videolan/x264.git ] || fail "Homebrew builds x264 from $url"
 	[ "$revision" = "$commit" ] || fail "Homebrew builds x264 commit $revision, the release attaches $commit"
 	[ "$patches" = 0 ] && [ "$local_patches" = 0 ] || fail "Homebrew patches x264 ($patches + $local_patches patches)"
-	grep -q "  x264-$commit.tar.gz\$" "$x264/SHA256SUMS" || fail "x264-$commit.tar.gz isn't in third_party/x264"
+	[ "$checksum" = "$formula_sha256" ] || fail "Homebrew's x264 formula is $checksum, not the reviewed $formula_sha256"
+	tarball_sha512
 	;;
 windows)
 	vcpkg=${2:?windows needs the vcpkg root}
@@ -43,6 +66,7 @@ windows)
 	diff -r "$vcpkg/ports/x264" "$x264/vcpkg-2026.10.16-ports-x264" ||
 		fail "vcpkg's x264 port differs from third_party/x264/vcpkg-2026.10.16-ports-x264"
 	grep -q -x "set(ref $commit)" "$vcpkg/ports/x264/portfile.cmake" || fail "vcpkg's x264 port doesn't build $commit"
+	tarball_sha512
 	;;
 *) fail "unknown platform $1" ;;
 esac
