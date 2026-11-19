@@ -773,3 +773,303 @@ fn the_shutdown_signals_come_out_as_they_were_given() {
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
+
+/// `starfold attach dir` with its stdin, stdout and stderr piped to this test.
+fn attach(dir: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_starfold"))
+        .arg("attach")
+        .arg(dir)
+        .env("RUST_LOG", "trace")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// An attach's stdin and stdout as one stream, either end of which can be let go.
+struct Piped {
+    out: Option<std::process::ChildStdout>,
+    into: Option<std::process::ChildStdin>,
+}
+
+impl Piped {
+    fn of(child: &mut Child) -> Piped {
+        Piped {
+            out: child.stdout.take(),
+            into: child.stdin.take(),
+        }
+    }
+}
+
+impl Read for Piped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.out.as_mut().unwrap().read(buf)
+    }
+}
+
+impl Write for Piped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.into.as_mut().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.into.as_mut().unwrap().flush()
+    }
+}
+
+fn stderr_of(child: &mut Child) -> String {
+    let mut said = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut said)
+        .unwrap();
+    said
+}
+
+type Relayed = tokio_tungstenite::tungstenite::WebSocket<Piped>;
+
+/// The next message on a WebSocket through attach, and whether it was one of the server's
+/// pings.
+fn next_through(ws: &mut Relayed) -> (tokio_tungstenite::tungstenite::Message, bool) {
+    let m = ws.read().expect("the WebSocket through attach");
+    let ping = matches!(&m, tokio_tungstenite::tungstenite::Message::Text(t) if t.starts_with(r#"{"t":"ping""#));
+    (m, ping)
+}
+
+/// A WebSocket on `/ws` through a new attach to `dir`, past the server's hello.
+fn ws_through(dir: &Path) -> (Child, Relayed) {
+    let mut child = attach(dir);
+    let (mut ws, reply) =
+        tokio_tungstenite::tungstenite::client("ws://localhost/ws", Piped::of(&mut child))
+            .expect("the upgrade through attach");
+    assert_eq!(reply.status(), 101);
+    loop {
+        if let (tokio_tungstenite::tungstenite::Message::Text(t), _) = next_through(&mut ws) {
+            let j: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if j["t"] == "hello" {
+                break;
+            }
+        }
+    }
+    (child, ws)
+}
+
+/// Through `starfold attach` over a pipe pair: an HTTP GET gets the server's reply, and
+/// nothing else, on stdout, with stdin held open until the server closes, after which
+/// attach exits 0 with nothing on stderr; a WebSocket upgrade then carries the hello, the
+/// server's pings, a ping of ours answered and a key. The end of stdin (no close frame)
+/// ends the server's session, its cleanup runs (the client is logged as disconnected
+/// after the keys are released), and attach exits 0.
+#[test]
+fn attach_relays_http_and_a_websocket() {
+    use tokio_tungstenite::tungstenite::Message;
+    let x = Display::start();
+    let d = scratch("attach", 0o700);
+    let server = Server::start(&x, &d, &["--listen-tcp=false"]);
+    let dir = d.join("sf");
+
+    let mut child = attach(&dir);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(HEALTHZ).unwrap();
+    let mut reply = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut reply)
+        .unwrap();
+    let status = exited(&mut child, Duration::from_secs(10)).expect("attach still running");
+    drop(stdin);
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    let reply = String::from_utf8(reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.ends_with("\r\n\r\nok"), "{reply}");
+
+    let (mut child, mut ws) = ws_through(&dir);
+    let mut pings = 0;
+    while pings < 2 {
+        pings += usize::from(next_through(&mut ws).1);
+    }
+    ws.send(Message::Ping(bytes::Bytes::from_static(b"through attach")))
+        .unwrap();
+    loop {
+        if let (Message::Pong(p), _) = next_through(&mut ws) {
+            assert_eq!(&p[..], b"through attach");
+            break;
+        }
+    }
+    ws.send(Message::Text("k,65,1".into())).unwrap();
+    ws.flush().unwrap();
+    let before = read_log(&server.log).matches(" disconnected").count();
+    let pipes = ws.get_mut();
+    drop(pipes.into.take());
+    let mut out = pipes.out.take().unwrap();
+    let drained = std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        out.read_to_end(&mut rest).map(|_| ())
+    });
+    let status = exited(&mut child, Duration::from_secs(10)).expect("attach outlived stdin");
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    drained.join().unwrap().unwrap();
+    wait_for("the session's cleanup", Duration::from_secs(10), || {
+        (read_log(&server.log).matches(" disconnected").count() > before).then_some(())
+    });
+    drop(server);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Attach to a directory with nothing listening in it, or with a bad command line: exit 1
+/// (2 for the command line), the error on stderr and not a byte on stdout.
+#[test]
+fn attach_errors_go_to_stderr_alone() {
+    let d = scratch("attach-nothing", 0o700);
+    std::fs::create_dir(d.join("sf")).unwrap();
+    std::fs::set_permissions(d.join("sf"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (args, code, want) in [
+        (
+            vec![d.join("sf").into_os_string()],
+            1,
+            format!("starfold attach {0}: {0}/s: ", d.join("sf").display()),
+        ),
+        (vec![], 2, "usage: starfold attach DIR".to_string()),
+        (
+            vec!["a".into(), "b".into()],
+            2,
+            "usage: starfold attach DIR".to_string(),
+        ),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_starfold"))
+            .arg("attach")
+            .args(&args)
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{args:?}: {said}");
+        assert!(said.starts_with(&want), "{args:?}: {said}");
+        assert!(out.stdout.is_empty(), "{args:?}: stdout {:?}", out.stdout);
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Another user puts a listening socket at `DIR/s` (here `DIR` is ours and sticky, so
+/// the walk passes and anyone may add an entry): attach connects, reads the listener's
+/// uid, refuses with exit 1 naming that uid, and sends nothing; the impostor reads 0
+/// bytes.
+#[test]
+fn attach_refuses_a_listener_of_another_uid() {
+    sudo_works();
+    let user = Throwaway::create();
+    assert_ne!(user.uid, own_uid());
+    let d = scratch("attach-impostor", 0o711);
+    let dir = d.join("sf");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let socket = dir.join("s");
+    let impostor = "import os, socket, sys\n\
+        s = socket.socket(socket.AF_UNIX)\n\
+        s.bind(sys.argv[1])\n\
+        os.chmod(sys.argv[1], 0o666)\n\
+        s.listen(1)\n\
+        s.settimeout(30)\n\
+        c, _ = s.accept()\n\
+        c.settimeout(10)\n\
+        data = b''\n\
+        try:\n    \
+        while True:\n        b = c.recv(100)\n        if not b:\n            break\n        \
+        data += b\n\
+        except (ConnectionResetError, TimeoutError):\n    pass\n\
+        print(len(data))\n";
+    let them = Command::new("sudo")
+        .args(["-n", "-u", &user.name, "--", "python3", "-c", impostor])
+        .arg(&socket)
+        .current_dir("/")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("the impostor's socket", Duration::from_secs(10), || {
+        std::fs::metadata(&socket)
+            .is_ok_and(|m| m.permissions().mode() & 0o777 == 0o666)
+            .then_some(())
+    });
+    let mut child = attach(&dir);
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(HEALTHZ);
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    let status = exited(&mut child, Duration::from_secs(10)).expect("attach still running");
+    drop(stdin);
+    let said = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(
+        said.contains(&format!(
+            "refusing: the listener is uid {}, not this process's uid {}",
+            user.uid,
+            own_uid()
+        )),
+        "{said}"
+    );
+    assert!(out.is_empty(), "stdout {out:?}");
+    let them = them.wait_with_output().unwrap();
+    assert!(
+        them.status.success(),
+        "{}",
+        String::from_utf8_lossy(&them.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&them.stdout).trim(), "0");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A WebSocket through attach left idle by its client for ten minutes stays up: the
+/// server's pings keep arriving through it, and a ping of ours is still answered at the
+/// end. Ignored by default for its length: `cargo test --test unix_socket -- --ignored
+/// attach_keeps_an_idle_websocket_up --nocapture`.
+#[test]
+#[ignore = "takes ten minutes"]
+fn attach_keeps_an_idle_websocket_up() {
+    use tokio_tungstenite::tungstenite::Message;
+    let x = Display::start();
+    let d = scratch("attach-idle", 0o700);
+    let server = Server::start(&x, &d, &["--listen-tcp=false"]);
+    let (mut child, mut ws) = ws_through(&d.join("sf"));
+    let start = Instant::now();
+    let (mut pings, mut last) = (0u64, Instant::now());
+    let mut longest = Duration::ZERO;
+    while start.elapsed() < Duration::from_secs(600) {
+        if next_through(&mut ws).1 {
+            pings += 1;
+            longest = longest.max(last.elapsed());
+            last = Instant::now();
+        }
+    }
+    println!(
+        "idle {:?} through attach: {pings} server pings, longest gap {longest:?}",
+        start.elapsed()
+    );
+    assert!(pings >= 600, "{pings} pings");
+    assert!(longest < Duration::from_secs(5), "a gap of {longest:?}");
+    ws.send(Message::Ping(bytes::Bytes::from_static(b"still here")))
+        .unwrap();
+    loop {
+        if let (Message::Pong(p), _) = next_through(&mut ws) {
+            assert_eq!(&p[..], b"still here");
+            break;
+        }
+    }
+    assert!(child.try_wait().unwrap().is_none(), "attach ended");
+    drop(ws);
+    let _ = exited(&mut child, Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(server);
+    std::fs::remove_dir_all(&d).unwrap();
+}

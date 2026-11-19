@@ -180,7 +180,12 @@ fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
 /// passes, nobody else can move the new directory, or any directory above it, aside or put
 /// something in its place.
 #[cfg(target_os = "linux")]
-fn check_dir(dir: &std::os::fd::OwnedFd, shown: &Path, path: &Path) -> std::io::Result<()> {
+fn check_dir(
+    dir: &std::os::fd::OwnedFd,
+    shown: &Path,
+    path: &Path,
+    who: &str,
+) -> std::io::Result<()> {
     let st = fstat(dir)?;
     let me = unsafe { libc::geteuid() };
     let mode = st.st_mode & 0o7777;
@@ -201,15 +206,15 @@ fn check_dir(dir: &std::os::fd::OwnedFd, shown: &Path, path: &Path) -> std::io::
     } else {
         return Ok(());
     };
-    Err(untrusted(path, shown, &why))
+    Err(untrusted(path, shown, &why, who))
 }
 
 #[cfg(target_os = "linux")]
-fn untrusted(path: &Path, shown: &Path, why: &str) -> std::io::Error {
+fn untrusted(path: &Path, shown: &Path, why: &str, who: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         format!(
-            "{}: {} {why}; --listen-unix needs every directory on the way to belong to you \
+            "{}: {} {why}; {who} needs every directory on the way to belong to you \
              or root and to let no other user rename entries in it (writable by no one else \
              unless sticky, as /tmp is)",
             path.display(),
@@ -263,13 +268,17 @@ fn probe(path: &Path) -> std::io::Result<()> {
 const MAX_SYMLINKS: usize = 40;
 
 /// Opens the directory `dir` (relative to the working directory if it isn't absolute) for
-/// --listen-unix `path`, walking from / one component at a time with `O_NOFOLLOW`, so
+/// `path`, given to `who` (named in a refusal), walking from / one component at a time with `O_NOFOLLOW`, so
 /// nothing redirects the walk between the checks and the open: every directory on the way,
 /// / and `dir` included, must pass [`check_dir`]. A symlink on the way is followed only if
 /// it belongs to this user or root (it sits in a directory that passed, so no one else can
 /// replace it), and its target is walked by the same rules.
 #[cfg(target_os = "linux")]
-fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+pub fn open_trusted_dir(
+    dir: &Path,
+    path: &Path,
+    who: &str,
+) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::ffi::OsString;
     use std::path::{Component, PathBuf};
     let flags = libc::O_PATH | libc::O_DIRECTORY;
@@ -293,7 +302,7 @@ fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::Own
     }
     let root = || -> std::io::Result<std::os::fd::OwnedFd> {
         let fd = open_at(None, c"/", flags)?;
-        check_dir(&fd, Path::new("/"), path)?;
+        check_dir(&fd, Path::new("/"), path, who)?;
         Ok(fd)
     };
     let mut fd = root()?;
@@ -309,7 +318,7 @@ fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::Own
         let here = shown.join(&c);
         match open_at(Some(&fd), &name, flags) {
             Ok(next) => {
-                check_dir(&next, &here, path)?;
+                check_dir(&next, &here, path, who)?;
                 fd = next;
                 shown = here;
             }
@@ -326,11 +335,12 @@ fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::Own
                         path,
                         &here,
                         &format!("is a symlink that belongs to user {}", st.st_uid),
+                        who,
                     ));
                 }
                 links += 1;
                 if links > MAX_SYMLINKS {
-                    return Err(untrusted(path, &here, "is one symlink too many"));
+                    return Err(untrusted(path, &here, "is one symlink too many", who));
                 }
                 let target =
                     nix::fcntl::readlinkat(&fd, name.as_c_str()).map_err(std::io::Error::from)?;
@@ -440,7 +450,7 @@ pub fn bind_unix_std(
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let name = cname(name)?;
-    let parent = open_trusted_dir(parent_path, path)?;
+    let parent = open_trusted_dir(parent_path, path, "--listen-unix")?;
     let me = unsafe { libc::geteuid() };
     let fresh = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
     if !fresh {
@@ -842,18 +852,27 @@ fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
 /// so the answer can't change later.
 #[cfg(target_os = "linux")]
 pub fn uid_map_is_identity(proc: &Path) -> Result<(), String> {
-    let why = "the unix listener runs only in a user namespace whose uid map is the \
-         identity (\"0 0 4294967295\"), where every peer's uid is exact";
+    identity_uid_map(proc).map_err(|e| {
+        format!(
+            "--listen-unix: refusing: {e}; the unix listener runs only in a user namespace \
+             whose uid map is the identity (\"0 0 4294967295\"), where every peer's uid is \
+             exact"
+        )
+    })
+}
+
+/// Why the procfs at `proc` doesn't show the full identity uid map, if it doesn't: what
+/// uid_map held, quoted, or why it couldn't be read.
+#[cfg(target_os = "linux")]
+pub fn identity_uid_map(proc: &Path) -> Result<(), String> {
     match read_uid_map(proc) {
         Ok(map) if is_identity_uid_map(&map) => Ok(()),
         Ok(map) => Err(format!(
-            "--listen-unix: refusing: {}/self/uid_map holds {}; {why}",
+            "{}/self/uid_map holds {}",
             proc.display(),
             quote_uid_map(&map)
         )),
-        Err(e) => Err(format!(
-            "--listen-unix: refusing: cannot read this process's uid_map ({e}); {why}"
-        )),
+        Err(e) => Err(format!("cannot read this process's uid_map ({e})")),
     }
 }
 
@@ -2085,6 +2104,58 @@ mod tests {
                     .await
                     .unwrap();
             assert!(matches!(released, Ok(InputEvent::ReleaseAll)));
+            server.abort();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// `attach`'s relay between two pipes and the socket: a WebSocket spoken over the
+        /// pipes reaches the server, and the end of the input pipe alone (no close frame)
+        /// ends the server's session with its cleanup, releasing every key, and then the
+        /// relay, cleanly.
+        #[tokio::test]
+        async fn a_session_relayed_by_attach_ends_with_its_input() {
+            let (hub, input) = wired();
+            let s = app(&hub, false, None);
+            let d = dir("attach-relay");
+            let path = d.join("sf");
+            let (l, _) = bind_unix(&path, 0o600).unwrap();
+            let server = tokio::spawn(axum::serve(l, router(s)).into_future());
+            let sock = tokio::net::UnixStream::connect(unix_socket_path(&path))
+                .await
+                .unwrap();
+            let (stdin, ours_in) = tokio::io::duplex(4096);
+            let (stdout, ours_out) = tokio::io::duplex(4096);
+            let relay = tokio::spawn(crate::attach::relay(stdin, stdout, sock));
+            let pipes = tokio::io::join(ours_out, ours_in);
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/ws", pipes)
+                .await
+                .unwrap();
+            let Payload::Text(hello) = next(&mut ws, false).await else {
+                panic!("the hello is text");
+            };
+            assert_eq!(hello, hub.hello());
+            ws.send(Ws::Text("k,65,1".into())).await.unwrap();
+            let (typed, input) = key(input).await;
+            assert!(typed, "the key never reached the desktop");
+
+            let (mut from_relay, to_relay) = ws.into_inner().into_inner();
+            drop(to_relay);
+            let drained = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut rest = Vec::new();
+                from_relay.read_to_end(&mut rest).await.map(|_| ())
+            });
+            gone(&hub).await;
+            let released =
+                tokio::task::spawn_blocking(move || input.recv_timeout(Duration::from_secs(5)))
+                    .await
+                    .unwrap();
+            assert!(matches!(released, Ok(InputEvent::ReleaseAll)));
+            let ended = tokio::time::timeout(Duration::from_secs(5), relay)
+                .await
+                .expect("the relay outlived the server's end of the socket");
+            assert_eq!(ended.unwrap(), Ok(()));
+            drained.await.unwrap().unwrap();
             server.abort();
             std::fs::remove_dir_all(&d).unwrap();
         }

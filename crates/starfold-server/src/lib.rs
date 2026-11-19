@@ -6,6 +6,7 @@
 
 mod access;
 mod actions;
+mod attach;
 #[cfg(target_os = "linux")]
 mod audio;
 mod build_facts;
@@ -122,10 +123,14 @@ fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
 }
 
 /// The `starfold` binary's `main`: [`run`] with the process's arguments, probing the
-/// hardware encoders in child processes that run this executable again. A program that
-/// embeds the server can call it from its own `main` to get the same isolation.
+/// hardware encoders in child processes that run this executable again, or `starfold
+/// attach DIR` (see attach.rs). A program that embeds the server can call it from its own
+/// `main` to get the same isolation.
 pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("attach") {
+        std::process::exit(attach::main(&args[1..]));
+    }
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
