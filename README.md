@@ -108,7 +108,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
-| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 recordings at once, each written to `--recording-dir` as it runs; with no H.264 viewer a recording runs an H.264 encode of its own, up to `--framerate` (see below)            |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 45 % of a core on a 6-vCPU VM (see below)                |
 | `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                 | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
@@ -201,10 +201,11 @@ encoded frame beside the viewers, never as one of them, so it has no part in the
 control, their frame rate or their bitrate. With viewers taking H.264 it shares their encode
 and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer would get
 running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
-own: that encode's CPU is the cost of recording an unwatched screen. It needs `--stripes=1`
-(otherwise 409), and a frame of another size (a resize) ends it. It doesn't include the
-cursor, which viewers draw, except on macOS when the cursor is in the video: with
-`--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
+own: that encode's CPU is the cost of recording an unwatched screen. With x264 at 1920x1080
+and full-screen motion at 60 Hz it was about 45 % of one core on a 6-vCPU VM, against under
+1 % with nothing recording. It needs `--stripes=1` (otherwise 409), and a frame of another
+size (a resize) ends it. It doesn't include the cursor, which viewers draw, except on macOS
+when the cursor is in the video: with `--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
 
 While it runs, a recording's video goes to a file with no name in `--recording-dir`, and the
 answer is read back from that file:
