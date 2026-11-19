@@ -107,6 +107,7 @@ export function setupKeyboard(
 		code: string;
 		ks: number;
 		timer: ReturnType<typeof setTimeout>;
+		dropped?: boolean;
 	} | null = null;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
@@ -189,16 +190,21 @@ export function setupKeyboard(
 			return;
 		}
 		// Hold the paste shortcut until the image is on the remote clipboard.
-		if (pendingPaste) {
-			clearTimeout(pendingPaste.timer);
-			pendingPaste.timer = setTimeout(flushPaste, 3000);
+		const own = pendingPaste;
+		if (own) {
+			clearTimeout(own.timer);
+			own.timer = setTimeout(flushPaste, 3000);
 		}
 		toPng(file)
 			.then((png) =>
-				disposed ? undefined : app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
+				disposed || own?.dropped
+					? undefined
+					: app.sendBin(Bin.ClipImageUp, new Uint8Array(png))
 			)
 			.catch((err) => console.warn('[starfold] image paste failed', err))
-			.finally(flushPaste);
+			.finally(() => {
+				if (own && pendingPaste === own) flushPaste();
+			});
 	});
 
 	// Text that arrives without usable keydowns (IME, dead-key composition, mobile
@@ -228,7 +234,10 @@ export function setupKeyboard(
 	ls.on(window, 'blur', releaseAll);
 	if (embedded)
 		ls.on(kbd, 'blur', () => {
-			if (pendingPaste) clearTimeout(pendingPaste.timer);
+			if (pendingPaste) {
+				clearTimeout(pendingPaste.timer);
+				pendingPaste.dropped = true;
+			}
 			pendingPaste = null;
 			for (const code of down.keys()) release(code);
 		});

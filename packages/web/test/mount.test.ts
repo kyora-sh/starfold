@@ -381,6 +381,81 @@ describe('mount', () => {
 		await tick();
 	});
 
+	test('an image paste dropped by a blur sends nothing, and the next paste sends only its own image first', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const kbd = box.children[1];
+		const ctrlV = () =>
+			kbd.dispatchEvent(
+				Object.assign(new Event('keydown', { cancelable: true }), {
+					code: 'KeyV',
+					key: 'v',
+					ctrlKey: true,
+					metaKey: true,
+				})
+			);
+		const pasteImage = () => {
+			let bytes!: (b: ArrayBuffer) => void;
+			const file = {
+				type: 'image/png',
+				arrayBuffer: () => new Promise<ArrayBuffer>((r) => (bytes = r)),
+			};
+			kbd.dispatchEvent(
+				Object.assign(new Event('paste', { cancelable: true }), {
+					clipboardData: {
+						getData: () => '',
+						items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }],
+					},
+				})
+			);
+			return (b: number) => bytes(new Uint8Array([b]).buffer);
+		};
+		const sent = () =>
+			(w.posted as unknown as { t: string; d: string | ArrayBuffer }[]).flatMap(
+				({ t, d }) => {
+					if (t === 'sendBin')
+						return [`img:${new Uint8Array(d as ArrayBuffer).slice(1).join()}`];
+					if (t === 'send' && (d as string).startsWith('k,118,'))
+						return [d as string];
+					return [];
+				}
+			);
+
+		ctrlV();
+		const first = pasteImage();
+		kbd.dispatchEvent(new Event('blur'));
+		ctrlV();
+		const second = pasteImage();
+		first(1);
+		await sleep(20);
+		expect(sent()).toEqual([]);
+		second(2);
+		await sleep(20);
+		expect(sent()).toEqual(['img:2', 'k,118,1']);
+		await sleep(3100);
+		expect(sent()).toEqual(['img:2', 'k,118,1']);
+		h.unmount();
+		await tick();
+	}, 10000);
+
+	test('an unmount in the same task as a worker error still reports one close', async () => {
+		const { o, calls } = recording();
+		const h = mount(container() as never, o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		await until(() => calls.some((c) => c.what === 'status:open'));
+		w.dispatchEvent(new Event('error', { cancelable: true }));
+		h.unmount();
+		await tick();
+		expect(calls.map((c) => c.what)).toEqual([
+			'status:connecting',
+			'status:open',
+			`close:${UNMOUNTED.code}:${UNMOUNTED.reason}`,
+		]);
+	});
+
 	test('a touch tap on the surface focuses the keyboard field', async () => {
 		const box = container();
 		const h = mount(box as never, recording().o);
