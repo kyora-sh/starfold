@@ -105,6 +105,10 @@ Desktop (the X11 display in $DISPLAY):
   --scroll-px-per-notch         desktop pixels one wheel notch scrolls (default 180)
   --round-corners               corner radius for top-level windows (default 0)
   --round-windows               title:radius,... rounds windows with that title
+  STARFOLD_DIRECT_FB=1          (environment) read Xvfb's -shmem framebuffer in
+                                place instead of GetImage; see the README for
+                                what it checks and its known limits
+  STARFOLD_NO_DIRECT_FB         (environment) never read it in place; wins
 ";
 
 #[cfg(target_os = "macos")]
