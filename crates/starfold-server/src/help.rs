@@ -18,9 +18,9 @@ Server:
                                 it; removes both on exit; the host and origin
                                 checks still apply. Only a peer with this
                                 process's uid is let in (SO_PEERCRED); the same
-                                uid is not separated. Refused unless this uid is
-                                shown to differ from the kernel's overflow uid
-                                (/proc/sys/kernel/overflowuid). Its parent must
+                                uid is not separated. Refused outside the
+                                initial user namespace (/proc/self/uid_map must
+                                be 0 0 4294967295). Its parent must
                                 not let other users rename entries: e.g. /tmp
                                 (sticky) or a directory only you can write
   --listen-unix-mode            the socket's permissions (default 0600); group

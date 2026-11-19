@@ -233,12 +233,13 @@ error for it.
 
 What keeps other users out: the server lets in only a peer with its own uid. The kernel
 records each connecting process's credentials at `connect`, and starfold reads them
-(`SO_PEERCRED`) before it reads or writes a byte, closing any other connection; the uid
-an unmapped user reads as (65534) is never let in. That uid is the kernel's overflow uid,
-which can be set to another value, so starfold reads `/proc/sys/kernel/overflowuid` once
-at start and refuses `--listen-unix` unless the file holds a uid other than its own (an
-unreadable or unparsable file is a refusal too): a peer the kernel can't map into
-starfold's user namespace never reads as starfold's uid. What isn't claimed:
+(`SO_PEERCRED`) before it reads or writes a byte, closing any other connection. The unix
+listener runs only in the initial user namespace, where every uid is mapped and the uid
+the kernel reports is exact; in another namespace an unmapped peer reads as the overflow
+uid, which could be starfold's own. So at start starfold reads `/proc/self/uid_map`
+(from procfs, checked with `fstatfs`, through no mount point) and refuses `--listen-unix`
+unless it is the full identity map, `0 0 4294967295`, before anything is made; the
+refusal quotes what it read. This needs Linux 5.6 or later (`openat2`). What isn't claimed:
 
 - **The same uid is not separated.** In a sandbox where other code runs as starfold's
   uid, that code can reach starfold.

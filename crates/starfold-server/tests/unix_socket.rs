@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 /// [`a_second_process_of_the_same_user_gets_ws_and_a_screenshot`]: the socket to use.
 const SAME_UID_CLIENT: &str = "STARFOLD_TEST_SAME_UID_CLIENT";
 
-const REFUSAL: &str = "--listen-unix: cannot prove this process's uid differs from the \
-     kernel's overflow uid; refusing";
+const REFUSAL: &str = "--listen-unix: refusing: /proc/self/uid_map holds ";
 
 fn scratch(name: &str, mode: u32) -> PathBuf {
     let d = std::env::temp_dir().join(format!("sf-it-{name}-{}", std::process::id()));
@@ -60,14 +59,6 @@ fn sudo_works() {
         ok,
         "this test needs passwordless `sudo -n`: it runs a process as another uid"
     );
-}
-
-fn overflow_uid() -> u32 {
-    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
 }
 
 fn own_uid() -> u32 {
@@ -284,44 +275,49 @@ impl Drop for Throwaway {
     }
 }
 
-/// In a user namespace of its own with no uid mapped (`unshare --user`), the binary's own
-/// uid reads as the kernel's overflow uid, as an unmapped peer's does: the case where
-/// "unmapped" would alias "us". It reads the real /proc/sys/kernel/overflowuid at start
-/// and refuses --listen-unix before it binds; the directory is never made.
+/// In a user namespace of its own (`unshare --user`), with no uid mapped and with only
+/// root mapped to this uid, the binary refuses --listen-unix before it binds, quoting the
+/// uid_map it read; the directory is never made.
 #[test]
-fn as_the_overflow_uid_the_unix_listener_is_refused() {
-    let overflow = overflow_uid();
-    assert_ne!(own_uid(), overflow, "this test runs as the overflow uid");
-    let id = Command::new("unshare")
-        .args(["--user", "--", "id", "-u"])
-        .output()
-        .unwrap_or_else(|e| panic!("this test needs unshare (util-linux): {e}"));
-    assert!(
-        id.status.success(),
-        "this test needs unprivileged user namespaces: {}",
-        String::from_utf8_lossy(&id.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&id.stdout).trim(),
-        overflow.to_string(),
-        "an unmapped uid reads as the overflow uid"
-    );
-    let at = Path::new("/tmp").join(format!("sf-it-overflow-{}-sf", std::process::id()));
-    let out = Command::new("unshare")
-        .args(["--user", "--"])
-        .arg(env!("CARGO_BIN_EXE_starfold"))
-        .arg(format!("--listen-unix={}", at.display()))
-        .args(["--listen-tcp=false", "--enable-basic-auth=false"])
-        .env_remove("DISPLAY")
-        .output()
-        .unwrap();
-    let said = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{said}");
-    assert!(said.contains(REFUSAL), "{said}");
-    assert!(!at.exists(), "{} was made", at.display());
+fn outside_the_initial_user_namespace_the_unix_listener_is_refused() {
+    let at = Path::new("/tmp").join(format!("sf-it-userns-{}-sf", std::process::id()));
+    for (flags, map) in [
+        (&["--user"][..], String::new()),
+        (
+            &["--user", "--map-root-user"][..],
+            format!("{:>10} {:>10} {:>10}\\n", 0, own_uid(), 1),
+        ),
+    ] {
+        let probe = Command::new("unshare")
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .unwrap_or_else(|e| panic!("this test needs unshare (util-linux): {e}"));
+        assert!(
+            probe.status.success(),
+            "this test needs unprivileged user namespaces: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let out = Command::new("unshare")
+            .args(flags)
+            .arg("--")
+            .arg(env!("CARGO_BIN_EXE_starfold"))
+            .arg(format!("--listen-unix={}", at.display()))
+            .args(["--listen-tcp=false", "--enable-basic-auth=false"])
+            .env_remove("DISPLAY")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{flags:?}: {said}");
+        assert!(
+            said.contains(&format!("{REFUSAL}\"{map}\";")),
+            "{flags:?}: {said}"
+        );
+        assert!(!at.exists(), "{flags:?}: {} was made", at.display());
+    }
 }
 
-/// A client running as a throwaway user (neither the server's uid nor the overflow uid)
+/// A client running as a throwaway user
 /// reaches the socket (mode 0666, directory 0711) of the real server and gets nothing: the
 /// connection closes before a byte either way, and the server logs the refusal. The
 /// server's own uid still gets in.
@@ -330,7 +326,6 @@ fn another_user_gets_nothing_through_the_socket() {
     sudo_works();
     let user = Throwaway::create();
     assert_ne!(user.uid, own_uid());
-    assert_ne!(user.uid, overflow_uid());
     let x = Display::start();
     let d = scratch("other-user", 0o711);
     let server = Server::start(&x, &d, &["--listen-unix-mode=0666", "--listen-tcp=false"]);

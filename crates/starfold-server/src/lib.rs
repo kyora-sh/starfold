@@ -150,8 +150,8 @@ type Prebound = std::convert::Infallible;
 
 /// --listen-unix's socket, bound first thing, while this is the process's only thread:
 /// the bind changes the process's working directory and umask for a moment (see
-/// [`server::bind_in`]). It is bound only if this process's uid is provably not the
-/// kernel's overflow uid ([`server::provably_not_the_overflow_uid`]). SIGTERM and SIGINT
+/// [`server::bind_in`]). It is bound only in the initial user namespace
+/// ([`server::initial_user_namespace`]), checked before anything is made. SIGTERM and SIGINT
 /// wait (blocked) from just before the bind until the server's handlers take them, first
 /// thing in [`serve`], so one that comes meanwhile still removes the socket. A bad flag,
 /// a refusal or a bind that fails ends the process here, before any desktop is touched.
@@ -178,10 +178,8 @@ fn prebind(args: &[String]) -> Option<Prebound> {
             );
             std::process::exit(1);
         }
-        let own = unsafe { libc::geteuid() };
-        let overflow = std::fs::read_to_string(server::OVERFLOW_UID_FILE);
-        if !server::provably_not_the_overflow_uid(overflow, own) {
-            eprintln!("{}", server::OVERFLOW_UID_REFUSAL);
+        if let Err(e) = server::initial_user_namespace(std::path::Path::new("/proc")) {
+            eprintln!("{e}");
             std::process::exit(1);
         }
         let blocked = block_shutdown_signals();

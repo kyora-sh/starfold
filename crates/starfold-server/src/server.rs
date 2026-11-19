@@ -521,43 +521,117 @@ pub fn remove_at_exit(file: SocketFile) -> &'static SocketFile {
     file
 }
 
-/// The uid an unmapped user reads as (the default overflow uid): never let in.
+/// The full identity map, which only the initial user namespace has by default: every
+/// uid is mapped, so a peer's SO_PEERCRED uid is exact and never stands for "unmapped".
 #[cfg(target_os = "linux")]
-const OVERFLOW_UID: u32 = 65534;
+const IDENTITY_UID_MAP: [&[u8]; 3] = [b"0", b"0", b"4294967295"];
 
-/// Where the kernel says which uid an unmapped user reads as (the overflow uid, settable).
+/// How much of a uid_map a refusal quotes.
 #[cfg(target_os = "linux")]
-pub const OVERFLOW_UID_FILE: &str = "/proc/sys/kernel/overflowuid";
+const QUOTED_MAP_BYTES: usize = 200;
 
-/// Why --listen-unix is refused when [`provably_not_the_overflow_uid`] can't say yes.
+/// Whether `map`, the contents of a uid_map, is exactly the full identity map: one line
+/// of the three fields `0 0 4294967295`, as the kernel writes them (space padded, no
+/// leading zeros, one newline at the end). Anything else is not: a partial or shifted map,
+/// more lines, an empty map (a namespace with nothing mapped yet).
 #[cfg(target_os = "linux")]
-pub const OVERFLOW_UID_REFUSAL: &str = "--listen-unix: cannot prove this process's uid differs \
-     from the kernel's overflow uid; refusing";
+pub fn is_identity_uid_map(map: &[u8]) -> bool {
+    let Some(line) = map.strip_suffix(b"\n") else {
+        return false;
+    };
+    if line.contains(&b'\n') {
+        return false;
+    }
+    line.split(|b| *b == b' ')
+        .filter(|f| !f.is_empty())
+        .eq(IDENTITY_UID_MAP)
+}
 
-/// Whether `own` is shown not to be the overflow uid by `read`, the contents of
-/// [`OVERFLOW_UID_FILE`] as read once at start: a peer the kernel can't map into this
-/// process's user namespace reads as that uid, so a server running as it would take such a
-/// peer for itself. Only a value that parses (decimal, as the kernel writes it) and differs
-/// from `own` is a yes; a read that failed, anything else in the file, or `own` itself is a
-/// no, and the unix listener is not started.
+/// What a refusal says a uid_map held: the bytes, escaped, cut at [`QUOTED_MAP_BYTES`].
 #[cfg(target_os = "linux")]
-pub fn provably_not_the_overflow_uid(read: std::io::Result<String>, own: u32) -> bool {
-    read.ok()
-        .and_then(|s| {
-            let v = s.strip_suffix('\n').unwrap_or(&s);
-            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| v.parse::<u32>().ok())
-                .flatten()
-        })
-        .is_some_and(|overflow| overflow != own)
+fn quote_uid_map(map: &[u8]) -> String {
+    let shown = &map[..map.len().min(QUOTED_MAP_BYTES)];
+    let quoted: String = shown.escape_ascii().to_string();
+    if shown.len() < map.len() {
+        format!("\"{quoted}\" (the first {} of {} bytes)", shown.len(), map.len())
+    } else {
+        format!("\"{quoted}\"")
+    }
+}
+
+/// Reads this process's uid_map from the procfs mounted at `proc`: the directory is opened
+/// `O_NOFOLLOW` and must be procfs (`fstatfs`, PROC_SUPER_MAGIC); `self/uid_map` is opened
+/// from it with `openat2` crossing no mount (`RESOLVE_NO_XDEV`, so nothing bind-mounted over
+/// the file or a directory on the way is read) and following no magic link; the file opened
+/// must be procfs too. Any failure is an error that says which step failed.
+#[cfg(target_os = "linux")]
+fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::sys::stat::Mode;
+    use nix::sys::statfs::{PROC_SUPER_MAGIC, fstatfs};
+    use std::io::Read;
+    let procfs = |fd: &std::os::fd::OwnedFd, what: &str| -> Result<(), String> {
+        let t = fstatfs(fd)
+            .map_err(|e| format!("{what}: fstatfs: {e}"))?
+            .filesystem_type();
+        if t == PROC_SUPER_MAGIC {
+            Ok(())
+        } else {
+            Err(format!("{what} is not procfs (filesystem type {t:?})"))
+        }
+    };
+    let root = open(
+        proc,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{}: {e}", proc.display()))?;
+    procfs(&root, &proc.display().to_string())?;
+    let at = proc.join("self/uid_map");
+    let map = openat2(
+        &root,
+        "self/uid_map",
+        OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_NO_XDEV | ResolveFlag::RESOLVE_NO_MAGICLINKS),
+    )
+    .map_err(|e| format!("{}: openat2: {e}", at.display()))?;
+    procfs(&map, &at.display().to_string())?;
+    let mut read = Vec::new();
+    std::fs::File::from(map)
+        .take(64 * 1024)
+        .read_to_end(&mut read)
+        .map_err(|e| format!("{}: {e}", at.display()))?;
+    Ok(read)
+}
+
+/// Whether the procfs at `proc` shows this process in a user namespace with the full
+/// identity uid map, which the unix listener needs: there every uid is mapped, so the
+/// kernel never reports a peer as the overflow uid, which could otherwise be this
+/// process's own. `Err` says why not, quoting what uid_map held. A uid_map is written once,
+/// so the answer can't change later.
+#[cfg(target_os = "linux")]
+pub fn initial_user_namespace(proc: &Path) -> Result<(), String> {
+    let why = "the unix listener runs only in the initial user namespace (uid_map \
+         \"0 0 4294967295\"), where every peer's uid is exact";
+    match read_uid_map(proc) {
+        Ok(map) if is_identity_uid_map(&map) => Ok(()),
+        Ok(map) => Err(format!(
+            "--listen-unix: refusing: {}/self/uid_map holds {}; {why}",
+            proc.display(),
+            quote_uid_map(&map)
+        )),
+        Err(e) => Err(format!(
+            "--listen-unix: refusing: cannot read this process's uid_map ({e}); {why}"
+        )),
+    }
 }
 
 /// Whether a peer whose uid is `peer` may talk to a server running as `own`: the same
-/// user only, and never the overflow uid, which stands for anyone the kernel can't name
-/// here.
+/// user only.
 #[cfg(target_os = "linux")]
 pub fn admits(peer: u32, own: u32) -> bool {
-    peer == own && peer != OVERFLOW_UID
+    peer == own
 }
 
 /// The unix listener with the check that keeps other users out: every accepted
@@ -2532,47 +2606,88 @@ mod tests {
             std::fs::remove_dir_all(&d).unwrap();
         }
 
-        /// Only the server's own uid is let in, and never the overflow uid an unmapped user
-        /// reads as, even for a server that runs as it.
+        /// Only the server's own uid is let in.
         #[test]
         fn only_the_servers_own_uid_is_admitted() {
             assert!(admits(1000, 1000));
             assert!(admits(0, 0));
             assert!(!admits(1001, 1000));
             assert!(!admits(0, 1000));
-            assert!(!admits(OVERFLOW_UID, 1000));
-            assert!(!admits(OVERFLOW_UID, OVERFLOW_UID));
+            assert!(!admits(65534, 1000));
         }
 
-        /// The unix listener starts only on proof that this process's uid is not the
-        /// kernel's overflow uid: a file that can't be read, anything but the decimal uid
-        /// the kernel writes, or this process's own uid there, and it does not.
+        /// Only the full identity map, as the kernel writes it, is the initial namespace's.
         #[test]
-        fn the_unix_listener_needs_proof_it_is_not_the_overflow_uid() {
-            let read = |s: &str| Ok(s.to_string());
-            let unreadable = || Err(std::io::Error::from_raw_os_error(libc::EACCES));
-            assert!(provably_not_the_overflow_uid(read("65534\n"), 1000));
-            assert!(provably_not_the_overflow_uid(read("1000\n"), 1001));
-            assert!(provably_not_the_overflow_uid(read("0"), 1000));
-            assert!(!provably_not_the_overflow_uid(unreadable(), 1000));
-            for garbage in [
-                "",
-                "\n",
-                "nobody\n",
-                "-1\n",
-                "+65534\n",
-                " 65534\n",
-                "65534 \n",
-                "65534\n\n",
-                "99999999999\n",
+        fn only_the_full_identity_uid_map_is_accepted() {
+            assert!(is_identity_uid_map(
+                b"         0          0 4294967295\n"
+            ));
+            assert!(is_identity_uid_map(b"0 0 4294967295\n"));
+            for map in [
+                &b""[..],
+                b"\n",
+                b"0 0 4294967295",
+                b"0 0 4294967295\n\n",
+                b"0 0 4294967294\n",
+                b"0 1000 1\n",
+                b"0 100000 65536\n",
+                b"1000 1000 1\n",
+                b"0 0 4294967295\n0 0 4294967295\n",
+                b"0 0 1000\n1000 1000 4294966295\n",
+                b"0 0 4294967295 0\n",
+                b"0 0\n",
+                b"+0 0 4294967295\n",
+                b"0\t0\t4294967295\n",
+                b"00 0 4294967295\n",
+                b"0 0 4294967296\n",
+                b"0 0 04294967295\n",
             ] {
                 assert!(
-                    !provably_not_the_overflow_uid(read(garbage), 1000),
-                    "{garbage:?}"
+                    !is_identity_uid_map(map),
+                    "{}",
+                    map.escape_ascii()
                 );
             }
-            assert!(!provably_not_the_overflow_uid(read("1000\n"), 1000));
-            assert!(!provably_not_the_overflow_uid(read("65534\n"), 65534));
+        }
+
+        /// A namespace with another map is refused, and the refusal quotes what was read,
+        /// cut when long.
+        #[test]
+        fn a_refusal_quotes_the_uid_map() {
+            assert_eq!(quote_uid_map(b"0 1000 1\n"), "\"0 1000 1\\n\"");
+            let long = b"0 1000 1\n".repeat(100);
+            let q = quote_uid_map(&long);
+            assert!(q.ends_with("(the first 200 of 900 bytes)"), "{q}");
+        }
+
+        /// The real procfs gives this process's own uid_map, whatever it is here.
+        #[test]
+        fn the_uid_map_is_read_from_procfs() {
+            let real = std::fs::read("/proc/self/uid_map").unwrap();
+            assert_eq!(read_uid_map(Path::new("/proc")).unwrap(), real);
+            assert_eq!(
+                initial_user_namespace(Path::new("/proc")).is_ok(),
+                is_identity_uid_map(&real)
+            );
+        }
+
+        /// A directory that isn't procfs is refused, even one laid out like it, holding the
+        /// identity map; so is a symlink to the real /proc and a path that doesn't exist.
+        #[test]
+        fn a_uid_map_not_on_procfs_is_refused() {
+            let d = std::env::temp_dir().join(format!("sf-fake-proc-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("self")).unwrap();
+            std::fs::write(d.join("self/uid_map"), "0 0 4294967295\n").unwrap();
+            let e = initial_user_namespace(&d).unwrap_err();
+            assert!(e.contains("is not procfs"), "{e}");
+            let link = d.join("proc-link");
+            std::os::unix::fs::symlink("/proc", &link).unwrap();
+            let e = initial_user_namespace(&link).unwrap_err();
+            assert!(e.contains("cannot read"), "{e}");
+            let e = initial_user_namespace(&d.join("missing")).unwrap_err();
+            assert!(e.contains("cannot read"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
         }
 
         /// The first look at the socket after the bind fails (as an EIO would make it):
