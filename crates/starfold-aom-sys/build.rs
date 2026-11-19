@@ -118,6 +118,17 @@ fn check_source(src: &Path) {
         )),
         None => fail(&format!("`git status` failed in {SUBMODULE}.\n{fix}")),
     }
+    // libaom's include path puts the source root before the build directory, so a stray
+    // config/aom_config.h there would replace the generated one.
+    match git(src, &["ls-files", "--others", "--", "config"]) {
+        Some(s) if s.is_empty() => {}
+        Some(s) => fail(&format!(
+            "{SUBMODULE} has files under config/ that are not libaom's, and libaom's build \
+             would read them before its own generated configuration:\n{s}\n\
+             Remove them, or run:\n\n    git -C {SUBMODULE} clean -fdx config"
+        )),
+        None => fail(&format!("`git ls-files` failed in {SUBMODULE}.\n{fix}")),
+    }
     // A submodule's HEAD lives in the superproject's .git/modules, outside `aom`: watch it, so
     // moving the submodule to another commit runs this check again.
     // (Changed files inside `aom` are already watched through the directory.)
