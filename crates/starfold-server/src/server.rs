@@ -2647,7 +2647,11 @@ mod tests {
             let refused = std::os::unix::net::UnixStream::connect(unix_socket_path(&at))
                 .unwrap_err()
                 .raw_os_error();
-            assert_eq!(refused, Some(libc::ECONNREFUSED), "the socket left behind is dead");
+            assert_eq!(
+                refused,
+                Some(libc::ECONNREFUSED),
+                "the socket left behind is dead"
+            );
             let (l, file) = bind_unix(&at, 0o600).unwrap();
             let now = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap();
             assert_eq!(file.socket_id, Some((now.dev(), now.ino())));
