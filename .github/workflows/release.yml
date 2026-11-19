@@ -50,7 +50,17 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      flavours: ${{ steps.flavours.outputs.flavours }}
     steps:
+      # The binary flavours every platform builds, one line each: deleting a line drops that flavour
+      # everywhere. x264 decides the archive's x264 extras (COPYING, its runtime package).
+      - id: flavours
+        run: |
+          flavours=(
+            '{"name": "starfold-x264", "licence": "GPL-2.0-or-later", "features": "", "x264": true}'
+            '{"name": "starfold", "licence": "MIT", "features": "--no-default-features --features openh264", "x264": false}'
+          )
+          echo "flavours=[$(IFS=,; echo "${flavours[*]}")]" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       # Cargo.toml's version; on a tag, the tag has to name the same one.
       - id: version
@@ -65,25 +75,17 @@ jobs:
           echo "release version $version"
 
   linux:
-    name: Linux x86_64 (${{ matrix.licence }})
+    name: Linux x86_64 (${{ matrix.flavour.licence }})
     needs: version
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: starfold
-            features: --no-default-features --features openh264
-            licence: MIT
-            runtime: libyuv0 libopus0 libpulse0 libstdc++6
-          - name: starfold-x264
-            features: ''
-            licence: GPL-2.0-or-later
-            runtime: libyuv0 libopus0 libpulse0 libx264-164
+        flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-x86_64-linux
+      ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-x86_64-linux
     steps:
       - uses: actions/checkout@v4
       - name: Native libraries
@@ -100,8 +102,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ matrix.name }}-linux-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-release-${{ matrix.name }}-linux-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-release-${{ matrix.flavour.name }}-linux-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.flavour.name }}-linux-${{ env.RUST_TOOLCHAIN }}-
       - id: cargo-about
         uses: actions/cache@v4
         with:
@@ -115,7 +117,7 @@ jobs:
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
-        run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
+        run: cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }}
       # build.rs embeds the library dirs pkg-config reports as an rpath; a released binary may only
       # carry system ones.
       - name: Library paths
@@ -125,13 +127,13 @@ jobs:
           [ -z "$bad" ] || { echo "::error::the binary's rpath names build-only directories: $bad"; exit 1; }
           ldd target/release/starfold
       - name: Version and licence
-        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' target/release/starfold
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' target/release/starfold
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-unknown-linux-gnu \
-            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
-          if [ '${{ matrix.licence }}' = MIT ]; then
+            ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          if [ '${{ matrix.flavour.x264 }}' != true ]; then
             cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
           fi
           ls -l "$RUNNER_TEMP/licenses"
@@ -141,7 +143,8 @@ jobs:
       - name: Clean Ubuntu 24.04
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src ubuntu:24.04 \
-            .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.licence }}' ${{ matrix.runtime }}
+            .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.flavour.licence }}' \
+            libyuv0 libopus0 libpulse0 ${{ matrix.flavour.x264 && 'libx264-164' || 'libstdc++6' }}
       - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
@@ -151,23 +154,17 @@ jobs:
           if-no-files-found: error
 
   linux-arm64:
-    name: Linux aarch64 (${{ matrix.licence }}, cross-compiled)
+    name: Linux aarch64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: starfold
-            features: --no-default-features --features openh264
-            licence: MIT
-          - name: starfold-x264
-            features: ''
-            licence: GPL-2.0-or-later
+        flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-aarch64-linux
+      ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-aarch64-linux
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
       CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
@@ -204,8 +201,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ matrix.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-release-${{ matrix.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-release-${{ matrix.flavour.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.flavour.name }}-linux-arm64-${{ env.RUST_TOOLCHAIN }}-
       - id: cargo-about
         uses: actions/cache@v4
         with:
@@ -219,7 +216,7 @@ jobs:
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
-        run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.features }}
+        run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
       - name: Library paths
         run: |
           bin=target/aarch64-unknown-linux-gnu/release/starfold
@@ -229,13 +226,13 @@ jobs:
       - name: Version and licence (qemu)
         env:
           QEMU_LD_PREFIX: /
-        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' qemu-aarch64-static target/aarch64-unknown-linux-gnu/release/starfold
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' qemu-aarch64-static target/aarch64-unknown-linux-gnu/release/starfold
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-unknown-linux-gnu \
-            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
-          if [ '${{ matrix.licence }}' = MIT ]; then
+            ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+          if [ '${{ matrix.flavour.x264 }}' != true ]; then
             cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
           fi
           ls -l "$RUNNER_TEMP/licenses"
@@ -250,25 +247,17 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS arm64 (${{ matrix.licence }})
+    name: macOS arm64 (${{ matrix.flavour.licence }})
     needs: version
     runs-on: kyora-macos
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: starfold
-            features: --no-default-features --features openh264
-            licence: MIT
-            brew: opus pkgconf esbuild
-          - name: starfold-x264
-            features: ''
-            licence: GPL-2.0-or-later
-            brew: x264 opus pkgconf esbuild
+        flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-aarch64-macos
+      ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-aarch64-macos
       # Homebrew's static Opus and x264, so the binary needs nothing from Homebrew at run time.
       OPUS_STATIC: '1'
       X264_STATIC: '1'
@@ -293,8 +282,8 @@ jobs:
           } >> "$GITHUB_ENV"
           printf '%s\n' "$prefix/bin" "$prefix/sbin" >> "$GITHUB_PATH"
       - run: |
-          brew install ${{ matrix.brew }}
-          if [ '${{ matrix.licence }}' != MIT ]; then
+          brew install opus pkgconf esbuild ${{ matrix.flavour.x264 && 'x264' || '' }}
+          if [ '${{ matrix.flavour.x264 }}' = true ]; then
             [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
           fi
           brew list --versions opus
@@ -304,8 +293,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ matrix.name }}-macos-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-release-${{ matrix.name }}-macos-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-release-${{ matrix.flavour.name }}-macos-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.flavour.name }}-macos-${{ env.RUST_TOOLCHAIN }}-
       - id: cargo-about
         uses: actions/cache@v4
         with:
@@ -319,7 +308,7 @@ jobs:
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
-        run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
+        run: cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }}
       # Only the system's libraries and frameworks, nothing from Homebrew. build.rs's rpath to
       # Homebrew's Opus is unused with Opus linked in, so it is dropped (and the binary re-signed).
       - name: Library paths
@@ -340,14 +329,14 @@ jobs:
             exit 1
           fi
       - name: Version and licence
-        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' target/release/starfold
+        run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' target/release/starfold
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-apple-darwin \
-            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+            ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           cp "$(brew --prefix opus)/COPYING" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
-          if [ '${{ matrix.licence }}' = MIT ]; then
+          if [ '${{ matrix.flavour.x264 }}' != true ]; then
             cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
           fi
           ls -l "$RUNNER_TEMP/licenses"
@@ -362,32 +351,22 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: Windows x86_64 (${{ matrix.licence }}, cross-compiled)
+    name: Windows x86_64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: starfold
-            features: --no-default-features --features openh264
-            licence: MIT
-          - name: starfold-x264
-            features: ''
-            licence: GPL-2.0-or-later
+        flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      ARCHIVE: ${{ matrix.name }}-${{ needs.version.outputs.version }}-x86_64-windows
+      ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-x86_64-windows
       VCPKG_BASELINE: 2026.10.16
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
       VCPKG_DOWNLOADS: ${{ github.workspace }}/.vcpkg-downloads
       VCPKGRS_TRIPLET: x64-mingw-static
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
-      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs:
-      # OpenH264's C++ links libstdc++ statically (the cc crate's CXXSTDLIB_STATIC).
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static
-      CXXSTDLIB_STATIC_x86_64_pc_windows_gnu: '1'
     steps:
       - uses: actions/checkout@v4
       - name: MinGW, NASM and vcpkg's build tools
@@ -420,8 +399,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ matrix.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-release-${{ matrix.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-release-${{ matrix.flavour.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.flavour.name }}-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
       - id: cargo-about
         uses: actions/cache@v4
         with:
@@ -434,8 +413,16 @@ jobs:
           fi
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs. The cc
+      # crate links OpenH264's C++ with -lstdc++; a directory holding only libstdc++.a, searched
+      # first, makes that the static archive.
       - name: Build
-        run: cargo build --release --locked -p starfold-server --target x86_64-pc-windows-gnu ${{ matrix.features }}
+        run: |
+          static=$RUNNER_TEMP/static-libstdcxx
+          mkdir -p "$static"
+          ln -sf "$(x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a)" "$static/libstdc++.a"
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static -L native=$static"
+          cargo build --release --locked -p starfold-server --target x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
       # Windows' own DLLs only: no MinGW runtime beside the .exe.
       - name: DLLs
         run: |
@@ -453,18 +440,18 @@ jobs:
             apt-get -q update >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get -q install -y --no-install-recommends wine64 >/dev/null
             .github/release/check-version.sh "$1" "$2" /usr/lib/wine/wine64 target/x86_64-pc-windows-gnu/release/starfold.exe
-          ' _ "$VERSION" '${{ matrix.licence }}'
+          ' _ "$VERSION" '${{ matrix.flavour.licence }}'
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-pc-windows-gnu \
-            ${{ matrix.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
+            ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           share=$VCPKG_ROOT/installed/$VCPKGRS_TRIPLET/share
           cp "$share/opus/copyright" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
           cp "$share/libyuv/copyright" "$RUNNER_TEMP/licenses/libyuv-LICENSE.txt"
           cp /usr/share/doc/mingw-w64-common/copyright "$RUNNER_TEMP/licenses/MinGW-w64-copyright.txt"
           cp /usr/share/doc/gcc-mingw-w64-base/copyright "$RUNNER_TEMP/licenses/GCC-runtime-copyright.txt"
-          if [ '${{ matrix.licence }}' = MIT ]; then
+          if [ '${{ matrix.flavour.x264 }}' != true ]; then
             cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
           fi
           ls -l "$RUNNER_TEMP/licenses"
@@ -575,7 +562,7 @@ jobs:
         working-directory: dist
         run: |
           ls -l
-          sha256sum -c *.sha256
+          sha256sum -c -- *.sha256
       - name: x264's source
         run: |
           (cd third_party/x264 && sha256sum -c SHA256SUMS && sha512sum -c SHA512SUMS)

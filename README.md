@@ -25,41 +25,63 @@ instead; see [macOS](#macos) and [Windows](#windows).
 
 ## Install
 
-Each [release](https://github.com/kyora-sh/starfold/releases) attaches prebuilt binaries in two
-flavours per platform (`<version>` is the release's, e.g. `0.3.2`):
+Two ways: a prebuilt binary from a release, or a build from source with cargo. Either way there are
+two flavours, which differ only in the software H.264 encoder (the hardware encoders are the same):
 
-| Platform              | MIT (OpenH264)                            | GPL-2.0-or-later (x264)                        |
-| --------------------- | ----------------------------------------- | ---------------------------------------------- |
-| Linux x86_64          | `starfold-<version>-x86_64-linux.tar.gz`  | `starfold-x264-<version>-x86_64-linux.tar.gz`  |
-| Linux aarch64         | `starfold-<version>-aarch64-linux.tar.gz` | `starfold-x264-<version>-aarch64-linux.tar.gz` |
-| macOS (Apple silicon) | `starfold-<version>-aarch64-macos.tar.gz` | `starfold-x264-<version>-aarch64-macos.tar.gz` |
-| Windows x86_64        | `starfold-<version>-x86_64-windows.zip`   | `starfold-x264-<version>-x86_64-windows.zip`   |
+- **x264**, the default build: x264 is GPL-2.0-or-later, so the binary is too, as a combined work.
+  Each release attaches x264's source.
+- **OpenH264**: OpenH264 is BSD-2-Clause, so the binary stays MIT.
 
-The two differ only in the software H.264 encoder; the hardware encoders are the same. The
-`starfold-*` archives use OpenH264 (BSD-2-Clause), so the binary is MIT. The `starfold-x264-*`
-archives use x264, which is GPL-2.0-or-later, so the binary is too, as a combined work; the
-release attaches x264's source. See [Licensing](#licensing).
+See [Licensing](#licensing).
+
+### From source
+
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on
+Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
+  libx264-dev libyuv-dev libopus-dev libpulse-dev
+cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
+```
+
+`--tag v<version>` installs a release instead of main's head. For the MIT build, add
+`--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
+`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
+[Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
+
+### Prebuilt binaries
+
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches both flavours for each
+platform (`<version>` is the release's, e.g. `0.3.2`):
+
+| Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
+| --------------------- | ---------------------------------------------- | ----------------------------------------- |
+| Linux x86_64          | `starfold-x264-<version>-x86_64-linux.tar.gz`  | `starfold-<version>-x86_64-linux.tar.gz`  |
+| Linux aarch64         | `starfold-x264-<version>-aarch64-linux.tar.gz` | `starfold-<version>-aarch64-linux.tar.gz` |
+| macOS (Apple silicon) | `starfold-x264-<version>-aarch64-macos.tar.gz` | `starfold-<version>-aarch64-macos.tar.gz` |
+| Windows x86_64        | `starfold-x264-<version>-x86_64-windows.zip`   | `starfold-<version>-x86_64-windows.zip`   |
 
 Download an archive and its `.sha256`, check it and unpack it:
 
 ```sh
-sha256sum -c starfold-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
-tar -xzf starfold-<version>-x86_64-linux.tar.gz
-./starfold-<version>-x86_64-linux/starfold --version
+sha256sum -c starfold-x264-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
+./starfold-x264-<version>-x86_64-linux/starfold --version
 ```
 
 `--version` names the version, the software encoders in the binary and its licence:
-`starfold <version> (encoders: openh264; licence: MIT)` or
-`starfold <version> (encoders: x264; licence: GPL-2.0-or-later)`. Each archive also holds
-`LICENSE`, `THIRD_PARTY.md` and `licenses/`, the licence texts of everything compiled into the
-binary; the x264 archives add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
+`starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
+`starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
+`THIRD_PARTY.md` and `licenses/`, the licence texts of everything compiled into the binary; the
+x264 archives add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
 
 What each platform needs at run time:
 
 - **Linux** (built on Ubuntu 24.04, so it needs a distribution at least that new): libyuv, Opus and
   PulseAudio's client library, plus x264 for the x264 flavour. On Ubuntu 24.04:
-  `sudo apt install libyuv0 libopus0 libpulse0`, and `libx264-164` for `starfold-x264-*`. Plus an
-  X server to stream, such as Xvfb (see [Usage](#usage)).
+  `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for `starfold-x264-*`. Plus
+  an X server to stream, such as Xvfb (see [Usage](#usage)).
 - **macOS**: nothing beyond the system; Opus and x264 are linked in. The binary is not notarized,
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
