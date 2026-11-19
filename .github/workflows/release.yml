@@ -106,12 +106,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cargo-about
-          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+          key: cargo-about-${{ env.CARGO_ABOUT }}-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
       - name: cargo-about
         run: |
           if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
-            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT" --features cli
           fi
+          ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
@@ -191,7 +192,7 @@ jobs:
           SRC
           sudo dpkg --add-architecture arm64
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64; }
+          deps() { aptq 180 update && aptq 720 install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64 libxcb1-dev:arm64; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -209,12 +210,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cargo-about
-          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+          key: cargo-about-${{ env.CARGO_ABOUT }}-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
       - name: cargo-about
         run: |
           if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
-            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT" --features cli
           fi
+          ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.features }}
@@ -308,22 +310,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cargo-about
-          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+          key: cargo-about-${{ env.CARGO_ABOUT }}-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
       - name: cargo-about
         run: |
           if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
-            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT" --features cli
           fi
+          ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p starfold-server ${{ matrix.features }}
-      # Only the system's libraries and frameworks, nothing from Homebrew.
+      # Only the system's libraries and frameworks, nothing from Homebrew. build.rs's rpath to
+      # Homebrew's Opus is unused with Opus linked in, so it is dropped (and the binary re-signed).
       - name: Library paths
         run: |
-          otool -L target/release/starfold
-          otool -l target/release/starfold | grep -A2 LC_RPATH || true
-          if otool -L target/release/starfold | tail -n +2 | grep -v -E '^[[:space:]]+/(usr/lib|System/Library)/'; then
+          bin=target/release/starfold
+          otool -L "$bin"
+          if otool -L "$bin" | tail -n +2 | grep -v -E '^[[:space:]]+/(usr/lib|System/Library)/'; then
             echo "::error::the binary links a library outside the system's"
+            exit 1
+          fi
+          for p in $(otool -l "$bin" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }'); do
+            install_name_tool -delete_rpath "$p" "$bin"
+          done
+          codesign --force --sign - "$bin"
+          if otool -l "$bin" | grep -q LC_RPATH; then
+            echo "::error::an rpath is left in the binary"
             exit 1
           fi
       - name: Version and licence
@@ -371,8 +383,10 @@ jobs:
       VCPKG_DOWNLOADS: ${{ github.workspace }}/.vcpkg-downloads
       VCPKGRS_TRIPLET: x64-mingw-static
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
-      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs.
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static
+      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs:
+      # OpenH264's C++ gets libstdc++ as a static archive instead of the cc crate's -lstdc++.
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-l:libstdc++.a
+      CXXSTDLIB_x86_64_pc_windows_gnu: ''
       WINEDEBUG: -all
     steps:
       - uses: actions/checkout@v4
@@ -412,12 +426,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cargo-about
-          key: cargo-about-${{ env.CARGO_ABOUT }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+          key: cargo-about-${{ env.CARGO_ABOUT }}-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
       - name: cargo-about
         run: |
           if [ "${{ steps.cargo-about.outputs.cache-hit }}" != true ]; then
-            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT"
+            cargo install --locked --root ~/cargo-about cargo-about --version "$CARGO_ABOUT" --features cli
           fi
+          ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p starfold-server --target x86_64-pc-windows-gnu ${{ matrix.features }}
@@ -430,8 +445,14 @@ jobs:
             echo "::error::starfold.exe needs a DLL that isn't Windows' own"
             exit 1
           fi
+      # Ubuntu's `wine` wrapper aborts without the 32-bit Wine, so the 64-bit loader is called directly.
       - name: Version and licence (Wine)
-        run: .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' wine target/x86_64-pc-windows-gnu/release/starfold.exe
+        env:
+          WINEDLLOVERRIDES: mscoree,mshtml=
+        run: |
+          wine64=$(command -v wine64 || echo /usr/lib/wine/wine64)
+          "$wine64" wineboot --init
+          .github/release/check-version.sh "$VERSION" '${{ matrix.licence }}' "$wine64" target/x86_64-pc-windows-gnu/release/starfold.exe
       - name: Licences
         run: |
           mkdir -p "$RUNNER_TEMP/licenses"
