@@ -156,7 +156,8 @@ fn codec_rank(c: Codec) -> u8 {
 }
 
 /// The base cohort's encoder `sel` stands for here: the pinned one, which must be eligible
-/// (for H.264 if it encodes that, else for AV1), or the first eligible hardware H.264 one
+/// (for AV1 if this build encodes AV1 with it and not H.264, else for H.264), or the first
+/// eligible hardware H.264 one
 /// that isn't experimental, else [`SOFTWARE`].
 pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String> {
     let b = match sel {
@@ -168,9 +169,9 @@ pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String>
         #[cfg(feature = "sw-arm")]
         Selection::Arm(..) => SOFTWARE,
     };
-    let codec = match b.implements(Codec::H264) {
-        true => Codec::H264,
-        false => Codec::Av1,
+    let codec = match !b.implements(Codec::H264) && b.implements(Codec::Av1) {
+        true => Codec::Av1,
+        false => Codec::H264,
     };
     reg.check(b, codec).map(|e| Candidate {
         codec,
@@ -184,6 +185,10 @@ pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String>
 /// then [`SOFTWARE`] for when a hardware base one fails. An experimental backend takes part only when it is the base one,
 /// i.e. pinned with `--encoder`.
 pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
+    ranked(reg, base, HARDWARE_FIRST)
+}
+
+fn ranked(reg: &Registry, base: Candidate, hardware_first: bool) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
     for codec in [Codec::Av1, Codec::Hevc] {
         for e in reg
@@ -206,7 +211,7 @@ pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
     if !v.contains(&base) {
         v.push(base);
     }
-    v.sort_by_key(|c| rank(*c));
+    v.sort_by_key(|c| rank(*c, hardware_first));
     let software = Candidate {
         codec: SOFTWARE_CODEC,
         backend: SOFTWARE,
@@ -214,7 +219,9 @@ pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
     };
     if base.hardware
         && !v.contains(&software)
-        && reg.eligible(software.codec).any(|e| e.backend == software.backend)
+        && reg
+            .eligible(software.codec)
+            .any(|e| e.backend == software.backend)
     {
         v.push(software);
     }
@@ -227,10 +234,11 @@ pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
 /// a host with hardware H.264 or HEVC.
 const HARDWARE_FIRST: bool = true;
 
-/// A candidate's place in [`candidates`], lowest first.
-fn rank(c: Candidate) -> (bool, u8, bool) {
+/// A candidate's place in [`candidates`], lowest first, in the order [`HARDWARE_FIRST`]
+/// names.
+fn rank(c: Candidate, hardware_first: bool) -> (bool, u8, bool) {
     let leads = c.hardware && !c.backend.experimental();
-    (HARDWARE_FIRST && !leads, codec_rank(c.codec), !c.hardware)
+    (hardware_first && !leads, codec_rank(c.codec), !c.hardware)
 }
 
 /// The base cohort's encoders in the order it falls back through them: the H.264 ones in

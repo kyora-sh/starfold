@@ -1100,7 +1100,7 @@ fn a_pinned_qsv_that_cannot_start_says_why() {
         }],
     };
     let pinned = Selection::Pinned(Backend::Qsv);
-    let e = crate::negotiate::h264_backend(&reg, pinned).unwrap_err();
+    let e = crate::negotiate::base_backend(&reg, pinned).unwrap_err();
     let named = e.contains("no usable qsv H264 encoder");
     assert!(named && e.contains(why), "{e}");
 
@@ -1116,7 +1116,7 @@ fn a_pinned_qsv_that_cannot_start_says_why() {
         encoders: vec![c],
         diagnostics: Vec::new(),
     };
-    let e = crate::negotiate::h264_backend(&reg, pinned).unwrap_err();
+    let e = crate::negotiate::base_backend(&reg, pinned).unwrap_err();
     assert!(e.contains(failed), "{e}");
 }
 

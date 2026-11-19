@@ -261,9 +261,11 @@ pub const SOFTWARE_CODEC: Codec = Codec::Av1;
 pub enum Backend {
     /// The tests' stand-in for a software H.264 encoder.
     #[cfg(test)]
+    #[serde(rename = "fake-h264")]
     FakeH264,
     /// The tests' stand-in for libaom in a build without it.
     #[cfg(test)]
+    #[serde(rename = "fake-av1")]
     FakeAv1,
     #[cfg(feature = "x264")]
     X264,
@@ -287,9 +289,11 @@ pub enum Backend {
 impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
-            "openh264" => Err("starfold no longer has OpenH264: the default build streams AV1 \
+            "openh264" => Err(
+                "starfold no longer has OpenH264: the default build streams AV1 \
                  from libaom, and x264 is the H.264 encoder (build with `--features x264`)"
-                .into()),
+                    .into(),
+            ),
             #[cfg(feature = "libaom")]
             "libaom" => Ok(Backend::Libaom),
             #[cfg(not(feature = "libaom"))]

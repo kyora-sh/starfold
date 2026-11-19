@@ -946,9 +946,7 @@ impl Engine {
     /// The base candidate to fall back to from the current one.
     fn next_base(&self) -> Option<Candidate> {
         self.chain.iter().copied().find(|c| {
-            *c != self.base
-                && !self.failed.contains(c)
-                && self.offers.iter().any(|o| o.cand == *c)
+            *c != self.base && !self.failed.contains(c) && self.offers.iter().any(|o| o.cand == *c)
         })
     }
 
@@ -961,7 +959,11 @@ impl Engine {
                 match self.open_cohort(n) {
                     Ok(c) => self.cohorts.push(c),
                     Err(e) => {
-                        log::warn!("{:?} from {} failed to open: {e}", n.codec, n.backend.name());
+                        log::warn!(
+                            "{:?} from {} failed to open: {e}",
+                            n.codec,
+                            n.backend.name()
+                        );
                         self.fail(n, format!("failed to open: {e}"));
                         continue;
                     }

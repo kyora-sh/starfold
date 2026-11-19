@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoder::SOFTWARE_H264;
+use crate::encoder::{SOFTWARE, SOFTWARE_CODEC};
 
 /// A provider that reports what it was given, after `delay`.
 struct Fake {
@@ -55,7 +55,7 @@ fn good(codec: Codec, backend: Backend) -> EncoderCapability {
 }
 
 fn registry(fakes: Vec<Fake>) -> Registry {
-    let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(SOFTWARE_H264))];
+    let mut v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(SOFTWARE, SOFTWARE_CODEC))];
     v.extend(
         fakes
             .into_iter()
@@ -64,17 +64,19 @@ fn registry(fakes: Vec<Fake>) -> Registry {
     Registry::probe(v, Duration::from_secs(5))
 }
 
-fn software_h264_left(r: &Registry) {
-    let c = r.check(SOFTWARE_H264, Codec::H264).expect("software H.264");
+fn software_left(r: &Registry) {
+    let c = r
+        .check(SOFTWARE, SOFTWARE_CODEC)
+        .expect("the software encoder");
     assert_eq!(c.acceleration, Acceleration::Software);
     assert!(c.eligible());
 }
 
 #[test]
-fn software_h264_is_verified_by_a_real_encode() {
+fn the_software_encoder_is_verified_by_a_real_encode() {
     let r = registry(Vec::new());
-    software_h264_left(&r);
-    assert_eq!(r.eligible(Codec::H264).count(), 1);
+    software_left(&r);
+    assert_eq!(r.eligible(SOFTWARE_CODEC).count(), 1);
     assert_eq!(r.eligible(Codec::Hevc).count(), 0);
     assert!(r.diagnostics.is_empty());
 }
@@ -84,7 +86,7 @@ fn missing_library_is_a_diagnostic() {
     let mut f = Fake::new(Backend::Vaapi);
     f.diagnostics = vec![(None, "libva.so.2: cannot open shared object file")];
     let r = registry(vec![f]);
-    software_h264_left(&r);
+    software_left(&r);
     assert!(r.encoders.iter().all(|c| c.backend != Backend::Vaapi));
     let e = r.check(Backend::Vaapi, Codec::H264).unwrap_err();
     assert!(e.contains("libva.so.2"), "{e}");
@@ -98,7 +100,7 @@ fn denied_device_skips_only_that_device() {
     c.device_id = "/dev/dri/renderD129".into();
     f.caps = vec![c];
     let r = registry(vec![f]);
-    software_h264_left(&r);
+    software_left(&r);
     assert_eq!(r.diagnostics.len(), 1);
     assert_eq!(
         r.diagnostics[0].device.as_deref(),
@@ -129,7 +131,9 @@ fn unimplemented_backends_are_never_eligible() {
     {
         assert!(!c.implemented && !c.eligible(), "{c:?}");
     }
-    assert_eq!(r.eligible(Codec::Av1).count(), 0);
+    assert!(r
+        .eligible(Codec::Av1)
+        .all(|c| c.backend != Backend::MediaFoundation));
     let e = r.check(Backend::MediaFoundation, Codec::H264).unwrap_err();
     assert!(e.contains("no encoder in this build"), "{e}");
 }
@@ -144,13 +148,13 @@ fn a_probe_cannot_claim_an_implementation() {
     assert!(!r
         .encoders
         .iter()
-        .any(|c| c.codec == Codec::Av1 && c.implemented));
+        .any(|c| c.backend == Backend::VideoToolbox && c.codec == Codec::Av1 && c.implemented));
 }
 
 #[test]
 fn eligibility_needs_every_property_known() {
     let base = {
-        let mut c = good(Codec::H264, Backend::OpenH264);
+        let mut c = good(Codec::H264, Backend::FakeH264);
         c.implemented = true;
         c
     };
@@ -184,7 +188,7 @@ fn session_failure_keeps_the_diagnosis() {
     let mut f = Fake::new(Backend::VideoToolbox);
     f.caps = vec![c];
     let r = registry(vec![f]);
-    software_h264_left(&r);
+    software_left(&r);
     let e = r.check(Backend::VideoToolbox, Codec::Hevc).unwrap_err();
     assert!(e.contains("-12902"), "{e}");
 }
@@ -236,11 +240,12 @@ fn size_limits_are_not_independent() {
 fn hung_probes_become_diagnostics() {
     let mut slow = Fake::new(Backend::Nvenc);
     slow.delay = Duration::from_secs(3);
-    let v: Vec<Box<dyn ProbeProvider>> = vec![Box::new(Software(SOFTWARE_H264)), Box::new(slow)];
+    let v: Vec<Box<dyn ProbeProvider>> =
+        vec![Box::new(Software(SOFTWARE, SOFTWARE_CODEC)), Box::new(slow)];
     let t = Instant::now();
     let r = Registry::probe(v, Duration::from_millis(500));
     assert!(t.elapsed() < Duration::from_secs(2));
-    software_h264_left(&r);
+    software_left(&r);
     assert_eq!(r.diagnostics.len(), 1);
     assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);
     assert!(
@@ -259,7 +264,7 @@ fn software_only_probes_load_no_hardware_backend() {
     assert!(
         backends
             .iter()
-            .all(|b| b.name() == "openh264" || b.name() == "x264"),
+            .all(|b| b.name() == "libaom" || b.name() == "x264"),
         "{backends:?}"
     );
 }
@@ -275,7 +280,7 @@ fn experimental_probes_are_off_by_default() {
             .collect(),
         PROBE_TIMEOUT,
     );
-    software_h264_left(&r);
+    software_left(&r);
     let experimental = [Backend::Vaapi, Backend::Nvenc, Backend::MediaFoundation];
     let off: Vec<_> = r
         .encoders
@@ -307,8 +312,8 @@ fn stats_json_shape() {
     let r = registry(vec![f]);
     let v = serde_json::to_value(&r).unwrap();
     let e = &v["encoders"][0];
-    assert_eq!(e["codec"], "h264");
-    assert_eq!(e["backend"], SOFTWARE_H264.name());
+    assert_eq!(e["codec"], serde_json::to_value(SOFTWARE_CODEC).unwrap());
+    assert_eq!(e["backend"], SOFTWARE.name());
     assert_eq!(e["acceleration"], "software");
     assert_eq!(e["status"]["state"], "verified");
     assert_eq!(e["implemented"], true);
@@ -486,14 +491,14 @@ fn bounded_providers_are_waited_for() {
     let mut hung = Fake::new(Backend::Nvenc);
     hung.delay = Duration::from_secs(5);
     let v: Vec<Box<dyn ProbeProvider>> = vec![
-        Box::new(Software(SOFTWARE_H264)),
+        Box::new(Software(SOFTWARE, SOFTWARE_CODEC)),
         Box::new(child),
         Box::new(hung),
     ];
     let t = Instant::now();
     let r = Registry::probe(v, Duration::from_millis(200));
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
-    software_h264_left(&r);
+    software_left(&r);
     assert!(r.encoders.iter().any(|c| c.backend == Backend::Vaapi));
     assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
     assert_eq!(r.diagnostics[0].backend, Backend::Nvenc);

@@ -449,7 +449,7 @@ fn stats_say_why_quick_sync_is_off_as_it_stands_now() {
 /// snapshot.
 #[test]
 fn stats_list_no_backend_that_is_off_as_chosen() {
-    use crate::encoder::{with_live, Backend, Codec, SOFTWARE_H264};
+    use crate::encoder::{with_live, Backend, Codec};
     use crate::negotiate::{chosen, Candidate};
     let qsv = |codec| Candidate {
         codec,
@@ -458,7 +458,7 @@ fn stats_list_no_backend_that_is_off_as_chosen() {
     };
     let sw = Candidate {
         codec: Codec::H264,
-        backend: SOFTWARE_H264,
+        backend: Backend::FakeH264,
         hardware: false,
     };
     let live = [qsv(Codec::Hevc), sw];
