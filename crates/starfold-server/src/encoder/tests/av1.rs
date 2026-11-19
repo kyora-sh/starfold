@@ -1,6 +1,6 @@
 //! The web client's `codecs.test.ts` AV1 cases, against the server's port.
 
-use super::super::av1::{codec_string, sequence_header};
+use super::super::av1::{av1c, codec_string, sequence_header};
 
 #[derive(Default)]
 struct BitWriter {
@@ -65,9 +65,15 @@ fn the_8_bit_design_example() {
     ] {
         w = w.f(n, v);
     }
+    let tu = temporal_unit(&w.bytes());
     assert_eq!(
-        codec_string(&temporal_unit(&w.bytes())).as_deref(),
+        codec_string(&tu).as_deref(),
         Some("av01.0.13M.08.0.110.01.13.06.0")
+    );
+    // Profile 0, level 13, main tier, 8-bit 4:2:0, chroma sample position 0.
+    assert_eq!(
+        av1c(sequence_header(&tu).unwrap()),
+        Some([0x81, 13, 0x0c, 0])
     );
 }
 
@@ -133,9 +139,15 @@ fn timing_info_two_operating_points_high_tier_10_bit_full_range() {
     ] {
         w = w.f(n, v);
     }
+    let tu = temporal_unit(&w.bytes());
     assert_eq!(
-        codec_string(&temporal_unit(&w.bytes())).as_deref(),
+        codec_string(&tu).as_deref(),
         Some("av01.0.16H.10.0.112.09.16.09.1")
+    );
+    // Level 16, high tier, 10-bit, 4:2:0, chroma sample position 2.
+    assert_eq!(
+        av1c(sequence_header(&tu).unwrap()),
+        Some([0x81, 16, 0x80 | 0x40 | 0x0c | 2, 0])
     );
 }
 
@@ -157,4 +169,107 @@ fn none_without_a_sequence_header_or_from_a_truncated_one() {
         codec_string(&[0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
         None
     );
+}
+
+/// A reduced still-picture sequence header of `profile` at `level`, 64x64, then `color`
+/// (its color_config fields) and the rest.
+fn still_picture(profile: u64, level: u64, color: &[(u32, u64)]) -> Vec<u8> {
+    let mut w = BitWriter::default();
+    for (n, v) in [
+        (3, profile),
+        (1, 1),
+        (1, 1),
+        (5, level),
+        (4, 5),
+        (4, 5),
+        (6, 63),
+        (6, 63),
+        (3, 0),
+        (3, 0),
+    ]
+    .into_iter()
+    .chain(color.iter().copied())
+    .chain([(1, 0), (1, 1)])
+    {
+        w = w.f(n, v);
+    }
+    temporal_unit(&w.bytes())
+}
+
+#[test]
+fn av1c_of_reduced_still_picture_headers_across_profiles_depths_and_subsampling() {
+    for (what, profile, level, color, third) in [
+        (
+            "profile 1, 8-bit 4:4:4",
+            1,
+            5,
+            &[(1, 0), (1, 0), (1, 0)][..],
+            0x00,
+        ),
+        (
+            "profile 1, 10-bit 4:4:4",
+            1,
+            5,
+            &[(1, 1), (1, 0), (1, 1)][..],
+            0x40,
+        ),
+        (
+            "profile 1, sRGB",
+            1,
+            5,
+            &[(1, 0), (1, 1), (8, 1), (8, 13), (8, 0)][..],
+            0x00,
+        ),
+        (
+            "profile 2, 12-bit 4:2:2",
+            2,
+            8,
+            &[(1, 1), (1, 1), (1, 0), (1, 0), (1, 0), (1, 1), (1, 0)][..],
+            0x68,
+        ),
+        (
+            "profile 2, 12-bit 4:4:4",
+            2,
+            8,
+            &[(1, 1), (1, 1), (1, 0), (1, 0), (1, 0), (1, 0)][..],
+            0x60,
+        ),
+        (
+            "profile 2, 12-bit 4:2:0, chroma sample position 2",
+            2,
+            8,
+            &[
+                (1, 1),
+                (1, 1),
+                (1, 0),
+                (1, 0),
+                (1, 0),
+                (1, 1),
+                (1, 1),
+                (2, 2),
+            ][..],
+            0x6e,
+        ),
+        (
+            "profile 2, 10-bit 4:2:2",
+            2,
+            8,
+            &[(1, 1), (1, 0), (1, 0), (1, 0), (1, 1)][..],
+            0x48,
+        ),
+        (
+            "profile 0, monochrome",
+            0,
+            4,
+            &[(1, 0), (1, 1), (1, 0), (1, 1)][..],
+            0x1c,
+        ),
+    ] {
+        let tu = still_picture(profile, level, color);
+        assert_eq!(
+            av1c(sequence_header(&tu).unwrap()),
+            Some([0x81, (profile << 5 | level) as u8, third, 0]),
+            "{what}"
+        );
+    }
 }

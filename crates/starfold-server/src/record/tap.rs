@@ -1,4 +1,4 @@
-//! Where recordings take the H.264 stream: beside its viewers, never among them. The
+//! Where recordings take the stream: beside its viewers, never among them. The
 //! encode thread hands each frame of the cohort being recorded to every tap as it hands it
 //! to the viewers, with the size its encoder was opened at. A tap is not a hub client:
 //! flow control, the cohort's display rate, its bitrate and `deliver` never see it.
@@ -13,6 +13,7 @@
 //! counting as demand on the stream at once ([`Taps::any`]), whoever ends it.
 
 use super::End;
+use crate::encoder::Codec;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,13 +29,25 @@ pub const LARGEST_FRAME: usize = 8 << 20;
 /// What a queued frame costs besides its bytes (its message and the channel's slot).
 pub const OVERHEAD: usize = 256;
 
+/// The cohort a frame comes from, as [`Taps::offer`] takes it.
+#[derive(Clone, Copy)]
+pub struct Source {
+    pub cohort: u64,
+    pub codec: Codec,
+    /// The size its encoder was opened at.
+    pub size: (u32, u32),
+}
+
 /// One encoded frame as a recording gets it.
 pub struct Tapped {
     /// The size its encoder was opened at: the size of the picture it encodes.
     pub size: (u32, u32),
+    /// The recorded cohort's codec: H.264 or AV1.
+    pub codec: Codec,
     pub key: bool,
     pub captured_at: Instant,
-    /// The protocol 1 message, header included (Annex-B from byte 16 on).
+    /// The protocol 1 message, header included (from byte 16 on, Annex-B for H.264, a
+    /// temporal unit for AV1).
     pub data: Bytes,
     /// What it counts against the queue until [`Tap::release`]d.
     pub charge: usize,
@@ -207,12 +220,16 @@ impl Taps {
     pub fn offer(
         &self,
         seen: &mut Seen,
-        cohort: u64,
-        size: (u32, u32),
+        from: Source,
         all_key: bool,
         captured_at: Instant,
         msgs: &[Bytes],
     ) {
+        let Source {
+            cohort,
+            codec,
+            size,
+        } = from;
         if cohort != self.cohort() || !self.any() {
             return;
         }
@@ -240,6 +257,7 @@ impl Taps {
             };
             t.admit(Tapped {
                 size,
+                codec,
                 key: all_key,
                 captured_at,
                 data: data.clone(),

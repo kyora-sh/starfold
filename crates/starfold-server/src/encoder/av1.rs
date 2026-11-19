@@ -47,22 +47,89 @@ fn leb128(d: &[u8], mut i: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// One OBU of a temporal unit.
+pub struct Obu<'a> {
+    pub kind: u8,
+    /// Its header byte and, with the extension flag, the extension byte.
+    pub header: &'a [u8],
+    pub payload: &'a [u8],
+    /// Header, size field (if any) and payload.
+    pub whole: &'a [u8],
+}
+
+/// The most bytes of a sequence header's payload a recording takes; an encoder's is a few
+/// dozen.
+pub const MAX_SEQUENCE_HEADER: usize = 512;
+
+/// The OBU starting at `i` and where the next one starts; `None` if it runs past the end
+/// or sets the forbidden bit.
+fn obu_at(d: &[u8], i: usize) -> Option<(Obu<'_>, usize)> {
+    let h = *d.get(i)?;
+    if h & 0x80 != 0 {
+        return None;
+    }
+    let header_end = i + 1 + ((h >> 2) & 1) as usize;
+    let mut j = header_end;
+    let mut size = d.len().checked_sub(j)?;
+    if h & 2 != 0 {
+        (size, j) = leb128(d, j)?;
+    }
+    let end = j.checked_add(size).filter(|&e| e <= d.len())?;
+    let obu = Obu {
+        kind: (h >> 3) & 0xf,
+        header: &d[i..header_end],
+        payload: &d[j..end],
+        whole: &d[i..end],
+    };
+    Some((obu, end))
+}
+
+/// Every OBU of a temporal unit, in order, read in place; an error for one that runs past
+/// the end or sets the forbidden bit, and nothing after it.
+pub fn obus(d: &[u8]) -> Obus<'_> {
+    Obus { d, i: 0 }
+}
+
+pub struct Obus<'a> {
+    d: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Iterator for Obus<'a> {
+    type Item = Result<Obu<'a>, &'static str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.d.len() {
+            return None;
+        }
+        match obu_at(self.d, self.i) {
+            Some((o, next)) => {
+                self.i = next;
+                Some(Ok(o))
+            }
+            None => {
+                self.i = self.d.len();
+                Some(Err(
+                    "an AV1 frame with an OBU that is malformed or runs past its end",
+                ))
+            }
+        }
+    }
+}
+
 /// The kind and payload of the first OBU in a temporal unit that `want` takes.
 fn first_obu(d: &[u8], want: impl Fn(u8) -> bool) -> Option<(u8, &[u8])> {
+    first_whole_obu(d, want).map(|o| (o.kind, o.payload))
+}
+
+fn first_whole_obu(d: &[u8], want: impl Fn(u8) -> bool) -> Option<Obu<'_>> {
     let mut i = 0;
     while i < d.len() {
-        let h = d[i];
-        let kind = (h >> 3) & 0xf;
-        let mut j = i + 1 + ((h >> 2) & 1) as usize;
-        let mut size = d.len().checked_sub(j)?;
-        if h & 2 != 0 {
-            (size, j) = leb128(d, j)?;
+        let (o, next) = obu_at(d, i)?;
+        if want(o.kind) {
+            return Some(o);
         }
-        let end = j.checked_add(size).filter(|&e| e <= d.len())?;
-        if want(kind) {
-            return Some((kind, &d[j..end]));
-        }
-        i = end;
+        i = next;
     }
     None
 }
@@ -70,6 +137,32 @@ fn first_obu(d: &[u8], want: impl Fn(u8) -> bool) -> Option<(u8, &[u8])> {
 /// The payload of the first sequence header OBU in a temporal unit.
 pub fn sequence_header(d: &[u8]) -> Option<&[u8]> {
     first_obu(d, |k| k == 1).map(|(_, p)| p)
+}
+
+/// The first sequence header OBU in a temporal unit, header and size field included.
+pub fn sequence_header_obu(d: &[u8]) -> Option<&[u8]> {
+    first_whole_obu(d, |k| k == 1).map(|o| o.whole)
+}
+
+/// The four fixed bytes of an `av1C` box (AV1-ISOBMFF section 2.3.3) for a sequence
+/// header's payload of at most [`MAX_SEQUENCE_HEADER`] bytes; its configOBUs follow them.
+pub fn av1c(sh: &[u8]) -> Option<[u8; 4]> {
+    if sh.len() > MAX_SEQUENCE_HEADER {
+        return None;
+    }
+    let s = sequence(sh)?;
+    Some([
+        0x81,
+        (s.profile << 5 | s.level) as u8,
+        (s.tier << 7
+            | ((s.depth > 8) as u32) << 6
+            | ((s.depth == 12) as u32) << 5
+            | s.mono << 4
+            | s.ssx << 3
+            | s.ssy << 2
+            | s.csp) as u8,
+        0,
+    ])
 }
 
 /// The frame_type (0 key, 1 inter, 2 intra-only, 3 switch) of the first frame in a
@@ -87,6 +180,42 @@ pub fn codec_string(temporal_unit: &[u8]) -> Option<String> {
 }
 
 fn from_sequence_header(sh: &[u8]) -> Option<String> {
+    let s = sequence(sh)?;
+    let base = format!(
+        "av01.{}.{:02}{}.{:02}",
+        s.profile,
+        s.level,
+        if s.tier == 1 { 'H' } else { 'M' },
+        s.depth
+    );
+    let rest = format!(
+        "{}.{}{}{}.{:02}.{:02}.{:02}.{}",
+        s.mono, s.ssx, s.ssy, s.csp, s.cp, s.tc, s.mc, s.range
+    );
+    Some(if rest == "0.110.01.01.01.0" {
+        base
+    } else {
+        format!("{base}.{rest}")
+    })
+}
+
+/// What a sequence header says about the stream's format.
+struct Sequence {
+    profile: u32,
+    level: u32,
+    tier: u32,
+    depth: u32,
+    mono: u32,
+    ssx: u32,
+    ssy: u32,
+    csp: u32,
+    cp: u32,
+    tc: u32,
+    mc: u32,
+    range: u32,
+}
+
+fn sequence(sh: &[u8]) -> Option<Sequence> {
     let b = &mut Bits { d: sh, pos: 0 };
     let profile = b.f(3)?;
     b.f(1)?;
@@ -187,14 +316,18 @@ fn from_sequence_header(sh: &[u8]) -> Option<String> {
             csp = b.f(2)?;
         }
     }
-    let base = format!(
-        "av01.{profile}.{level:02}{}.{depth:02}",
-        if tier == 1 { 'H' } else { 'M' }
-    );
-    let rest = format!("{mono}.{ssx}{ssy}{csp}.{cp:02}.{tc:02}.{mc:02}.{range}");
-    Some(if rest == "0.110.01.01.01.0" {
-        base
-    } else {
-        format!("{base}.{rest}")
+    Some(Sequence {
+        profile,
+        level,
+        tier,
+        depth,
+        mono,
+        ssx,
+        ssy,
+        csp,
+        cp,
+        tc,
+        mc,
+        range,
     })
 }

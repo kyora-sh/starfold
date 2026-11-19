@@ -39,6 +39,7 @@ x264 and an OpenH264 build distributed under MIT; see [Install](README.md#instal
 - The embeddable client works end to end over an exec-style byte bridge (#80)
 - A unix socket listener, `--listen-unix` (Linux), and a framed WebSocket mode, `--framed` (#85)
 - `starfold attach DIR`: a per-connection relay to the unix socket listener (Linux) (#88)
+- A recording of an AV1 encode is AV1 in MP4 (`av01`), not only H.264; a codec change mid-recording starts a new segment, and a frame no MP4 sample can be made of ends it with `bad_frame` (#93)
 
 ### Fixes
 

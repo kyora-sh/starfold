@@ -21,13 +21,14 @@
 //! it ends with no answer to give. The writer finishing never gives the place back, and a
 //! writer stuck on its disk does not keep it ([`STALL`]).
 //!
-//! Another encoder taking over mid-recording (new SPS/PPS) starts a new MP4 segment at
-//! its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
+//! Another encoder taking over mid-recording (new SPS/PPS, a new AV1 sequence header, or
+//! the other codec) starts a new MP4 segment at its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
 //! every `segment-k.mp4`; without it the response is the first segment, as an MP4, and
 //! `x-starfold-segments` and `x-starfold-record-end` say how many there were and why the
 //! recording ended.
 //!
-//! A recording is the H.264 stream starfold already encodes, rewrapped as MP4. It takes the
+//! A recording is the stream starfold already encodes, H.264 or AV1, rewrapped as MP4
+//! (`avc1`, or `av01` with the sequence header in `av1C`). It takes the
 //! frames beside the viewers ([`tap`]), not as one of them, so it never holds the stream
 //! back. Like the stream, it holds frames only when the screen changes, and it doesn't
 //! include the cursor (viewers draw it locally), except on macOS with `--show-cursor` or
@@ -39,6 +40,7 @@ pub(crate) mod tap;
 pub use spool::default_dir;
 pub use tap::Taps;
 
+use crate::encoder::{av1, Codec};
 use crate::hub::Hub;
 use crate::mp4;
 use axum::body::Body;
@@ -283,6 +285,8 @@ pub(crate) enum End {
     SegmentCap,
     /// A keyframe with new parameter sets that can't start a segment.
     BadParameterSets,
+    /// A frame an MP4 sample can't be made of.
+    BadFrame,
     /// A segment couldn't be written; the others are there.
     SegmentLost,
     /// The stream it recorded stopped being one picture per frame, or its writer or
@@ -310,6 +314,7 @@ impl End {
             End::Resized => "resized",
             End::SegmentCap => "segment_cap",
             End::BadParameterSets => "bad_parameter_sets",
+            End::BadFrame => "bad_frame",
             End::SegmentLost => "segment_lost",
             End::Closed => "closed",
             End::SizeLimit => "size_limit",
@@ -381,19 +386,20 @@ impl Drop for InDisk<'_> {
     }
 }
 
-/// One segment while it is recorded: where its samples start in the index, its parameter
-/// sets, and when it ended (the next segment's first frame).
+/// One segment while it is recorded: where its samples start in the index, its track
+/// (from its keyframe's parameter sets or sequence header), and when it ended (the next
+/// segment's first frame).
 struct Part {
     from: usize,
-    params: Option<(Vec<u8>, Vec<u8>)>,
+    track: Option<mp4::Track>,
     end_ms: Option<u64>,
 }
 
 impl Part {
-    fn at(from: usize, keyframe: &[u8]) -> Part {
+    fn at(from: usize, codec: Codec, keyframe: &[u8]) -> Part {
         Part {
             from,
-            params: mp4::parameter_sets(keyframe).ok(),
+            track: mp4::Track::of(codec, keyframe).ok(),
             end_ms: None,
         }
     }
@@ -417,7 +423,7 @@ struct Writer {
     index: Vec<mp4::Sample>,
     parts: Vec<Part>,
     size: Option<(u32, u32)>,
-    first: Option<Vec<Vec<u8>>>,
+    first: Option<(Codec, Vec<Vec<u8>>)>,
     last_ms: Option<u64>,
     /// Sample bytes handed to `out`.
     written: u64,
@@ -477,16 +483,16 @@ impl Writer {
         let ms = self.ms(f.captured_at);
         let ms = self.last_ms.map_or(ms, |l| ms.max(l + 1));
         if f.key {
-            let p = params(d);
+            let p = params(f.codec, d).ok_or(End::BadParameterSets)?;
             match &self.first {
                 None => {
                     self.first = Some(p);
-                    self.parts.push(Part::at(self.index.len(), d));
+                    self.parts.push(Part::at(self.index.len(), f.codec, d));
                 }
-                // Another encoder took over the stream: it can't share the track, so its
-                // keyframe starts the next segment.
-                Some(prev) if !p.is_empty() && *prev != p => {
-                    if !complete(&p) {
+                // Another encoder (or codec) took over the stream: it can't share the
+                // track, so its keyframe starts the next segment.
+                Some(prev) if prev.0 != p.0 || (!p.1.is_empty() && *prev != p) => {
+                    if mp4::Track::of(f.codec, d).is_err() {
                         return Err(End::BadParameterSets);
                     }
                     if self.parts.len() == MAX_SEGMENTS {
@@ -495,21 +501,26 @@ impl Writer {
                     if let Some(last) = self.parts.last_mut() {
                         last.end_ms = Some(ms);
                     }
-                    self.parts.push(Part::at(self.index.len(), d));
+                    self.parts.push(Part::at(self.index.len(), f.codec, d));
                     self.first = Some(p);
                 }
                 Some(_) => {}
             }
+        } else if self.first.as_ref().is_some_and(|(c, _)| *c != f.codec) {
+            return Err(End::BadFrame);
         }
         if self.parts.is_empty() {
             self.parts.push(Part {
                 from: 0,
-                params: None,
+                track: None,
                 end_ms: None,
             });
         }
-        let units = mp4::units(d);
-        let size: u64 = units.iter().map(|n| 4 + n.len() as u64).sum();
+        let sample = mp4::sample_units(f.codec, d).map_err(|e| {
+            log::warn!("recording: {e}");
+            End::BadFrame
+        })?;
+        let size = sample.size;
         if self.written + size > self.limit() {
             return Err(End::SizeLimit);
         }
@@ -520,11 +531,9 @@ impl Writer {
                 hook(self.written).map_err(disk_error)?;
             }
             // Straight from the stream's buffer into the writer's: the frame is not copied.
-            for n in &units {
-                self.out
-                    .write_all(&(n.len() as u32).to_be_bytes())
-                    .map_err(disk_error)?;
-                self.out.write_all(n).map_err(disk_error)?;
+            for u in sample.iter() {
+                self.out.write_all(u.prefix()).map_err(disk_error)?;
+                self.out.write_all(u.body).map_err(disk_error)?;
             }
         }
         if self.index.len() == self.index.capacity() {
@@ -696,9 +705,9 @@ impl Clip {
                 true => index[kept].ms,
                 false => p.end_ms.unwrap_or(end_ms),
             };
-            let header = match &p.params {
+            let header = match &p.track {
                 None => Err("recording doesn't start with a keyframe".to_string()),
-                Some((sps, pps)) => mp4::header(samples, sps, pps, size.0, size.1, seg_end),
+                Some(track) => mp4::header(samples, track, size.0, size.1, seg_end),
             };
             match header {
                 Ok(header) => {
@@ -1330,25 +1339,35 @@ async fn begin(r: &Arc<Recorder>, max: Duration) -> Result<Rec, Response> {
     })
 }
 
-/// A keyframe's SPS and PPS, the level left out: an MP4 track keeps the first
-/// keyframe's, which still describe a stream that only changed level.
-fn params(d: &[u8]) -> Vec<Vec<u8>> {
-    mp4::nals(d)
-        .into_iter()
-        .filter(|n| matches!(n[0] & 0x1f, 7 | 8))
-        .map(|n| {
-            let mut v = n.to_vec();
-            if v[0] & 0x1f == 7 && v.len() > 3 {
-                v[3] = 0;
+/// A keyframe's codec and what describes its stream: H.264's SPS and PPS, the level left
+/// out (an MP4 track keeps the first keyframe's, which still describe a stream that only
+/// changed level); AV1's sequence header. None for an AV1 sequence header OBU an MP4 can't
+/// take: without a size field, or longer than [`av1::MAX_SEQUENCE_HEADER`].
+fn params(codec: Codec, d: &[u8]) -> Option<(Codec, Vec<Vec<u8>>)> {
+    let p = match codec {
+        Codec::H264 => mp4::nals(d)
+            .filter(|n| matches!(n[0] & 0x1f, 7 | 8))
+            .map(|n| {
+                let mut v = n.to_vec();
+                if v[0] & 0x1f == 7 && v.len() > 3 {
+                    v[3] = 0;
+                }
+                v
+            })
+            .collect(),
+        Codec::Av1 => match av1::sequence_header_obu(d) {
+            None => Vec::new(),
+            Some(obu) => {
+                let s = av1::sequence_header(obu)?;
+                if obu[0] & 2 == 0 || s.len() > av1::MAX_SEQUENCE_HEADER {
+                    return None;
+                }
+                vec![s.to_vec()]
             }
-            v
-        })
-        .collect()
-}
-
-/// Whether parameter sets from `params` can open an MP4 (`mp4::header` needs these).
-fn complete(p: &[Vec<u8>]) -> bool {
-    p.iter().any(|n| n[0] & 0x1f == 7 && n.len() >= 4) && p.iter().any(|n| n[0] & 0x1f == 8)
+        },
+        _ => Vec::new(),
+    };
+    Some((codec, p))
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.

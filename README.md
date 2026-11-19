@@ -334,7 +334,13 @@ can reach the server can stop the recording and take the clip.
 
 Under `--read-only` the three routes are refused even with `--enable-recording`.
 
-A recording is the H.264 stream starfold sends to viewers, saved as MP4. It takes each
+A recording is the stream starfold sends to viewers, saved as MP4 without re-encoding: H.264
+(`avc1`) from an H.264 encoder, AV1 (`av01`, ISO/IEC 14496-12 with the AV1 codec ISO media
+file format binding) from an AV1 one. An AV1 MP4 plays in Chrome, Edge and Firefox, in VLC,
+and with ffmpeg and ffprobe; Safari and QuickTime play it only on a Mac or iPhone whose
+hardware decodes AV1 (Apple M3 or A17 Pro and later), so on an older Mac open it in a browser
+other than Safari or in VLC, or convert it with `ffmpeg -i clip.mp4 -c:v libx264 clip-h264.mp4`.
+Today the recorded encode is the H.264 one a protocol 1 viewer would get. It takes each
 encoded frame beside the viewers, never as one of them, so it has no part in their flow
 control, their frame rate or their bitrate. With viewers taking H.264 it shares their encode
 and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer would get
@@ -383,11 +389,12 @@ answer is read back from that file:
   whose client goes away ends its recording.
 
 If another encoder takes over mid-recording (a hardware encoder failing over to the
-software one, say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
+software one, say, or one codec taking over from the other), the recording continues in a
+new MP4, up to 16 of them. Add `format=zip` to
 `/record` or `/record/stop` for all of them: `segment-1.mp4`, `segment-2.mp4`, ... and a
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
-`segment_lost`, `closed`, `size_limit`, `frame_cap`, `large_frame`, `disk_slow`,
+`bad_frame` (a frame no MP4 sample can be made of), `segment_lost`, `closed`, `size_limit`, `frame_cap`, `large_frame`, `disk_slow`,
 `disk_space` or `disk_error`). Without it you get the first MP4. Every answer says how many
 MP4s there were and why the recording ended, in `x-starfold-segments` and
 `x-starfold-record-end`; one with no video is JSON with the `error` and the `end_reason`. A zip
