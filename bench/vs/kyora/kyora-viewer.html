@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>kyora-rfb</title>
+		<style>
+			html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+			canvas { display: block; outline: none; }
+			canvas[hidden] { display: none; }
+			.bar { position: fixed; left: -10000px; top: 0; }
+		</style>
+	</head>
+	<body>
+		<canvas data-live="/websockify" width="1920" height="1080" tabindex="0" hidden></canvas>
+		<div class="bar"><span data-screen-mode=""></span><span data-screen-status=""></span><button type="button" data-live-toggle="">Live view</button><button type="button" data-live-control="" aria-pressed="false" hidden>Take control</button></div>
+		<script>
+			// The dashboard's markup around the viewer. Ready once its first pixels are drawn; with control=1 it
+			// takes control the way a user does, through the confirm.
+			const live = document.querySelector('canvas[data-live]');
+			for (const m of ['putImageData', 'drawImage']) {
+				const f = CanvasRenderingContext2D.prototype[m];
+				CanvasRenderingContext2D.prototype[m] = function (...a) { if (this.canvas === live) window.rfbReady = true; return f.apply(this, a); };
+			}
+			window.confirm = () => true;
+		</script>
+		<script src="vms-viewer.js"></script>
+		<script>
+			document.querySelector('[data-live-toggle]').click();
+			if (new URLSearchParams(location.search).get('control') === '1') document.querySelector('[data-live-control]').click();
+		</script>
+	</body>
+</html>

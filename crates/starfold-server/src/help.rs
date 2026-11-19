@@ -50,6 +50,9 @@ Server:
   --allowed-hosts               host names to answer for besides IP addresses and
                                 localhost (.example.com covers subdomains, * any)
   --allowed-origins             other sites whose pages may connect (* any)
+  --base-path                   serve under this path prefix (such as /desktop),
+                                for a reverse proxy that forwards it unchanged;
+                                given once, never empty or / (default: none)
 
 Login:
   --enable-basic-auth           ask for a password (default true)

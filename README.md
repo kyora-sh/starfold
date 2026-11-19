@@ -23,6 +23,75 @@ DISPLAY=:1 starfold         # streams display :1 and prints a link that signs yo
 Open the link it prints. On a Mac or a Windows PC, `starfold` streams that machine's own screen
 instead; see [macOS](#macos) and [Windows](#windows).
 
+## Install
+
+### Prebuilt binaries
+
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches two builds per platform
+(`<version>` is the release's, e.g. `0.3.2`; [Licensing](#licensing) has the details):
+
+- **x264, recommended** (`starfold-x264-<version>-<platform>`): GPL-2.0-or-later as a combined work
+  with x264, whose source the release attaches beside it.
+- **OpenH264** (`starfold-<version>-<platform>`): needs no x264 library, and is distributed under
+  MIT. Like any program built with GCC, the Linux and Windows binaries include GCC's runtime code
+  (its startup files on Linux; also the C++ runtime libraries on Windows), which is
+  GPL-3.0-or-later with the GCC Runtime Library Exception: the exception is what lets the binary be
+  distributed under MIT. Linux binaries also include glibc's startup files, which are
+  LGPL-2.1-or-later with permission to link them into any program. These texts are in the
+  `licenses/` of the archives they apply to: GCC's in the Linux and Windows ones, glibc's in the
+  Linux ones.
+
+| Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
+| --------------------- | ---------------------------------------------- | ----------------------------------------- |
+| Linux x86_64          | `starfold-x264-<version>-x86_64-linux.tar.gz`  | `starfold-<version>-x86_64-linux.tar.gz`  |
+| Linux aarch64         | `starfold-x264-<version>-aarch64-linux.tar.gz` | `starfold-<version>-aarch64-linux.tar.gz` |
+| macOS (Apple silicon) | `starfold-x264-<version>-aarch64-macos.tar.gz` | `starfold-<version>-aarch64-macos.tar.gz` |
+| Windows x86_64        | `starfold-x264-<version>-x86_64-windows.zip`   | `starfold-<version>-x86_64-windows.zip`   |
+
+Download an archive and its `.sha256`, check it and unpack it:
+
+```sh
+sha256sum -c starfold-x264-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
+./starfold-x264-<version>-x86_64-linux/starfold --version
+```
+
+`--version` names the version, the software encoders in the binary and the licence it is
+distributed under: `starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
+`starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
+`THIRD_PARTY.md` and `licenses/`: the licence texts of the Rust crates and Rust standard library
+compiled into the binary, of what `THIRD_PARTY.md` lists for that platform, and of each library or runtime object
+linked in statically (OpenH264; glibc's and GCC's startup files on Linux; Opus on macOS and
+Windows; libyuv, the MinGW-w64 runtime and GCC's runtime libraries on Windows). The x264 archives
+add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
+
+What each platform needs at run time:
+
+- **Linux** (built on Ubuntu 24.04, so it needs a distribution at least that new): libyuv, Opus and
+  PulseAudio's client library, plus x264 for the x264 build and the C++ runtime for the OpenH264
+  one. On Ubuntu 24.04: `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for
+  `starfold-x264-*` or `libstdc++6` for `starfold-*` (most systems have it already). Plus an X
+  server to stream, such as Xvfb (see [Usage](#usage)).
+- **macOS**: nothing beyond the system; Opus is linked in, and x264 in the x264 build. The binary is not notarized,
+  so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
+- **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
+
+### From source
+
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on
+Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
+  libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev
+cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
+```
+
+That is the x264 build; `--tag v<version>` installs a release instead of main's head. For the MIT
+build, add `--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
+`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
+[Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
+
 ## Benchmarks
 
 [`bench/results/2026-11-starfold-vs-novnc.md`](bench/results/2026-11-starfold-vs-novnc.md) measures
@@ -39,9 +108,28 @@ caveats and raw cells are in the results file.
 
 Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esbuild;
 `nix-shell --arg withRust true` provides them all (plain `nix-shell` all but Rust, for your own
-toolchain). The H.264 encoder is x264. OpenH264, built from source (needs nasm), is optional:
+toolchain). The H.264 encoder is x264, on x86_64 and aarch64 only: on other architectures the
+`x264` feature refuses to build. OpenH264, built from source (needs nasm), is optional:
 `--features openh264` adds it beside x264 (`--encoder openh264`), and
 `--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
+
+The AV1 encoder libaom (BSD-2-Clause) is optional: `--features libaom` adds it
+(`--encoder libaom`). It is built from source, libaom v3.15.3 at commit
+`b141d9c45db236335351c8a4b2a14b3ade27c937`, which is the git submodule
+`crates/starfold-aom-sys/aom`, and is linked statically, so no system libaom is used. That build
+also needs git, cmake 3.16 or newer, perl and, on x86_64, nasm (or yasm); the build stops before
+compiling and names any that are missing:
+
+| System         | Install                                                                          |
+| -------------- | -------------------------------------------------------------------------------- |
+| Debian, Ubuntu | `sudo apt install cmake perl nasm libclang-dev`                                  |
+| Fedora         | `sudo dnf install cmake perl nasm clang-devel`                                   |
+| macOS          | `brew install cmake nasm` (perl and libclang come with `xcode-select --install`) |
+
+Clone with the submodule (`git clone --recursive`, or `git submodule update --init` in an existing
+clone). The build checks that the submodule is at that commit with no file changed, so it needs
+the submodule's git metadata: GitHub's "Download ZIP" and its automatic source archives contain
+neither the submodule nor that, and can't build libaom.
 
 ```sh
 nix-shell --arg withRust true
@@ -136,6 +224,7 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, file contents or recordings; files are listed and downloaded only when `--file-transfers` names `download`; watching still influences delivery as any viewer does     |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
+| `--base-path`                                                  | none                                                                  | serve everything under this path prefix (such as `/desktop`), for a reverse proxy that forwards it unchanged; see [Hosts and origins](#hosts-and-origins)                                                 |
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
@@ -200,6 +289,23 @@ host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-
 To let a page on another site connect, name that site with `--allowed-origins`.
 Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as
 usual. A refused request gets a 403 that names the flag to add.
+
+A proxy that serves starfold under a path, such as `https://example.com/desktop/`, and
+forwards the path unchanged needs `--base-path=/desktop`. starfold then serves its pages
+under `/desktop/` only and prints its link with the prefix. Every request, `/desktop`
+itself included, goes through the same host, origin and password checks as without a
+prefix; once they pass, `/desktop` is sent on to `/desktop/` and paths outside the prefix
+are not found. A proxy that strips the prefix before forwarding needs no flag, but has to
+send `/desktop` on to `/desktop/` itself: the page's URLs are relative, so from
+`/desktop` they would resolve at the site's root.
+
+Give `--base-path` once, with a prefix such as `/desktop` (letters, digits, `.`, `_`, `~`
+or `-` between single slashes, at most 1024 bytes; one trailing slash is dropped). Given
+twice, without a value, empty, `/` or in any other shape, the server does not start: it
+exits with code 2 and says why on stderr, even beside `--help` or `--version`; leave the
+flag out to serve at the root. (This is about starting the server; the encoder-probe child
+the server runs for itself opens no listener and ignores the flag.) The prefix is part of every request line, so it counts against the length a
+request line may have (64 KiB in starfold, often less in a proxy).
 
 ### For agents and scripts
 
@@ -368,8 +474,13 @@ What keeps other users out, in three parts:
   parent), and starfold holds a lock on it (`flock`) for as long as it serves, so a
   second instance on it is refused. In it, an existing `s` is replaced only if it is a
   socket of starfold's user that refuses a connection (nothing listens on it); anything
-  else there, or at `DIR`, is refused. Any refusal names the directory, symlink or entry
-  at fault, with its owner and mode, and touches nothing of someone else's.
+  else there, or at `DIR`, is refused. A server that has just died can leave `DIR` held
+  for a moment by a child it forked that has not yet started its program (the child's
+  copies of the lock and the listening socket close when it does); a restart in that
+  moment is refused as another server using it, which fails safe, and once the child has
+  started its program `DIR` can be taken back as above. Any refusal names the directory,
+  symlink or entry at fault, with its owner and mode, and touches nothing of someone
+  else's.
 
 The socket's mode decides who reaches `connect` at all. With the default
 `--listen-unix-mode=0600` no other uid can connect: the kernel refuses it. That holds
@@ -444,12 +555,13 @@ at most 64 MiB, kind byte included; the page doesn't send a larger one.
 
 ### macOS
 
-starfold also streams a Mac's own screen, with every feature of the Linux version but
-`--listen-unix` (ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system
-audio).
+starfold also streams a Mac's own screen (ScreenCaptureKit capture, CGEvent input,
+NSPasteboard clipboard, system audio). Not on a Mac: `--listen-unix` and `starfold attach`
+(Linux-only), the VA-API and NVENC encoders (a Mac has VideoToolbox), rounded corners (X11 only),
+and the microphone FIFO (the microphone plays into a loopback device instead, below).
 
 ```sh
-brew install opus pkgconf esbuild
+brew install x264 opus pkgconf esbuild
 cargo build --release
 ./target/release/starfold --port=6901
 ```
@@ -474,9 +586,12 @@ rounded-corner flags don't apply.
 
 ### Windows
 
-starfold also streams a Windows desktop (Windows 10 or later), with every feature of the
-Linux version but `--listen-unix` (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
-WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
+starfold also streams a Windows desktop (Windows 10 version 1703 or later, for per-monitor DPI
+awareness v2; DXGI Desktop Duplication capture,
+SendInput, clipboard text and images, WASAPI system audio). Not on Windows: `--listen-unix` and
+`starfold attach` (Linux-only), the VA-API encoder (Windows has NVENC, Media Foundation and Quick
+Sync), rounded corners (X11 only), and the microphone FIFO (the microphone plays into a virtual
+audio cable instead, below). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
 vcpkg install x264 libyuv opus --triplet x64-windows-static-md
@@ -553,7 +668,12 @@ The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2
 so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
 work. Each release attaches the exact x264 source its builds link
 ([third_party/x264](third_party/x264/README.md)). A build with
-`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
-no GPL component, so the binary stays under starfold's MIT licence; `starfold --version` lists
-the encoders a binary includes and its licence.
+`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead, so the
+binary is distributed under starfold's MIT licence; `starfold --version` lists the encoders a
+binary includes and that licence. A binary built with GCC includes GCC's runtime code (on Linux
+its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under
+GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary
+under MIT; a Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with
+permission to link them into any program. The Linux and Windows release archives carry these
+texts; the macOS ones have neither (Apple's toolchain links no GCC or glibc code).
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.

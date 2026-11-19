@@ -16,6 +16,7 @@
 		"*.nix",
 		"patches/**",
 		"bench/**",
-		"third_party/**"
+		"third_party/**",
+		".github/release/*.hbs"
 	]
 }

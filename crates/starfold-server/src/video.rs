@@ -432,14 +432,38 @@ struct Cohort {
 
 /// The slowest rate an encoder budgets frames for: no frame may take more than a tenth of a
 /// second's worth of the cap.
-const FPS_FLOOR: u32 = 10;
+pub(crate) const FPS_FLOOR: u32 = 10;
 
-/// How often a cohort takes a frame while the picture moves. Flow control and a busy encoder
-/// skip frames, and an encoder that budgets for every capture would starve the ones that go out.
+/// How many of the last gaps between motion frames a raise of the budgeted rate looks at.
+const UP_GAPS: usize = 3;
+
+/// How far above the budgeted rate frames have to come before it is raised.
+const UP_SHARE: f64 = 0.05;
+
+/// A gap between motion frames this long or longer is a pause, not a rate.
+const PAUSE_MS: f64 = 1000.0;
+
+/// The rate a cohort's encoder budgets each picture for: the rate frames are delivered to
+/// it while the picture moves, so the stream spends its target on average, neither more
+/// (frames delivered faster than budgeted, each sized for the slower rate) nor much less.
+///
+/// - Measured: a moving average of the gaps between motion frames (each new gap weighs
+///   0.2, about the last five frames). A gap of a second or more is a pause and isn't
+///   counted.
+/// - Raised at once when the last three gaps run 5% or more faster than the budgeted rate,
+///   to their mean rate, at most twice the cap: frames delivered faster than budgeted
+///   would each spend a slower rate's share.
+/// - Lowered (flow control and a busy encoder skip frames, and an encoder that budgets for
+///   every capture would starve the ones that go out) only by a quarter or more, at most
+///   once a second, and never below the floor.
+/// - Back to the cap after a pause and at the start, so the first pictures after either are
+///   budgeted for the full rate, not for the slow trickle before.
 struct Pace {
     last: Option<Instant>,
-    /// Smoothed interval between frames taken in motion (ms); pauses of a second or more are stills.
+    /// Smoothed interval between frames taken in motion (ms), since the last pause.
     interval_ms: Option<f64>,
+    /// The last [`UP_GAPS`] gaps (ms), since the last pause.
+    recent: std::collections::VecDeque<f64>,
     fps: u32,
     changed: Instant,
 }
@@ -449,35 +473,66 @@ impl Pace {
         Pace {
             last: None,
             interval_ms: None,
+            recent: std::collections::VecDeque::with_capacity(UP_GAPS),
             fps,
             changed: Instant::now(),
         }
     }
 
-    /// A motion frame went to the encoder at `now`. Changes the budgeted rate at most once a
-    /// second, and only by a quarter or more.
+    fn set(&mut self, fps: u32, now: Instant, cohort: u64, why: &str) {
+        log::info!(
+            "cohort {cohort}: encoder rate {} -> {fps} fps ({why})",
+            self.fps
+        );
+        self.fps = fps;
+        self.changed = now;
+    }
+
+    /// A motion frame went to the encoder at `now`, the cohort capped at `max` fps.
     fn took(&mut self, now: Instant, max: u32, cohort: u64) {
-        if let Some(gap) = self
+        let top = max.saturating_mul(2).max(1);
+        let gap = self
             .last
-            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0)
-        {
-            if gap < 1000.0 {
-                self.interval_ms = Some(self.interval_ms.map_or(gap, |i| i * 0.8 + gap * 0.2));
+            .map(|l| now.saturating_duration_since(l).as_secs_f64() * 1000.0);
+        self.last = Some(now);
+        if self.fps > top {
+            self.set(top, now, cohort, "the cap went down");
+        }
+        match gap {
+            Some(g) if g < PAUSE_MS => {
+                self.interval_ms = Some(self.interval_ms.map_or(g, |i| i * 0.8 + g * 0.2));
+                if self.recent.len() == UP_GAPS {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(g);
+            }
+            Some(_) => {
+                self.interval_ms = None;
+                self.recent.clear();
+                if self.fps != max {
+                    self.set(max, now, cohort, "after a pause");
+                }
+                return;
+            }
+            None => return,
+        }
+        if self.recent.len() == UP_GAPS {
+            let mean = self.recent.iter().sum::<f64>() / UP_GAPS as f64;
+            let up = ((1000.0 / mean.max(1.0)).round() as u32).min(top);
+            if up as f64 >= self.fps as f64 * (1.0 + UP_SHARE) {
+                let why = format!("frames every {mean:.0} ms");
+                self.set(up, now, cohort, &why);
+                return;
             }
         }
-        self.last = Some(now);
         let Some(interval) = self.interval_ms else {
             return;
         };
-        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), max);
+        let want = ((1000.0 / interval.max(1.0)).round() as u32).clamp(FPS_FLOOR.min(max), top);
         let step = (want as f64 - self.fps as f64).abs() >= self.fps as f64 * 0.25;
         if step && now.saturating_duration_since(self.changed) >= Duration::from_secs(1) {
-            log::info!(
-                "cohort {cohort}: encoder rate {} -> {want} fps (a frame every {interval:.0} ms)",
-                self.fps
-            );
-            self.fps = want;
-            self.changed = now;
+            let why = format!("a frame every {interval:.0} ms");
+            self.set(want, now, cohort, &why);
         }
     }
 }
@@ -577,7 +632,7 @@ fn encoder_config(
 /// controller reins the total in if several stripes move at once. An encoder that
 /// `holds` its cap runs at it on any picture, so it gets its area share exactly.
 /// 0 = uncapped.
-fn stripe_share(target: u32, n: usize, holds: bool) -> u32 {
+pub(crate) fn stripe_share(target: u32, n: usize, holds: bool) -> u32 {
     if target == 0 {
         return 0;
     }
@@ -999,12 +1054,12 @@ impl Engine {
                 y: s.y as usize,
                 h: s.h as usize,
                 enc: (self.open)(&ecfg)?,
-                cfg: ecfg,
-                max_threads: if self.cfg.adaptive_threads {
+                max_threads: if self.cfg.adaptive_threads && ecfg.backend.takes_threads() {
                     (self.cfg.threads / n as u32).max(1)
                 } else {
                     1
                 },
+                cfg: ecfg,
                 applied_kbps: None,
                 applied_crf: -1.0,
                 applied_fps: 0,
@@ -1595,9 +1650,9 @@ impl Engine {
                 // A keyframe only a recording waits for costs what a usual frame does.
                 boost: v.want_key && !c.shared.degraded(),
                 fps: if typing {
-                    max_fps
+                    max_fps.max(c.pace.fps)
                 } else {
-                    c.pace.fps.min(max_fps)
+                    c.pace.fps
                 },
             }) {
                 Ok(()) => {
@@ -2580,6 +2635,30 @@ struct Stripe {
     open: Open,
 }
 
+/// A stripe's encoder between closing a failed one and opening its replacement: it encodes
+/// nothing, so while no replacement opens, every picture is a failed one that tries again.
+struct Retired;
+
+impl VideoEncoder for Retired {
+    fn set_rate(&mut self, _: RateConfig) -> Result<(), EncodeError> {
+        Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        _: &FrameView<'_>,
+        _: EncodeOptions<'_>,
+    ) -> Result<Vec<encoder::AccessUnit>, EncodeError> {
+        Err(EncodeError(
+            "no encoder: the failed one is closed and none opened in its place".into(),
+        ))
+    }
+
+    fn drain(&mut self) -> Result<Vec<encoder::AccessUnit>, EncodeError> {
+        Ok(Vec::new())
+    }
+}
+
 const HDR: usize = negotiate::HDR_V1;
 
 struct StripeJob {
@@ -2725,6 +2804,24 @@ impl ThreadGovernor {
     }
 }
 
+/// Replaces a stripe's encoder with a fresh one at `threads`. The old one is closed first, so
+/// it holds nothing the fresh one needs, and is gone even if that can't open: the stripe then
+/// has none ([`Retired`]) until a later picture opens one. The reason if it can't.
+fn reopen(s: &mut Stripe, threads: u32) -> Option<String> {
+    s.enc = Box::new(Retired);
+    match (s.open)(&EncoderConfig {
+        threads,
+        ..s.cfg.clone()
+    }) {
+        Ok(e) => {
+            s.enc = e;
+            s.applied_kbps = None;
+            None
+        }
+        Err(e) => Some(e.0),
+    }
+}
+
 fn stripe_worker(
     i: usize,
     mut s: Stripe,
@@ -2835,59 +2932,46 @@ fn stripe_worker(
                 out.as_ref().map_or(0, |o| o.1.len())
             );
         }
-        if s.max_threads > 1 {
-            // Changed macroblocks in this stripe (all of them without a damage map).
-            let changed = info
-                .as_ref()
-                .map_or((s.h.div_ceil(16) * job.mb_cols) as f64, |m| {
-                    m.iter().filter(|&&c| c == 0).count() as f64
-                });
-            if let Some(t) = gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads) {
-                match (s.open)(&EncoderConfig {
-                    threads: t,
-                    ..s.cfg.clone()
-                }) {
-                    Ok(e) => {
-                        log::info!(
-                            "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
-                            gov.ewma_ms
-                        );
-                        // A fresh encoder opens with an IDR on its next frame.
-                        s.enc = e;
-                        s.applied_kbps = None;
-                        gov.threads = t;
-                        gov.heavy = 0;
-                        gov.light_since = None;
-                    }
-                    Err(e) => log::error!("encoder reopen failed: {e}"),
-                }
-            }
-        }
+        // The thread count the governor wants, for an encoder that takes one.
+        let want = (s.max_threads > 1)
+            .then(|| {
+                // Changed macroblocks in this stripe (all of them without a damage map).
+                let changed = info
+                    .as_ref()
+                    .map_or((s.h.div_ceil(16) * job.mb_cols) as f64, |m| {
+                        m.iter().filter(|&&c| c == 0).count() as f64
+                    });
+                gov.want(te.elapsed().as_secs_f64() * 1000.0, changed, s.max_threads)
+            })
+            .flatten();
         let failed = out.is_err();
         let error = out.as_ref().err().map(|e| e.0.clone());
+        if let Err(e) = &out {
+            log::error!("stripe {i}: {e}");
+        }
+        // A session that failed may stay broken, and the governor may want another thread
+        // count: either way the next picture gets a fresh one (which starts with an IDR).
+        if failed || want.is_some() {
+            let threads = want.unwrap_or(if s.max_threads > 1 {
+                gov.threads
+            } else {
+                s.cfg.threads
+            });
+            if let Some(why) = reopen(&mut s, threads) {
+                log::error!("stripe {i}: encoder reopen failed: {why}");
+            } else if let Some(t) = want {
+                log::info!(
+                    "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
+                    gov.ewma_ms
+                );
+                gov.threads = t;
+                gov.heavy = 0;
+                gov.light_since = None;
+            }
+        }
         let res = match out {
             Ok((key, out)) if out.len() > HDR => Some((key, out)),
-            Ok(_) => None,
-            Err(e) => {
-                log::error!("stripe {i}: {e}");
-                // A session that failed may stay broken: the next picture gets a fresh
-                // one (which starts with an IDR).
-                match (s.open)(&EncoderConfig {
-                    threads: if s.max_threads > 1 {
-                        gov.threads
-                    } else {
-                        s.cfg.threads
-                    },
-                    ..s.cfg.clone()
-                }) {
-                    Ok(e) => {
-                        s.enc = e;
-                        s.applied_kbps = None;
-                    }
-                    Err(e) => log::error!("stripe {i}: encoder reopen failed: {e}"),
-                }
-                None
-            }
+            _ => None,
         };
         // Done with the picture before saying so: the capture thread reuses it then.
         drop(job);

@@ -62,12 +62,17 @@ fn requests_and_replies_round_trip() {
     }
     let replies = [
         Reply::Opened {
-            low_power: true,
+            low_power: Some(true),
             holds_cap: false,
             name: "mfx-gen".into(),
         },
         Reply::Opened {
-            low_power: false,
+            low_power: Some(false),
+            holds_cap: true,
+            name: "mfx-gen".into(),
+        },
+        Reply::Opened {
+            low_power: None,
             holds_cap: true,
             name: "mfx-gen".into(),
         },
@@ -196,7 +201,7 @@ fn the_helper_serves_a_session() {
     assert_eq!(
         replies[0],
         Reply::Opened {
-            low_power: false,
+            low_power: Some(false),
             holds_cap: true,
             name: "fake-gen".into()
         }
@@ -276,6 +281,60 @@ fn a_stopped_device_is_reported_and_the_helper_leaves_without_closing_it() {
         }
         r => panic!("{r:?}"),
     }
+    let l = log.lock().unwrap();
+    assert!(!l.dropped, "the runtime is not closed");
+    assert_eq!(l.live, 1, "nor the frame's surface released");
+}
+
+/// Output that takes `left` writes, then fails: the server's end of the pipe closed.
+struct ClosesAfter {
+    left: usize,
+    out: Vec<u8>,
+}
+
+impl std::io::Write for ClosesAfter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.left -= 1;
+        self.out.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stopped device whose report can't get out leaves the helper as a reported one does:
+/// the stopped exit (the session forgotten, freeing nothing), not the ordinary one.
+#[test]
+fn a_stopped_device_whose_report_fails_still_frees_nothing() {
+    let (mut fake, log) = Fake::new(Codec::H264);
+    fake.sync = VecDeque::from([ffi_in_execution()]);
+    let o = open(Codec::H264, 640, 480);
+    let mut input = Request::Open(o).bytes();
+    input.extend(
+        Request::Frame {
+            slot: 0,
+            pts: 0,
+            key: false,
+        }
+        .bytes(),
+    );
+    let mut out = ClosesAfter {
+        left: 1,
+        out: Vec::new(),
+    };
+    let code = serve(
+        input.as_slice(),
+        &mut out,
+        |o| Ok(grey(o)),
+        session_on(fake),
+    );
+    assert_eq!(bodies(&out.out).len(), 1, "only Opened got out");
+    assert_eq!(code, STOPPED_EXIT);
     let l = log.lock().unwrap();
     assert!(!l.dropped, "the runtime is not closed");
     assert_eq!(l.live, 1, "nor the frame's surface released");
@@ -466,7 +525,7 @@ mod remote {
     /// A helper's open, its session holding its cap or not.
     fn opened_holding(holds_cap: bool) -> String {
         let opened = says(&Reply::Opened {
-            low_power: true,
+            low_power: Some(true),
             holds_cap,
             name: "fake-gen".into(),
         });
@@ -562,7 +621,7 @@ mod remote {
     }
 
     /// The line logged when a helper with `low_power` opens its session.
-    fn open_line(low_power: bool) -> (u32, String) {
+    fn open_line(low_power: Option<bool>) -> (u32, String) {
         let opened = says(&Reply::Opened {
             low_power,
             holds_cap: true,
@@ -575,7 +634,7 @@ mod remote {
 
     #[test]
     fn the_open_line_says_low_power_off() {
-        let (pid, line) = open_line(false);
+        let (pid, line) = open_line(Some(false));
         assert_eq!(
             line,
             format!("qsv helper {pid}: opened fake-gen for H.264, LowPower off")
@@ -584,11 +643,46 @@ mod remote {
 
     #[test]
     fn the_open_line_says_low_power_on() {
-        let (pid, line) = open_line(true);
+        let (pid, line) = open_line(Some(true));
         assert_eq!(
             line,
             format!("qsv helper {pid}: opened fake-gen for H.264, LowPower on")
         );
+    }
+
+    /// A runtime that doesn't read LowPower back leaves it unknown in the line, not the mode
+    /// the session asked for.
+    #[test]
+    fn the_open_line_says_low_power_unknown_when_not_read_back() {
+        let (pid, line) = open_line(None);
+        assert_eq!(
+            line,
+            format!("qsv helper {pid}: opened fake-gen for H.264, LowPower unknown")
+        );
+    }
+
+    /// A rate change that fails leaves the encoder no longer said to hold its cap: what its
+    /// rate control runs is then unknown.
+    #[test]
+    fn a_failed_rate_change_drops_holding_the_cap() {
+        let p = policy(QUICK);
+        let refused = says(&Reply::Error {
+            stopped: false,
+            reason: "MFXVideoENCODE_Reset failed".into(),
+        });
+        let mut enc = start(
+            p,
+            format!(
+                "{}; {}; {refused}; sleep 30",
+                opened(),
+                says(&Reply::RateSet)
+            ),
+        );
+        enc.set_rate(RateConfig::new(24.0, 5_000, 30)).unwrap();
+        assert!(enc.holds_cap());
+        assert!(enc.set_rate(RateConfig::new(24.0, 6_000, 30)).is_err());
+        assert!(!enc.holds_cap());
+        assert!(p.off().is_none(), "an ordinary failure");
     }
 
     #[test]

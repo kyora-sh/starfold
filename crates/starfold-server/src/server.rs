@@ -2090,6 +2090,34 @@ mod tests {
             d
         }
 
+        /// A socket at `path` that nothing listens on, as a server killed by a signal leaves
+        /// it. Bound and closed without ever listening: a listener bound and dropped here
+        /// would still accept while a child another test forks holds a copy of its fd.
+        fn dead_socket(path: &std::path::Path) {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let fd = cvt(unsafe {
+                libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+            })
+            .unwrap();
+            let _sock = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "{}", path.display());
+            for (d, b) in addr.sun_path.iter_mut().zip(bytes) {
+                *d = *b as libc::c_char;
+            }
+            cvt(unsafe {
+                libc::bind(
+                    fd,
+                    (&raw const addr).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            })
+            .unwrap();
+        }
+
         fn runtime() -> tokio::runtime::Runtime {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2901,7 +2929,7 @@ mod tests {
             let at = d.join("sf");
             std::fs::create_dir(&at).unwrap();
             std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
-            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
+            dead_socket(&unix_socket_path(&at));
             let refused = std::os::unix::net::UnixStream::connect(unix_socket_path(&at))
                 .unwrap_err()
                 .raw_os_error();
@@ -3145,7 +3173,7 @@ mod tests {
             std::fs::create_dir(&at).unwrap();
             std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o2700)).unwrap();
             assert_eq!(std::fs::metadata(&at).unwrap().mode() & 0o7777, 0o2700);
-            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
+            dead_socket(&unix_socket_path(&at));
             let (l, file) = bind_unix(&at, 0o600).expect("a 02700 directory of ours");
             std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
             drop(l);

@@ -340,10 +340,12 @@ pub struct Remote {
     stream: hw::Stream,
     /// Why this helper is no longer used.
     gone: Option<String>,
-    /// The implementation the helper opened, and whether it runs LowPower.
+    /// The implementation the helper opened, and whether it runs LowPower, as its session
+    /// read it back (None: the runtime didn't say).
     pub name: String,
-    pub low_power: bool,
-    /// Whether the helper's session holds its cap, as it said when it opened.
+    pub low_power: Option<bool>,
+    /// Whether the helper's session holds its cap, as it said when it opened; false once a
+    /// rate change failed (its session's rate control is then unknown).
     holds_cap: bool,
     /// Every frame request sent: pts, IDR asked.
     #[cfg(test)]
@@ -420,7 +422,7 @@ impl Remote {
             ),
             gone: None,
             name: String::new(),
-            low_power: false,
+            low_power: None,
             holds_cap: false,
             #[cfg(test)]
             sent: Vec::new(),
@@ -450,7 +452,11 @@ impl Remote {
                 } else {
                     "H.264"
                 };
-                let mode = if low_power { "on" } else { "off" };
+                let mode = match low_power {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unknown",
+                };
                 let line = format!(
                     "qsv helper {}: opened {name} for {codec}, LowPower {mode}",
                     r.proc.id()
@@ -595,8 +601,8 @@ impl Remote {
     }
 }
 
-impl VideoEncoder for Remote {
-    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+impl Remote {
+    fn change_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
         self.usable()?;
         let r = rate_of(&rate);
         if r == self.rate {
@@ -610,6 +616,17 @@ impl VideoEncoder for Remote {
             Reply::Error { stopped, reason } => Err(self.refused(stopped, reason)),
             _ => Err(self.broke("answered a rate change out of turn")),
         }
+    }
+}
+
+impl VideoEncoder for Remote {
+    /// A rate change that fails, however, leaves the encoder no longer said to hold its cap.
+    fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+        let r = self.change_rate(rate);
+        if r.is_err() {
+            self.holds_cap = false;
+        }
+        r
     }
 
     fn encode(

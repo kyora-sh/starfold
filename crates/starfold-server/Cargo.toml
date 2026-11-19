@@ -28,10 +28,12 @@ x264 = ["dep:bindgen"]
 # OpenH264 (BSD-2-Clause) built from its bundled source, not Cisco's downloadable binary:
 # the software H.264 encoder of a build without x264 (`--no-default-features --features openh264`).
 openh264 = ["dep:openh264-sys2"]
+# libaom (BSD-2-Clause), the AV1 encoder, `--encoder libaom`: built from the pinned source in
+# crates/starfold-aom-sys/aom (a git submodule) and linked statically; needs cmake, perl and nasm.
+libaom = ["sw-arm", "dep:starfold-aom-sys"]
 # Software encoders for the bench, picked with --encoder <arm>; native libraries from pkg-config.
 sw-arm = ["dep:bindgen"]
 libvpx = ["sw-arm"]
-libaom = ["sw-arm"]
 svt-av1 = ["sw-arm"]
 kvazaar = ["sw-arm"]
 # GPL-2.0, measurement only.
@@ -49,6 +51,8 @@ tokio = { version = "1", features = [
 	"io-util",
 ] }
 axum = { version = "0.8", features = ["ws"] }
+# --base-path puts its checks in front of the router as one service (base_path.rs).
+tower = { version = "0.5", default-features = false }
 # axum's WebSocket errors, to tell a message refused for its size.
 tungstenite = { version = "0.29", default-features = false }
 libc = "0.2"
@@ -70,6 +74,7 @@ zip = { version = "7", default-features = false, features = [
 openh264-sys2 = { version = "=0.9.9", optional = true, default-features = false, features = [
 	"source",
 ] }
+starfold-aom-sys = { path = "../starfold-aom-sys", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["dir", "fs", "poll", "time"] }
@@ -119,6 +124,7 @@ windows = { version = "0.61", features = [
 	"Win32_System_JobObjects",
 	"Win32_System_Memory",
 	"Win32_System_Ole",
+	"Win32_System_Pipes",
 	"Win32_System_StationsAndDesktops",
 	"Win32_System_Threading",
 	"Win32_System_Variant",

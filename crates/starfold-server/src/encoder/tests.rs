@@ -438,6 +438,132 @@ fn short_or_wrapping_planes_are_rejected() {
     }
 }
 
+/// `len` bytes of read-only address space reading as zeros, that no page backs until it is
+/// touched; unmapped on drop.
+#[cfg(all(unix, target_pointer_width = "64"))]
+struct Untouched {
+    at: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl Untouched {
+    fn new(len: usize) -> Self {
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            at,
+            libc::MAP_FAILED,
+            "mapping {len} bytes: {}",
+            std::io::Error::last_os_error()
+        );
+        Untouched { at, len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: a live, readable mapping of `len` bytes, never written, for `self`'s lifetime.
+        unsafe { std::slice::from_raw_parts(self.at.cast(), self.len) }
+    }
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl Drop for Untouched {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.at, self.len) };
+    }
+}
+
+/// A plane whose rows times its stride doesn't fit a C int is refused, though it holds them
+/// all; two rows fewer, it fits. Any plane the bound refuses and the rest of the check accepts
+/// is longer than `i32::MAX` bytes, so the luma plane is a 2 GiB mapping that nothing reads:
+/// it takes address space, not memory.
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[test]
+fn a_plane_past_a_c_int_is_refused() {
+    let stride = 1usize << 26;
+    let y = Untouched::new(32 * stride);
+    let uv = vec![128u8; 32 * 16];
+    let at = |height: u32| FrameView {
+        width: 64,
+        height,
+        y: y.bytes(),
+        u: &uv,
+        v: &uv,
+        stride_y: stride,
+        stride_uv: 32,
+    };
+    assert_eq!(32 * stride, i32::MAX as usize + 1);
+    assert!(at(32).check().is_err(), "32 rows at 1 << 26");
+    assert!(at(30).check().is_ok(), "30 rows at 1 << 26");
+}
+
+/// A plane with a stride wider than the picture that ends right after the last row's
+/// pixels is refused before any encoder sees it: OpenH264 and x264's C copy step their
+/// pointer a stride past every row, the last one too, which would point beyond its end.
+/// With every row's stride there, it encodes.
+#[test]
+fn a_padded_plane_must_hold_its_last_rows_stride() {
+    let (w, h, pad) = (64usize, 48usize, 16usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let (sy, suv) = (w + pad, cw + pad / 2);
+    let p = Picture::new(w, h);
+    let padded = |src: &[u8], rows: usize, cols: usize, stride: usize| {
+        let mut out = vec![0u8; rows * stride];
+        for r in 0..rows {
+            out[r * stride..][..cols].copy_from_slice(&src[r * cols..][..cols]);
+        }
+        out
+    };
+    let (y, u, v) = (
+        padded(&p.y, h, w, sy),
+        padded(&p.u, ch, cw, suv),
+        padded(&p.v, ch, cw, suv),
+    );
+    let ends_at_last_pixel = |len: usize, rows: usize, cols: usize, stride: usize| {
+        assert_eq!(len, rows * stride);
+        (rows - 1) * stride + cols
+    };
+    let short = FrameView {
+        width: w as u32,
+        height: h as u32,
+        y: &y[..ends_at_last_pixel(y.len(), h, w, sy)],
+        u: &u[..ends_at_last_pixel(u.len(), ch, cw, suv)],
+        v: &v[..ends_at_last_pixel(v.len(), ch, cw, suv)],
+        stride_y: sy,
+        stride_uv: suv,
+    };
+    assert!(short.check().is_err());
+    let full = FrameView {
+        y: &y,
+        u: &u,
+        v: &v,
+        ..short
+    };
+    assert!(full.check().is_ok());
+    for b in backends() {
+        let mut enc = open(&config(b, w as u32, h as u32, 4000)).unwrap();
+        let Err(e) = enc.encode(&short, EncodeOptions::default()) else {
+            panic!("{b:?}: encoded a plane short of its last row's stride");
+        };
+        assert!(e.0.contains("don't hold a 64x48 picture"), "{b:?}: {e}");
+        let only_luma = FrameView { y: short.y, ..full };
+        assert!(
+            enc.encode(&only_luma, EncodeOptions::default()).is_err(),
+            "{b:?}: luma alone"
+        );
+        let aus = enc.encode(&full, EncodeOptions::default()).unwrap();
+        assert!(!aus.is_empty(), "{b:?}");
+    }
+}
+
 #[test]
 fn idr_missing_parameter_sets_gets_cached_ones() {
     let nal = |t: u8, body: &[u8]| [&[0, 0, 0, 1, t][..], body].concat();
@@ -517,7 +643,7 @@ fn backends_without_the_codec_refuse_to_open() {
 #[test]
 fn videotoolbox_probe() {
     use super::caps::{host_providers, Registry, PROBE_TIMEOUT};
-    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let r = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     println!("{}", serde_json::to_string_pretty(&r).unwrap());
     for codec in [Codec::H264, Codec::Hevc] {
         let c = r.check(Backend::VideoToolbox, codec).unwrap();
@@ -542,7 +668,7 @@ fn vt(codec: Codec, w: u32, h: u32, kbps: u32) -> Box<dyn VideoEncoder> {
 #[cfg(target_os = "macos")]
 fn vt_hardware(codec: Codec) -> bool {
     use super::caps::{host_providers, Acceleration, Registry, PROBE_TIMEOUT};
-    let r = Registry::probe(host_providers(true, false), PROBE_TIMEOUT);
+    let r = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
     let hw = r
         .check(Backend::VideoToolbox, codec)
         .is_ok_and(|c| c.acceleration == Acceleration::Hardware);
@@ -893,6 +1019,8 @@ struct Refining {
     last_psnr: f64,
     /// What each frame tells the encoder didn't change (x264 marks up its copy).
     map: Option<Vec<u8>>,
+    /// Every byte the encoder sent, in order.
+    stream: Vec<u8>,
 }
 
 impl Refining {
@@ -926,6 +1054,7 @@ impl Refining {
             scrolled: 0,
             last_psnr: 0.0,
             map: None,
+            stream: Vec::new(),
         };
         me.step(true, None);
         me
@@ -952,6 +1081,7 @@ impl Refining {
         for au in &aus {
             n += au.data.len();
             key |= au.keyframe;
+            self.stream.extend_from_slice(&au.data);
             if let Some(d) = self.dec.decode(&au.data).unwrap() {
                 self.last_psnr = luma_psnr(d.y(), d.strides().0, &self.pic);
             }
@@ -1160,13 +1290,19 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
     assert_eq!(first(Some(refine)), first(None));
 }
 
-/// x264 under VBV, as it streams: no pass leaves the picture worse and the ladder ends far
-/// sharper than motion left it, with or without a byte budget, at one thread or sliced. A
-/// budgeted first step may change nothing: motion counts as QP 51 until a pass proves better.
+/// x264 under VBV, as it streams, at one thread and sliced, each with and without a byte
+/// budget: every pass sends bytes and no IDR. At one thread no pass leaves the picture worse,
+/// a budget holds within twice itself, and the ladder ends far sharper than motion left it and
+/// complete. Sliced runs under VBV assert only bytes and no IDR: x264's row rate control reads
+/// the other slices' live size estimates (`ratecontrol.c` `x264_ratecontrol_mb`), so their
+/// pictures and sizes depend on thread timing; under the full suite's load a first budgeted
+/// step once came out 6.06e-5 dB below the one before. Sliced refinement is asserted rung by
+/// rung without VBV, below. A budgeted first step may change nothing: motion records its blocks
+/// at QP 52, above any QP a pass aims for, until a pass proves better.
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
-    for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, Some(60_000))] {
+    for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, None), (4, Some(60_000))] {
         let mut s = Refining::on(Backend::X264, threads, 30);
         s.enc.set_rate(RateConfig::new(24.0, 3000, 30)).unwrap();
         s.scroll(30);
@@ -1176,20 +1312,61 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             let (n, key) = s.pass(qp, max_bytes);
             let at = format!("t{threads} {max_bytes:?} qp {qp}");
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
-            assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
-            assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
+            if threads == 1 {
+                assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
+                assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
+            }
             prev = s.last_psnr;
         }
-        assert!(
-            prev > motion + 3.0,
-            "t{threads} {max_bytes:?}: {motion} -> {prev}"
-        );
+        if threads == 1 {
+            assert!(prev > motion + 3.0, "t1 {max_bytes:?}: {motion} -> {prev}");
+            assert!(!s.enc.refinable(Refine {
+                qp: 12,
+                max_bytes: None
+            }));
+        }
+        s.scroll(5);
+    }
+}
+
+/// Sliced x264 without VBV codes the same bytes whatever the threads' timing: no slice reads
+/// another's state while it encodes (row rate control returns before its cross-slice read
+/// without VBV, no deblocking across slices, slice results merged in thread order). So each
+/// rung of the ladder is strictly sharper than the one before, and a second encoder fed the
+/// same frames sends the same bytes.
+#[cfg(feature = "x264")]
+#[test]
+fn x264_sliced_refining_without_vbv_sharpens_every_rung_the_same_every_run() {
+    let run = || {
+        let mut cfg = Refining::config(Backend::X264, 4, 30);
+        cfg.rate = RateConfig::new(24.0, 0, 30);
+        let mut s = Refining::with(open(&cfg).unwrap());
+        s.scroll(30);
+        let motion = s.last_psnr;
+        let mut prev = motion;
+        for qp in [20, 16, 12] {
+            let (n, key) = s.pass(qp, None);
+            assert!(n > 0 && !key, "qp {qp}: {n} bytes, key {key}");
+            assert!(s.last_psnr > prev, "qp {qp}: {} after {prev}", s.last_psnr);
+            prev = s.last_psnr;
+        }
+        assert!(prev > motion + 3.0, "{motion} -> {prev}");
         assert!(!s.enc.refinable(Refine {
             qp: 12,
             max_bytes: None
         }));
         s.scroll(5);
-    }
+        s.stream
+    };
+    let first = run();
+    let second = run();
+    assert!(!first.is_empty());
+    assert!(
+        first == second,
+        "two encoders sent different bytes: {} and {}",
+        first.len(),
+        second.len()
+    );
 }
 
 /// 1080p text under a 2 Mbit/s VBV, refined as the engine does it: the ladder at its planned

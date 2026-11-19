@@ -361,8 +361,14 @@ fn describe(c: &EncoderCapability) -> String {
 /// encoders; the VA-API, NVENC, Media Foundation and Quick Sync probes are experimental and
 /// run only with `experimental`. Hardware probes run in a child process when this executable
 /// takes `--probe-encoders` (see [`super::isolate`]), else in the server itself; Quick Sync's
-/// only ever in a helper process, so without one it is unavailable.
-pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbeProvider>> {
+/// only ever in a helper process, so without one it is unavailable, and in the stream's own
+/// rate control mode: constant bitrate if `capped` (`--max-kbps` above 0), else constant QP.
+pub fn host_providers(
+    hardware: bool,
+    experimental: bool,
+    capped: bool,
+) -> Vec<Box<dyn ProbeProvider>> {
+    let _ = capped;
     let mut v: Vec<Box<dyn ProbeProvider>> = Vec::new();
     #[cfg(feature = "x264")]
     v.push(Box::new(Software(Backend::X264)));
@@ -383,16 +389,19 @@ pub fn host_providers(hardware: bool, experimental: bool) -> Vec<Box<dyn ProbePr
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
     v.push(if experimental {
-        super::qsv::provider(PROBE_TIMEOUT)
+        super::qsv::provider(PROBE_TIMEOUT, capped)
     } else {
         Box::new(Disabled(Backend::Qsv))
     });
     v
 }
 
-/// The whole startup probe.
-pub fn host_probe(hardware: bool, experimental: bool) -> Registry {
-    Registry::probe(host_providers(hardware, experimental), PROBE_TIMEOUT)
+/// The whole startup probe, for a stream that is `capped` or not.
+pub fn host_probe(hardware: bool, experimental: bool, capped: bool) -> Registry {
+    Registry::probe(
+        host_providers(hardware, experimental, capped),
+        PROBE_TIMEOUT,
+    )
 }
 
 /// This platform's hardware probes, run in-process: the experimental ones only with

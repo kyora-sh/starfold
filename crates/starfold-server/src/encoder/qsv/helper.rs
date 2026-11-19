@@ -114,10 +114,10 @@ pub fn serve(
     let mut session = match open(&cfg, o.luid) {
         Ok((s, name)) => {
             if let Some(why) = &s.low_power_why {
-                eprintln!("LowPower on: the runtime refused the full encoder ({why})");
+                eprintln!("LowPower asked: the runtime refused the full encoder ({why})");
             }
             let opened = Reply::Opened {
-                low_power: s.low_power,
+                low_power: s.low_power_read,
                 holds_cap: s.holds_cap(),
                 name,
             };
@@ -200,29 +200,42 @@ pub fn serve(
                 }
             }
         };
-        let stopped = matches!(r, Reply::Error { stopped: true, .. });
-        if !reply(&mut output, &r) {
-            return DONE;
-        }
+        let stopped =
+            matches!(r, Reply::Error { stopped: true, .. }) || session.stopped().is_some();
+        let sent = reply(&mut output, &r);
+        // A stopped session frees nothing, whether or not the reply got out: a picture still
+        // on the GPU can reach its output buffer and descriptors.
         if stopped {
             std::mem::forget(session);
             return STOPPED_EXIT;
+        }
+        if !sent {
+            return DONE;
         }
     }
 }
 
 /// `--encoder-helper qsv`: serves the server on stdin and stdout. With `--probe` after it,
-/// runs the Quick Sync probe here instead and prints its report, as a probe child does.
+/// runs the Quick Sync probe here instead and prints its report, as a probe child does: at
+/// constant bitrate, or at constant QP with [`super::PROBE_UNCAPPED`] after it.
 #[cfg(windows)]
 pub fn main(args: &[String]) -> i32 {
     use super::proc::Mapped;
+    let probe = |capped: bool| {
+        crate::encoder::isolate::report_main(Backend::Qsv, || super::probe_here(capped))
+    };
     match args {
         [qsv] if qsv == "qsv" => {}
-        [qsv, probe] if qsv == "qsv" && probe == "--probe" => {
-            return crate::encoder::isolate::report_main(Backend::Qsv, super::probe_here);
+        [qsv, p] if qsv == "qsv" && p == "--probe" => return probe(true),
+        [qsv, p, u] if qsv == "qsv" && p == "--probe" && u == super::PROBE_UNCAPPED => {
+            return probe(false)
         }
         _ => {
-            eprintln!("{} takes qsv [--probe]", super::HELPER_FLAG);
+            eprintln!(
+                "{} takes qsv [--probe [{}]]",
+                super::HELPER_FLAG,
+                super::PROBE_UNCAPPED
+            );
             return BAD_REQUEST;
         }
     }
