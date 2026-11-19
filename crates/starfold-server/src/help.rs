@@ -4,6 +4,7 @@ use crate::build_facts;
 
 const USAGE: &str = "
 Usage: starfold [--flag=value]...
+       starfold attach DIR
 
 Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
 WebSocket, and prints a link that signs you in. Flags take --name=value or
@@ -33,6 +34,12 @@ Server:
                                 0600 no other uid can connect at all, except
                                 root or a process with CAP_DAC_OVERRIDE,
                                 CAP_DAC_READ_SEARCH, CAP_FOWNER or CAP_SYS_ADMIN
+  attach DIR                    a command, not a flag: relays stdin and stdout
+                                to the socket --listen-unix DIR serves, one
+                                connection per run, after the same uid-map
+                                and path checks, and only if the listener had
+                                this uid when it called listen (SO_PEERCRED;
+                                starfold attach --help)
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1
