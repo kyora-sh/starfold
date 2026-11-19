@@ -4,9 +4,13 @@
 // issued and nobody used; anything else gets close 4401. With a good ticket it starts a
 // child process that relays bytes between its stdin/stdout and starfold's TCP port
 // (embed-relay.mjs), speaks HTTP/1.1 and the WebSocket upgrade to starfold over that stream
-// (Host: localhost, no Origin, Authorization: Bearer <password>), then passes every message
-// both ways unchanged and answers starfold's pings itself. Every HTTP request line it gets is
-// in `access`, and every attempt's first message in `firsts`.
+// (Host: localhost, no Origin, Authorization: Bearer <password>), then passes every text and
+// binary message both ways unchanged and answers both sides' pings itself. Close frames are not
+// passed through as they are: a browser close is echoed back with its code only and sent on to
+// starfold with that code and no reason; a starfold close reaches the browser with its code and
+// reason, a close without a code (1005) as 1000. Every HTTP request line it gets is in `access`,
+// every upgrade request (to any path) is counted in `upgrades`, and every attempt's first
+// message is in `firsts`.
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -93,6 +97,46 @@ class Frames {
 	}
 }
 
+/** The upgrade request the gateway sends starfold; `password` null leaves out Authorization. */
+const upgradeRequest = (key, password) =>
+	'GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+	`Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n` +
+	(password === null ? '' : `Authorization: Bearer ${password}\r\n`) +
+	'\r\n';
+
+const relayPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'embed-relay.mjs');
+
+/**
+ * Sends starfold the gateway's own upgrade request through a relay child, with `password` or
+ * (null) without Authorization, and resolves with the response's status line.
+ */
+export function probeUpgrade(starfoldPort, password, ms = 5000) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, [relayPath, '127.0.0.1', String(starfoldPort)], {
+			stdio: ['pipe', 'pipe', 'ignore'],
+		});
+		let got = Buffer.alloc(0);
+		const timer = setTimeout(() => {
+			child.kill();
+			reject(new Error('no upgrade response'));
+		}, ms);
+		child.stdin.on('error', () => {});
+		child.stdout.on('data', (d) => {
+			got = Buffer.concat([got, d]);
+			const at = got.indexOf('\r\n');
+			if (at < 0) return;
+			clearTimeout(timer);
+			child.kill();
+			resolve(got.subarray(0, at).toString());
+		});
+		child.on('close', () => {
+			clearTimeout(timer);
+			reject(new Error('relay closed before a response'));
+		});
+		child.stdin.write(upgradeRequest(crypto.randomBytes(16).toString('base64'), password));
+	});
+}
+
 // One browser connection: waits for the ticket, then bridges to starfold through the relay.
 function session(gw, sock, head) {
 	let upstream = null;
@@ -165,11 +209,7 @@ function session(gw, sock, head) {
 		const out = child.stdin;
 		out.on('error', () => {});
 		const key = crypto.randomBytes(16).toString('base64');
-		out.write(
-			'GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-				`Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n` +
-				`Authorization: Bearer ${gw.password}\r\n\r\n`
-		);
+		out.write(upgradeRequest(key, gw.password));
 		let response = Buffer.alloc(0);
 		const fromStarfold = new Frames((op, payload) => {
 			if (op === 9) return out.write(frame(10, payload, true));
@@ -214,7 +254,7 @@ function session(gw, sock, head) {
  */
 export async function startGateway({ page, pkgDir, starfoldPort, password }) {
 	const gw = {
-		relay: path.join(path.dirname(fileURLToPath(import.meta.url)), 'embed-relay.mjs'),
+		relay: relayPath,
 		starfoldPort,
 		password,
 		issued: new Set(),
@@ -251,9 +291,9 @@ export async function startGateway({ page, pkgDir, starfoldPort, password }) {
 	});
 	server.on('upgrade', (req, sock, head) => {
 		gw.access.push(`${req.method} ${req.url} (upgrade)`);
+		gw.upgrades++;
 		const key = req.headers['sec-websocket-key'];
 		if (req.url !== '/ws' || !key) return sock.destroy();
-		gw.upgrades++;
 		sock.write(
 			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
 				`Sec-WebSocket-Accept: ${accept(key)}\r\n\r\n`

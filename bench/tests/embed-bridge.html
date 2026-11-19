@@ -7,7 +7,24 @@
 			// and a preamble that fetches a fresh ticket per connect. `window.ticketMode` lets the
 			// test make the preamble reuse the last ticket or send one never issued.
 			import { mount } from '/pkg/index.js';
-			const t = (window.embedTest = { statuses: [], closes: [], preambles: 0, tickets: [] });
+			const t = (window.embedTest = { statuses: [], closes: [], preambles: 0, tickets: [], painted: 0 });
+			// Frames Chrome actually presented on any stripe <video> the client adds (dropped
+			// frames never get a video frame callback).
+			const watch = (v) => {
+				const on = () => {
+					t.painted++;
+					v.requestVideoFrameCallback(on);
+				};
+				v.requestVideoFrameCallback(on);
+			};
+			const desk = document.getElementById('desk');
+			new MutationObserver((records) => {
+				for (const r of records)
+					for (const n of r.addedNodes) {
+						if (n.nodeName === 'VIDEO') watch(n);
+						else if (n.querySelectorAll) n.querySelectorAll('video').forEach(watch);
+					}
+			}).observe(desk, { childList: true, subtree: true });
 			window.ticketMode = 'fresh';
 			const ticket = async () => {
 				t.preambles++;
@@ -18,7 +35,7 @@
 				t.tickets.push(ticket);
 				return ticket;
 			};
-			t.handle = mount(document.getElementById('desk'), {
+			t.handle = mount(desk, {
 				connect: { url: `ws://${location.host}/ws`, preamble: ticket },
 				onClose: (code, reason) => t.closes.push({ code, reason }),
 				onStatus: (status, detail) => t.statuses.push(detail ? `${status}:${detail.kind}` : status),

@@ -5,8 +5,9 @@
 // ending in onClose(4401) with no reconnect, connect() after a close fetching a new ticket
 // that works, and no ticket in any request URL. Runs in under a minute.
 // Usage: node embed-bridge.mjs   (XVFB, STARFOLD_BIN, CHROMIUM, PLAYWRIGHT_NODE_MODULES;
-// EMBED_PKG: an unpacked package/ from packages/web/embed/pack.sh, else it packs one, which
-// needs esbuild and bun; needs xev, from x11-utils). CHROMIUM must decode H.264 (Google
+// EMBED_DISPLAY: the X display to start Xvfb on, else Xvfb picks a free one; EMBED_PKG: an
+// unpacked package/ from packages/web/embed/pack.sh, else it packs one, which needs esbuild
+// and bun; needs xev, from x11-utils). CHROMIUM must decode H.264 (Google
 // Chrome, or a Chromium built with its proprietary codecs): Playwright's own Chromium offers
 // no decoder, and starfold answers it with no-common-codec and no frames.
 import { createRequire } from 'module';
@@ -16,7 +17,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { startGateway } from './embed-gateway.mjs';
+import { probeUpgrade, startGateway } from './embed-gateway.mjs';
 const require = createRequire(process.env.PLAYWRIGHT_NODE_MODULES || process.cwd() + '/node_modules/');
 let pw;
 try {
@@ -28,11 +29,12 @@ const { chromium } = pw;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const bin = process.env.STARFOLD_BIN || path.join(HERE, '../../target/release/starfold');
-const DISPLAY = process.env.EMBED_DISPLAY || ':11';
 const port = Number(process.env.STARFOLD_PORT || '6911');
 const password = crypto.randomBytes(16).toString('hex');
 const log = '/tmp/starfold-embed-bridge.log';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** How long after an attempt ends the test watches for a reconnect it must not see. */
+const QUIET_MS = 5000;
 let failed = 0;
 const check = (ok, what) => {
 	console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`);
@@ -56,6 +58,61 @@ const procs = [];
 let work;
 let b;
 let gw;
+let cleaned = null;
+const cleanup = () =>
+	(cleaned ??= (async () => {
+		await b?.close().catch(() => {});
+		try {
+			gw?.close();
+		} catch {}
+		for (const c of procs.toReversed()) {
+			try {
+				process.kill(-c.pid, 'SIGTERM');
+			} catch {}
+		}
+		await sleep(500);
+		for (const c of procs) {
+			try {
+				process.kill(-c.pid, 0);
+				process.kill(-c.pid, 'SIGKILL');
+				console.log(`killed leftover group ${c.pid}`);
+			} catch {}
+		}
+		if (work) fs.rmSync(work, { recursive: true, force: true });
+	})());
+for (const [sig, code] of [
+	['SIGINT', 130],
+	['SIGTERM', 143],
+])
+	process.on(sig, () => {
+		console.log(`${sig}: cleaning up`);
+		cleanup().finally(() => process.exit(code));
+	});
+
+/**
+ * Starts Xvfb and resolves with its display once it accepts clients (-displayfd); rejects if
+ * it exits first (an occupied display) or is not ready within 10 s.
+ */
+function startXvfb() {
+	const want = process.env.EMBED_DISPLAY;
+	const args = [...(want ? [want] : []), '-displayfd', '3', '-screen', '0', '1920x1080x24', '-shmem', '-ac', '-nolisten', 'tcp'];
+	const x = group(process.env.XVFB || 'Xvfb', args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe'] });
+	return new Promise((resolve, reject) => {
+		let got = '';
+		const timer = setTimeout(() => reject(new Error('Xvfb was not ready within 10 s')), 10000);
+		x.stdio[3].on('data', (d) => {
+			got += d;
+			if (!got.includes('\n')) return;
+			clearTimeout(timer);
+			resolve(`:${got.trim()}`);
+		});
+		x.on('exit', (code, sig) => {
+			clearTimeout(timer);
+			reject(new Error(`Xvfb exited before it was ready (${code ?? sig}${want ? `; is ${want} in use?` : ''})`));
+		});
+	});
+}
+
 try {
 	work = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-bridge-'));
 	let pkgDir = process.env.EMBED_PKG;
@@ -64,24 +121,32 @@ try {
 		execFileSync('tar', ['-xzf', tgz, '-C', work]);
 		pkgDir = path.join(work, 'package');
 	}
-	group(process.env.XVFB || 'Xvfb', [DISPLAY, '-screen', '0', '1920x1080x24', '-shmem', '-ac', '-nolisten', 'tcp'], { stdio: 'ignore' });
-	await sleep(1000);
+	const DISPLAY = await startXvfb();
 	// The X app the keys must reach: xev over the whole screen, so it has the keyboard focus
 	// wherever the pointer is (no window manager: focus follows the pointer).
 	let xevOut = '';
 	const xev = group('stdbuf', ['-oL', 'xev', '-geometry', '1920x1080+0+0', '-event', 'keyboard'], { env: { ...process.env, DISPLAY }, stdio: ['ignore', 'pipe', 'ignore'] });
 	xev.stdout.on('data', (d) => (xevOut += d));
 	const out = fs.openSync(log, 'w');
-	group(bin, [`--port=${port}`, '--audio-enabled=false', `--basic-auth-password=${password}`, '--framerate=30'], { env: { ...process.env, DISPLAY, RUST_LOG: 'info' }, stdio: ['ignore', out, out] });
+	const server = group(bin, [`--port=${port}`, '--audio-enabled=false', `--basic-auth-password=${password}`, '--framerate=30'], { env: { ...process.env, DISPLAY, RUST_LOG: 'info' }, stdio: ['ignore', out, out] });
+	let serverExited = false;
+	server.on('exit', () => (serverExited = true));
 
-	for (let i = 0; i < 100; i++) {
+	// Ready means our starfold answers /healthz; each request gets 1 s, the whole wait 10 s.
+	const healthy = await until(async () => {
+		if (serverExited) return false;
 		try {
-			if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) break;
-		} catch {}
-		await sleep(100);
-	}
-	const bare = await fetch(`http://127.0.0.1:${port}/ws`);
-	check(bare.status === 401, `starfold asks for its password: /ws without it answers ${bare.status}`);
+			return (await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
+		} catch {
+			return false;
+		}
+	}, 10000);
+	if (!healthy || serverExited) throw new Error(`starfold was not ready on ${port} within 10 s${serverExited ? ' (it exited)' : ''}`);
+	// The gateway's own upgrade request over the relay, without and then with the password.
+	const bare = await probeUpgrade(port, null);
+	check(/^HTTP\/1\.1 401 /.test(bare), `starfold asks for its password: the upgrade without it answers ${bare}`);
+	const authed = await probeUpgrade(port, password);
+	check(/^HTTP\/1\.1 101 /.test(authed), `with the password the same upgrade answers ${authed}`);
 
 	gw = await startGateway({ page: path.join(HERE, 'embed-bridge.html'), pkgDir, starfoldPort: port, password });
 	b = await chromium.launch({ executablePath: process.env.CHROMIUM || 'chromium', args: ['--no-sandbox'] });
@@ -96,29 +161,25 @@ try {
 		const t = window.embedTest;
 		return { statuses: [...t.statuses], closes: [...t.closes], preambles: t.preambles, tickets: [...t.tickets] };
 	});
-	// Frames presented on the stripe <video>s since `mark()`: a new connection's hello can
-	// rebuild them, so each element counts from what it had at the mark (0 for a new one).
-	const presented = () =>
-		p.evaluate(() => {
-			const seen = (window.embedSeen ??= new WeakMap());
-			return [...document.querySelectorAll('#desk video')].reduce((n, v) => n + v.getVideoPlaybackQuality().totalVideoFrames - (seen.get(v) ?? 0), 0);
-		});
-	const mark = () =>
-		p.evaluate(() => {
-			window.embedSeen = new WeakMap();
-			for (const v of document.querySelectorAll('#desk video')) window.embedSeen.set(v, v.getVideoPlaybackQuality().totalVideoFrames);
-		});
+	// Frames Chrome presented on the stripe <video>s since `mark()`, counted by the page's video
+	// frame callbacks (embed-bridge.html), which dropped frames never get.
+	let painted0 = 0;
+	const presented = async () => (await p.evaluate(() => window.embedTest.painted)) - painted0;
+	const mark = async () => {
+		painted0 = await p.evaluate(() => window.embedTest.painted);
+	};
 	const opens = async () => (await state()).statuses.filter((s) => s === 'open').length;
 	// The gateway completes the upgrade before it reads the ticket, so a rejected attempt
-	// opens too. `ends` runs `act`, waits for a close and 2.5 s more, and returns everything
-	// that happened from before `act` on.
+	// opens too. `ends` runs `act`, waits for a close and QUIET_MS more, and returns everything
+	// that happened from before `act` on; `upgrades` counts every upgrade request the gateway
+	// got, to any path. A retry scheduled later than QUIET_MS is caught by the final tally.
 	const ends = async (act) => {
 		const s0 = await state();
 		const u0 = gw.upgrades;
 		const f0 = gw.firsts.length;
 		await act();
 		await until(async () => (await state()).closes.length > s0.closes.length);
-		await sleep(2500);
+		await sleep(QUIET_MS);
 		const s1 = await state();
 		return { closes: s1.closes.slice(s0.closes.length), preambles: s1.preambles - s0.preambles, upgrades: gw.upgrades - u0, firsts: gw.firsts.slice(f0), status: s1.statuses.at(-1) };
 	};
@@ -170,37 +231,27 @@ try {
 	// 6) No ticket, issued or not, in any URL the page requested or the gateway was asked for,
 	// raw or percent-decoded.
 	const secrets = [...gw.minted, 'not-a-ticket'];
-	const decoded = (u) => {
+	// Each component is decoded on its own, so one malformed escape can't hide another.
+	const decode = (x) => {
 		try {
-			return decodeURIComponent(u);
+			return decodeURIComponent(x.replaceAll('+', ' '));
 		} catch {
-			return u;
+			return x;
 		}
 	};
-	const leaked = [...urls, ...gw.access].filter((u) => secrets.some((s) => u.includes(s) || decoded(u).includes(s)));
+	const forms = (u) => [u, decode(u), ...u.split(/[/?&=#;]/).map(decode)];
+	const leaked = [...urls, ...gw.access].filter((u) => forms(u).some((f) => secrets.some((s) => f.includes(s))));
 	check(leaked.length === 0 && gw.access.length > 0, `no ticket in ${urls.length} page request URLs or ${gw.access.length} gateway access-log lines${leaked.length ? ': ' + leaked.join(' | ') : ''}`);
 	console.log('gateway access log:\n  ' + gw.access.join('\n  '));
+
+	// 7) Over the whole run, after one more quiet window: exactly the four upgrade requests the
+	// steps made (first, reused, unknown, reconnect), so no retry came late either.
+	await sleep(QUIET_MS);
+	check(gw.upgrades === 4, `${gw.upgrades} upgrade requests over the run, 4 expected`);
 } catch (e) {
 	check(false, `threw ${e && e.stack}`);
 } finally {
-	await b?.close().catch(() => {});
-	try {
-		gw?.close();
-	} catch {}
-	for (const c of procs.toReversed()) {
-		try {
-			process.kill(-c.pid, 'SIGTERM');
-		} catch {}
-	}
-	await sleep(500);
-	for (const c of procs) {
-		try {
-			process.kill(-c.pid, 0);
-			process.kill(-c.pid, 'SIGKILL');
-			console.log(`killed leftover group ${c.pid}`);
-		} catch {}
-	}
-	if (work) fs.rmSync(work, { recursive: true, force: true });
+	await cleanup();
 }
 console.log(failed ? `${failed} FAILED (server log: ${log})` : 'all passed');
 process.exit(failed ? 1 : 0);
