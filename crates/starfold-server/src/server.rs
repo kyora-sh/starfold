@@ -189,15 +189,11 @@ fn check_dir(
     let st = fstat(dir)?;
     let me = unsafe { libc::geteuid() };
     let mode = st.st_mode & 0o7777;
-    let fs = refused_filesystem(
-        nix::sys::statfs::fstatfs(dir)
-            .map_err(std::io::Error::from)?
-            .filesystem_type(),
-    );
+    let fs = filesystem_refusal(dir)?;
     let why = if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         "is not a directory".to_string()
     } else if let Some(fs) = fs {
-        fs.to_string()
+        fs
     } else if st.st_uid != me && st.st_uid != 0 {
         format!("belongs to user {} (mode {mode:04o})", st.st_uid)
     } else if st.st_mode & 0o022 != 0 && st.st_mode & libc::S_ISVTX == 0 {
@@ -210,19 +206,101 @@ fn check_dir(
     Err(untrusted(path, shown, &why, who))
 }
 
-/// Why a directory on a filesystem of type `t` can't be on the --listen-unix path, or
-/// None: procfs, whose links resolve differently for each process, and FUSE, whose daemon
-/// reports owners and modes as it likes and decides itself what may change.
+/// Why the directory `dir` can't be on the --listen-unix path because of the filesystem it
+/// is on, or None. procfs is refused: its links resolve differently for each process. A
+/// FUSE-type filesystem (whose daemon reports owners and modes as it likes) is judged by its
+/// mount ([`judge_fuse_mount`]): virtiofs, and a FUSE mount of root's or this user's, are
+/// taken; any other, or one whose mount can't be found, is refused.
 #[cfg(target_os = "linux")]
-fn refused_filesystem(t: nix::sys::statfs::FsType) -> Option<&'static str> {
+fn filesystem_refusal(dir: &std::os::fd::OwnedFd) -> std::io::Result<Option<String>> {
     use nix::sys::statfs::{FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC};
-    match t {
-        PROC_SUPER_MAGIC => Some("is on procfs, whose links resolve differently for each process"),
-        FUSE_SUPER_MAGIC => {
-            Some("is on a FUSE mount, whose owners and modes its daemon reports as it likes")
-        }
-        _ => None,
+    Ok(
+        match nix::sys::statfs::fstatfs(dir)
+            .map_err(std::io::Error::from)?
+            .filesystem_type()
+        {
+            PROC_SUPER_MAGIC => {
+                Some("is on procfs, whose links resolve differently for each process".into())
+            }
+            FUSE_SUPER_MAGIC => judge_fuse_mount(
+                mount_id(dir),
+                read_proc_self(Path::new("/proc"), "mountinfo", 16 << 20),
+                unsafe { libc::geteuid() },
+            )
+            .err(),
+            _ => None,
+        },
+    )
+}
+
+/// The id of the mount `fd` is on (statx `STATX_MNT_ID`, Linux 5.8 and later), or None.
+#[cfg(target_os = "linux")]
+fn mount_id(fd: &std::os::fd::OwnedFd) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::statx(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID,
+            &mut stx,
+        )
+    };
+    (r == 0 && stx.stx_mask & libc::STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+}
+
+/// Whether a directory on a FUSE-type filesystem whose mount is `id` may be on the path, from
+/// `mountinfo` (/proc/self/mountinfo as read) and this process's euid: `Ok` for virtiofs, and
+/// for `fuse`, `fuseblk` or `fuse.*` when its `user_id=` option is 0 or `euid` (a FUSE mount
+/// of root's is the administrator's, like a root-owned directory). `Err` says why not, as the
+/// rest of "<directory> ...": no mount id, a mountinfo that can't be read, a mount that isn't
+/// in it, another user's FUSE mount, or anything else; it quotes the mount's line.
+#[cfg(target_os = "linux")]
+pub fn judge_fuse_mount(
+    id: Option<u64>,
+    mountinfo: Result<Vec<u8>, String>,
+    euid: u32,
+) -> Result<(), String> {
+    let id = id.ok_or("is on FUSE, and the kernel gives no mount id to look it up by (statx STATX_MNT_ID needs Linux 5.8 or later)")?;
+    let info =
+        mountinfo.map_err(|e| format!("is on FUSE, and its mount can't be looked up: {e}"))?;
+    let key = id.to_string();
+    let line = info
+        .split(|b| *b == b'\n')
+        .find(|l| l.split(|b| *b == b' ').next() == Some(key.as_bytes()))
+        .ok_or_else(|| format!("is on FUSE, and its mount {id} isn't in /proc/self/mountinfo"))?;
+    let quoted = quote_bytes(line);
+    let after = std::str::from_utf8(line)
+        .ok()
+        .and_then(|l| l.split_once(" - "))
+        .map(|(_, after)| after)
+        .ok_or_else(|| format!("is on FUSE, and its mount reads {quoted}"))?;
+    let mut fields = after.split(' ');
+    let fstype = fields.next().unwrap_or("");
+    let options = fields.nth(1).unwrap_or("");
+    if fstype == "virtiofs" {
+        return Ok(());
     }
+    if fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.") {
+        let owner = options
+            .split(',')
+            .find_map(|o| o.strip_prefix("user_id="))
+            .and_then(|v| v.parse::<u32>().ok());
+        return match owner {
+            Some(u) if u == 0 || u == euid => Ok(()),
+            Some(u) => Err(format!(
+                "is on a FUSE mount of user {u}, whose daemon reports owners and modes as it \
+                 likes (mount {quoted})"
+            )),
+            None => Err(format!(
+                "is on a FUSE mount whose owner can't be read (mount {quoted})"
+            )),
+        };
+    }
+    Err(format!(
+        "is on a FUSE-type filesystem that is neither virtiofs nor FUSE (mount {quoted})"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -523,7 +601,7 @@ pub fn bind_unix_std(
         let there = stat_at(&parent, &name)?;
         if there.st_mode & libc::S_IFMT != libc::S_IFDIR
             || there.st_uid != me
-            || there.st_mode & 0o7777 != 0o700
+            || !matches!(there.st_mode & 0o7777, 0o700 | 0o2700)
         {
             return Err(in_the_way(path, describe(&there)));
         }
@@ -540,19 +618,14 @@ pub fn bind_unix_std(
         })
         .map_err(unmake)?;
     let st = fstat(&dir).map_err(unmake)?;
-    if let Some(why) = refused_filesystem(
-        nix::sys::statfs::fstatfs(&dir)
-            .map_err(std::io::Error::from)
-            .map_err(unmake)?
-            .filesystem_type(),
-    ) {
-        return Err(unmake(untrusted(path, path, why, "--listen-unix")));
+    if let Some(why) = filesystem_refusal(&dir).map_err(unmake)? {
+        return Err(unmake(untrusted(path, path, &why, "--listen-unix")));
     }
     let made = stat_at(&parent, &name).map_err(unmake)?;
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
         return Err(moved());
     }
-    if !fresh && (st.st_uid != me || st.st_mode & 0o7777 != 0o700) {
+    if !fresh && (st.st_uid != me || !matches!(st.st_mode & 0o7777, 0o700 | 0o2700)) {
         return Err(in_the_way(path, describe(&st)));
     }
     if st.st_uid != me {
@@ -807,9 +880,9 @@ pub fn is_identity_uid_map(map: &[u8]) -> bool {
         .eq(IDENTITY_UID_MAP)
 }
 
-/// What a refusal says a uid_map held: the bytes, escaped, cut at [`QUOTED_MAP_BYTES`].
+/// What a refusal says a file held: the bytes, escaped, cut at [`QUOTED_MAP_BYTES`].
 #[cfg(target_os = "linux")]
-fn quote_uid_map(map: &[u8]) -> String {
+fn quote_bytes(map: &[u8]) -> String {
     let shown = &map[..map.len().min(QUOTED_MAP_BYTES)];
     let quoted: String = shown.escape_ascii().to_string();
     if shown.len() < map.len() {
@@ -830,6 +903,14 @@ fn quote_uid_map(map: &[u8]) -> String {
 /// must be procfs too. Any failure is an error that says which step failed.
 #[cfg(target_os = "linux")]
 fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
+    read_proc_self(proc, "uid_map", 64 * 1024)
+}
+
+/// Reads `self/<file>` of the procfs mounted at `proc`, at most `limit` bytes, the way
+/// [`read_uid_map`] says: `proc` must be procfs, the file is opened with `openat2` crossing
+/// no mount and following no magic link, and must be procfs too.
+#[cfg(target_os = "linux")]
+fn read_proc_self(proc: &Path, file: &str, limit: u64) -> Result<Vec<u8>, String> {
     use nix::fcntl::{open, openat2, OFlag, OpenHow, ResolveFlag};
     use nix::sys::stat::Mode;
     use nix::sys::statfs::{fstatfs, PROC_SUPER_MAGIC};
@@ -851,10 +932,11 @@ fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
     )
     .map_err(|e| format!("{}: {e}", proc.display()))?;
     procfs(&root, &proc.display().to_string())?;
-    let at = proc.join("self/uid_map");
+    let rel = format!("self/{file}");
+    let at = proc.join(&rel);
     let map = openat2(
         &root,
-        "self/uid_map",
+        rel.as_str(),
         OpenHow::new()
             .flags(OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
             .resolve(ResolveFlag::RESOLVE_NO_XDEV | ResolveFlag::RESOLVE_NO_MAGICLINKS),
@@ -863,7 +945,7 @@ fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
     procfs(&map, &at.display().to_string())?;
     let mut read = Vec::new();
     std::fs::File::from(map)
-        .take(64 * 1024)
+        .take(limit)
         .read_to_end(&mut read)
         .map_err(|e| format!("{}: {e}", at.display()))?;
     Ok(read)
@@ -894,7 +976,7 @@ pub fn identity_uid_map(proc: &Path) -> Result<(), String> {
         Ok(map) => Err(format!(
             "{}/self/uid_map holds {}",
             proc.display(),
-            quote_uid_map(&map)
+            quote_bytes(&map)
         )),
         Err(e) => Err(format!("cannot read this process's uid_map ({e})")),
     }
@@ -2883,7 +2965,7 @@ mod tests {
             let d = dir("mode-0750");
             let at = d.join("sf");
             std::fs::create_dir(&at).unwrap();
-            for mode in [0o750, 0o710, 0o701, 0o500] {
+            for mode in [0o750, 0o710, 0o701, 0o500, 0o2750, 0o4700, 0o1700, 0o6700] {
                 std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).unwrap();
                 let e = bind_unix(&at, 0o600).unwrap_err();
                 assert!(
@@ -2962,26 +3044,101 @@ mod tests {
             std::fs::remove_dir_all(&d).unwrap();
         }
 
-        /// procfs and FUSE are refused on the path, other filesystems are judged by their
-        /// owners and modes. A real FUSE mount needs root and a FUSE filesystem, so the
-        /// binary's refusal of one is in tests/unix_socket.rs; this is the type check alone.
+        /// A FUSE-type directory is judged by its mount's line in /proc/self/mountinfo:
+        /// virtiofs and a FUSE mount of root's or ours are taken; another user's FUSE mount,
+        /// one without an owner, any other type, a mount that isn't listed, a mountinfo that
+        /// can't be read and a kernel without mount ids are refused, quoting what was read.
         #[test]
-        fn procfs_and_fuse_are_refused_on_the_path() {
-            use nix::sys::statfs::*;
-            assert!(refused_filesystem(PROC_SUPER_MAGIC)
-                .unwrap()
-                .contains("procfs"));
-            assert!(refused_filesystem(FUSE_SUPER_MAGIC)
-                .unwrap()
-                .contains("FUSE"));
-            for ok in [
-                EXT4_SUPER_MAGIC,
-                TMPFS_MAGIC,
-                BTRFS_SUPER_MAGIC,
-                OVERLAYFS_SUPER_MAGIC,
-            ] {
-                assert_eq!(refused_filesystem(ok), None, "{ok:?}");
+        fn a_fuse_type_directory_is_judged_by_its_mount() {
+            let info = |l: &str| {
+                Ok(format!("22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/vda rw\n{l}\n30 22 0:5 / /proc rw - proc proc rw\n").into_bytes())
+            };
+            let virtiofs = "29 22 0:27 / /run/kata rw,relatime shared:9 - virtiofs kataShared rw";
+            assert_eq!(judge_fuse_mount(Some(29), info(virtiofs), 1000), Ok(()));
+            let fuse = |id: u32, ty: &str| {
+                format!("29 22 0:41 / /mnt/x rw,nosuid,nodev,relatime shared:9 - {ty} src rw,user_id={id},group_id={id},allow_other")
+            };
+            for ty in ["fuse", "fuseblk", "fuse.bindfs", "fuse.sshfs"] {
+                assert_eq!(
+                    judge_fuse_mount(Some(29), info(&fuse(0, ty)), 1000),
+                    Ok(()),
+                    "{ty}"
+                );
+                assert_eq!(
+                    judge_fuse_mount(Some(29), info(&fuse(1000, ty)), 1000),
+                    Ok(()),
+                    "{ty}"
+                );
+                let e = judge_fuse_mount(Some(29), info(&fuse(1001, ty)), 1000).unwrap_err();
+                assert!(
+                    e.starts_with("is on a FUSE mount of user 1001"),
+                    "{ty}: {e}"
+                );
+                assert!(e.contains("user_id=1001"), "{ty}: {e}");
             }
+            let no_owner = "29 22 0:41 / /mnt/x rw - fuse.x src rw,allow_other";
+            let e = judge_fuse_mount(Some(29), info(no_owner), 1000).unwrap_err();
+            assert!(e.contains("owner can't be read"), "{e}");
+            let other = "29 22 0:41 / /mnt/x rw - ceph src rw";
+            let e = judge_fuse_mount(Some(29), info(other), 1000).unwrap_err();
+            assert!(e.contains("neither virtiofs nor FUSE"), "{e}");
+            let e = judge_fuse_mount(Some(31), info(virtiofs), 1000).unwrap_err();
+            assert!(
+                e.contains("its mount 31 isn't in /proc/self/mountinfo"),
+                "{e}"
+            );
+            let e = judge_fuse_mount(Some(2), info(virtiofs), 1000).unwrap_err();
+            assert!(
+                e.contains("its mount 2 isn't"),
+                "a prefix of an id isn't the id: {e}"
+            );
+            let e = judge_fuse_mount(Some(29), Err("/proc: Permission denied".into()), 1000)
+                .unwrap_err();
+            assert!(
+                e.contains("can't be looked up: /proc: Permission denied"),
+                "{e}"
+            );
+            let e = judge_fuse_mount(None, info(virtiofs), 1000).unwrap_err();
+            assert!(e.contains("no mount id"), "{e}");
+            let garbled = "29 22 0:41 / /mnt/x rw fuse src";
+            let e = judge_fuse_mount(Some(29), info(garbled), 1000).unwrap_err();
+            assert!(e.contains(&format!("its mount reads \"{garbled}\"")), "{e}");
+        }
+
+        /// The real /proc/self/mountinfo is read through the checked procfs, and the mount
+        /// of / is in it.
+        #[test]
+        fn mountinfo_is_read_from_procfs() {
+            let real = std::fs::read("/proc/self/mountinfo").unwrap();
+            assert_eq!(
+                read_proc_self(Path::new("/proc"), "mountinfo", 16 << 20).unwrap(),
+                real
+            );
+            let root = open_at(None, c"/", libc::O_PATH | libc::O_DIRECTORY).unwrap();
+            let id = mount_id(&root).expect("a mount id for /").to_string();
+            assert!(real
+                .split(|b| *b == b'\n')
+                .any(|l| l.split(|b| *b == b' ').next() == Some(id.as_bytes())));
+        }
+
+        /// A directory of ours left with mode 02700 (made under a setgid parent and left
+        /// before its mode was set) is taken back like a 0700 one.
+        #[test]
+        fn a_setgid_directory_left_behind_is_taken_back() {
+            use std::os::unix::fs::MetadataExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("left-setgid");
+            let at = d.join("sf");
+            std::fs::create_dir(&at).unwrap();
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o2700)).unwrap();
+            assert_eq!(std::fs::metadata(&at).unwrap().mode() & 0o7777, 0o2700);
+            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
+            let (l, file) = bind_unix(&at, 0o600).expect("a 02700 directory of ours");
+            std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
+            drop(l);
+            remove_unix(&file);
+            std::fs::remove_dir_all(&d).unwrap();
         }
 
         #[test]
@@ -3261,9 +3418,9 @@ mod tests {
         /// cut when long.
         #[test]
         fn a_refusal_quotes_the_uid_map() {
-            assert_eq!(quote_uid_map(b"0 1000 1\n"), "\"0 1000 1\\n\"");
+            assert_eq!(quote_bytes(b"0 1000 1\n"), "\"0 1000 1\\n\"");
             let long = b"0 1000 1\n".repeat(100);
-            let q = quote_uid_map(&long);
+            let q = quote_bytes(&long);
             assert!(q.ends_with("(the first 200 of 900 bytes)"), "{q}");
         }
 
