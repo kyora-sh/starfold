@@ -273,10 +273,99 @@ curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901
 # {"seq":812,"events":19}
 ```
 
+### On a unix socket (Linux only)
+
+`--listen-unix DIR` serves the same routes, with the same login and host checks, on a
+unix socket: starfold makes `DIR` for its user alone (mode 0700), or takes one it left
+behind, and listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
+refused: `--listen-unix is not available on this platform yet`. It binds before any
+thread starts, so it works from the `starfold` binary or a program whose own `main` calls
+`starfold::main` first thing (the bind checks that the process has one thread);
+`starfold::run` refuses it.
+
+What keeps other users out, in three parts:
+
+- **Every accepted peer has starfold's uid.** The kernel records each connecting
+  process's credentials at `connect`, and starfold reads them (`SO_PEERCRED`) before it
+  reads or writes a byte, closing any connection from another uid.
+- **That uid is exact.** In a user namespace whose uid map is the identity (the initial
+  namespace, or one root gave the same map) every uid is mapped; elsewhere an unmapped
+  peer reads as the overflow uid, which could be starfold's own. So at start starfold
+  reads `/proc/self/uid_map` (from procfs, checked with `fstatfs`, through no mount
+  point) and refuses `--listen-unix` unless it is the full identity map,
+  `0 0 4294967295`, before anything is made; the refusal quotes what it read. This needs
+  Linux 5.6 or later (`openat2`) built with user namespaces (`CONFIG_USER_NS`, which
+  gives the file).
+- **Nobody else can substitute the path while starfold binds it.** Before it makes `DIR`,
+  starfold walks the path from `/`, one directory at a time without following symlinks
+  on its own: every directory on the way must belong to starfold's user or root and let
+  no other user rename entries in it (writable by no one else unless sticky, as `/tmp`
+  is, and no ACL entry that lets anyone else write). A symlink on the way is followed
+  only if it belongs to starfold's user or root, and its target is held to the same
+  rules. No directory on the way, and not `DIR`, may be on procfs (`/proc/self/cwd`, say,
+  resolves differently for each process) or on another user's FUSE mount (its daemon
+  reports owners and modes as it likes). A directory on a FUSE-type filesystem is judged
+  by its mount (its line in `/proc/self/mountinfo`, found by `statx` mount id and read
+  through the checked procfs): virtiofs is taken, as is a `fuse`/`fuseblk`/`fuse.*` mount
+  whose `user_id=` is root's or starfold's user's (a FUSE mount of root's is the
+  administrator's, like a root-owned directory); any other, or one that can't be found,
+  is refused. This needs a kernel that gives mount ids (Linux 5.8 or later) for any FUSE
+  directory on the path. An existing `DIR` is taken only if it is a real directory (not a
+  symlink) of starfold's user with mode exactly 0700 (or 02700, as under a setgid
+  parent), and starfold holds a lock on it (`flock`) for as long as it serves, so a
+  second instance on it is refused. In it, an existing `s` is replaced only if it is a
+  socket of starfold's user that refuses a connection (nothing listens on it); anything
+  else there, or at `DIR`, is refused. Any refusal names the directory, symlink or entry
+  at fault, with its owner and mode, and touches nothing of someone else's.
+
+The socket's mode decides who reaches `connect` at all. With the default
+`--listen-unix-mode=0600` no other uid can connect: the kernel refuses it. That holds
+for ordinary processes; root, and any process with a capability that overrides file
+permissions (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`, `CAP_SYS_ADMIN`,
+granted directly or by a file), can between them connect anyway and replace or remove
+`DIR/s`; the peer-uid check still closes their connections if their uid isn't
+starfold's.
+`0660` or `0666` let that group or everyone connect; the kernel accepts the connection
+and starfold closes it unread after the peer-uid check, which is then the only thing
+between other users and the server.
+
+**Clients check the listener.** The path is trusted only while starfold holds it: before
+starfold starts, or after it exits, another user who can write to an ancestor (a sticky
+`/tmp` included) can put something else at `DIR/s`. A client that connects by path reads
+the listener's uid (`SO_PEERCRED` on its own end) and sends nothing, a token least of
+all, unless it is the uid it expects. That check can only be relied on from a client
+whose own user namespace maps the expected uid and the would-be impostor's: in a
+namespace that doesn't, an unmapped listener reads as the overflow uid, which can equal
+the uid the client expects.
+
+What isn't claimed:
+
+- **The same uid is not separated.** In a sandbox where other code runs as starfold's
+  uid, that code can reach starfold.
+- A peer that is let in can hand its connection to another process; the connection keeps
+  the credentials it was opened with.
+- root can do anything, and so can a process with the capabilities above.
+- **ID-mapped mounts report ownership as their mapping says.** An administrator can make
+  another uid's directory look like starfold's through an ID-mapped mount; such a mount
+  on the path is outside what is claimed.
+
+The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` and its
+socket are removed when starfold exits (a stop by SIGTERM or SIGINT, or a startup error
+after the bind); a crash or SIGKILL leaves them, and the next start takes `DIR` back
+(mode 0700, so after a crash of a server with a group or other socket mode, whose `DIR`
+then had search bits, the next start refuses it until it is removed); and starfold checks that it is the process's
+only thread when it binds, since the bind sets the working directory and umask for a
+moment.
+
+`--framed` sends every WebSocket message as binary with a kind byte, for hops that carry
+binary messages only; the page then needs `?framed=1`. Framed, a message from the page is
+at most 64 MiB, kind byte included; the page doesn't send a larger one.
+
 ### macOS
 
-starfold also streams a Mac's own screen, with every feature of the Linux version
-(ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
+starfold also streams a Mac's own screen, with every feature of the Linux version but
+`--listen-unix` (ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system
+audio).
 
 ```sh
 brew install opus pkgconf esbuild
@@ -305,7 +394,7 @@ rounded-corner flags don't apply.
 ### Windows
 
 starfold also streams a Windows desktop (Windows 10 or later), with every feature of the
-Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
+Linux version but `--listen-unix` (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
 WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
