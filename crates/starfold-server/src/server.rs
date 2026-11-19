@@ -1891,7 +1891,12 @@ mod tests {
             mic,
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1), true),
+            recorder: crate::record::Recorder::new(
+                hub.clone(),
+                Duration::from_secs(1),
+                true,
+                crate::record::default_dir(),
+            ),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
@@ -3570,7 +3575,7 @@ mod tests {
         let hub = Hub::new();
         let mut s = app(&hub, false, None);
         let flags = crate::parse_args(["--port".to_string(), "6901".to_string()]);
-        s.recorder = crate::recorder_from_args(&flags, &hub);
+        s.recorder = crate::recorder_from_args(&flags, &hub).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
@@ -3603,7 +3608,12 @@ mod tests {
         hub.width.store(64, Ordering::Relaxed);
         hub.height.store(32, Ordering::Relaxed);
         let mut s = app(&hub, false, None);
-        s.recorder = crate::record::Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        s.recorder = crate::record::Recorder::new(
+            hub.clone(),
+            Duration::from_secs(30),
+            true,
+            crate::record::default_dir(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
@@ -3611,9 +3621,9 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let started: serde_json::Value = serde_json::from_str(&text).unwrap();
         let id = started["id"].as_str().unwrap().to_string();
-        // Three H.264 access units as the hub sends them: a keyframe with SPS and PPS, then
-        // two more frames.
-        let recorder = hub.clients.lock()[0].clone();
+        // Three H.264 access units as the encode thread hands them out: a keyframe with SPS
+        // and PPS, then two more frames.
+        hub.taps.set_cohort(1);
         let mut key = vec![0x01, 1, 0, 0, 0, 1];
         key.resize(16, 0);
         key.extend_from_slice(&[
@@ -3622,10 +3632,18 @@ mod tests {
         let mut delta = vec![0x01, 0, 0, 0, 0, 2];
         delta.resize(16, 0);
         delta.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]);
+        let mut seen = crate::record::tap::Seen::default();
         for frame in [&key, &delta, &delta] {
-            recorder.send(Out::Bin(Bytes::copy_from_slice(frame)));
+            let msg = Bytes::copy_from_slice(frame);
+            hub.taps.offer(
+                &mut seen,
+                1,
+                (64, 32),
+                frame[1] == 1,
+                Instant::now(),
+                &[msg],
+            );
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let stop = format!("/record/stop?id={id}");
         let (status, clip) = ask(port, "POST", &stop, "").await;
         assert_eq!(status, 200, "{clip}");

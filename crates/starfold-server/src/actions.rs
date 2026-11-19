@@ -647,7 +647,12 @@ mod tests {
             mic: None,
             resize: false,
             read_only,
-            recorder: crate::record::Recorder::new(hub, Duration::from_secs(1), false),
+            recorder: crate::record::Recorder::new(
+                hub,
+                Duration::from_secs(1),
+                false,
+                crate::record::default_dir(),
+            ),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",

@@ -17,6 +17,8 @@ mod compat;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
+#[cfg(test)]
+mod counting;
 #[cfg(target_os = "linux")]
 mod desktop;
 pub mod encoder;
@@ -43,6 +45,10 @@ mod wait;
 mod win;
 #[cfg(any(windows, test))]
 mod winlib;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: counting::Counting = counting::Counting;
 
 // The macOS and Windows backends provide the same modules with the same interfaces.
 #[cfg(target_os = "macos")]
@@ -288,6 +294,10 @@ fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
         eprintln!("{e}");
         std::process::exit(2);
     });
+    if let Err(e) = record::settings(&a) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     if listen.unix.is_some() && prebound.is_none() {
         eprintln!(
             "--listen-unix needs the starfold binary: it binds before any thread starts, \
@@ -337,16 +347,14 @@ fn files_from_args(a: &HashMap<String, String>, read_only: bool) -> Result<files
 }
 
 /// The recorder `serve` uses: GET /screenshot; /record* only with --enable-recording (off
-/// by default); --max-record-seconds caps a recording's length.
+/// by default); --max-record-seconds caps a recording's length; recordings spool in
+/// --recording-dir ([`record::settings`]).
 fn recorder_from_args(
     a: &HashMap<String, String>,
     hub: &std::sync::Arc<hub::Hub>,
-) -> std::sync::Arc<record::Recorder> {
-    record::Recorder::new(
-        hub.clone(),
-        std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
-        record::enabled(a),
-    )
+) -> Result<std::sync::Arc<record::Recorder>, String> {
+    let s = record::settings(a)?;
+    Ok(record::Recorder::new(hub.clone(), s.max, s.on, s.dir))
 }
 
 async fn serve(
@@ -637,6 +645,10 @@ async fn serve(
         ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
     }
+    let recorder = recorder_from_args(&a, &hub).unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(2);
+    });
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).
@@ -689,7 +701,7 @@ async fn serve(
         mic,
         resize: resize_on,
         read_only,
-        recorder: recorder_from_args(&a, &hub),
+        recorder,
         // --title: the browser tab's title.
         index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
