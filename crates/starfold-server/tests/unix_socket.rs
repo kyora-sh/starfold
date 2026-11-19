@@ -404,6 +404,37 @@ fn a_symlink_another_user_owns_is_not_followed() {
     std::fs::remove_dir_all(&target).unwrap();
 }
 
+/// A server killed with SIGKILL leaves its directory and dead socket; the next start on the
+/// same path takes them back and serves.
+#[test]
+fn a_restart_after_a_kill_takes_the_directory_back() {
+    let x = Display::start();
+    let d = scratch("restart", 0o700);
+    let mut first = Server::start(&x, &d, &["--listen-tcp=false"]);
+    unsafe { libc::kill(first.pid(), libc::SIGKILL) };
+    first.child.wait().unwrap();
+    let socket = first.socket.clone();
+    // Reaped already: its Drop would signal a pid that may be someone else's by now.
+    std::mem::forget(first);
+    assert!(socket.exists(), "a killed server left nothing behind");
+    assert!(!healthy(&socket));
+    std::fs::remove_file(d.join("log")).unwrap();
+    let second = Server::start(&x, &d, &["--listen-tcp=false"]);
+    assert!(healthy(&second.socket));
+}
+
+/// A second instance on the path of a live one is refused and takes nothing from it.
+#[test]
+fn a_second_instance_is_refused_and_the_first_keeps_serving() {
+    let x = Display::start();
+    let d = scratch("second-instance", 0o700);
+    let first = Server::start(&x, &d, &["--listen-tcp=false"]);
+    let (code, said) = refused_start(&d.join("sf"));
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("another server is using it"), "{said}");
+    assert!(healthy(&first.socket), "{}", read_log(&first.log));
+}
+
 /// A client running as a throwaway user
 /// reaches the socket (mode 0666, directory 0711) of the real server and gets nothing: the
 /// connection closes before a byte either way, and the server logs the refusal. The

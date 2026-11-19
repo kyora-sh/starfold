@@ -349,13 +349,14 @@ fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
             .any(|e| (e.0 == USER || e.0 == GROUP) && e.1 & WRITE != 0))
 }
 
-/// Serves --listen-unix: makes the directory `path` (it must not exist yet; its parent
-/// must, reached by [`open_trusted_dir`]) for this user alone and binds a socket named `s`
-/// in it with permissions `mode`.
-/// Every step after the mkdir works on the directory as opened, and nothing that already
-/// existed is used, replaced or removed: a path that exists, a server's or a stale one, is
-/// an error. Group or other access in `mode` gives that class search permission on the
-/// directory, once the socket has its mode.
+/// Serves --listen-unix: makes the directory `path` (its parent must exist, reached by
+/// [`open_trusted_dir`]) for this user alone, or takes an existing one that is a directory
+/// of this user's with mode 0700, locks it (`flock`, held while the directory stays open),
+/// and binds a socket named `s` in it with permissions `mode`. An `s` already there is
+/// replaced only if it is a socket of this user's that refuses a connection; anything
+/// else in the way is an error naming it. Every step after the mkdir works on the
+/// directory as opened. Group or other access in `mode` gives that class search
+/// permission on the directory, once the socket has its mode.
 ///
 /// The walk to the parent ([`open_trusted_dir`]) is what keeps another user from
 /// substituting the path while it is bound; who may talk to the server is decided by the
@@ -392,23 +393,39 @@ pub fn bind_unix_std(
         .unwrap_or(Path::new("."));
     let name = cname(name)?;
     let parent = open_trusted_dir(parent_path, path)?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+    let me = unsafe { libc::geteuid() };
+    let fresh = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+    if !fresh {
         let e = Error::last_os_error();
-        return Err(match e.raw_os_error() {
-            Some(libc::EEXIST) => Error::new(
-                ErrorKind::AlreadyExists,
-                format!(
-                    "{} exists ({}): --listen-unix makes a new directory there",
-                    path.display(),
-                    stat_at(&parent, &name).map_or_else(
-                        |e| format!("can't be read: {e}"),
-                        |st| format!("owner uid {}, mode {:04o}", st.st_uid, st.st_mode & 0o7777)
-                    )
-                ),
-            ),
-            _ => e,
-        });
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            return Err(e);
+        }
     }
+    let describe = |st: &libc::stat| {
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => "a directory",
+            libc::S_IFLNK => "a symlink",
+            libc::S_IFSOCK => "a socket",
+            libc::S_IFREG => "a file",
+            _ => "something else",
+        };
+        format!(
+            "{kind}, owner uid {}, mode {:04o}",
+            st.st_uid,
+            st.st_mode & 0o7777
+        )
+    };
+    let in_the_way = |what: &Path, why: String| {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "{} is in the way ({why}): --listen-unix takes an existing directory only if \
+                 it is a directory of this user's with mode 0700, and replaces a socket in it \
+                 only if it is this user's and nothing listens on it",
+                what.display()
+            ),
+        )
+    };
     let moved = || {
         Error::new(
             ErrorKind::PermissionDenied,
@@ -417,11 +434,12 @@ pub fn bind_unix_std(
     };
     // Until the directory is open, what can't be set up takes back the empty directory just
     // made (an empty directory of ours under that name; a umask of 0777, say, makes one
-    // even its owner can't open), so the next start isn't refused for it.
+    // even its owner can't open), so the next start isn't refused for it. A directory that
+    // was there before is never removed here.
     let unmake = |e: Error| {
-        let ours = stat_at(&parent, &name).is_ok_and(|s| {
-            s.st_mode & libc::S_IFMT == libc::S_IFDIR && s.st_uid == unsafe { libc::geteuid() }
-        });
+        let ours = fresh
+            && stat_at(&parent, &name)
+                .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR && s.st_uid == me);
         if ours {
             let _ = unlink_at(&parent, &name, libc::AT_REMOVEDIR);
         }
@@ -429,17 +447,60 @@ pub fn bind_unix_std(
     };
     let dir = open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY)
         .map_err(|e| match e.raw_os_error() {
-            Some(libc::ELOOP | libc::ENOTDIR) => moved(),
+            Some(libc::ELOOP | libc::ENOTDIR) if fresh => moved(),
+            Some(libc::ELOOP | libc::ENOTDIR) => in_the_way(
+                path,
+                stat_at(&parent, &name)
+                    .map_or_else(|e| format!("can't be read: {e}"), |st| describe(&st)),
+            ),
             _ => e,
         })
         .map_err(unmake)?;
     let st = fstat(&dir).map_err(unmake)?;
     let made = stat_at(&parent, &name).map_err(unmake)?;
-    if st.st_uid != unsafe { libc::geteuid() }
-        || st.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || id(&st) != id(&made)
-    {
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
         return Err(moved());
+    }
+    if st.st_uid != me || st.st_mode & 0o7777 != 0o700 {
+        return Err(if fresh {
+            moved()
+        } else {
+            in_the_way(path, describe(&st))
+        });
+    }
+    // Held for as long as the directory stays open, which is the server's life: a second
+    // start on the same directory, live or racing, is turned away here and touches nothing.
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        let e = Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{}: another server is using it", path.display()),
+            ),
+            _ => e,
+        });
+    }
+    if !fresh {
+        let socket_path = unix_socket_path(path);
+        match stat_at(&dir, SOCKET) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+            Ok(s) if is_socket(&s) && s.st_uid == me => {
+                match std::os::unix::net::UnixStream::connect(&socket_path) {
+                    Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                        unlink_at(&dir, SOCKET, 0)?;
+                    }
+                    Err(e) => return Err(in_the_way(&socket_path, format!("a socket: {e}"))),
+                    Ok(_) => {
+                        return Err(in_the_way(
+                            &socket_path,
+                            "a socket something listens on".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(s) => return Err(in_the_way(&socket_path, describe(&s))),
+        }
     }
     let mut file = SocketFile {
         parent,
@@ -2135,12 +2196,16 @@ mod tests {
                     "{e}"
                 );
             };
+            let open_dir = |p: &std::path::Path| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
             let empty = d.join("empty");
-            std::fs::create_dir(&empty).unwrap();
+            open_dir(&empty);
             refused(&empty);
             assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
             let stale = d.join("stale");
-            std::fs::create_dir(&stale).unwrap();
+            open_dir(&stale);
             drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&stale)).unwrap());
             refused(&stale);
             assert!(
@@ -2148,7 +2213,7 @@ mod tests {
                 "a stale socket was replaced"
             );
             let live = d.join("live");
-            std::fs::create_dir(&live).unwrap();
+            open_dir(&live);
             let server = std::os::unix::net::UnixListener::bind(unix_socket_path(&live)).unwrap();
             refused(&live);
             std::os::unix::net::UnixStream::connect(unix_socket_path(&live))
@@ -2568,6 +2633,96 @@ mod tests {
             std::fs::remove_dir_all(&d).unwrap();
         }
 
+        /// A directory of this user's with mode 0700, as a server killed by a signal leaves
+        /// it with its dead socket, is taken back: the dead socket is replaced by a live one.
+        #[test]
+        fn a_directory_left_behind_is_taken_back() {
+            use std::os::unix::fs::MetadataExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("left");
+            let at = d.join("sf");
+            std::fs::create_dir(&at).unwrap();
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
+            let dead = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap().ino();
+            let (l, file) = bind_unix(&at, 0o600).unwrap();
+            let now = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap();
+            assert_ne!(now.ino(), dead, "the dead socket is still there");
+            assert_eq!(file.socket_id.map(|s| s.1 as u64), Some(now.ino()));
+            std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
+            drop(l);
+            remove_unix(&file);
+            assert!(!at.exists());
+            std::fs::create_dir(&at).unwrap();
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (l, file) = bind_unix(&at, 0o600).expect("an empty directory of ours");
+            drop(l);
+            remove_unix(&file);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// In a directory that could be taken back, a socket something listens on is left
+        /// alone, and anything at `s` that isn't a socket is too; each refusal names it.
+        #[test]
+        fn what_is_in_the_way_in_a_directory_of_ours_is_left_alone() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("in-the-way");
+            let at = d.join("sf");
+            let s = unix_socket_path(&at);
+            std::fs::create_dir(&at).unwrap();
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let live = std::os::unix::net::UnixListener::bind(&s).unwrap();
+            let e = bind_unix(&at, 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+            assert!(
+                e.to_string().contains(&format!("{} is in the way (a socket something listens on)", s.display())),
+                "{e}"
+            );
+            std::os::unix::net::UnixStream::connect(&s).expect("the live socket is gone");
+            drop(live);
+            std::fs::remove_file(&s).unwrap();
+            for what in ["a file", "a directory", "a symlink"] {
+                match what {
+                    "a file" => std::fs::write(&s, b"x").unwrap(),
+                    "a directory" => std::fs::create_dir(&s).unwrap(),
+                    _ => std::os::unix::fs::symlink("/tmp", &s).unwrap(),
+                }
+                let e = bind_unix(&at, 0o600).unwrap_err();
+                assert!(
+                    e.to_string().contains(&format!("{} is in the way ({what}, owner uid", s.display())),
+                    "{what}: {e}"
+                );
+                assert!(std::fs::symlink_metadata(&s).is_ok(), "{what} was removed");
+                let _ = std::fs::remove_file(&s);
+                let _ = std::fs::remove_dir(&s);
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// An existing directory of ours is taken only with mode 0700 exactly.
+        #[test]
+        fn a_directory_of_ours_with_another_mode_is_refused() {
+            use std::os::unix::fs::MetadataExt;
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("mode-0750");
+            let at = d.join("sf");
+            std::fs::create_dir(&at).unwrap();
+            for mode in [0o750, 0o710, 0o701, 0o500] {
+                std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).unwrap();
+                let e = bind_unix(&at, 0o600).unwrap_err();
+                assert!(
+                    e.to_string().contains(&format!("is in the way (a directory, owner uid {}, mode {mode:04o})", unsafe { libc::geteuid() })),
+                    "{mode:o}: {e}"
+                );
+                assert_eq!(std::fs::metadata(&at).unwrap().mode() & 0o7777, mode);
+            }
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
         #[test]
         fn a_second_server_on_the_path_is_turned_away() {
             let rt = runtime();
@@ -2577,6 +2732,7 @@ mod tests {
             let (l, file) = bind_unix(&at, 0o600).unwrap();
             let e = bind_unix(&at, 0o600).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+            assert!(e.to_string().contains("another server is using it"), "{e}");
             std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
             drop(l);
             remove_unix(&file);

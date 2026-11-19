@@ -13,7 +13,8 @@ Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
   --listen-tcp                 listen on --addr/--port (default true)
   --listen-unix                 also serve on a unix socket (Linux only): makes
-                                this directory, which must not exist yet, for
+                                this directory (or takes one of yours, mode
+                                0700, whose socket nothing listens on) for
                                 this user alone and listens on the socket s in
                                 it; removes both when it exits (not after a
                                 crash or SIGKILL); the host and origin

@@ -253,8 +253,8 @@ curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901
 ### On a unix socket (Linux only)
 
 `--listen-unix DIR` serves the same routes, with the same login and host checks, on a
-unix socket: starfold makes `DIR` (which must not exist yet) for its user alone and
-listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
+unix socket: starfold makes `DIR` for its user alone (mode 0700), or takes one it left
+behind, and listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
 refused: `--listen-unix is not available on this platform yet`. It binds before any
 thread starts, so it works from the `starfold` binary or a program whose own `main` calls
 `starfold::main` first thing (the bind checks that the process has one thread);
@@ -279,9 +279,13 @@ What keeps other users out, in three parts:
   no other user rename entries in it (writable by no one else unless sticky, as `/tmp`
   is, and no ACL entry that lets anyone else write). A symlink on the way is followed
   only if it belongs to starfold's user or root, and its target is held to the same
-  rules. `DIR` itself must not exist yet: one that does, whoever made it, is refused,
-  with its owner and mode in the error. Any refusal names the directory or symlink at
-  fault, and nothing is made.
+  rules. An existing `DIR` is taken only if it is a real directory (not a symlink) of
+  starfold's user with mode exactly 0700, and starfold holds a lock on it (`flock`) for
+  as long as it serves, so a second instance on it is refused. In it, an existing `s`
+  is replaced only if it is a socket of starfold's user that refuses a connection
+  (nothing listens on it); anything else there, or at `DIR`, is refused. Any refusal
+  names the directory, symlink or entry at fault, with its owner and mode, and touches
+  nothing of someone else's.
 
 The socket's mode decides who reaches `connect` at all. With the default
 `--listen-unix-mode=0600` no other uid (root aside) can connect: the kernel refuses it.
@@ -303,10 +307,11 @@ What isn't claimed:
   the credentials it was opened with.
 - root can do anything.
 
-The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` is made
-fresh for this user alone and removed when starfold exits (a stop by SIGTERM or SIGINT,
-or a startup error after the bind); a crash or SIGKILL leaves it, and the next start on
-that path is refused until it is removed; and starfold checks that it is the process's
+The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` and its
+socket are removed when starfold exits (a stop by SIGTERM or SIGINT, or a startup error
+after the bind); a crash or SIGKILL leaves them, and the next start takes `DIR` back
+(mode 0700, so after a crash of a server with a group or other socket mode, whose `DIR`
+then had search bits, the next start refuses it until it is removed); and starfold checks that it is the process's
 only thread when it binds, since the bind sets the working directory and umask for a
 moment.
 
