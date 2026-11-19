@@ -114,6 +114,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.commit }}
+          submodules: true
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
@@ -212,6 +213,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.commit }}
+          submodules: true
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
@@ -313,6 +315,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.commit }}
+          submodules: true
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
@@ -451,6 +454,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.commit }}
+          submodules: true
       - name: Archive name
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
