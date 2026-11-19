@@ -49,7 +49,7 @@ env:
 jobs:
   version:
     name: Version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-2x4
     timeout-minutes: 5
     outputs:
@@ -86,7 +86,7 @@ jobs:
   linux:
     name: Linux x86_64 (${{ matrix.flavour.licence }})
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -173,7 +173,7 @@ jobs:
   linux-arm64:
     name: Linux aarch64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -274,7 +274,7 @@ jobs:
   macos:
     name: macOS arm64 (${{ matrix.flavour.licence }})
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-macos
     timeout-minutes: 60
     strategy:
@@ -386,7 +386,7 @@ jobs:
   windows:
     name: Windows x86_64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -525,7 +525,7 @@ jobs:
   python:
     name: Python SDK (sdist, wheel)
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-2x4
     timeout-minutes: 10
     env:
@@ -566,7 +566,7 @@ jobs:
   embed:
     name: Embeddable web client (npm tarball)
     needs: version
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 15
     env:
@@ -609,7 +609,7 @@ jobs:
   check:
     name: Release check
     needs: [version, linux, linux-arm64, macos, windows, python, embed]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'scratch-proof/not-this-repository'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-2x4
     timeout-minutes: 10
     steps:
