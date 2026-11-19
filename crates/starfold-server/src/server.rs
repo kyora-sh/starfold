@@ -461,11 +461,11 @@ pub fn bind_unix_std(
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
         return Err(moved());
     }
+    if !fresh && (st.st_uid != me || st.st_mode & 0o7777 != 0o700) {
+        return Err(in_the_way(path, describe(&st)));
+    }
     if st.st_uid != me {
         return Err(moved());
-    }
-    if !fresh && st.st_mode & 0o7777 != 0o700 {
-        return Err(in_the_way(path, describe(&st)));
     }
     // Held for as long as the directory stays open, which is the server's life: a second
     // start on the same directory, live or racing, is turned away here and touches nothing.
