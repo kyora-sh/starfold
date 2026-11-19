@@ -171,48 +171,149 @@ fn clear_acl(dir: &std::os::fd::OwnedFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The --listen-unix parent's contract, checked on the parent as opened: no other user can
-/// rename or replace entries in it. That is a parent owned by this user or by root,
-/// writable by no one else unless it is sticky (as /tmp is), and with no ACL entry that
-/// lets anyone else write to it. With such a parent, nobody else can move the new
-/// directory aside or put something in its place while it is set up.
+/// The --listen-unix path's contract, checked on each directory of the walk as opened: no
+/// other user can rename or replace entries in it. That is a directory owned by this user
+/// or by root, writable by no one else unless it is sticky (as /tmp is), and with no ACL
+/// entry that lets anyone else write to it. When every directory from / down to the parent
+/// passes, nobody else can move the new directory, or any directory above it, aside or put
+/// something in its place.
 #[cfg(target_os = "linux")]
-fn check_parent(parent: &std::os::fd::OwnedFd, path: &Path) -> std::io::Result<()> {
-    let st = fstat(parent)?;
-    let refuse = |why: &str| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "{}: {why}; --listen-unix needs a parent where no other user can rename \
-                 entries, e.g. /tmp (sticky) or a directory only you can write",
-                path.display()
-            ),
-        ))
-    };
+fn check_dir(dir: &std::os::fd::OwnedFd, shown: &Path, path: &Path) -> std::io::Result<()> {
+    let st = fstat(dir)?;
     let me = unsafe { libc::geteuid() };
-    if st.st_uid != me && st.st_uid != 0 {
-        return refuse(&format!("its parent belongs to user {}", st.st_uid));
-    }
-    let sticky = st.st_mode & libc::S_ISVTX != 0;
-    if st.st_mode & 0o022 != 0 && !sticky {
-        return refuse("its parent is writable by other users and not sticky");
-    }
-    if acl_lets_others_write(parent)? {
-        return refuse("its parent has an ACL entry that lets other users add or remove entries");
-    }
-    Ok(())
+    let mode = st.st_mode & 0o7777;
+    let why = if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        "is not a directory".to_string()
+    } else if st.st_uid != me && st.st_uid != 0 {
+        format!("belongs to user {} (mode {mode:04o})", st.st_uid)
+    } else if st.st_mode & 0o022 != 0 && st.st_mode & libc::S_ISVTX == 0 {
+        format!("is writable by other users and not sticky (mode {mode:04o})")
+    } else if acl_lets_others_write(dir)? {
+        "has an ACL entry that lets other users add or remove entries".to_string()
+    } else {
+        return Ok(());
+    };
+    Err(untrusted(path, shown, &why))
 }
 
-/// The parent's access ACL has a named user or group entry with write permission that
-/// its mask doesn't take away.
+#[cfg(target_os = "linux")]
+fn untrusted(path: &Path, shown: &Path, why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{}: {} {why}; --listen-unix needs every directory on the way to belong to you \
+             or root and to let no other user rename entries in it (writable by no one else \
+             unless sticky, as /tmp is)",
+            path.display(),
+            shown.display()
+        ),
+    )
+}
+
+/// How many symlinks [`open_trusted_dir`] follows on one walk.
+#[cfg(target_os = "linux")]
+const MAX_SYMLINKS: usize = 40;
+
+/// Opens the directory `dir` (relative to the working directory if it isn't absolute) for
+/// --listen-unix `path`, walking from / one component at a time with `O_NOFOLLOW`, so
+/// nothing redirects the walk between the checks and the open: every directory on the way,
+/// / and `dir` included, must pass [`check_dir`]. A symlink on the way is followed only if
+/// it belongs to this user or root (it sits in a directory that passed, so no one else can
+/// replace it), and its target is walked by the same rules.
+#[cfg(target_os = "linux")]
+fn open_trusted_dir(dir: &Path, path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::ffi::OsString;
+    use std::path::{Component, PathBuf};
+    let flags = libc::O_PATH | libc::O_DIRECTORY;
+    let me = unsafe { libc::geteuid() };
+    let push = |pending: &mut Vec<OsString>, p: &Path| {
+        let start = pending.len();
+        for c in p.components() {
+            match c {
+                Component::RootDir => pending.push("/".into()),
+                Component::ParentDir => pending.push("..".into()),
+                Component::Normal(n) => pending.push(n.to_os_string()),
+                Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
+        pending[start..].reverse();
+    };
+    let mut pending = Vec::new();
+    push(&mut pending, dir);
+    if !dir.is_absolute() {
+        push(&mut pending, &std::env::current_dir()?);
+    }
+    let root = || -> std::io::Result<std::os::fd::OwnedFd> {
+        let fd = open_at(None, c"/", flags)?;
+        check_dir(&fd, Path::new("/"), path)?;
+        Ok(fd)
+    };
+    let mut fd = root()?;
+    let mut shown = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(c) = pending.pop() {
+        if c == "/" {
+            fd = root()?;
+            shown = PathBuf::from("/");
+            continue;
+        }
+        let name = cname(&c)?;
+        let here = shown.join(&c);
+        match open_at(Some(&fd), &name, flags) {
+            Ok(next) => {
+                check_dir(&next, &here, path)?;
+                fd = next;
+                shown = here;
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                let st = stat_at(&fd, &name)?;
+                if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("{}: {} is not a directory", path.display(), here.display()),
+                    ));
+                }
+                if st.st_uid != me && st.st_uid != 0 {
+                    return Err(untrusted(
+                        path,
+                        &here,
+                        &format!("is a symlink that belongs to user {}", st.st_uid),
+                    ));
+                }
+                links += 1;
+                if links > MAX_SYMLINKS {
+                    return Err(untrusted(path, &here, "is one symlink too many"));
+                }
+                let target = nix::fcntl::readlinkat(&fd, name.as_c_str())
+                    .map_err(std::io::Error::from)?;
+                push(&mut pending, Path::new(&target));
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {}: {e}", path.display(), here.display()),
+                ));
+            }
+        }
+    }
+    Ok(fd)
+}
+
+/// The directory's access ACL has a named user or group entry with write permission that
+/// its mask doesn't take away. Read through /proc/self/fd, which names exactly the open
+/// directory, since an `O_PATH` descriptor has no `fgetxattr`.
 #[cfg(target_os = "linux")]
 fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     let name = c"system.posix_acl_access";
     let mut buf = vec![0u8; 4096];
+    let at = cname(std::ffi::OsStr::new(&format!(
+        "/proc/self/fd/{}",
+        dir.as_raw_fd()
+    )))?;
     let n = unsafe {
-        libc::fgetxattr(
-            dir.as_raw_fd(),
+        libc::getxattr(
+            at.as_ptr(),
             name.as_ptr(),
             buf.as_mut_ptr().cast(),
             buf.len(),
@@ -249,14 +350,16 @@ fn acl_lets_others_write(dir: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
 }
 
 /// Serves --listen-unix: makes the directory `path` (it must not exist yet; its parent
-/// must) for this user alone and binds a socket named `s` in it with permissions `mode`.
+/// must, reached by [`open_trusted_dir`]) for this user alone and binds a socket named `s`
+/// in it with permissions `mode`.
 /// Every step after the mkdir works on the directory as opened, and nothing that already
 /// existed is used, replaced or removed: a path that exists, a server's or a stale one, is
 /// an error. Group or other access in `mode` gives that class search permission on the
 /// directory, once the socket has its mode.
 ///
-/// The directory rules keep an honest setup tidy and fail early; they are not what keeps
-/// other users out. That is the peer check every connection passes ([`PeerChecked`]).
+/// The walk to the parent ([`open_trusted_dir`]) is what keeps another user from
+/// substituting the path while it is bound; who may talk to the server is decided by the
+/// peer check every connection passes ([`PeerChecked`]).
 ///
 /// It changes the process's working directory and umask while it binds (see [`bind_in`]),
 /// so it runs before any other thread exists: the binary calls it first thing.
@@ -288,20 +391,23 @@ pub fn bind_unix_std(
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let name = cname(name)?;
-    let parent = open_at(
-        None,
-        &cname(parent_path.as_os_str())?,
-        libc::O_RDONLY | libc::O_DIRECTORY,
-    )?;
-    check_parent(&parent, path)?;
+    let parent = open_trusted_dir(parent_path, path)?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
         let e = Error::last_os_error();
         return Err(match e.raw_os_error() {
             Some(libc::EEXIST) => Error::new(
                 ErrorKind::AlreadyExists,
                 format!(
-                    "{} exists: --listen-unix makes a new directory there",
-                    path.display()
+                    "{} exists ({}): --listen-unix makes a new directory there",
+                    path.display(),
+                    stat_at(&parent, &name).map_or_else(
+                        |e| format!("can't be read: {e}"),
+                        |st| format!(
+                            "owner uid {}, mode {:04o}",
+                            st.st_uid,
+                            st.st_mode & 0o7777
+                        )
+                    )
                 ),
             ),
             _ => e,
@@ -521,7 +627,8 @@ pub fn remove_at_exit(file: SocketFile) -> &'static SocketFile {
     file
 }
 
-/// The full identity map, which only the initial user namespace has by default: every
+/// The full identity map, which the initial user namespace has (and a namespace root gave
+/// the same map): every
 /// uid is mapped, so a peer's SO_PEERCRED uid is exact and never stands for "unmapped".
 #[cfg(target_os = "linux")]
 const IDENTITY_UID_MAP: [&[u8]; 3] = [b"0", b"0", b"4294967295"];
@@ -615,9 +722,9 @@ fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
 /// process's own. `Err` says why not, quoting what uid_map held. A uid_map is written once,
 /// so the answer can't change later.
 #[cfg(target_os = "linux")]
-pub fn initial_user_namespace(proc: &Path) -> Result<(), String> {
-    let why = "the unix listener runs only in the initial user namespace (uid_map \
-         \"0 0 4294967295\"), where every peer's uid is exact";
+pub fn uid_map_is_identity(proc: &Path) -> Result<(), String> {
+    let why = "the unix listener runs only in a user namespace whose uid map is the \
+         identity (\"0 0 4294967295\"), where every peer's uid is exact";
     match read_uid_map(proc) {
         Ok(map) if is_identity_uid_map(&map) => Ok(()),
         Ok(map) => Err(format!(
@@ -2026,6 +2133,7 @@ mod tests {
             let refused = |p: &std::path::Path| {
                 let e = bind_unix(p, 0o600).unwrap_err();
                 assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+                assert!(e.to_string().contains(&format!("owner uid {}", unsafe { libc::geteuid() })), "{e}");
             };
             let empty = d.join("empty");
             std::fs::create_dir(&empty).unwrap();
@@ -2320,17 +2428,73 @@ mod tests {
             std::fs::remove_dir_all(&d).unwrap();
         }
 
+        /// A directory above the parent in which other users could rename entries (here
+        /// one of ours, writable by everyone, not sticky) is refused before anything is
+        /// made, and the error names it: someone could move the parent aside and put
+        /// another in its place. Sticky, it is taken.
         #[test]
-        fn a_symlinked_parent_is_refused() {
+        fn an_ancestor_others_can_rename_in_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("ancestor");
+            let parent = d.join("p");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let e = bind_unix(&parent.join("sf"), 0o600).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            let said = e.to_string();
+            assert!(
+                said.contains(&format!("{} is writable by other users and not sticky", d.display())),
+                "{said}"
+            );
+            assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            let (l, file) = bind_unix(&parent.join("sf"), 0o600).unwrap();
+            drop(l);
+            remove_unix(&file);
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// A symlink of this user's on the way is followed, and where it leads is held to
+        /// the same rules: a target under a directory others can rename in is refused, with
+        /// nothing made there; a good one takes the socket.
+        #[test]
+        fn a_symlinked_parent_is_walked_by_the_same_rules() {
             let rt = runtime();
             let _guard = rt.enter();
             let d = dir("via");
-            let target = dir("via-target");
+            let open = dir("via-open");
+            let target = open.join("t");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
             std::os::unix::fs::symlink(&target, d.join("via")).unwrap();
-            assert!(bind_unix(&d.join("via").join("sf"), 0o600).is_err());
+            let e = bind_unix(&d.join("via").join("sf"), 0o600).unwrap_err();
+            assert!(e.to_string().contains("not sticky"), "{e}");
             assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (l, file) = bind_unix(&d.join("via").join("sf"), 0o600).unwrap();
+            assert!(unix_socket_path(&target.join("sf")).exists());
+            drop(l);
+            remove_unix(&file);
             std::fs::remove_dir_all(&d).unwrap();
-            std::fs::remove_dir_all(&target).unwrap();
+            std::fs::remove_dir_all(&open).unwrap();
+        }
+
+        /// A path through something that isn't a directory is refused, naming it.
+        #[test]
+        fn a_file_on_the_way_is_refused() {
+            let rt = runtime();
+            let _guard = rt.enter();
+            let d = dir("file-on-way");
+            std::fs::write(d.join("f"), "").unwrap();
+            let e = bind_unix(&d.join("f").join("sf"), 0o600).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("{} is not a directory", d.join("f").display())),
+                "{e}"
+            );
+            std::fs::remove_dir_all(&d).unwrap();
         }
 
         #[test]
@@ -2644,7 +2808,7 @@ mod tests {
             assert!(!admits(65534, 1000));
         }
 
-        /// Only the full identity map, as the kernel writes it, is the initial namespace's.
+        /// Only the full identity map, as the kernel writes it, is accepted.
         #[test]
         fn only_the_full_identity_uid_map_is_accepted() {
             assert!(is_identity_uid_map(b"         0          0 4294967295\n"));
@@ -2688,7 +2852,7 @@ mod tests {
             let real = std::fs::read("/proc/self/uid_map").unwrap();
             assert_eq!(read_uid_map(Path::new("/proc")).unwrap(), real);
             assert_eq!(
-                initial_user_namespace(Path::new("/proc")).is_ok(),
+                uid_map_is_identity(Path::new("/proc")).is_ok(),
                 is_identity_uid_map(&real)
             );
         }
@@ -2701,13 +2865,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(d.join("self")).unwrap();
             std::fs::write(d.join("self/uid_map"), "0 0 4294967295\n").unwrap();
-            let e = initial_user_namespace(&d).unwrap_err();
+            let e = uid_map_is_identity(&d).unwrap_err();
             assert!(e.contains("is not procfs"), "{e}");
             let link = d.join("proc-link");
             std::os::unix::fs::symlink("/proc", &link).unwrap();
-            let e = initial_user_namespace(&link).unwrap_err();
+            let e = uid_map_is_identity(&link).unwrap_err();
             assert!(e.contains("cannot read"), "{e}");
-            let e = initial_user_namespace(&d.join("missing")).unwrap_err();
+            let e = uid_map_is_identity(&d.join("missing")).unwrap_err();
             assert!(e.contains("cannot read"), "{e}");
             std::fs::remove_dir_all(&d).unwrap();
         }

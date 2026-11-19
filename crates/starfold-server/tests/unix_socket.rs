@@ -235,7 +235,9 @@ struct Throwaway {
 
 impl Throwaway {
     fn create() -> Throwaway {
-        let name = format!("sf-test-{}", std::process::id());
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("sf-test-{}-{n}", std::process::id());
         let made = Command::new("sudo")
             .args([
                 "-n",
@@ -280,7 +282,7 @@ impl Drop for Throwaway {
 /// root mapped to this uid, the binary refuses --listen-unix before it binds, quoting the
 /// uid_map it read; the directory is never made.
 #[test]
-fn outside_the_initial_user_namespace_the_unix_listener_is_refused() {
+fn without_the_identity_uid_map_the_unix_listener_is_refused() {
     let at = Path::new("/tmp").join(format!("sf-it-userns-{}-sf", std::process::id()));
     for (flags, map) in [
         (&["--user"][..], String::new()),
@@ -316,6 +318,90 @@ fn outside_the_initial_user_namespace_the_unix_listener_is_refused() {
         );
         assert!(!at.exists(), "{flags:?}: {} was made", at.display());
     }
+}
+
+/// Runs the binary with --listen-unix at `at` and TCP off, and returns its exit code and
+/// what it printed; it is refused before any desktop is touched.
+fn refused_start(at: &Path) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_starfold"))
+        .arg(format!("--listen-unix={}", at.display()))
+        .args(["--listen-tcp=false", "--enable-basic-auth=false"])
+        .env_remove("DISPLAY")
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Another user makes the directory first (in sticky /tmp, where it then can't be moved by
+/// us or replaced by anyone else): starfold refuses to start and names its owner and mode,
+/// and the directory is left as it was. Clients that connect by path check the listener's
+/// uid themselves (README), so the impostor gets nothing from them either.
+#[test]
+fn a_directory_another_user_made_first_is_refused() {
+    sudo_works();
+    let user = Throwaway::create();
+    let at = Path::new("/tmp").join(format!("sf-it-theirs-{}", std::process::id()));
+    let as_them = |args: &[&str]| {
+        let ok = Command::new("sudo")
+            .args(["-n", "-u", &user.name, "--"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{args:?} as {}", user.name);
+    };
+    as_them(&["mkdir", "-m", "0755", at.to_str().unwrap()]);
+    let (code, said) = refused_start(&at);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains(&format!("exists (owner uid {}, mode 0755)", user.uid)),
+        "{said}"
+    );
+    let meta = std::fs::metadata(&at).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!((meta.uid(), meta.mode() & 0o7777), (user.uid, 0o755));
+    assert_eq!(std::fs::read_dir(&at).unwrap().count(), 0);
+    as_them(&["rmdir", at.to_str().unwrap()]);
+}
+
+/// A symlink on the way that belongs to another user (here in a sticky directory of ours,
+/// where anyone may add entries) is not followed: starfold refuses to start, naming it, and
+/// makes nothing where it points.
+#[test]
+fn a_symlink_another_user_owns_is_not_followed() {
+    sudo_works();
+    let user = Throwaway::create();
+    let d = scratch("their-link", 0o1777);
+    let target = scratch("their-link-target", 0o700);
+    let link = d.join("link");
+    let ok = Command::new("sudo")
+        .args(["-n", "-u", &user.name, "--", "ln", "-s"])
+        .arg(&target)
+        .arg(&link)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "ln -s as {}", user.name);
+    let (code, said) = refused_start(&link.join("sf"));
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains(&format!(
+            "{} is a symlink that belongs to user {}",
+            link.display(),
+            user.uid
+        )),
+        "{said}"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    let _ = Command::new("sudo")
+        .args(["-n", "rm", "-f"])
+        .arg(&link)
+        .status();
+    std::fs::remove_dir_all(&d).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
 }
 
 /// A client running as a throwaway user

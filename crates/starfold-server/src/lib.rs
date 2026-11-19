@@ -151,8 +151,8 @@ type Prebound = std::convert::Infallible;
 
 /// --listen-unix's socket, bound first thing, while this is the process's only thread:
 /// the bind changes the process's working directory and umask for a moment (see
-/// [`server::bind_in`]). It is bound only in the initial user namespace
-/// ([`server::initial_user_namespace`]), checked before anything is made. SIGTERM and SIGINT
+/// [`server::bind_in`]). It is bound only in a user namespace whose uid map is the identity
+/// ([`server::uid_map_is_identity`]), checked before anything is made. SIGTERM and SIGINT
 /// wait (blocked) from just before the bind until the server's handlers take them, first
 /// thing in [`serve`], so one that comes meanwhile still removes the socket. A bad flag,
 /// a refusal or a bind that fails ends the process here, before any desktop is touched.
@@ -179,7 +179,7 @@ fn prebind(args: &[String]) -> Option<Prebound> {
             );
             std::process::exit(1);
         }
-        if let Err(e) = server::initial_user_namespace(std::path::Path::new("/proc")) {
+        if let Err(e) = server::uid_map_is_identity(std::path::Path::new("/proc")) {
             eprintln!("{e}");
             std::process::exit(1);
         }

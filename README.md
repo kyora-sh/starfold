@@ -260,40 +260,55 @@ thread starts, so it works from the `starfold` binary or a program whose own `ma
 `starfold::main` first thing (the bind checks that the process has one thread);
 `starfold::run` refuses it.
 
-What keeps other users out: the server lets in only a peer with its own uid. The kernel
-records each connecting process's credentials at `connect`, and starfold reads them
-(`SO_PEERCRED`) before it reads or writes a byte, closing any other connection. The unix
-listener runs only in the initial user namespace, where every uid is mapped and the uid
-the kernel reports is exact; in another namespace an unmapped peer reads as the overflow
-uid, which could be starfold's own. So at start starfold reads `/proc/self/uid_map`
-(from procfs, checked with `fstatfs`, through no mount point) and refuses `--listen-unix`
-unless it is the full identity map, `0 0 4294967295`, before anything is made; the
-refusal quotes what it read. This needs Linux 5.6 or later (`openat2`). What isn't claimed:
+What keeps other users out, in three parts:
+
+- **Every accepted peer has starfold's uid.** The kernel records each connecting
+  process's credentials at `connect`, and starfold reads them (`SO_PEERCRED`) before it
+  reads or writes a byte, closing any connection from another uid.
+- **That uid is exact.** In a user namespace whose uid map is the identity (the initial
+  namespace, or one root gave the same map) every uid is mapped; elsewhere an unmapped
+  peer reads as the overflow uid, which could be starfold's own. So at start starfold
+  reads `/proc/self/uid_map` (from procfs, checked with `fstatfs`, through no mount
+  point) and refuses `--listen-unix` unless it is the full identity map,
+  `0 0 4294967295`, before anything is made; the refusal quotes what it read. This needs
+  Linux 5.6 or later (`openat2`) built with user namespaces (`CONFIG_USER_NS`, which
+  gives the file).
+- **Nobody else can substitute the path while starfold binds it.** Before it makes `DIR`,
+  starfold walks the path from `/`, one directory at a time without following symlinks
+  on its own: every directory on the way must belong to starfold's user or root and let
+  no other user rename entries in it (writable by no one else unless sticky, as `/tmp`
+  is, and no ACL entry that lets anyone else write). A symlink on the way is followed
+  only if it belongs to starfold's user or root, and its target is held to the same
+  rules. `DIR` itself must not exist yet: one that does, whoever made it, is refused,
+  with its owner and mode in the error. Any refusal names the directory or symlink at
+  fault, and nothing is made.
+
+The socket's mode decides who reaches `connect` at all. With the default
+`--listen-unix-mode=0600` no other uid (root aside) can connect: the kernel refuses it.
+`0660` or `0666` let that group or everyone connect; the kernel accepts the connection
+and starfold closes it unread after the peer-uid check, which is then the only thing
+between other users and the server.
+
+**Clients check the listener.** The path is trusted only while starfold holds it: before
+starfold starts, or after it exits, another user who can write to an ancestor (a sticky
+`/tmp` included) can put something else at `DIR/s`. A client that connects by path reads
+the listener's uid (`SO_PEERCRED` on its own end) and sends nothing, a token least of
+all, unless it is the uid it expects.
+
+What isn't claimed:
 
 - **The same uid is not separated.** In a sandbox where other code runs as starfold's
   uid, that code can reach starfold.
 - A peer that is let in can hand its connection to another process; the connection keeps
   the credentials it was opened with.
 - root can do anything.
-- **Which connections the kernel accepts.** With the default `--listen-unix-mode=0600`,
-  only starfold's uid (and root) can `connect`. `0660` or `0666` let that group or
-  everyone `connect` too: the kernel accepts the connection, and starfold closes it
-  unread after the peer-uid check. With those modes the peer-uid check is the only
-  thing between other users and the server.
-- **That a path leads to starfold.** A client that connects by path trusts every
-  directory on the way: another user who can rename an ancestor, or who creates
-  `DIR/s` before starfold does or after it exits, can serve something else there. A
-  client that has to know it reached starfold checks the listener's uid itself
-  (`SO_PEERCRED` on its own end).
 
-The rest is hygiene, which keeps an honest setup tidy and fails early, not what keeps
-other users out: `DIR`'s parent must not let other users rename entries in it (owned by
-you or root, writable by no one else unless sticky as `/tmp` is, and no ACL entry that
-lets anyone else write); `DIR` is made fresh for this user alone and removed when
-starfold exits (a stop by SIGTERM or SIGINT, or a startup error after the bind); a crash
-or SIGKILL leaves it, and the next start on that path is refused until it is removed;
-and starfold checks that it is the process's only thread when it binds, since the bind
-sets the working directory and umask for a moment.
+The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` is made
+fresh for this user alone and removed when starfold exits (a stop by SIGTERM or SIGINT,
+or a startup error after the bind); a crash or SIGKILL leaves it, and the next start on
+that path is refused until it is removed; and starfold checks that it is the process's
+only thread when it binds, since the bind sets the working directory and umask for a
+moment.
 
 `--framed` sends every WebSocket message as binary with a kind byte, for hops that carry
 binary messages only; the page then needs `?framed=1`. Framed, a message from the page is

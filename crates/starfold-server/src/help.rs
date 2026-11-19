@@ -19,15 +19,17 @@ Server:
                                 crash or SIGKILL); the host and origin
                                 checks still apply. Only a peer with this
                                 process's uid is let in (SO_PEERCRED); the same
-                                uid is not separated. Refused outside the
-                                initial user namespace (/proc/self/uid_map must
-                                be 0 0 4294967295). Its parent must
-                                not let other users rename entries: e.g. /tmp
-                                (sticky) or a directory only you can write
+                                uid is not separated. Refused unless this
+                                user namespace's uid map is the identity
+                                (/proc/self/uid_map 0 0 4294967295), and unless
+                                every directory from / to it belongs to you or
+                                root and lets no other user rename entries
+                                (e.g. under /tmp, sticky, or your home)
   --listen-unix-mode            the socket's permissions (default 0600); group
                                 or other write access also lets that class
                                 search the directory and connect, and then
-                                only the peer-uid check keeps them out
+                                only the peer-uid check keeps them out; with
+                                0600 no other uid can connect at all
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1
