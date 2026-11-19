@@ -553,7 +553,11 @@ fn quote_uid_map(map: &[u8]) -> String {
     let shown = &map[..map.len().min(QUOTED_MAP_BYTES)];
     let quoted: String = shown.escape_ascii().to_string();
     if shown.len() < map.len() {
-        format!("\"{quoted}\" (the first {} of {} bytes)", shown.len(), map.len())
+        format!(
+            "\"{quoted}\" (the first {} of {} bytes)",
+            shown.len(),
+            map.len()
+        )
     } else {
         format!("\"{quoted}\"")
     }
@@ -566,9 +570,9 @@ fn quote_uid_map(map: &[u8]) -> String {
 /// must be procfs too. Any failure is an error that says which step failed.
 #[cfg(target_os = "linux")]
 fn read_uid_map(proc: &Path) -> Result<Vec<u8>, String> {
-    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::fcntl::{open, openat2, OFlag, OpenHow, ResolveFlag};
     use nix::sys::stat::Mode;
-    use nix::sys::statfs::{PROC_SUPER_MAGIC, fstatfs};
+    use nix::sys::statfs::{fstatfs, PROC_SUPER_MAGIC};
     use std::io::Read;
     let procfs = |fd: &std::os::fd::OwnedFd, what: &str| -> Result<(), String> {
         let t = fstatfs(fd)
@@ -2643,9 +2647,7 @@ mod tests {
         /// Only the full identity map, as the kernel writes it, is the initial namespace's.
         #[test]
         fn only_the_full_identity_uid_map_is_accepted() {
-            assert!(is_identity_uid_map(
-                b"         0          0 4294967295\n"
-            ));
+            assert!(is_identity_uid_map(b"         0          0 4294967295\n"));
             assert!(is_identity_uid_map(b"0 0 4294967295\n"));
             for map in [
                 &b""[..],
@@ -2666,11 +2668,7 @@ mod tests {
                 b"0 0 4294967296\n",
                 b"0 0 04294967295\n",
             ] {
-                assert!(
-                    !is_identity_uid_map(map),
-                    "{}",
-                    map.escape_ascii()
-                );
+                assert!(!is_identity_uid_map(map), "{}", map.escape_ascii());
             }
         }
 
