@@ -477,8 +477,8 @@ struct Segment<'a> {
 }
 
 /// A segment is the X server's only if it created it and maps it now: the same
-/// dev:inode as our own mapping, so a segment left by an earlier process with the same
-/// pid, or one of another IPC namespace, is refused.
+/// dev:inode (the inode is the segment id) as our own mapping, so a segment left by an
+/// earlier process with the same pid is refused.
 fn check_segment(server_pid: u32, s: &Segment) -> Result<(), String> {
     if u32::try_from(s.cpid).ok() != Some(server_pid) {
         return Err(format!(
