@@ -2,8 +2,8 @@
 // attempt with an id; the page answers the worker's preamble request only for the current
 // attempt and only while live, and decides on its own what the embedder hears:
 // - each attempt ends in exactly one of: onClose (a socket was asked for), preamble-failed,
-//   or connect-failed; one replaced by a newer connect() or ended by end() before its socket
-//   was asked for ends silently;
+//   or connect-failed, a failed worker included; one replaced by a newer connect() or ended
+//   by end() before its socket was asked for ends silently;
 // - the page posts at most one preamble reply per attempt, only for the current one, and
 //   ignores connect() from then until that attempt's close: the port is FIFO, so a reply
 //   never follows a newer attempt's connect;
@@ -13,7 +13,7 @@ import type { LifeDown, LifeUp } from '../life';
 import { Dispatcher } from './dispatch';
 import type { Report } from './dispatch';
 import { CONNECT_FAILED, callPreamble } from './preamble';
-import { UNMOUNTED } from './types';
+import { UNMOUNTED, WORKER_FAILED } from './types';
 import type { ConnectFailure, Preamble, Status } from './types';
 
 export interface LifeOptions {
@@ -54,17 +54,19 @@ export class PageLife {
 	}
 
 	/**
-	 * The worker failed (it could not be loaded, or it threw at the top level): the current
-	 * attempt ends with connect-failed, and no attempt follows.
+	 * The worker failed (it could not be loaded, or it threw) and the caller stopped it: an
+	 * attempt whose socket was asked for ends with onClose(WORKER_FAILED), one still waiting for
+	 * its preamble with connect-failed, and no attempt follows.
 	 */
 	workerFailed() {
 		if (!this.live) return;
-		const had = this.phase !== 'idle';
+		const was = this.phase;
 		this.phase = 'idle';
 		this.live = false;
 		this.port.removeEventListener('message', this.listener);
 		this.port.close();
-		if (had) this.status('connect-failed', CONNECT_FAILED);
+		if (was === 'socket') this.closed(WORKER_FAILED.code, WORKER_FAILED.reason);
+		else if (was === 'asking') this.status('connect-failed', CONNECT_FAILED);
 	}
 
 	/**

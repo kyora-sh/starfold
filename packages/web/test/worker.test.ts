@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { PageLife } from '../src/embed/attempts';
 import type { LifeOptions } from '../src/embed/attempts';
-import { PROTOCOL_ERROR } from '../src/embed/types';
+import { NO_COMMON_CODEC, PROTOCOL_ERROR } from '../src/embed/types';
 import type { Status } from '../src/embed/types';
 import { fakeServer, sleep, until } from './server';
 
@@ -96,6 +96,29 @@ describe('the production worker', () => {
 		);
 		await until(() => seen.closes.length === 1, 5000);
 		expect(seen.closes).toEqual([[PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason]]);
+	});
+
+	test('a negotiation with no common codec closes the socket and reports NO_COMMON_CODEC', async () => {
+		const { s, page, seen } = start({ preamble: () => 'ticket' });
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && seen.status.includes('open'), 5000);
+		const ws = s.conns[0].ws!;
+		ws.send(
+			JSON.stringify({
+				t: 'hello',
+				protocol: 2,
+				w: 640,
+				h: 360,
+				videoOffers: [],
+			})
+		);
+		ws.send(JSON.stringify({ t: 'codec', epoch: 1, error: 'no-common-codec' }));
+		await until(() => seen.closes.length === 1, 5000);
+		expect(seen.closes).toEqual([
+			[NO_COMMON_CODEC.code, NO_COMMON_CODEC.reason],
+		]);
+		expect(seen.status.at(-1)).toBe('closed');
+		await until(() => s.conns[0].closed);
 	});
 
 	test('terminated in the task that posted the preamble reply, it opens no socket', async () => {
