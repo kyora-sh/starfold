@@ -1,17 +1,8 @@
-//! libaom (BSD-2-Clause, only with the `libaom` feature): AV1 in realtime mode with the
-//! screen-content tools (palette, intra block copy), as WebRTC AV1 screen share uses it.
+//! libaom (BSD-2-Clause, only with the `libaom` feature, built from source by
+//! starfold-aom-sys): AV1 in realtime mode with the screen-content tools (palette, intra
+//! block copy), as WebRTC AV1 screen share uses it.
 
-#[allow(
-    non_camel_case_types,
-    non_upper_case_globals,
-    non_snake_case,
-    dead_code,
-    unused_imports,
-    clippy::all
-)]
-mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/aom.rs"));
-}
+use starfold_aom_sys as ffi;
 
 use super::{
     av1, AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig,
@@ -23,7 +14,7 @@ use std::ptr;
 
 const MAX_Q: u32 = 63;
 const UNCAPPED_KBPS: u32 = 200_000;
-const SPEED: c_int = 10;
+const SPEED: c_int = 9;
 
 pub struct Aom {
     // libaom keeps pointers to the configuration it was given, so neither may move.
@@ -64,6 +55,7 @@ impl Aom {
             return Err(EncodeError(format!("libaom can't encode {:?}", c.codec)));
         }
         let speed = super::arm_speed("libaom", &c.preset, SPEED)?;
+        ffi::check_layout().map_err(EncodeError)?;
         unsafe {
             let iface = ffi::aom_codec_av1_cx();
             let mut cfg: Box<ffi::aom_codec_enc_cfg_t> = Box::new(std::mem::zeroed());

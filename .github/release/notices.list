@@ -6,3 +6,8 @@ packages/web/dav1d/COPYING-wasi-libc COPYING-wasi-libc all
 packages/web/inter-LICENSE.txt inter-LICENSE.txt all
 third_party/x264/README.md x264-source-README.md x264
 third_party/libvpl/LICENSE libvpl-LICENSE.txt windows
+third_party/libaom/LICENSE libaom-LICENSE.txt all
+third_party/libaom/PATENTS libaom-PATENTS.txt all
+third_party/libaom/LICENSE-fastfeat libaom-LICENSE-fastfeat.txt all
+third_party/libaom/LICENSE-vector libaom-LICENSE-vector.txt all
+third_party/libaom/LICENSE-x86inc libaom-LICENSE-x86inc.txt all

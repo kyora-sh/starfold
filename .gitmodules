@@ -1,0 +1,4 @@
+[submodule "crates/starfold-aom-sys/aom"]
+	path = crates/starfold-aom-sys/aom
+	url = https://aomedia.googlesource.com/aom
+	shallow = true

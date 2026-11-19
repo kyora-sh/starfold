@@ -151,6 +151,7 @@ fn a_rate_change_keeps_encoding() {
 }
 
 /// `bench/vs/source.c`'s video picture as 4:2:0: a pan, grain and moving discs, 30 frames long.
+#[cfg(unix)]
 fn film(w: usize, h: usize, grain: u32) -> Vec<Picture> {
     use std::f64::consts::PI;
     const LOOP: usize = 30;
@@ -200,6 +201,7 @@ fn film(w: usize, h: usize, grain: u32) -> Vec<Picture> {
 }
 
 /// RGB to BT.601 limited-range 4:2:0, chroma averaged over each 2x2 block.
+#[cfg(unix)]
 fn i420(rgb: &mut [[i32; 3]], w: usize, h: usize) -> Picture {
     let mut p = Picture::new(w, h);
     let cw = w.div_ceil(2);
@@ -222,6 +224,7 @@ fn i420(rgb: &mut [[i32; 3]], w: usize, h: usize) -> Picture {
 }
 
 /// `bench/scroll.html` as Chrome renders it: raw BGRX, `w` wide (`bench/vs/setup.sh`'s page).
+#[cfg(unix)]
 fn page(path: &str, w: usize) -> Picture {
     let raw = std::fs::read(path).unwrap_or_else(|e| panic!("PAGE {path}: {e}"));
     assert!(
@@ -237,6 +240,7 @@ fn page(path: &str, w: usize) -> Picture {
 }
 
 /// Rows [y0, y0 + rows) and columns [x0, x0 + cols) of `from`, at (x, y) in `to`; even origins.
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn blit(
     to: &mut Picture,
@@ -261,6 +265,7 @@ fn blit(
 }
 
 /// The 22-row band below the first screen with the most ink: where typed glyphs come from.
+#[cfg(unix)]
 fn inkiest_line(page: &Picture, h: usize) -> usize {
     (h..page.h - 22)
         .step_by(2)
@@ -446,6 +451,7 @@ fn arm_bench() {
 }
 
 /// VP8, VP9 and AV1 go in IVF for ffmpeg; H.264 and HEVC are self-delimiting.
+#[cfg(unix)]
 fn ivf_fourcc(codec: Codec) -> Option<&'static [u8; 4]> {
     match codec {
         #[cfg(feature = "libvpx")]
@@ -457,6 +463,7 @@ fn ivf_fourcc(codec: Codec) -> Option<&'static [u8; 4]> {
     }
 }
 
+#[cfg(unix)]
 fn ivf_header(s: &mut impl std::io::Write, codec: Codec, w: u16, h: u16) {
     let Some(fourcc) = ivf_fourcc(codec) else {
         return;
@@ -470,6 +477,7 @@ fn ivf_header(s: &mut impl std::io::Write, codec: Codec, w: u16, h: u16) {
     s.write_all(&0u64.to_le_bytes()).unwrap();
 }
 
+#[cfg(unix)]
 fn ivf_frame(s: &mut impl std::io::Write, codec: Codec, pts: u64, data: &[u8]) {
     if ivf_fourcc(codec).is_some() {
         s.write_all(&(data.len() as u32).to_le_bytes()).unwrap();

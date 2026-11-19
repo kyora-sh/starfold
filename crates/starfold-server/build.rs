@@ -72,12 +72,6 @@ fn arm_libs() -> Vec<pkg_config::Library> {
             "(vpx|vp8|vp9|VPX|VP8|VP9|STARFOLD).*",
         ),
         (
-            cfg!(feature = "libaom"),
-            "aom",
-            "#include <aom/aom_encoder.h>\n#include <aom/aomcx.h>\nstatic const int STARFOLD_AOM_ABI = AOM_ENCODER_ABI_VERSION;\n",
-            "(aom|aome|av1|AOM|AV1|STARFOLD).*",
-        ),
-        (
             cfg!(feature = "svt-av1"),
             "SvtAv1Enc",
             "#include <EbSvtAv1Enc.h>\n",
@@ -203,8 +197,14 @@ fn x264_archive() -> Option<Vec<std::path::PathBuf>> {
 /// triplet from VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained
 /// starfold.exe). Capture, audio and input use system DLLs.
 fn windows_libs() -> X264 {
-    if cfg!(feature = "sw-arm") {
-        panic!("the bench's software encoders build on Linux and macOS only");
+    // libaom builds from its submodule on every target; the other arms come from pkg-config.
+    if cfg!(any(
+        feature = "libvpx",
+        feature = "svt-av1",
+        feature = "kvazaar",
+        feature = "x265"
+    )) {
+        panic!("the bench's pkg-config encoders (libvpx, svt-av1, kvazaar, x265) build on Linux and macOS only");
     }
     let x264 = cfg!(feature = "x264").then(|| {
         vcpkg::Config::new()
