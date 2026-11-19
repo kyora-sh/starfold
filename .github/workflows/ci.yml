@@ -243,6 +243,9 @@ jobs:
             wait $pid 2>/dev/null || true
             [ $ok = 1 ] || { echo "::error::--encoder=$enc --preset=$preset did not start"; exit 1; }
           done
+          # --base-path through the real binary, including the cases that serve (they need
+          # this display; the Test step runs only the ones that stop).
+          DISPLAY=:99 STARFOLD_SERVE_TESTS=1 cargo test --features svt-av1,x265 --locked --test base_path_cli
 
   libaom:
     name: Rust with libaom (clippy, test, startup, aarch64 and Windows builds)

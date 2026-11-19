@@ -1461,6 +1461,7 @@ dependencies = [
  "starfold-aom-sys",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tungstenite",
  "vcpkg",
  "windows",

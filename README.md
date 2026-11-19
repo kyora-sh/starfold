@@ -224,6 +224,7 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, file contents or recordings; files are listed and downloaded only when `--file-transfers` names `download`; watching still influences delivery as any viewer does     |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
+| `--base-path`                                                  | none                                                                  | serve everything under this path prefix (such as `/desktop`), for a reverse proxy that forwards it unchanged; see [Hosts and origins](#hosts-and-origins)                                                 |
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
@@ -287,6 +288,23 @@ host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-
 To let a page on another site connect, name that site with `--allowed-origins`.
 Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as
 usual. A refused request gets a 403 that names the flag to add.
+
+A proxy that serves starfold under a path, such as `https://example.com/desktop/`, and
+forwards the path unchanged needs `--base-path=/desktop`. starfold then serves its pages
+under `/desktop/` only and prints its link with the prefix. Every request, `/desktop`
+itself included, goes through the same host, origin and password checks as without a
+prefix; once they pass, `/desktop` is sent on to `/desktop/` and paths outside the prefix
+are not found. A proxy that strips the prefix before forwarding needs no flag, but has to
+send `/desktop` on to `/desktop/` itself: the page's URLs are relative, so from
+`/desktop` they would resolve at the site's root.
+
+Give `--base-path` once, with a prefix such as `/desktop` (letters, digits, `.`, `_`, `~`
+or `-` between single slashes, at most 1024 bytes; one trailing slash is dropped). Given
+twice, without a value, empty, `/` or in any other shape, the server does not start: it
+exits with code 2 and says why on stderr, even beside `--help` or `--version`; leave the
+flag out to serve at the root. (This is about starting the server; the encoder-probe child
+the server runs for itself opens no listener and ignores the flag.) The prefix is part of every request line, so it counts against the length a
+request line may have (64 KiB in starfold, often less in a proxy).
 
 ### For agents and scripts
 

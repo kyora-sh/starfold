@@ -9,6 +9,7 @@ mod actions;
 mod attach;
 #[cfg(target_os = "linux")]
 mod audio;
+mod base_path;
 mod build_facts;
 #[cfg(target_os = "linux")]
 mod capture;
@@ -76,6 +77,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> HashMap<String, String>
     m
 }
 
+/// The arguments as text; one that isn't UTF-8 is refused (no flag starfold reads can hold
+/// it) instead of panicking.
+fn utf8_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            a.into_string().map_err(|a| {
+                format!(
+                    "argument {} ({:?}) is not UTF-8",
+                    i + 1,
+                    a.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
+
 /// Selkies ranges look like "60-60"; take the upper bound.
 fn range_max(v: Option<&String>, default: f64) -> f64 {
     v.and_then(|s| s.rsplit('-').next()?.trim().parse().ok())
@@ -127,7 +145,13 @@ fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
 /// attach DIR` (see attach.rs). A program that embeds the server can call it from its own
 /// `main` to get the same isolation.
 pub fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("starfold: {e}");
+            std::process::exit(2);
+        }
+    };
     if args.first().map(String::as_str) == Some("attach") {
         std::process::exit(attach::main(&args[1..]));
     }
@@ -246,6 +270,15 @@ pub fn run(args: impl IntoIterator<Item = String>) {
 }
 
 fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
+    // The one place --base-path is read and checked, before --help and --version: asking
+    // for a prefix that can't be served stops here, to stderr whatever the log filter.
+    let base = match base_path::from_args(&args) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("starfold: --base-path: {e}");
+            std::process::exit(2);
+        }
+    };
     // --help and --version print and return instead of starting the server.
     if help::print_if_asked(&args) {
         return;
@@ -283,11 +316,11 @@ fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
     // main dispatch queue and the server runs beside it.
     #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(move || rt.block_on(serve(a, listen, prebound)));
+        std::thread::spawn(move || rt.block_on(serve(a, listen, prebound, base)));
         dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a, listen, prebound));
+    rt.block_on(serve(a, listen, prebound, base));
 }
 
 /// The shared folder `serve` uses. --file-transfers=upload,download (as in selkies);
@@ -316,7 +349,12 @@ fn recorder_from_args(
     )
 }
 
-async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Prebound>) {
+async fn serve(
+    a: HashMap<String, String>,
+    listen: Listen,
+    prebound: Option<Prebound>,
+    base: Option<base_path::BasePath>,
+) {
     let hub = hub::Hub::new();
     // SIGTERM and SIGINT lead to the shutdown below (which removes the unix socket) from
     // here on, before anything that can block; one that came since the socket was bound
@@ -667,16 +705,12 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     // --enable-basic-auth=false.
     let login =
         login::Login::from_args(&a).map(|(l, generated)| (std::sync::Arc::new(l), generated));
-    let mut app = server::router(state);
-    if let Some((l, _)) = &login {
-        app = app.layer(axum::middleware::from_fn_with_state(
-            l.clone(),
-            login::check,
-        ));
-    }
-    // Added last, so it runs first: a request for the wrong host or from another site's
-    // page is turned away before the login is asked for.
-    let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
+    let app = axum::ServiceExt::<axum::extract::Request>::into_make_service(base_path::compose(
+        server::router(state),
+        base.as_ref(),
+        login.as_ref().map(|(l, _)| l.clone()),
+        access,
+    ));
     // A port that can't be had ends the process through `exit`, which removes the unix
     // socket bound before it.
     let tcp = match listen.tcp {
@@ -708,14 +742,14 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
     #[cfg(not(target_os = "linux"))]
     let _ = prebound;
     if tcp.is_some() {
-        log::info!("listening on http://{addr}:{port}");
+        log::info!("{}", base_path::listening(&addr, port, base.as_ref()));
     }
-    // Where to point a browser on this machine.
-    let page = match addr.as_str() {
-        _ if tcp.is_none() => "/ on the unix socket".into(),
-        "0.0.0.0" | "::" => format!("http://localhost:{port}/"),
-        a if a.contains(':') => format!("http://[{a}]:{port}/"),
-        a => format!("http://{a}:{port}/"),
+    let page = match tcp {
+        Some(_) => base_path::page(&addr, port, base.as_ref()),
+        None => format!(
+            "{}/ on the unix socket",
+            base.as_ref().map_or("", |b| b.as_str())
+        ),
     };
     match &login {
         Some((l, true)) => log::info!(
