@@ -10,8 +10,11 @@ name: Release
 # third_party/x264 (hash-checked, nothing fetched).
 #
 # A pull request that changes this workflow, and a manual run, are dry runs: every build runs and
-# uploads its files as workflow artifacts; only a pushed tag creates the release.
-# Bump `version` in crates/starfold-server/Cargo.toml on main first; the tag has to match it.
+# uploads its files as workflow artifacts; only a pushed tag creates the release. A pull request
+# from a fork runs nothing here: every job is gated on the head repository being this one, so no
+# fork's code reaches the self-hosted runners.
+# Bump `version` in crates/starfold-server/Cargo.toml and python/starfold/pyproject.toml on main
+# first; the tag has to match both.
 on:
   push:
     tags: ['v*']
@@ -46,14 +49,17 @@ env:
 jobs:
   version:
     name: Version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-2x4
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
       flavours: ${{ steps.flavours.outputs.flavours }}
+      flavour_names: ${{ steps.flavours.outputs.names }}
     steps:
       # The binary flavours every platform builds, one line each: deleting a line drops that flavour
-      # everywhere. x264 decides the archive's x264 extras (COPYING, its runtime package).
+      # everywhere, and from the files the release job expects. x264 decides the archive's x264
+      # extras (COPYING, the x264 source check, its runtime package).
       - id: flavours
         run: |
           flavours=(
@@ -61,12 +67,15 @@ jobs:
             '{"name": "starfold", "licence": "MIT", "features": "--no-default-features --features openh264", "x264": false}'
           )
           echo "flavours=[$(IFS=,; echo "${flavours[*]}")]" >> "$GITHUB_OUTPUT"
+          echo "names=$(printf '%s\n' "${flavours[@]}" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-      # Cargo.toml's version; on a tag, the tag has to name the same one.
+      # Cargo.toml's version, which pyproject.toml must declare too; on a tag, the tag has to name it.
       - id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/starfold-server/Cargo.toml)
+          py=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/starfold/pyproject.toml)
           [ -n "$version" ] || { echo "::error::no version in crates/starfold-server/Cargo.toml"; exit 1; }
+          [ "$py" = "$version" ] || { echo "::error::python/starfold/pyproject.toml declares $py, crates/starfold-server/Cargo.toml $version"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
             exit 1
@@ -77,6 +86,7 @@ jobs:
   linux:
     name: Linux x86_64 (${{ matrix.flavour.licence }})
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -85,6 +95,7 @@ jobs:
         flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_FLAVOURS: ${{ needs.version.outputs.flavour_names }}
       ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-x86_64-linux
     steps:
       - uses: actions/checkout@v4
@@ -116,10 +127,13 @@ jobs:
           fi
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: x264's source is the one built against
+        if: matrix.flavour.x264
+        run: .github/release/x264-source.sh linux amd64
       - name: Build
         run: cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }}
       # build.rs embeds the library dirs pkg-config reports as an rpath; a released binary may only
-      # carry system ones.
+      # carry system ones: /lib, /usr/lib and their multiarch directories.
       - name: Library paths
         run: |
           readelf -d target/release/starfold | grep -E 'NEEDED|RPATH|RUNPATH'
@@ -130,7 +144,10 @@ jobs:
         run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' target/release/starfold
       - name: Licences
         run: |
-          mkdir -p "$RUNNER_TEMP/licenses"
+          mkdir -p "$RUNNER_TEMP/licenses/rust-std"
+          # Rust's standard library, linked into every binary: its notices from the toolchain built with.
+          doc=$(rustc --print sysroot)/share/doc/rust
+          cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           if [ '${{ matrix.flavour.x264 }}' != true ]; then
@@ -156,6 +173,7 @@ jobs:
   linux-arm64:
     name: Linux aarch64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -164,6 +182,7 @@ jobs:
         flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_FLAVOURS: ${{ needs.version.outputs.flavour_names }}
       ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-aarch64-linux
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
@@ -215,6 +234,9 @@ jobs:
           fi
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
+      - name: x264's source is the one built against
+        if: matrix.flavour.x264
+        run: .github/release/x264-source.sh linux arm64
       - name: Build
         run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
       - name: Library paths
@@ -229,7 +251,10 @@ jobs:
         run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' qemu-aarch64-static target/aarch64-unknown-linux-gnu/release/starfold
       - name: Licences
         run: |
-          mkdir -p "$RUNNER_TEMP/licenses"
+          mkdir -p "$RUNNER_TEMP/licenses/rust-std"
+          # Rust's standard library, linked into every binary: its notices from the toolchain built with.
+          doc=$(rustc --print sysroot)/share/doc/rust
+          cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           if [ '${{ matrix.flavour.x264 }}' != true ]; then
@@ -249,6 +274,7 @@ jobs:
   macos:
     name: macOS arm64 (${{ matrix.flavour.licence }})
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-macos
     timeout-minutes: 60
     strategy:
@@ -257,6 +283,7 @@ jobs:
         flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_FLAVOURS: ${{ needs.version.outputs.flavour_names }}
       ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-aarch64-macos
       # Homebrew's static Opus and x264, so the binary needs nothing from Homebrew at run time.
       OPUS_STATIC: '1'
@@ -287,6 +314,9 @@ jobs:
             [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
           fi
           brew list --versions opus
+      - name: x264's source is the one built against
+        if: matrix.flavour.x264
+        run: .github/release/x264-source.sh macos
       - uses: actions/cache@v4
         with:
           path: |
@@ -332,7 +362,10 @@ jobs:
         run: .github/release/check-version.sh "$VERSION" '${{ matrix.flavour.licence }}' target/release/starfold
       - name: Licences
         run: |
-          mkdir -p "$RUNNER_TEMP/licenses"
+          mkdir -p "$RUNNER_TEMP/licenses/rust-std"
+          # Rust's standard library, linked into every binary: its notices from the toolchain built with.
+          doc=$(rustc --print sysroot)/share/doc/rust
+          cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-apple-darwin \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           cp "$(brew --prefix opus)/COPYING" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
@@ -353,6 +386,7 @@ jobs:
   windows:
     name: Windows x86_64 (${{ matrix.flavour.licence }}, cross-compiled)
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 60
     strategy:
@@ -361,8 +395,13 @@ jobs:
         flavour: ${{ fromJSON(needs.version.outputs.flavours) }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_FLAVOURS: ${{ needs.version.outputs.flavour_names }}
       ARCHIVE: ${{ matrix.flavour.name }}-${{ needs.version.outputs.version }}-x86_64-windows
       VCPKG_BASELINE: 2026.10.16
+      # The commit tag 2026.10.16 names, so a moved tag can't change the ports built.
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+      # GCC's runtime licence comes from this package; another version fails the job.
+      GCC_MINGW_BASE: 13.2.0-6ubuntu1+26.1
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
       VCPKG_DOWNLOADS: ${{ github.workspace }}/.vcpkg-downloads
       VCPKGRS_TRIPLET: x64-mingw-static
@@ -386,9 +425,15 @@ jobs:
         run: |
           mkdir -p .vcpkg-cache .vcpkg-downloads
           retry() { for i in 1 2 3; do "$@" && return; [ "$i" = 3 ] || sleep $((i * 30)); done; return 1; }
-          retry git clone --quiet --depth 1 --branch "$VCPKG_BASELINE" https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          git init --quiet "$VCPKG_ROOT"
+          retry git -C "$VCPKG_ROOT" fetch --quiet --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_COMMIT"
+          git -C "$VCPKG_ROOT" checkout --quiet --detach FETCH_HEAD
+          [ "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "$VCPKG_COMMIT" ] || { echo "::error::vcpkg isn't at $VCPKG_COMMIT"; exit 1; }
           retry "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
           retry "$VCPKG_ROOT/vcpkg" install x264 libyuv opus --triplet "$VCPKGRS_TRIPLET"
+      - name: x264's source is the one built against
+        if: matrix.flavour.x264
+        run: .github/release/x264-source.sh windows "$VCPKG_ROOT"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -443,14 +488,26 @@ jobs:
           ' _ "$VERSION" '${{ matrix.flavour.licence }}'
       - name: Licences
         run: |
-          mkdir -p "$RUNNER_TEMP/licenses"
+          mkdir -p "$RUNNER_TEMP/licenses/rust-std"
+          # Rust's standard library, linked into every binary: its notices from the toolchain built with.
+          doc=$(rustc --print sysroot)/share/doc/rust
+          cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-pc-windows-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           share=$VCPKG_ROOT/installed/$VCPKGRS_TRIPLET/share
           cp "$share/opus/copyright" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
           cp "$share/libyuv/copyright" "$RUNNER_TEMP/licenses/libyuv-LICENSE.txt"
+          # The MinGW-w64 runtime (including winpthreads, should it be linked) and GCC's runtime
+          # libraries (libstdc++, libgcc), linked in statically: GPL-3.0-or-later with the GCC Runtime
+          # Library Exception, whose text is in gcc-mingw-w64-base's copyright file.
+          got=$(dpkg-query -W -f '${Version}' gcc-mingw-w64-base)
+          [ "$got" = "$GCC_MINGW_BASE" ] || { echo "::error::gcc-mingw-w64-base is $got, pinned $GCC_MINGW_BASE"; exit 1; }
+          grep -q 'GCC RUNTIME LIBRARY EXCEPTION' /usr/share/doc/gcc-mingw-w64-base/copyright
+          grep -q 'Version 3, 29 June 2007' /usr/share/common-licenses/GPL-3
           cp /usr/share/doc/mingw-w64-common/copyright "$RUNNER_TEMP/licenses/MinGW-w64-copyright.txt"
           cp /usr/share/doc/gcc-mingw-w64-base/copyright "$RUNNER_TEMP/licenses/GCC-runtime-copyright.txt"
+          cp /usr/share/common-licenses/GPL-3 "$RUNNER_TEMP/licenses/GPL-3.0.txt"
+          echo "winpthreads symbols in starfold.exe: $(x86_64-w64-mingw32-nm target/x86_64-pc-windows-gnu/release/starfold.exe 2>/dev/null | grep -c -E ' (pthread_|_pthread)' || true)"
           if [ '${{ matrix.flavour.x264 }}' != true ]; then
             cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
           fi
@@ -468,6 +525,7 @@ jobs:
   python:
     name: Python SDK (sdist, wheel)
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-2x4
     timeout-minutes: 10
     env:
@@ -480,11 +538,12 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           version: 0.11.8
-      # The release's version in this checkout's pyproject.toml only; the package name and its
-      # classifiers stay as they are.
+      # pyproject.toml declares the version (the Version job checked it against Cargo.toml and the
+      # tag); it is checked again here, never rewritten.
       - name: Build
         run: |
-          uv version --frozen "$VERSION"
+          py=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+          [ "$py" = "$VERSION" ] || { echo "::error::pyproject.toml declares $py, the release is $VERSION"; exit 1; }
           uv build --out-dir "$GITHUB_WORKSPACE/dist"
       - name: Check the version
         working-directory: dist
@@ -507,6 +566,7 @@ jobs:
   embed:
     name: Embeddable web client (npm tarball)
     needs: version
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: kyora-8x16
     timeout-minutes: 15
     env:
@@ -517,6 +577,8 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
+      # The embeddable client declares no version of its own: pack.sh writes the release's into the
+      # tarball's package.json, which the release job checks against the tag.
       - name: Pack
         env:
           SHA: ${{ github.sha }}
@@ -541,9 +603,29 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  # The release job's checks on every run, a dry run's too, against v<version>: the full file set,
+  # the checksums and the package versions (not whether that version has a release already). The
+  # release job runs them all again on what it downloads.
+  check:
+    name: Release check
+    needs: [version, linux, linux-arm64, macos, windows, python, embed]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: kyora-2x4
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the release files
+        env:
+          RELEASE_LOOKUP: '0'
+        run: .github/release/check-release.sh "v${{ needs.version.outputs.version }}" dist ${{ needs.version.outputs.flavour_names }}
+
   release:
     name: GitHub release
-    needs: [version, linux, linux-arm64, macos, windows, python, embed]
+    needs: [version, linux, linux-arm64, macos, windows, python, embed, check]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: kyora-8x16
     timeout-minutes: 15
@@ -558,17 +640,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Check the files
-        working-directory: dist
-        run: |
-          ls -l
-          sha256sum -c -- *.sha256
+      # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml declares
+      # too; dist/ holds exactly the expected files and every checksum checks; the packages carry the
+      # version; and the tag has no release yet.
+      - name: Check the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist ${{ needs.version.outputs.flavour_names }}
       - name: x264's source
         run: |
           (cd third_party/x264 && sha256sum -c SHA256SUMS && sha512sum -c SHA512SUMS)
           mkdir x264-source
           cp third_party/x264/*.tar.* third_party/x264/*.dsc x264-source/
           tar -czf x264-source/vcpkg-2026.10.16-ports-x264.tar.gz -C third_party/x264 vcpkg-2026.10.16-ports-x264
+      # A draft first, published only while the tag still names the commit built (publish.sh).
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -576,15 +661,17 @@ jobs:
           cat > x264-notes.md <<'NOTES'
           ## Downloads
 
-          `starfold-<version>-<platform>` binaries link OpenH264 and are MIT. `starfold-x264-<version>-<platform>`
-          binaries link x264 and are GPL-2.0-or-later as a combined work. Each archive has a `.sha256` beside it, and
-          the README's Install section lists what each platform needs at run time. The Python SDK (sdist and wheel)
-          and the embeddable web client (`starfold-web-embed-<version>.tgz`) are attached too.
+          `starfold-x264-<version>-<platform>` binaries link x264 and are GPL-2.0-or-later as a combined work.
+          `starfold-<version>-<platform>` binaries link OpenH264 and are distributed under MIT; the Windows one also
+          includes GCC's runtime libraries, under the GCC Runtime Library Exception (texts in its `licenses/`). Each
+          archive has a `.sha256` beside it, and the README's Install section lists what each platform needs at run
+          time. The Python SDK (sdist and wheel) and the embeddable web client (`starfold-web-embed-<version>.tgz`) are
+          attached too.
 
           ## x264 source
 
           A default build of this release links x264 and is GPL-2.0-or-later as a combined work; an
-          OpenH264-only build (`--no-default-features --features openh264`) has no x264 and stays MIT.
+          OpenH264-only build (`--no-default-features --features openh264`) has no x264.
           The source of each x264 a default build links is attached (see `third_party/x264/README.md`):
           - Linux: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1` (`.orig.tar.gz`, `.debian.tar.xz`, `.dsc`),
             upstream commit 31e19f92f00c7003fa115047ce50978bc98c3a0d.
@@ -592,9 +679,4 @@ jobs:
             (`x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz`). vcpkg 2026.10.16 builds it with the patches in
             `vcpkg-2026.10.16-ports-x264.tar.gz`; Homebrew builds it unpatched.
           NOTES
-          args=(--verify-tag --title "starfold ${GITHUB_REF_NAME#v}" --generate-notes --notes-file x264-notes.md)
-          prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
-          if [ -n "$prev" ]; then
-            args+=(--notes-start-tag "$prev")
-          fi
-          gh release create "$GITHUB_REF_NAME" "${args[@]}" x264-source/* dist/*
+          .github/release/publish.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" x264-notes.md x264-source/* dist/*
