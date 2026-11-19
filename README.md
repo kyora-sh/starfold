@@ -324,7 +324,10 @@ What keeps other users out, in three parts:
   parent), and starfold holds a lock on it (`flock`) for as long as it serves, so a
   second instance on it is refused. In it, an existing `s` is replaced only if it is a
   socket of starfold's user that refuses a connection (nothing listens on it); anything
-  else there, or at `DIR`, is refused. Any refusal names the directory, symlink or entry
+  else there, or at `DIR`, is refused. A server that has just died can leave `s`
+  listening for a moment in a child it forked that has not yet started its program (the
+  child's copy closes when it does); a restart in that moment is refused as a socket
+  something listens on, which fails safe, and a retry takes `DIR` back. Any refusal names the directory, symlink or entry
   at fault, with its owner and mode, and touches nothing of someone else's.
 
 The socket's mode decides who reaches `connect` at all. With the default
