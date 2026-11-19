@@ -280,15 +280,20 @@ What keeps other users out, in three parts:
   is, and no ACL entry that lets anyone else write). A symlink on the way is followed
   only if it belongs to starfold's user or root, and its target is held to the same
   rules. No directory on the way, and not `DIR`, may be on procfs (`/proc/self/cwd`, say,
-  resolves differently for each process) or on a FUSE mount (its daemon reports owners
-  and modes as it likes): a socket directory can't sit on either. An existing `DIR` is
-  taken only if it is a real directory (not a symlink) of starfold's user with mode
-  exactly 0700, and starfold holds a lock on it (`flock`) for as long as it serves, so a
-  second instance on it is refused. In it, an existing `s`
-  is replaced only if it is a socket of starfold's user that refuses a connection
-  (nothing listens on it); anything else there, or at `DIR`, is refused. Any refusal
-  names the directory, symlink or entry at fault, with its owner and mode, and touches
-  nothing of someone else's.
+  resolves differently for each process) or on another user's FUSE mount (its daemon
+  reports owners and modes as it likes). A directory on a FUSE-type filesystem is judged
+  by its mount (its line in `/proc/self/mountinfo`, found by `statx` mount id and read
+  through the checked procfs): virtiofs is taken, as is a `fuse`/`fuseblk`/`fuse.*` mount
+  whose `user_id=` is root's or starfold's user's (a FUSE mount of root's is the
+  administrator's, like a root-owned directory); any other, or one that can't be found,
+  is refused. This needs a kernel that gives mount ids (Linux 5.8 or later) for any FUSE
+  directory on the path. An existing `DIR` is taken only if it is a real directory (not a
+  symlink) of starfold's user with mode exactly 0700 (or 02700, as under a setgid
+  parent), and starfold holds a lock on it (`flock`) for as long as it serves, so a
+  second instance on it is refused. In it, an existing `s` is replaced only if it is a
+  socket of starfold's user that refuses a connection (nothing listens on it); anything
+  else there, or at `DIR`, is refused. Any refusal names the directory, symlink or entry
+  at fault, with its owner and mode, and touches nothing of someone else's.
 
 The socket's mode decides who reaches `connect` at all. With the default
 `--listen-unix-mode=0600` no other uid can connect: the kernel refuses it. That holds

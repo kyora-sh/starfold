@@ -441,14 +441,27 @@ fn a_second_instance_is_refused_and_the_first_keeps_serving() {
     assert!(healthy(&first.socket), "{}", read_log(&first.log));
 }
 
-/// A path on a FUSE mount (bindfs, mounted by root with allow_other over a directory of
-/// ours, so every owner and mode on it looks like ours) is refused, naming the mount, and
-/// nothing is made in what it mirrors. This test needs bindfs.
+/// A bindfs (FUSE) mount, unmounted when dropped.
+struct Fuse(PathBuf);
+
+impl Drop for Fuse {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// A FUSE mount of root's (bindfs, run by root with allow_other over a directory of ours, so
+/// its mountinfo says user_id=0) is the administrator's, as a root-owned directory is: a
+/// server on it starts and serves. This test needs bindfs.
 #[test]
-fn a_path_on_a_fuse_mount_is_refused() {
+fn a_fuse_mount_of_roots_is_taken() {
     sudo_works();
-    let src = scratch("fuse-src", 0o700);
-    let mnt = scratch("fuse-mnt", 0o700);
+    let x = Display::start();
+    let src = scratch("fuse-root-src", 0o700);
+    let mnt = scratch("fuse-root-mnt", 0o700);
     let mounted = Command::new("sudo")
         .args(["-n", "bindfs", "-o", "allow_other"])
         .arg(&src)
@@ -456,26 +469,103 @@ fn a_path_on_a_fuse_mount_is_refused() {
         .status()
         .is_ok_and(|s| s.success());
     assert!(mounted, "this test needs bindfs (a FUSE filesystem)");
-    struct Unmount(PathBuf);
-    impl Drop for Unmount {
+    let fuse = Fuse(mnt.clone());
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let line = info
+        .lines()
+        .find(|l| l.contains(&format!(" {} ", mnt.display())))
+        .unwrap_or_else(|| panic!("{} isn't in mountinfo", mnt.display()));
+    assert!(line.contains("fuse") && line.contains("user_id=0"), "{line}");
+    let server = Server::start(&x, &mnt, &["--listen-tcp=false"]);
+    assert!(healthy(&server.socket));
+    drop(server);
+    drop(fuse);
+    std::fs::remove_dir_all(&src).unwrap();
+    std::fs::remove_dir_all(&mnt).unwrap();
+}
+
+/// A FUSE mount of another user's (bindfs run by the throwaway user through fusermount3,
+/// with allow_other and every owner and mode shown as ours, mode 0700) is refused, naming
+/// the mount and its user, and nothing is made in what it mirrors. Letting an ordinary user
+/// mount with allow_other takes `user_allow_other` in /etc/fuse.conf: the test adds it if
+/// it isn't there and takes it out again. This test needs bindfs (and its fusermount3).
+#[test]
+fn another_users_fuse_mount_is_refused() {
+    sudo_works();
+    let user = Throwaway::create();
+    let conf = std::fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
+    let added = !conf.lines().any(|l| l.trim() == "user_allow_other");
+    let sh = |script: &str| {
+        let ok = Command::new("sudo")
+            .args(["-n", "sh", "-c", script])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "{script}");
+    };
+    if added {
+        sh("echo user_allow_other >> /etc/fuse.conf");
+    }
+    struct Restore(bool);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            let _ = Command::new("sudo")
-                .args(["-n", "umount"])
-                .arg(&self.0)
-                .status();
+            if self.0 {
+                let _ = Command::new("sudo")
+                    .args(["-n", "sed", "-i", "/^user_allow_other$/d", "/etc/fuse.conf"])
+                    .status();
+            }
         }
     }
-    let unmount = Unmount(mnt.clone());
+    let _restore = Restore(added);
+    let base = Path::new("/tmp").join(format!("sf-it-their-fuse-{}", std::process::id()));
+    let (src, mnt) = (base.with_extension("src"), base.with_extension("mnt"));
+    let as_them = |args: &[&str]| {
+        let out = Command::new("sudo")
+            .args(["-n", "-u", &user.name, "--"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} as {}: {}",
+            user.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    as_them(&["mkdir", "-m", "0755", src.to_str().unwrap()]);
+    as_them(&["mkdir", "-m", "0755", mnt.to_str().unwrap()]);
+    let me = own_uid().to_string();
+    as_them(&[
+        "bindfs",
+        "-o",
+        "allow_other",
+        "-u",
+        &me,
+        "-p",
+        "0700",
+        src.to_str().unwrap(),
+        mnt.to_str().unwrap(),
+    ]);
+    let fuse = Fuse(mnt.clone());
+    use std::os::unix::fs::MetadataExt;
+    let shown = std::fs::metadata(&mnt).unwrap();
+    assert_eq!((shown.uid(), shown.mode() & 0o777), (own_uid(), 0o700), "it looks like ours");
     let (code, said) = refused_start(&mnt.join("sf"));
     assert_eq!(code, Some(1), "{said}");
     assert!(
-        said.contains(&format!("{} is on a FUSE mount", mnt.display())),
+        said.contains(&format!(
+            "{} is on a FUSE mount of user {}",
+            mnt.display(),
+            user.uid
+        )),
         "{said}"
     );
+    drop(fuse);
     assert_eq!(std::fs::read_dir(&src).unwrap().count(), 0);
-    drop(unmount);
-    std::fs::remove_dir_all(&src).unwrap();
-    std::fs::remove_dir_all(&mnt).unwrap();
+    let _ = Command::new("sudo")
+        .args(["-n", "rm", "-rf"])
+        .arg(&src)
+        .arg(&mnt)
+        .status();
 }
 
 /// A client running as a throwaway user
