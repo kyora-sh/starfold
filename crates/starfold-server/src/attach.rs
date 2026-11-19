@@ -242,7 +242,8 @@ impl Stdio {
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(err());
         }
-        let ready = tokio::io::unix::AsyncFd::new(dup);
+        let ready =
+            unsafe { tokio::io::unix::AsyncFd::register(dup) }.map_err(|e| e.into_parts().1);
         let ready = ready.map(|fd| Ready { fd, flags });
         if ready.is_err() {
             unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
