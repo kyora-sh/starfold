@@ -440,14 +440,14 @@ async fn serve(
         capped,
     ));
     encoders.log();
-    let base = match negotiate::base_backend(&encoders, selection) {
+    let cohort = match negotiate::base_backend(&encoders, selection) {
         Ok(b) => b,
         Err(e) => {
             log::error!("--encoder {}: {e}", selection.name());
             std::process::exit(2);
         }
     };
-    let encoder = base.backend;
+    let encoder = cohort.backend;
     if !selection.is_arm() {
         let uncapped = range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32 == 0;
         for flag in build_facts::FLAGS
@@ -545,7 +545,7 @@ async fn serve(
     #[cfg(windows)]
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
-    let mut candidates = negotiate::candidates(&encoders, base);
+    let mut candidates = negotiate::candidates(&encoders, cohort);
     // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 (the base cohort's
     // encoder) to fall back to.
     if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE {
