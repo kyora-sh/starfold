@@ -50,6 +50,8 @@ cp "$root/LICENSE" "$root/THIRD_PARTY.md" "$root/README.md" "$dir/"
 required=()
 while read -r path as where; do
 	case $path in '#'* | '') continue ;; esac
+	case $where in all | x264 | linux | macos | windows) ;; *) fail "notices.list: '$where' for $path isn't all, x264, linux, macos or windows" ;; esac
+	[ -s "$root/$path" ] || fail "notices.list names $path, which is missing or empty"
 	if [ "$where" = all ] || { [ "$where" = x264 ] && [ $x264 = 1 ]; } || [ "$where" = "$platform" ]; then
 		cp "$root/$path" "$dir/licenses/$as"
 		required+=("licenses/$as")
@@ -92,6 +94,9 @@ windows) required+=(licenses/Opus-COPYING.txt licenses/libyuv-LICENSE.txt licens
 	licenses/GCC-runtime-copyright.txt licenses/GPL-3.0.txt) ;;
 esac
 
+for f in "${required[@]}"; do
+	[ ! -e "$dir/$f" ] || [ -s "$dir/$f" ] || fail "$f is empty"
+done
 cd "$work"
 # zip adds to an archive that exists; each archive starts from nothing.
 rm -f "$out/$name.$format" "$out/$name.$format.sha256"

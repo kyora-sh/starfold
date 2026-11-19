@@ -499,7 +499,8 @@ rounded-corner flags don't apply.
 
 ### Windows
 
-starfold also streams a Windows desktop (Windows 10 or later; DXGI Desktop Duplication capture,
+starfold also streams a Windows desktop (Windows 10 version 1703 or later, for per-monitor DPI
+awareness v2; DXGI Desktop Duplication capture,
 SendInput, clipboard text and images, WASAPI system audio). Not on Windows: `--listen-unix` and
 `starfold attach` (Linux-only), the VA-API encoder (Windows has NVENC, Media Foundation and Quick
 Sync), rounded corners (X11 only), and the microphone FIFO (the microphone plays into a virtual
@@ -586,5 +587,6 @@ binary includes and that licence. A binary built with GCC includes GCC's runtime
 its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under
 GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary
 under MIT; a Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with
-permission to link them into any program. Each release archive carries these texts.
+permission to link them into any program. The Linux and Windows release archives carry these
+texts; the macOS ones have neither (Apple's toolchain links no GCC or glibc code).
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.

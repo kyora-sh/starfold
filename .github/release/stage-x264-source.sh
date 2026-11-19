@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# stage-x264-source.sh <out dir>: the x264 source files expected-files.sh lists, into <out dir>,
-# each with a .sha256. A file from third_party/x264 must be listed in both SHA256SUMS and
-# SHA512SUMS and match both; the vcpkg port tarball is made from the port directory, whose files
-# must match SHA256SUMS too, as a reproducible tar (sorted, fixed times and owners, gzip -n).
+# stage-x264-source.sh <out dir>: the x264 source files expected-files.sh lists, into <out dir>
+# (which must not exist yet), each with a .sha256. A file from third_party/x264 must be listed in
+# both SHA256SUMS and SHA512SUMS and match both, and the files the Ubuntu .dsc names must match the
+# .dsc's own Checksums-Sha256 (sha256 and size); the vcpkg port tarball is made from the port
+# directory, whose files must match SHA256SUMS too, as a reproducible tar (sorted, fixed times and
+# owners, gzip -n).
 set -euo pipefail
 out=${1:?usage: stage-x264-source.sh <out dir>}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,6 +21,7 @@ check() { # check <path relative to third_party/x264>: it matches its line in bo
 		(cd "$x264" && "sha${sum}sum" -c --quiet <<<"$line") || fail "$f doesn't match SHA${sum}SUMS"
 	done
 }
+[ ! -e "$out" ] || fail "$out exists already"
 mkdir -p "$out"
 port=vcpkg-2026.10.16-ports-x264
 for f in $("$here/expected-files.sh" x264-source); do
@@ -36,4 +39,12 @@ for f in $("$here/expected-files.sh" x264-source); do
 	fi
 	(cd "$out" && sha256sum "$f" >"$f.sha256")
 done
+dsc=$(cd "$out" && echo x264_*.dsc)
+listed=$(python3 -I "$here/versions.py" dsc-sha256 "$out/$dsc") || fail "$dsc has no readable Checksums-Sha256"
+while read -r sum size name; do
+	[ -f "$out/$name" ] || fail "$dsc names $name, which isn't staged"
+	[ "$(sha256sum "$out/$name" | cut -d' ' -f1)" = "$sum" ] && [ "$(wc -c <"$out/$name" | tr -d ' ')" = "$size" ] ||
+		fail "$name doesn't match $dsc's Checksums-Sha256"
+	echo "$name matches $dsc"
+done <<<"$listed"
 ls -l "$out"

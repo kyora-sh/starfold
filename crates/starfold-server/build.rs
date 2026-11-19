@@ -133,7 +133,9 @@ fn arm_libs() -> Vec<pkg_config::Library> {
 
 /// x264 (with the feature), libyuv, Opus and PulseAudio from pkg-config.
 fn unix_libs(target: &str) -> X264 {
-    let x264 = cfg!(feature = "x264").then(|| pkg_config::probe_library("x264").expect("x264"));
+    let pinned = cfg!(feature = "x264").then(x264_archive).flatten();
+    let x264 = (cfg!(feature = "x264") && pinned.is_none())
+        .then(|| pkg_config::probe_library("x264").expect("x264"));
     let arms = arm_libs();
     // macOS captures NV12 (no libyuv) and gets audio from ScreenCaptureKit (no PulseAudio).
     let libs: &[&str] = if target == "macos" {
@@ -166,7 +168,31 @@ fn unix_libs(target: &str) -> X264 {
     }
     let rpath = std::env::join_paths(&dirs).expect("library dirs");
     println!("cargo:rpath={}", rpath.to_string_lossy());
-    x264.map(|l| l.include_paths)
+    pinned.or_else(|| x264.map(|l| l.include_paths))
+}
+
+/// With STARFOLD_X264_LIB set to a static `libx264.a`, x264 is linked from exactly that file,
+/// not looked up by name, and its headers come from the `include` directory beside its `lib`
+/// directory. The archive's resolved path is written to OUT_DIR/x264-linked, so a release build
+/// can check the archive it linked against the one it attaches the source of. Unset, nothing
+/// changes; set to anything but an existing file, the build fails.
+fn x264_archive() -> Option<Vec<std::path::PathBuf>> {
+    println!("cargo:rerun-if-env-changed=STARFOLD_X264_LIB");
+    let lib = std::env::var_os("STARFOLD_X264_LIB")?;
+    let lib = std::path::Path::new(&lib)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("STARFOLD_X264_LIB={lib:?}: {e}"));
+    assert!(lib.is_file(), "STARFOLD_X264_LIB={} is not a file", lib.display());
+    println!("cargo:rerun-if-changed={}", lib.display());
+    println!("cargo:rustc-link-arg={}", lib.display());
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("x264-linked"), lib.to_string_lossy().as_bytes()).unwrap();
+    let include = lib
+        .parent()
+        .and_then(|dir| dir.parent())
+        .expect("STARFOLD_X264_LIB is in a lib directory")
+        .join("include");
+    Some(vec![include])
 }
 
 /// x264 (with the feature), libyuv and Opus from vcpkg (`vcpkg install x264 libyuv opus`;

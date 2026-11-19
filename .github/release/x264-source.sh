@@ -2,7 +2,8 @@
 # x264-source.sh linux <dpkg arch> | macos <libx264.a> | windows <vcpkg root>: fails unless the
 # x264 this build links is the one whose source third_party/x264 holds (and the release attaches).
 #   linux:   the installed libx264-dev:<arch> was built from the source package and version the
-#            attached .dsc names.
+#            attached .dsc names, and the attached .orig.tar.gz and .debian.tar.xz match the .dsc's
+#            own Checksums-Sha256.
 #   macos:   <libx264.a>, the archive the build links (by its explicit path), belongs to Homebrew's
 #            installed x264 keg, and that keg's formula is the one reviewed: its source is upstream
 #            commit b35605ac and it has no patches (the formula file's checksum is pinned below, and
@@ -41,6 +42,12 @@ linux)
 	got=$(dpkg-query -W -f '${source:Package} ${source:Version}' "libx264-dev:$arch")
 	echo "libx264-dev:$arch from source $got; attached: $src $want"
 	[ "$got" = "$src $want" ] || fail "libx264-dev:$arch is built from $got, the release attaches $src $want"
+	listed=$(python3 -I "$root/.github/release/versions.py" dsc-sha256 "$dsc") || fail "$dsc has no readable Checksums-Sha256"
+	while read -r sum size name; do
+		[ -f "$x264/$name" ] && [ "$(sha256sum "$x264/$name" | cut -d' ' -f1)" = "$sum" ] &&
+			[ "$(wc -c <"$x264/$name" | tr -d ' ')" = "$size" ] || fail "$name doesn't match the .dsc's Checksums-Sha256"
+		echo "$name matches the .dsc"
+	done <<<"$listed"
 	;;
 macos)
 	lib=${2:?macos needs the libx264.a the build links}

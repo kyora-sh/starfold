@@ -89,8 +89,8 @@ jobs:
       - id: version
         run: |
           version=$(python3 -I .github/release/versions.py cargo crates/starfold-server/Cargo.toml)
-          py=$(python3 -I .github/release/versions.py pyproject python/starfold/pyproject.toml)
-          [ "$py" = "$version" ] || { echo "::error::python/starfold/pyproject.toml declares $py, crates/starfold-server/Cargo.toml $version"; exit 1; }
+          python3 -I .github/release/versions.py check pyproject python/starfold/pyproject.toml "$version" ||
+            { echo "::error::python/starfold/pyproject.toml doesn't declare $version, crates/starfold-server/Cargo.toml's version"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
             exit 1
@@ -344,12 +344,15 @@ jobs:
           fi
           brew list --versions opus
           echo "PKG_CONFIG_LIBDIR=$libdir" >> "$GITHUB_ENV"
+      # The x264 build links Homebrew's keg archive by its path (build.rs's STARFOLD_X264_LIB), the
+      # archive whose formula and source are checked here; the build then reports what it linked.
       - name: x264's source is the one built against
         if: matrix.flavour.x264
         run: |
-          lib=$(pkg-config --variable=libdir x264)/libx264.a
+          lib=$(cd "$(brew --prefix x264)/lib" && pwd -P)/libx264.a
           .github/release/x264-source.sh macos "$lib"
           shasum -a 256 "$lib"
+          echo "STARFOLD_X264_LIB=$lib" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
         with:
           path: |
@@ -371,7 +374,12 @@ jobs:
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
-        run: cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }}
+        run: |
+          cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }} \
+            --message-format=json-render-diagnostics > "$RUNNER_TEMP/build.json"
+          if [ '${{ matrix.flavour.x264 }}' = true ]; then
+            .github/release/x264-linked.sh "$RUNNER_TEMP/build.json" "$STARFOLD_X264_LIB"
+          fi
       # Only the system's libraries and frameworks, nothing from Homebrew. build.rs's rpath to
       # Homebrew's Opus is unused with Opus linked in, so it is dropped (and the binary re-signed).
       - name: Library paths
@@ -584,18 +592,19 @@ jobs:
       - name: Build
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
-          py=$(python3 -I ../../.github/release/versions.py pyproject pyproject.toml)
-          [ "$py" = "$VERSION" ] || { echo "::error::pyproject.toml declares $py, the release is $VERSION"; exit 1; }
+          python3 -I ../../.github/release/versions.py check pyproject pyproject.toml "$VERSION" ||
+            { echo "::error::pyproject.toml doesn't declare $VERSION"; exit 1; }
+          cmp LICENSE ../../LICENSE || { echo "::error::python/starfold/LICENSE isn't the repository's LICENSE"; exit 1; }
           uv build --out-dir "$GITHUB_WORKSPACE/dist"
-      - name: Check the version
+      # The version and the MIT licence text, the repository's LICENSE, inside both distributions.
+      - name: Check the version and the licence
         working-directory: dist
         run: |
           ls -l
-          for kind in wheel sdist; do
-            f=$([ $kind = wheel ] && echo "starfold-$VERSION-py3-none-any.whl" || echo "starfold-$VERSION.tar.gz")
-            got=$(python3 -I ../.github/release/versions.py $kind "$f")
-            [ "$got" = "$VERSION" ] || { echo "::error::$f says Version $got, the release is $VERSION"; exit 1; }
-          done
+          wheel=starfold-$VERSION-py3-none-any.whl sdist=starfold-$VERSION.tar.gz
+          python3 -I ../.github/release/versions.py check wheel "$wheel" "$VERSION"
+          python3 -I ../.github/release/versions.py check sdist "$sdist" "$VERSION"
+          python3 -I ../.github/release/python-licence.py "$wheel" "$sdist" "starfold-$VERSION" ../LICENSE
           for f in *; do sha256sum "$f" > "$f.sha256"; done
           unzip -l "starfold-$VERSION-py3-none-any.whl"
           tar -tzf "starfold-$VERSION.tar.gz"
@@ -637,8 +646,7 @@ jobs:
         working-directory: dist
         run: |
           f=starfold-web-embed-$VERSION.tgz
-          got=$(python3 -I ../.github/release/versions.py package-json "$f")
-          [ "$got" = "$VERSION" ] || { echo "::error::$f's package.json version is $got, the release is $VERSION"; exit 1; }
+          python3 -I ../.github/release/versions.py check package-json "$f" "$VERSION"
           sha256sum "$f" > "$f.sha256"
           tar -tzvf "$f"
       - uses: actions/upload-artifact@v4
@@ -664,12 +672,22 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      # Staged outside dist/; check-release.sh checks the downloads first, then joins it.
       - name: x264's source
-        run: .github/release/stage-x264-source.sh dist/x264-source
+        run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       - name: Check the release files
         env:
           RELEASE_LOOKUP: '0'
-        run: .github/release/check-release.sh "v${{ needs.version.outputs.version }}" dist ${{ needs.version.outputs.flavour_names }}
+        run: .github/release/check-release.sh "v${{ needs.version.outputs.version }}" dist "$RUNNER_TEMP/x264-source" ${{ needs.version.outputs.flavour_names }}
+      # A dry run's download is the whole release set: x264's source too. (A tag's run doesn't
+      # upload it, so the release job's download holds only the build artifacts.)
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type != 'tag'
+        with:
+          name: dry-run-x264-source-${{ needs.version.outputs.version }}
+          path: ${{ runner.temp }}/x264-source/
+          retention-days: 30
+          if-no-files-found: error
 
   # Only a pushed v* tag: a branch push (whatever its name), a manual run or anything else skips it.
   release:
@@ -690,14 +708,14 @@ jobs:
         with:
           path: dist
       - name: x264's source
-        run: .github/release/stage-x264-source.sh dist/x264-source
+        run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml declares
-      # too; dist/ holds exactly the expected files and every checksum checks; the packages carry the
-      # version; and the tag has no release yet.
+      # too; the downloads, then with x264's source joined, are exactly the expected files and every
+      # checksum checks; the packages carry the version; and the tag has no release yet.
       - name: Check the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist ${{ needs.version.outputs.flavour_names }}
+        run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/x264-source" ${{ needs.version.outputs.flavour_names }}
       # Created for the commit every job built, while the tag names it; the tag is read again after.
       - name: Create the release
         env:
