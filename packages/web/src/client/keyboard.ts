@@ -48,10 +48,16 @@ async function toPng(file: File): Promise<ArrayBuffer> {
 	return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
 }
 
+/**
+ * `embedded`: focus waits for the user instead of being taken at once on a top-level page, and
+ * when focus moves to another field of the page each held key is released and a paste
+ * shortcut still waiting for its paste is dropped.
+ */
 export function setupKeyboard(
 	app: App,
 	clipboard: Clipboard,
-	onInteract: () => void
+	onInteract: () => void,
+	embedded = false
 ) {
 	const { kbd, surface, send, isMac } = app;
 	const ls = listeners();
@@ -220,8 +226,14 @@ export function setupKeyboard(
 		kbd.value = '';
 	});
 	ls.on(window, 'blur', releaseAll);
+	if (embedded)
+		ls.on(kbd, 'blur', () => {
+			if (pendingPaste) clearTimeout(pendingPaste.timer);
+			pendingPaste = null;
+			for (const code of down.keys()) release(code);
+		});
 	ls.on(surface, 'focus', () => kbd.focus({ preventScroll: true }));
-	if (!app.inIframe) kbd.focus({ preventScroll: true });
+	if (!embedded && !app.inIframe) kbd.focus({ preventScroll: true });
 
 	return {
 		releaseAll,

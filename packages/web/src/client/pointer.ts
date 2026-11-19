@@ -7,7 +7,12 @@ import { createTouch } from './touch';
 /** DOM button -> X button (left, middle, right, back, forward). */
 const BUTTONS = [1, 2, 3, 8, 9];
 
-export function setupPointer(app: App, onInteract: () => void) {
+/** `onTap`: called after a touch tap has clicked. */
+export function setupPointer(
+	app: App,
+	onInteract: () => void,
+	onTap?: () => void
+) {
 	const { surface, send } = app;
 	const ls = listeners();
 
@@ -56,6 +61,7 @@ export function setupPointer(app: App, onInteract: () => void) {
 		moveTo: (x, y) => move({ clientX: x, clientY: y }, true),
 		queueScroll,
 		deskPerPx,
+		tapped: onTap,
 	});
 
 	ls.on<PointerEvent>(surface, 'pointermove', (e) => {
