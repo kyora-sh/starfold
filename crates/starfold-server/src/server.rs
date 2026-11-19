@@ -189,14 +189,15 @@ fn check_dir(
     let st = fstat(dir)?;
     let me = unsafe { libc::geteuid() };
     let mode = st.st_mode & 0o7777;
-    let on_procfs = nix::sys::statfs::fstatfs(dir)
-        .map_err(std::io::Error::from)?
-        .filesystem_type()
-        == nix::sys::statfs::PROC_SUPER_MAGIC;
+    let fs = refused_filesystem(
+        nix::sys::statfs::fstatfs(dir)
+            .map_err(std::io::Error::from)?
+            .filesystem_type(),
+    );
     let why = if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         "is not a directory".to_string()
-    } else if on_procfs {
-        "is on procfs, whose links resolve differently for each process".to_string()
+    } else if let Some(fs) = fs {
+        fs.to_string()
     } else if st.st_uid != me && st.st_uid != 0 {
         format!("belongs to user {} (mode {mode:04o})", st.st_uid)
     } else if st.st_mode & 0o022 != 0 && st.st_mode & libc::S_ISVTX == 0 {
@@ -207,6 +208,21 @@ fn check_dir(
         return Ok(());
     };
     Err(untrusted(path, shown, &why, who))
+}
+
+/// Why a directory on a filesystem of type `t` can't be on the --listen-unix path, or
+/// None: procfs, whose links resolve differently for each process, and FUSE, whose daemon
+/// reports owners and modes as it likes and decides itself what may change.
+#[cfg(target_os = "linux")]
+fn refused_filesystem(t: nix::sys::statfs::FsType) -> Option<&'static str> {
+    use nix::sys::statfs::{FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC};
+    match t {
+        PROC_SUPER_MAGIC => Some("is on procfs, whose links resolve differently for each process"),
+        FUSE_SUPER_MAGIC => {
+            Some("is on a FUSE mount, whose owners and modes its daemon reports as it likes")
+        }
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -524,6 +540,14 @@ pub fn bind_unix_std(
         })
         .map_err(unmake)?;
     let st = fstat(&dir).map_err(unmake)?;
+    if let Some(why) = refused_filesystem(
+        nix::sys::statfs::fstatfs(&dir)
+            .map_err(std::io::Error::from)
+            .map_err(unmake)?
+            .filesystem_type(),
+    ) {
+        return Err(unmake(untrusted(path, path, why)));
+    }
     let made = stat_at(&parent, &name).map_err(unmake)?;
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
         return Err(moved());
@@ -2936,6 +2960,28 @@ mod tests {
             );
             assert!(s.exists());
             std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        /// procfs and FUSE are refused on the path, other filesystems are judged by their
+        /// owners and modes. A real FUSE mount needs root and a FUSE filesystem, so the
+        /// binary's refusal of one is in tests/unix_socket.rs; this is the type check alone.
+        #[test]
+        fn procfs_and_fuse_are_refused_on_the_path() {
+            use nix::sys::statfs::*;
+            assert!(refused_filesystem(PROC_SUPER_MAGIC)
+                .unwrap()
+                .contains("procfs"));
+            assert!(refused_filesystem(FUSE_SUPER_MAGIC)
+                .unwrap()
+                .contains("FUSE"));
+            for ok in [
+                EXT4_SUPER_MAGIC,
+                TMPFS_MAGIC,
+                BTRFS_SUPER_MAGIC,
+                OVERLAYFS_SUPER_MAGIC,
+            ] {
+                assert_eq!(refused_filesystem(ok), None, "{ok:?}");
+            }
         }
 
         #[test]
