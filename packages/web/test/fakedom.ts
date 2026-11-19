@@ -98,6 +98,8 @@ export class FakeEl extends Tracked {
 export class FakeWorker extends Tracked {
 	static all: FakeWorker[] = [];
 	posted: { t: string }[] = [];
+	/** Posts made after terminate(): a real worker drops them, but the page still made them. */
+	late: { t: string }[] = [];
 	terminated = false;
 	life: MessagePort | null = null;
 	constructor(readonly url: string | URL) {
@@ -105,7 +107,10 @@ export class FakeWorker extends Tracked {
 		FakeWorker.all.push(this);
 	}
 	postMessage(m: { t: string; embed?: { life: MessagePort } }) {
-		if (this.terminated) return;
+		if (this.terminated) {
+			this.late.push(m);
+			return;
+		}
 		this.posted.push(m);
 		if (m.t === 'init' && m.embed) this.life = m.embed.life;
 	}
