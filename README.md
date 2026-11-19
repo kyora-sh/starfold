@@ -107,7 +107,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--files-root`                                                 | (none: no file transfer)                                              | folder the Files panel can see; see [File transfer](#file-transfer)                                                                                                                                       |
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
-| `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
+| `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`); at most 3600 with `--enable-recording`                                                                                                                                     |
 | `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 45 % of a core on a 6-vCPU VM (see below)                |
 | `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                 | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
@@ -203,27 +203,46 @@ and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer w
 running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
 own: that encode's CPU is the cost of recording an unwatched screen. With x264 at 1920x1080
 and full-screen motion at 60 Hz it was about 45 % of one core on a 6-vCPU VM, against under
-1 % with nothing recording. It needs `--stripes=1` (otherwise 409), and a frame of another
-size (a resize) ends it. It doesn't include the cursor, which viewers draw, except on macOS
+1 % with nothing recording. It needs a single-stripe stream: `--stripes=1`, and a picture the
+encoder doesn't split into stripes on its own (it does for a picture too large for one; then
+a start gets 409, and a recording running when the split comes ends with `closed`). A frame
+of another size (a resize) ends it. It doesn't include the cursor, which viewers draw, except on macOS
 when the cursor is in the video: with `--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
+
+A recording starts at a keyframe. It asks the H.264 encode for one through the viewers' own
+flow control: the keyframe comes with the first frame every viewer of that encode has room
+for, so a viewer that is behind gets no extra keyframe. With no viewer behind, that is the
+next capture; with one behind, as soon as it has caught up (or after 4 s, when the server
+gives up on it and sends it a keyframe of its own).
 
 While it runs, a recording's video goes to a file with no name in `--recording-dir`, and the
 answer is read back from that file:
 
-- At most 2 recordings run at once (`/record` and `/record/start` alike, each until its
-  answer is sent or dropped); a third gets 429.
-- A recording holds at most 2 GiB of video (`size_limit`), so recordings take at most 4 GiB
-  of `--recording-dir` together, and at most 120 frames a second of its length (`frame_cap`).
-- It starts only with at least min(1 GiB, 10 %) of the filesystem free (otherwise 507), and
-  ends with `disk_space` below that; it looks again after half the room that was left, at
-  most 64 MiB later.
-- In memory it holds the frames waiting for the disk (at most 4 MiB, or one frame of up to
-  8 MiB when nothing else waits), the writer's 256 KiB buffer, and 16 bytes a frame for 120
-  frames a second of its length (576 KB at 300 s): at most 10 MiB per recording at the
-  default length. A disk that falls further behind ends it with `disk_slow`; a frame over
-  8 MiB ends it with `large_frame`.
-- An answer whose client takes no bytes for 30 s is dropped, and the recording's file and
-  place with it. A started recording nobody stops is dropped 60 s after its length limit.
+- At most 2 recordings run at once (`/record` and `/record/start` alike), a third gets 429.
+  A recording keeps its place until its answer is dropped (sent, or its client gone), or
+  until it ends with no answer to give.
+- Each recording reserves the disk space it may fill when it starts: up to 2 GiB, out of the
+  free space above the floor (min(1 GiB, 10 %) of the filesystem) that the other recording
+  has not reserved. With less than 64 MiB of that room it gets 507 (`disk_space`); with less
+  than 2 GiB it records up to what it reserved (`size_limit`). So recordings take at most
+  4 GiB of `--recording-dir` together and never take it below the floor themselves. Another
+  program writing there can: a recording looks again after half the room that was left (at
+  most 64 MiB later) and ends with `disk_space` below the floor. A recording also ends at 120
+  frames a second of its length (`frame_cap`).
+- `--max-record-seconds` is at most 3600 with `--enable-recording` (the server refuses to
+  start above it). In memory a recording holds the frames waiting for the disk (at most
+  4 MiB, or one frame of up to 8 MiB when nothing else waits), the writer's 256 KiB buffer,
+  and 16 bytes a frame, as frames come, up to 120 frames a second of its length (576 KB at
+  300 s, 6.9 MB at 3600 s); its answer's MP4 header holds up to as much again for its tables.
+  At most 10 MiB per recording at the default length. A disk that falls further behind ends
+  it with `disk_slow`; a frame over 8 MiB ends it with `large_frame`.
+- A write that takes 10 s ends the recording with `disk_slow` and gives its place back at
+  once. The stuck write keeps its file, the space that file reserved, its buffer and its
+  queue until the disk returns. A write that fails is seen when the writer's buffer is next
+  written out (every 256 KiB) or when the recording ends.
+- An answer whose client takes no bytes for 30 s is dropped, and the recording's place with
+  it. A started recording nobody stops is dropped 60 s after it ended. A `/record` request
+  whose client goes away ends its recording.
 
 If another encoder takes over mid-recording (a hardware encoder failing over to the
 software one, say), the recording continues in a new MP4, up to 16 of them. Add `format=zip` to
@@ -231,8 +250,10 @@ software one, say), the recording continues in a new MP4, up to 16 of them. Add 
 `manifest.json` with each one's `start_ms`, `duration_ms` and `frames`, and the
 `end_reason` (`stopped`, `time_limit`, `resized`, `segment_cap`, `bad_parameter_sets`,
 `segment_lost`, `closed`, `size_limit`, `frame_cap`, `large_frame`, `disk_slow`,
-`disk_space` or `disk_error`). Without it you get the first MP4, with `x-starfold-segments` and
-`x-starfold-record-end` headers when there were more.
+`disk_space` or `disk_error`). Without it you get the first MP4. Every answer says how many
+MP4s there were and why the recording ended, in `x-starfold-segments` and
+`x-starfold-record-end`; one with no video is JSON with the `error` and the `end_reason`. A zip
+answer has no `Content-Length`: it is written as it is sent.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
 after every action and hope it was long enough:

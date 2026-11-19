@@ -487,6 +487,15 @@ impl Cohort {
         self.shared.cap()
     }
 
+    /// The frame interval its flow control judges its viewers at: the capture's, or its own
+    /// cap's when that is below the `capture` rate.
+    fn flow_ms(&self, capture: u32, interval_ms: f64) -> f64 {
+        match self.fps() < capture {
+            true => 1000.0 / self.fps().max(1) as f64,
+            false => interval_ms,
+        }
+    }
+
     /// Whether what was encoded so far has reached this cohort's viewers. One that hasn't
     /// answered for a while holds back nobody: flow control deals with it.
     fn drained(&self, v: &View) -> bool {
@@ -518,11 +527,14 @@ impl Drop for Cohort {
 }
 
 /// A cohort's viewers that get frames now, whether a recording takes its frames, and
-/// whether one of them is waiting for a keyframe.
+/// whether a viewer or a recording waits for a keyframe.
 struct View {
     clients: Vec<Arc<Client>>,
     recorded: bool,
     want_key: bool,
+    /// A recording waits for a keyframe: it gets one only in a turn whose flow control lets
+    /// every viewer of the cohort take a frame, never past a viewer that is held back.
+    tap_key: bool,
 }
 
 impl View {
@@ -1305,16 +1317,17 @@ impl Engine {
                 let clients = self.hub.cohort_clients(c.shared.id);
                 let sh = &c.shared;
                 let recorded = recording && taps.cohort() == sh.id;
-                let want_key = !sh.idr_inflight.load(Ordering::Acquire)
-                    && (!sh.degraded() || sh.last_key.lock().elapsed() >= RETRY_EVERY)
-                    && (clients
+                let may_key = !sh.idr_inflight.load(Ordering::Acquire)
+                    && (!sh.degraded() || sh.last_key.lock().elapsed() >= RETRY_EVERY);
+                let want_key = may_key
+                    && clients
                         .iter()
-                        .any(|x| x.needs_keyframe.load(Ordering::Relaxed))
-                        || (recorded && taps.wants_key()));
+                        .any(|x| x.needs_keyframe.load(Ordering::Relaxed));
                 View {
                     clients,
                     recorded,
                     want_key,
+                    tap_key: may_key && recorded && taps.wants_key(),
                 }
             })
             .collect()
@@ -1339,11 +1352,16 @@ impl Engine {
             if c.active && (v.clients.is_empty() || replaced) {
                 c.rc = RateCtl::new(self.cfg.max_kbps as f64, self.cfg.min_kbps as f64);
                 c.refine.reset();
-                c.skipped = None;
+                if !v.recorded {
+                    c.skipped = None;
+                }
             }
             if v.clients.is_empty() {
                 c.active = false;
-                c.skipped = None;
+                // A recording still takes this cohort: what it skipped is still owed.
+                if !v.recorded {
+                    c.skipped = None;
+                }
                 c.refine.baseline(&c.shared);
             } else {
                 c.active = true;
@@ -1399,13 +1417,24 @@ impl Engine {
             .iter()
             .zip(views)
             .map(|(c, v)| {
-                let ms = match c.fps() < capture {
-                    true => 1000.0 / c.fps().max(1) as f64,
-                    false => interval_ms,
-                };
+                let ms = c.flow_ms(capture, interval_ms);
                 v.watched()
                     && c.shared.busy.load(Ordering::Acquire) < 2
                     && ((v.want_key && !c.shared.degraded()) || flow_ok(&v.clients, ms))
+            })
+            .collect()
+    }
+
+    /// Which cohorts encode their next frame as a keyframe: one a viewer asked for, or one a
+    /// recording waits for, but only while flow control lets all of the cohort's viewers
+    /// take a frame. A recording's keyframe goes to a viewer only as a frame it had room for.
+    fn keys(&self, views: &[View], interval_ms: f64) -> Vec<bool> {
+        let capture = self.arrival_fps(views);
+        self.cohorts
+            .iter()
+            .zip(views)
+            .map(|(c, v)| {
+                v.want_key || (v.tap_key && flow_ok(&v.clients, c.flow_ms(capture, interval_ms)))
             })
             .collect()
     }
@@ -1435,8 +1464,10 @@ impl Engine {
         let due = self.passes(views, &ready, now);
         let passes: Vec<bool> = due.iter().zip(&early).map(|(&p, &e)| p && !e).collect();
         let catch_up = self.catch_up_due(&ready);
+        let keys = self.keys(views, interval_ms);
         Turn {
-            want_key: views.iter().any(|v| v.want_key),
+            want_key: keys.contains(&true),
+            keys,
             catch_up,
             paced: ready.iter().zip(&early).any(|(&r, &e)| r && e),
             pass_paced: due.iter().zip(&early).any(|(&p, &e)| p && e),
@@ -1529,7 +1560,9 @@ impl Engine {
             .is_some_and(|k| now.saturating_duration_since(k) < REFINE_IDLE);
         let stats = &self.hub.stats;
         let plans = turn.takes.iter().zip(&turn.passes);
-        for ((c, v), (&take, &pass)) in self.cohorts.iter_mut().zip(views).zip(plans) {
+        for (i, ((c, v), (&take, &pass))) in
+            self.cohorts.iter_mut().zip(views).zip(plans).enumerate()
+        {
             if !v.watched() {
                 continue;
             }
@@ -1539,7 +1572,7 @@ impl Engine {
                 }
                 continue;
             }
-            let force = v.want_key;
+            let force = turn.keys.get(i).copied().unwrap_or(v.want_key);
             let max_fps = c.fps();
             let Some((mut frame, step)) = c.refine.plan(f, force, c.skipped.is_some(), pass) else {
                 continue;
@@ -1559,7 +1592,8 @@ impl Engine {
             match tx.try_send(Job {
                 frame,
                 force_idr: force,
-                boost: force && !c.shared.degraded(),
+                // A keyframe only a recording waits for costs what a usual frame does.
+                boost: v.want_key && !c.shared.degraded(),
                 fps: if typing {
                     max_fps
                 } else {
@@ -1592,6 +1626,8 @@ impl Engine {
 struct Turn {
     takes: Vec<bool>,
     passes: Vec<bool>,
+    /// Each cohort's next frame is a keyframe ([`Engine::keys`]).
+    keys: Vec<bool>,
     want_key: bool,
     catch_up: bool,
     /// A cohort would take this capture but for its cap.
@@ -2898,6 +2934,8 @@ fn encode_loop(
     // Consecutive failed encodes per stripe; a stripe not asked to encode hasn't recovered.
     let mut fails = vec![0u32; n];
     let mut slow = SlowWatch::default();
+    // This thread's copy of the recordings' taps: it never waits on their lock.
+    let mut taps = crate::record::tap::Seen::default();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
         .into_iter()
@@ -3122,7 +3160,7 @@ fn encode_loop(
             .collect();
         deliver(&hub, sh.id, frame_id, all_key, total, &msgs);
         hub.taps
-            .offer(sh.id, (sh.w, sh.h), all_key, captured_at, &msgs);
+            .offer(&mut taps, sh.id, (sh.w, sh.h), all_key, captured_at, &msgs);
         finish(force_idr);
         hub.stats
             .send_lat_us

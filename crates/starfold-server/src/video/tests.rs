@@ -2031,6 +2031,7 @@ fn a_pass_is_work_for_the_capture_loop() {
     let turn = |pass| Turn {
         takes: vec![true],
         passes: vec![pass],
+        keys: vec![false],
         want_key: false,
         catch_up: false,
         paced: false,
@@ -4475,5 +4476,127 @@ fn a_cohort_only_a_recording_takes_runs_at_the_framerate_and_its_own_bitrate() {
         (hevc(&eng), hub.target_kbps.load(Ordering::Relaxed)),
         before,
         "the viewer's bitrate is untouched"
+    );
+}
+
+/// The frame ids a viewer got, and whether each was a keyframe.
+fn frames_of(rx: &mut UnboundedReceiver<Out>) -> Vec<(u32, bool)> {
+    videos(&drain(rx))
+        .into_iter()
+        .map(|(_, key, id, _)| (id, key))
+        .collect()
+}
+
+#[test]
+fn a_viewer_held_back_gets_no_keyframe_when_a_recording_starts() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    push(&mut eng);
+    for (id, _) in frames_of(&mut rx) {
+        assert!(c.ack(None, id));
+    }
+    // Frames it doesn't ack, until flow control holds the cohort back.
+    let mut unacked = Vec::new();
+    for _ in 0..10 {
+        push(&mut eng);
+        unacked.extend(frames_of(&mut rx).into_iter().map(|(id, _)| id));
+    }
+    assert!(!unacked.is_empty());
+    assert!(!flow_ok(&eng.views()[0].clients, 33.0), "held back");
+    let started = Instant::now();
+    let (_tap, trx) = hub.taps.add();
+    hub.replan();
+    for _ in 0..5 {
+        push(&mut eng);
+    }
+    assert_eq!(frames_of(&mut rx), [], "no keyframe while it is held back");
+    assert!(tapped(&trx).is_empty(), "the recording waits");
+    assert!(hub.taps.wants_key());
+    // The viewer catches up: the recording's keyframe is a frame it has room for.
+    for id in unacked {
+        c.ack(None, id);
+    }
+    push(&mut eng);
+    let got = frames_of(&mut rx);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].1, "the keyframe the recording waited for");
+    let t = tapped(&trx);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(t[0].1);
+    assert!(!hub.taps.wants_key());
+    println!(
+        "recording start with a viewer held back: {} ms, 6 captures (until it caught up)",
+        started.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn a_recording_starts_at_the_next_capture_when_no_viewer_is_held_back() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    for _ in 0..3 {
+        push(&mut eng);
+        for (id, _) in frames_of(&mut rx) {
+            assert!(c.ack(None, id));
+        }
+    }
+    let started = Instant::now();
+    let (_tap, trx) = hub.taps.add();
+    hub.replan();
+    let mut t = Instant::now();
+    still(&mut eng, &mut t);
+    let t = tapped(&trx);
+    assert_eq!(t.len(), 1, "a keyframe on a still screen: {t:?}");
+    assert!(t[0].1);
+    println!(
+        "recording start with no viewer held back: {} ms, 1 capture",
+        started.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn a_cohort_only_a_recording_takes_keeps_the_damage_it_skipped() {
+    let hub = Hub::new();
+    let cfg = VideoConfig {
+        high_fps: true,
+        paintover_burst: 0,
+        ..config()
+    };
+    let mut eng = Engine::new(
+        cfg.clone(),
+        hub.clone(),
+        W,
+        H,
+        &[HEVC, H264_HW],
+        fakes(Opts::default()),
+    )
+    .unwrap();
+    let (v, mut rv) = client(&hub);
+    join_v2(&hub, &v, &[Codec::Hevc]);
+    push(&mut eng);
+    ready(&v, &drain(&mut rv));
+    let (_tap, rx) = hub.taps.add();
+    hub.replan();
+    let t0 = Instant::now() + Duration::from_secs(1);
+    let band = Some(Band { y0: 0, y1: H });
+    capture(&mut eng, W, H, band, t0);
+    assert_eq!(tapped(&rx).len(), 1, "the recording's first frame");
+    // The last change before the screen goes still lands on a capture only HEVC takes.
+    capture(&mut eng, W, H, band, t0 + Duration::from_millis(8));
+    assert!(
+        tapped(&rx).is_empty(),
+        "too early for the H.264 cohort's cap"
+    );
+    for i in 1..=3 {
+        capture(&mut eng, W, H, None, t0 + Duration::from_millis(100 * i));
+    }
+    assert_eq!(
+        tapped(&rx).len(),
+        1,
+        "the change it skipped reaches the recording"
     );
 }

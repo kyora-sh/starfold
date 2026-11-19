@@ -3547,7 +3547,7 @@ mod tests {
         let hub = Hub::new();
         let mut s = app(&hub, false, None);
         let flags = crate::parse_args(["--port".to_string(), "6901".to_string()]);
-        s.recorder = crate::recorder_from_args(&flags, &hub);
+        s.recorder = crate::recorder_from_args(&flags, &hub).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
@@ -3604,10 +3604,17 @@ mod tests {
         let mut delta = vec![0x01, 0, 0, 0, 0, 2];
         delta.resize(16, 0);
         delta.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]);
+        let mut seen = crate::record::tap::Seen::default();
         for frame in [&key, &delta, &delta] {
             let msg = Bytes::copy_from_slice(frame);
-            hub.taps
-                .offer(1, (64, 32), frame[1] == 1, Instant::now(), &[msg]);
+            hub.taps.offer(
+                &mut seen,
+                1,
+                (64, 32),
+                frame[1] == 1,
+                Instant::now(),
+                &[msg],
+            );
         }
         let stop = format!("/record/stop?id={id}");
         let (status, clip) = ask(port, "POST", &stop, "").await;

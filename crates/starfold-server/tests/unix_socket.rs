@@ -1501,3 +1501,70 @@ fn attach_keeps_an_idle_websocket_up() {
     drop(server);
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// The binary with recording on and `args`, run in `cwd` with no display: its exit code
+/// and what it printed, once it ends (it is killed after 30 s).
+fn recording_start(cwd: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_starfold"))
+        .current_dir(cwd)
+        .args(["--enable-basic-auth=false", "--enable-recording"])
+        .args(args)
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = exited(&mut child, Duration::from_secs(30));
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let mut said = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut said)
+        .unwrap();
+    let _ = child.wait();
+    (status.and_then(|s| s.code()), said)
+}
+
+/// A --max-record-seconds above its bound, and a relative --recording-dir that resolves
+/// inside --files-root, refuse to start (exit 2) before anything listens; the bound itself
+/// starts and serves.
+#[test]
+fn recording_flags_are_checked_at_startup() {
+    let d = scratch("record-flags", 0o700);
+    for secs in ["3601", "10000000000000000", "0"] {
+        let (code, said) = recording_start(&d, &[&format!("--max-record-seconds={secs}")]);
+        assert_eq!(code, Some(2), "{secs}: {said}");
+        assert!(said.contains("--max-record-seconds"), "{secs}: {said}");
+    }
+    let share = d.join("share");
+    std::fs::create_dir(&share).unwrap();
+    let (code, said) = recording_start(&share, &["--files-root=.", "--recording-dir=rec"]);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(said.contains("inside --files-root"), "{said}");
+    assert!(
+        !share.join("rec").exists(),
+        "nothing made in the shared folder"
+    );
+    let x = Display::start();
+    let rec = d.join("rec");
+    let rec_arg = format!("--recording-dir={}", rec.display());
+    let server = Server::start(
+        &x,
+        &d,
+        &[
+            "--listen-tcp=false",
+            "--enable-recording",
+            "--max-record-seconds=3600",
+            &rec_arg,
+        ],
+    );
+    assert!(healthy(&server.socket));
+    assert!(rec.is_dir(), "made at startup");
+    drop(server);
+    std::fs::remove_dir_all(&d).unwrap();
+}

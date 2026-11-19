@@ -7,6 +7,10 @@
 //! viewers, and counts against the recording's queue until written: at most [`QUEUE`]
 //! bytes, or one frame of up to [`LARGEST_FRAME`] into an empty queue. A frame that does
 //! not fit ends the recording; it is never queued.
+//!
+//! The encode thread never waits on a lock here: it reads the tap list through its own
+//! copy ([`Seen`]), refreshed with `try_lock` when the list changed. A tap that ends stops
+//! counting as demand on the stream at once ([`Taps::any`]), whoever ends it.
 
 use super::End;
 use bytes::Bytes;
@@ -38,25 +42,34 @@ pub struct Tapped {
 
 pub enum Msg {
     Frame(Tapped),
-    End(End),
+    /// The recording ends, as of the given time: frames captured after it are not in it.
+    End(End, Instant),
 }
 
 /// One recording's place beside the stream.
 pub struct Tap {
     id: u64,
     tx: mpsc::Sender<Msg>,
-    /// Has had a keyframe from the cohort it records now.
-    started: AtomicBool,
+    /// The cohort whose keyframe it started at (0: none yet).
+    started: AtomicU64,
     /// Bytes handed over and not yet written.
     queued: AtomicUsize,
     /// Takes no more frames.
     closed: AtomicBool,
+    /// Its hub's count of open taps, given back once, when it ends.
+    open: Arc<AtomicUsize>,
 }
 
 impl Tap {
-    /// Ends the recording: frames handed over before this are recorded, none after.
-    pub fn end(&self, why: End) {
-        let _ = self.tx.send(Msg::End(why));
+    /// Ends the recording as of `at`: frames handed over before this are recorded, none
+    /// after, and it is no longer demand on the stream. False if it had ended already.
+    pub fn end(&self, why: End, at: Instant) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.open.fetch_sub(1, Ordering::AcqRel);
+        let _ = self.tx.send(Msg::End(why, at));
+        true
     }
 
     /// A frame's bytes were written (or dropped).
@@ -68,48 +81,61 @@ impl Tap {
         self.queued.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Takes no more frames; true the first time.
-    pub fn close(&self) -> bool {
-        !self.closed.swap(true, Ordering::AcqRel)
-    }
-
-    /// Hands over one frame if it fits the queue; else ends the recording.
+    /// Hands over one frame if it fits the queue; else ends the recording. A writer that
+    /// is gone ends it too.
     fn admit(&self, f: Tapped) {
         let q = self.queued();
         if q + f.charge > QUEUE && !(q == 0 && f.charge <= LARGEST_FRAME) {
-            if self.close() {
-                self.end(match f.charge > LARGEST_FRAME {
-                    true => End::LargeFrame,
-                    false => End::DiskSlow,
-                });
-            }
+            let why = match f.charge > LARGEST_FRAME {
+                true => End::LargeFrame,
+                false => End::DiskSlow,
+            };
+            self.end(why, f.captured_at);
             return;
         }
-        self.queued.fetch_add(f.charge, Ordering::AcqRel);
-        let _ = self.tx.send(Msg::Frame(f));
+        let (charge, at) = (f.charge, f.captured_at);
+        self.queued.fetch_add(charge, Ordering::AcqRel);
+        if self.tx.send(Msg::Frame(f)).is_err() {
+            self.release(charge);
+            self.end(End::Closed, at);
+        }
     }
+}
+
+/// An encode thread's copy of the tap list.
+#[derive(Default)]
+pub struct Seen {
+    version: u64,
+    list: Arc<Vec<Arc<Tap>>>,
 }
 
 /// The taps of a hub, and which cohort they take frames from.
 #[derive(Default)]
 pub struct Taps {
-    list: Mutex<Vec<Arc<Tap>>>,
+    /// Taps not yet removed, replaced whole on each change; the encode thread reads it
+    /// only with `try_lock`.
+    list: Mutex<Arc<Vec<Arc<Tap>>>>,
+    /// Counts the changes of `list`.
+    version: AtomicU64,
+    /// Taps not yet ended.
+    open: Arc<AtomicUsize>,
     /// The H.264 cohort a protocol 1 viewer would get (0: none yet).
     cohort: AtomicU64,
-    /// A tap waits for a keyframe.
-    key: AtomicBool,
+    /// Keyframes asked for, and the count a keyframe every open tap took had answered.
+    asked: AtomicU64,
+    answered: AtomicU64,
     next: AtomicU64,
 }
 
 impl Taps {
-    /// Whether any recording runs: the video thread keeps the recorded cohort encoding.
+    /// Whether any recording takes the stream: the video thread keeps the recorded cohort
+    /// encoding only while one does.
     pub fn any(&self) -> bool {
-        !self.list.lock().is_empty()
+        self.open.load(Ordering::Acquire) > 0
     }
 
     pub fn cohort(&self) -> u64 {
@@ -119,27 +145,21 @@ impl Taps {
     /// The video thread names the cohort recordings take. A new one starts each tap over at
     /// its first keyframe.
     pub fn set_cohort(&self, id: u64) {
-        let list = self.list.lock();
-        if self.cohort.swap(id, Ordering::AcqRel) == id {
-            return;
-        }
-        for t in list.iter() {
-            t.started.store(false, Ordering::Release);
-        }
-        if !list.is_empty() {
-            self.key.store(true, Ordering::Release);
+        if self.cohort.swap(id, Ordering::AcqRel) != id {
+            self.ask_key();
         }
     }
 
     /// Whether a tap waits for a keyframe from the recorded cohort.
     pub fn wants_key(&self) -> bool {
-        self.key.load(Ordering::Acquire) && self.any()
+        self.any() && self.asked.load(Ordering::Acquire) > self.answered.load(Ordering::Acquire)
     }
 
-    /// An encode failed: what follows must start from a keyframe, as for viewers.
+    /// What follows must start from a keyframe (an encode failed, a tap came, the cohort
+    /// changed).
     pub fn ask_key(&self) {
         if self.any() {
-            self.key.store(true, Ordering::Release);
+            self.asked.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -149,53 +169,73 @@ impl Taps {
         let tap = Arc::new(Tap {
             id: self.next.fetch_add(1, Ordering::Relaxed),
             tx,
-            started: AtomicBool::new(false),
+            started: AtomicU64::new(0),
             queued: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            open: self.open.clone(),
         });
-        self.list.lock().push(tap.clone());
-        self.key.store(true, Ordering::Release);
+        self.open.fetch_add(1, Ordering::AcqRel);
+        self.change(|v| v.push(tap.clone()));
+        self.ask_key();
         (tap, rx)
     }
 
-    pub fn remove(&self, tap: &Tap) {
-        self.list.lock().retain(|t| t.id != tap.id);
+    /// Ends `tap` if it hadn't (as of now, `why`) and takes it out of the list.
+    pub fn remove(&self, tap: &Tap, why: End) {
+        tap.end(why, Instant::now());
+        self.change(|v| v.retain(|t| t.id != tap.id));
     }
 
-    /// Called by `cohort`'s encode thread with each frame it hands its viewers. Never waits.
+    /// Holds the list's lock, as a start or a stop does for a moment (tests).
+    #[cfg(test)]
+    pub fn hold_list(&self) -> parking_lot::MutexGuard<'_, Arc<Vec<Arc<Tap>>>> {
+        self.list.lock()
+    }
+
+    fn change(&self, f: impl FnOnce(&mut Vec<Arc<Tap>>)) {
+        let mut list = self.list.lock();
+        let mut v = (**list).clone();
+        f(&mut v);
+        *list = Arc::new(v);
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Called by `cohort`'s encode thread with each frame it hands its viewers. Never waits:
+    /// `seen` is its copy of the list, refreshed only when the lock is free. A tap the copy
+    /// misses loses nothing: it waits for a keyframe, and a keyframe answers the taps'
+    /// request only when the copy was current.
     pub fn offer(
         &self,
+        seen: &mut Seen,
         cohort: u64,
         size: (u32, u32),
         all_key: bool,
         captured_at: Instant,
         msgs: &[Bytes],
     ) {
-        if cohort != self.cohort() {
+        if cohort != self.cohort() || !self.any() {
             return;
         }
-        let list = self.list.lock();
-        if list.is_empty() {
-            return;
+        let asked = self.asked.load(Ordering::Acquire);
+        if self.version.load(Ordering::Acquire) != seen.version {
+            if let Some(list) = self.list.try_lock() {
+                seen.list = list.clone();
+                seen.version = self.version.load(Ordering::Acquire);
+            }
         }
-        if all_key {
-            self.key.store(false, Ordering::Release);
-        }
-        for t in list.iter() {
-            if t.closed.load(Ordering::Acquire) {
+        for t in seen.list.iter() {
+            if t.is_closed() {
                 continue;
             }
-            if !t.started.load(Ordering::Acquire) {
+            if t.started.load(Ordering::Acquire) != cohort {
                 if !all_key {
                     continue;
                 }
-                t.started.store(true, Ordering::Release);
+                t.started.store(cohort, Ordering::Release);
             }
             let [data] = msgs else {
                 // A recording is one picture per frame; this stream no longer is.
-                if t.close() {
-                    t.end(End::Closed);
-                }
+                t.end(End::Closed, captured_at);
                 continue;
             };
             t.admit(Tapped {
@@ -205,6 +245,9 @@ impl Taps {
                 data: data.clone(),
                 charge: data.len() + OVERHEAD,
             });
+        }
+        if all_key && self.version.load(Ordering::Acquire) == seen.version {
+            self.answered.fetch_max(asked, Ordering::AcqRel);
         }
     }
 }

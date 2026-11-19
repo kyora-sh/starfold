@@ -261,6 +261,10 @@ fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
         eprintln!("{e}");
         std::process::exit(2);
     });
+    if let Err(e) = record::settings(&a) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     if listen.unix.is_some() && prebound.is_none() {
         eprintln!(
             "--listen-unix needs the starfold binary: it binds before any thread starts, \
@@ -311,36 +315,13 @@ fn files_from_args(a: &HashMap<String, String>, read_only: bool) -> Result<files
 
 /// The recorder `serve` uses: GET /screenshot; /record* only with --enable-recording (off
 /// by default); --max-record-seconds caps a recording's length; recordings spool in
-/// --recording-dir.
+/// --recording-dir ([`record::settings`]).
 fn recorder_from_args(
     a: &HashMap<String, String>,
     hub: &std::sync::Arc<hub::Hub>,
-) -> std::sync::Arc<record::Recorder> {
-    record::Recorder::new(
-        hub.clone(),
-        std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
-        record::enabled(a),
-        a.get("recording-dir")
-            .map_or_else(record::default_dir, std::path::PathBuf::from),
-    )
-}
-
-/// With --enable-recording, recordings may not spool inside --files-root, where the shared
-/// folder would list and serve them.
-fn recording_dir_allowed(a: &HashMap<String, String>) -> Result<(), String> {
-    let (Some(root), true) = (a.get("files-root"), record::enabled(a)) else {
-        return Ok(());
-    };
-    let dir = a
-        .get("recording-dir")
-        .map_or_else(record::default_dir, std::path::PathBuf::from);
-    match record::spool::inside(&dir, std::path::Path::new(root)) {
-        true => Err(format!(
-            "--recording-dir {} is inside --files-root {root}; recordings would be shared there",
-            dir.display()
-        )),
-        false => Ok(()),
-    }
+) -> Result<std::sync::Arc<record::Recorder>, String> {
+    let s = record::settings(a)?;
+    Ok(record::Recorder::new(hub.clone(), s.max, s.on, s.dir))
 }
 
 async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Prebound>) {
@@ -624,10 +605,10 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
         ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
     }
-    if let Err(e) = recording_dir_allowed(&a) {
+    let recorder = recorder_from_args(&a, &hub).unwrap_or_else(|e| {
         log::error!("{e}");
         std::process::exit(2);
-    }
+    });
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
     // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
     // output device that loops back to an input (BlackHole and the like).
@@ -680,7 +661,7 @@ async fn serve(a: HashMap<String, String>, listen: Listen, prebound: Option<Preb
         mic,
         resize: resize_on,
         read_only,
-        recorder: recorder_from_args(&a, &hub),
+        recorder,
         // --title: the browser tab's title.
         index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,

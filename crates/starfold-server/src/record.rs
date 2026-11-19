@@ -13,12 +13,19 @@
 //! no name in `--recording-dir` ([`spool`]) as it comes, and the answer is read back from
 //! that file. In memory a recording holds the frames waiting for its disk ([`tap::QUEUE`],
 //! or one frame of up to [`tap::LARGEST_FRAME`]), the writer's [`BUFFER`], and an index of
-//! 16 bytes a frame for at most [`MAX_FPS`] frames a second of its length.
+//! 16 bytes a frame, grown as frames come, for at most [`MAX_FPS`] frames a second of its
+//! length (at most [`MAX_RECORD_SECONDS`]).
+//!
+//! A recording holds one of [`MAX_RECORDINGS`] places ([`Place`]) from its start until
+//! exactly one of two things: its answer (the clip, then the response body) is dropped, or
+//! it ends with no answer to give. The writer finishing never gives the place back, and a
+//! writer stuck on its disk does not keep it ([`STALL`]).
 //!
 //! Another encoder taking over mid-recording (new SPS/PPS) starts a new MP4 segment at
 //! its keyframe. `format=zip` on `/record` or `/record/stop` returns `manifest.json` and
 //! every `segment-k.mp4`; without it the response is the first segment, as an MP4, and
-//! `x-starfold-segments` and `x-starfold-record-end` say when there was more.
+//! `x-starfold-segments` and `x-starfold-record-end` say how many there were and why the
+//! recording ended.
 //!
 //! A recording is the H.264 stream starfold already encodes, rewrapped as MP4. It takes the
 //! frames beside the viewers ([`tap`]), not as one of them, so it never holds the stream
@@ -40,18 +47,19 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use parking_lot::Mutex;
+use spool::Spool;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tap::{Msg, Tap, Tapped};
 use tokio::sync::oneshot;
 
-/// How long a started recording that ran into the length limit waits for its
-/// `/record/stop` before it is discarded (the caller may have crashed or forgotten).
+/// How long a started recording's clip waits for its `/record/stop` once the recording has
+/// ended on its own, before it is dropped (the caller may have crashed or forgotten).
 const UNCLAIMED: Duration = Duration::from_secs(60);
 /// The most segments of one recording: an encoder flapping between two configurations
 /// ends the recording here.
@@ -60,20 +68,29 @@ const MAX_SEGMENTS: usize = 16;
 pub const MAX_RECORDING_BYTES: u64 = 2 << 30;
 /// The most frames a second a recording indexes (the fastest cohort, `--high-fps`).
 pub const MAX_FPS: u64 = crate::video::HIGH_FPS as u64;
+/// The longest `--max-record-seconds` the server starts with. A recording's index is 16
+/// bytes a frame for [`MAX_FPS`] frames a second of its length, at most 6,912,000 bytes at
+/// this bound, and its MP4 header's sample tables at most as much again.
+pub const MAX_RECORD_SECONDS: u64 = 3600;
 /// What the writer gathers before each write; a sample this large or larger is written
 /// directly.
 pub const BUFFER: usize = 256 << 10;
 /// What an answer reads from the spool at a time.
 const CHUNK: usize = 64 << 10;
 /// The most recordings at once, server-wide: `/record` and `/record/start` alike, each
-/// until its clip is answered or dropped.
+/// until its answer is dropped or it ends with none.
 pub const MAX_RECORDINGS: usize = 2;
 /// The most bytes written between two checks of the free space; less when the free space
 /// is closer to the floor (half the room left).
 const CHECK_EVERY: u64 = 64 << 20;
 /// An answer whose client takes no bytes for this long is dropped, and its recording's
-/// spool and place with it.
+/// place with it.
 pub const IDLE: Duration = Duration::from_secs(30);
+/// A writer that spends this long in one disk operation ends its recording `disk_slow`,
+/// and the recording's place is given back; the stuck thread keeps only its file (and
+/// the disk space it reserved), its buffer, its index and the frames it had queued, until
+/// the operation returns.
+pub const STALL: Duration = Duration::from_secs(10);
 
 /// What a recording writes within; tests change it.
 #[derive(Clone)]
@@ -82,11 +99,16 @@ struct Limits {
     max_bytes: u64,
     /// The free space to leave, from the filesystem's size ([`spool::floor`]).
     floor: Arc<dyn Fn(u64) -> u64 + Send + Sync>,
+    /// How the free space is measured ([`spool::space`]).
+    space: Arc<spool::Space>,
     check_every: u64,
     /// How long an answer waits for its client to take bytes.
     idle: Duration,
-    /// Runs before each sample is written, with the bytes written so far; an error ends
-    /// the recording as a write error would. None in the server; tests block or fail here.
+    /// How long one disk operation of the writer may take.
+    stall: Duration,
+    /// Runs before each sample is written, with the bytes written so far, as part of the
+    /// write; an error ends the recording as a write error would. None in the server;
+    /// tests block or fail here.
     before_write: Option<Arc<dyn Fn(u64) -> io::Result<()> + Send + Sync>>,
 }
 
@@ -95,20 +117,33 @@ impl Default for Limits {
         Limits {
             max_bytes: MAX_RECORDING_BYTES,
             floor: Arc::new(spool::floor),
+            space: Arc::new(spool::space),
             check_every: CHECK_EVERY,
             idle: IDLE,
+            stall: STALL,
             before_write: None,
         }
     }
 }
 
-/// One of the [`MAX_RECORDINGS`] places, given back when its last holder lets go: the
-/// recording's writer, the started recording's entry, its clip and its answer.
+/// One of the [`MAX_RECORDINGS`] places. It has one owner at a time: the recording's
+/// route while it runs, then its clip, then the answer's body.
 struct Place(Arc<AtomicUsize>);
 
 impl Drop for Place {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Drops `x` on the blocking pool, as every spool is closed: closing a file is a file
+/// operation, which never runs on an async worker. On a thread with no runtime, here.
+pub(crate) fn off_workers<T: Send + 'static>(x: T) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn_blocking(move || drop(x));
+        }
+        Err(_) => drop(x),
     }
 }
 
@@ -123,6 +158,8 @@ pub struct Recorder {
     limits: Limits,
     /// Places held ([`MAX_RECORDINGS`]).
     running: Arc<AtomicUsize>,
+    /// Disk space the recordings' spools reserved.
+    budget: Arc<spool::Budget>,
     /// Started recordings by their id.
     active: Mutex<HashMap<String, Active>>,
     /// Numbers recordings in the log; never an id.
@@ -131,15 +168,75 @@ pub struct Recorder {
 
 struct Active {
     tap: Arc<Tap>,
-    done: Recording,
+    outcome: oneshot::Receiver<Outcome>,
     /// Its number in the log.
     n: u64,
-    _place: Arc<Place>,
 }
 
 /// Whether the command line turns recording on (`--enable-recording`; off by default).
 pub fn enabled(a: &HashMap<String, String>) -> bool {
     crate::truthy(a.get("enable-recording"), false)
+}
+
+/// The recorder's command line, checked.
+pub struct Settings {
+    pub max: Duration,
+    pub on: bool,
+    pub dir: PathBuf,
+}
+
+/// `--max-record-seconds`, `--enable-recording` and `--recording-dir`. With recording on,
+/// the length is at most [`MAX_RECORD_SECONDS`], and the directory is created and
+/// resolved now, so the check that it is not inside `--files-root` (where the shared
+/// folder would list and serve recordings) is of the directory recordings will use.
+pub fn settings(a: &HashMap<String, String>) -> Result<Settings, String> {
+    let on = enabled(a);
+    let secs = crate::range_max(a.get("max-record-seconds"), 300.0);
+    let given = a
+        .get("recording-dir")
+        .map_or_else(default_dir, PathBuf::from);
+    if !on {
+        let secs = secs.clamp(0.0, MAX_RECORD_SECONDS as f64);
+        return Ok(Settings {
+            max: Duration::from_secs_f64(secs),
+            on,
+            dir: given,
+        });
+    }
+    if !(secs > 0.0 && secs <= MAX_RECORD_SECONDS as f64) {
+        return Err(format!(
+            "--max-record-seconds must be above 0 and at most {MAX_RECORD_SECONDS} \
+             (a recording's index grows with its length)"
+        ));
+    }
+    let existed = given.exists();
+    std::fs::create_dir_all(&given)
+        .and_then(|()| given.canonicalize())
+        .map_err(|e| format!("--recording-dir {}: {e}", given.display()))
+        .and_then(|dir| {
+            let Some(root) = a.get("files-root") else {
+                return Ok(dir);
+            };
+            let root = Path::new(root)
+                .canonicalize()
+                .map_err(|e| format!("--files-root {root}: {e}"))?;
+            if !dir.starts_with(&root) {
+                return Ok(dir);
+            }
+            if !existed {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            Err(format!(
+                "--recording-dir {} is inside --files-root {}; recordings would be shared there",
+                dir.display(),
+                root.display()
+            ))
+        })
+        .map(|dir| Settings {
+            max: Duration::from_secs_f64(secs),
+            on,
+            dir,
+        })
 }
 
 /// A recording's id: 128 random bits from the system, as 32 hex digits.
@@ -171,8 +268,6 @@ fn query(req: &Request) -> Result<HashMap<String, String>, Response> {
         .map_err(IntoResponse::into_response)
 }
 
-type Recording = tokio::task::JoinHandle<Result<Clip, String>>;
-
 /// Why a recording ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum End {
@@ -188,15 +283,16 @@ pub(crate) enum End {
     BadParameterSets,
     /// A segment couldn't be written; the others are there.
     SegmentLost,
-    /// The stream it recorded stopped being one picture per frame.
+    /// The stream it recorded stopped being one picture per frame, or its writer or
+    /// caller went away.
     Closed,
-    /// [`MAX_RECORDING_BYTES`].
+    /// The disk space it reserved, at most [`MAX_RECORDING_BYTES`].
     SizeLimit,
     /// [`MAX_FPS`] frames a second of its length.
     FrameCap,
     /// A frame larger than [`tap::LARGEST_FRAME`].
     LargeFrame,
-    /// The disk fell [`tap::QUEUE`] behind the stream.
+    /// The disk fell [`tap::QUEUE`] behind the stream, or one write took [`STALL`].
     DiskSlow,
     /// The disk went below the free space a recording leaves.
     DiskSpace,
@@ -229,6 +325,60 @@ fn disk_error(e: io::Error) -> End {
     End::DiskError
 }
 
+/// A recording that has no clip to give, and why.
+#[derive(Debug)]
+struct Failed {
+    end: End,
+    why: String,
+}
+
+type Outcome = Result<Clip, Failed>;
+
+/// When the writer's current disk operation began, for [`STALL`]; and whether its
+/// recording gave up on it.
+struct Busy {
+    origin: Instant,
+    /// Milliseconds from `origin` to the operation's start, plus one (0: none).
+    since: AtomicU64,
+    abandoned: AtomicBool,
+}
+
+impl Busy {
+    fn new() -> Busy {
+        Busy {
+            origin: Instant::now(),
+            since: AtomicU64::new(0),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks one disk operation, until the guard is dropped.
+    fn enter(&self) -> InDisk<'_> {
+        let ms = self.origin.elapsed().as_millis() as u64 + 1;
+        self.since.store(ms, Ordering::Release);
+        InDisk(self)
+    }
+
+    /// Whether one disk operation has taken `limit` so far.
+    fn stalled(&self, limit: Duration) -> bool {
+        match self.since.load(Ordering::Acquire) {
+            0 => false,
+            ms => {
+                (self.origin.elapsed().as_millis() as u64 + 1).saturating_sub(ms)
+                    >= limit.as_millis() as u64
+            }
+        }
+    }
+}
+
+struct InDisk<'a>(&'a Busy);
+
+impl Drop for InDisk<'_> {
+    fn drop(&mut self) {
+        self.0.since.store(0, Ordering::Release);
+    }
+}
+
 /// One segment while it is recorded: where its samples start in the index, its parameter
 /// sets, and when it ended (the next segment's first frame).
 struct Part {
@@ -250,7 +400,7 @@ impl Part {
 /// A recording in progress: each frame's sample goes to the spool as it comes, and only
 /// its index entry stays in memory.
 struct Writer {
-    out: BufWriter<File>,
+    out: BufWriter<Spool>,
     /// Where the spool is (its free space, on Windows).
     dir: PathBuf,
     limits: Limits,
@@ -258,7 +408,9 @@ struct Writer {
     since: u64,
     next_check: u64,
     start: Instant,
-    /// The most frames it indexes; the index is reserved at this once.
+    /// Its length: frames captured this long after `start` or later are not in it.
+    max: Duration,
+    /// The most frames it indexes; the index grows up to it, never past.
     cap: usize,
     index: Vec<mp4::Sample>,
     parts: Vec<Part>,
@@ -267,31 +419,49 @@ struct Writer {
     last_ms: Option<u64>,
     /// Sample bytes handed to `out`.
     written: u64,
+    busy: Arc<Busy>,
 }
 
 impl Writer {
-    fn new(file: File, dir: PathBuf, limits: Limits, start: Instant, cap: usize) -> Writer {
+    fn new(spool: Spool, dir: PathBuf, limits: Limits, max: Duration, busy: Arc<Busy>) -> Writer {
         Writer {
-            out: BufWriter::with_capacity(BUFFER, file),
+            out: BufWriter::with_capacity(BUFFER, spool),
             dir,
             limits,
             since: 0,
             next_check: 0,
-            start,
-            cap,
-            index: Vec::with_capacity(cap),
+            start: Instant::now(),
+            max,
+            cap: (MAX_FPS as f64 * max.as_secs_f64()).ceil() as usize,
+            index: Vec::new(),
             parts: Vec::new(),
             size: None,
             first: None,
             last_ms: None,
             written: 0,
+            busy,
         }
+    }
+
+    /// The bytes it may write: its size limit, within what its spool reserved.
+    fn limit(&self) -> u64 {
+        self.limits.max_bytes.min(self.out.get_ref().limit())
+    }
+
+    /// Milliseconds from the start to `at`, at most its length.
+    fn ms(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.start)
+            .min(self.max)
+            .as_millis() as u64
     }
 
     /// Writes one tapped frame, or says why the recording ends before it. The recording's
     /// size is its first frame's, as its encoder was opened: the size of the pictures it
     /// records, not the hub's, which a resize may already have changed.
     fn frame(&mut self, f: &Tapped) -> Result<(), End> {
+        if f.captured_at.saturating_duration_since(self.start) >= self.max {
+            return Err(End::TimeLimit);
+        }
         if *self.size.get_or_insert(f.size) != f.size {
             return Err(End::Resized);
         }
@@ -302,10 +472,7 @@ impl Writer {
         if self.index.len() >= self.cap {
             return Err(End::FrameCap);
         }
-        let ms = f
-            .captured_at
-            .saturating_duration_since(self.start)
-            .as_millis() as u64;
+        let ms = self.ms(f.captured_at);
         let ms = self.last_ms.map_or(ms, |l| ms.max(l + 1));
         if f.key {
             let p = params(d);
@@ -341,18 +508,26 @@ impl Writer {
         }
         let units = mp4::units(d);
         let size: u64 = units.iter().map(|n| 4 + n.len() as u64).sum();
-        if self.written + size > self.limits.max_bytes {
+        if self.written + size > self.limit() {
             return Err(End::SizeLimit);
         }
-        if let Some(hook) = &self.limits.before_write {
-            hook(self.written).map_err(disk_error)?;
+        {
+            let busy = self.busy.clone();
+            let _disk = busy.enter();
+            if let Some(hook) = &self.limits.before_write {
+                hook(self.written).map_err(disk_error)?;
+            }
+            // Straight from the stream's buffer into the writer's: the frame is not copied.
+            for n in &units {
+                self.out
+                    .write_all(&(n.len() as u32).to_be_bytes())
+                    .map_err(disk_error)?;
+                self.out.write_all(n).map_err(disk_error)?;
+            }
         }
-        // Straight from the stream's buffer into the writer's: the frame is not copied.
-        for n in &units {
-            self.out
-                .write_all(&(n.len() as u32).to_be_bytes())
-                .map_err(disk_error)?;
-            self.out.write_all(n).map_err(disk_error)?;
+        if self.index.len() == self.index.capacity() {
+            let more = self.index.len().max(64).min(self.cap - self.index.len());
+            self.index.reserve_exact(more);
         }
         self.index.push(mp4::Sample {
             ms,
@@ -369,10 +544,13 @@ impl Writer {
     }
 
     /// Ends the recording below the floor; else sets when to look again: after half the room
-    /// left, at most [`Limits::check_every`], so the floor is never passed by more than that
-    /// (and what the buffer holds).
+    /// left, at most [`Limits::check_every`]. The spool's reservation keeps this server's
+    /// recordings above the floor; this catches the disk filling from elsewhere.
     fn check_space(&mut self) -> Result<(), End> {
-        let (free, total) = spool::space(self.out.get_ref(), &self.dir).map_err(disk_error)?;
+        let busy = self.busy.clone();
+        let _disk = busy.enter();
+        let (free, total) =
+            (self.limits.space)(self.out.get_ref().file(), &self.dir).map_err(disk_error)?;
         let floor = (self.limits.floor)(total);
         if free < floor {
             log::warn!("recording: {free} bytes free, below the {floor} it leaves");
@@ -384,24 +562,30 @@ impl Writer {
     }
 
     /// Writes out what is buffered and makes the clip of the samples that reached the file.
-    fn finish(self, mut end: End) -> Result<Clip, String> {
-        let end_ms = self.start.elapsed().as_millis() as u64;
+    /// `end_ms`: when the recording ended, from its start.
+    fn finish(self, mut end: End, end_ms: u64) -> Outcome {
+        let busy = self.busy.clone();
         let Writer {
-            mut out,
+            out,
             index,
             parts,
             size,
             ..
         } = self;
-        if let Err(e) = out.flush() {
-            let e = disk_error(e);
-            if end != End::DiskError {
-                end = e;
+        let (spool, on_disk) = {
+            let _disk = busy.enter();
+            let mut out = out;
+            if let Err(e) = out.flush() {
+                let e = disk_error(e);
+                if end != End::DiskError {
+                    end = e;
+                }
             }
-        }
-        let (file, _) = out.into_parts();
-        // A write that failed may have left part of a sample: only whole ones count.
-        let on_disk = file.metadata().map_or(0, |m| m.len());
+            let (spool, _) = out.into_parts();
+            // A write that failed may have left part of a sample: only whole ones count.
+            let on_disk = spool.file().metadata().map_or(0, |m| m.len());
+            (spool, on_disk)
+        };
         let mut at = 0u64;
         let whole = index
             .iter()
@@ -417,40 +601,49 @@ impl Writer {
             size.unwrap_or_default(),
             end,
             end_ms,
-            file,
+            spool,
         )
     }
 }
 
-/// Records what the tap hands over until it is ended, `max` after the writer's start, or a
-/// limit. `release` gives each frame's charge back to the tap once it is written.
-fn run(
-    rx: mpsc::Receiver<Msg>,
-    mut w: Writer,
-    max: Duration,
-    release: impl Fn(usize),
-) -> Result<Clip, String> {
-    let deadline = w.start + max;
-    let end = loop {
+/// Records what the tap hands over until it is ended, its length after the writer's start
+/// (by the frames' capture times, and by the clock when none comes), a limit, or its
+/// recording gives up on it. `release` gives each frame's charge back to the tap once it is
+/// written.
+fn run(rx: mpsc::Receiver<Msg>, mut w: Writer, release: impl Fn(usize)) -> Outcome {
+    let deadline = w.start + w.max;
+    let mut last_at = w.start;
+    let (end, at) = loop {
+        if w.busy.abandoned.load(Ordering::Acquire) {
+            break (End::DiskSlow, last_at);
+        }
         let f = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Msg::Frame(f)) => f,
-            Ok(Msg::End(why)) => break why,
-            Err(mpsc::RecvTimeoutError::Timeout) => break End::TimeLimit,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break End::Closed,
+            Ok(Msg::End(why, at)) => break (why, at),
+            Err(mpsc::RecvTimeoutError::Timeout) => break (End::TimeLimit, deadline),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break (End::Closed, last_at),
         };
         let done = w.frame(&f);
-        let charge = f.charge;
+        let (charge, at) = (f.charge, f.captured_at);
         drop(f);
         release(charge);
         if let Err(why) = done {
-            break why;
+            break (why, at);
         }
+        last_at = at;
     };
+    for m in rx.try_iter() {
+        if let Msg::Frame(f) = m {
+            release(f.charge);
+        }
+    }
     drop(rx);
-    w.finish(end)
+    let end_ms = w.ms(at);
+    w.finish(end, end_ms)
 }
 
 /// One segment of a finished recording: its MP4 header and where its samples are.
+#[derive(Clone)]
 struct Segment {
     header: Vec<u8>,
     /// Its samples' offset and length in the spool.
@@ -462,14 +655,13 @@ struct Segment {
     frames: usize,
 }
 
+/// A finished recording: its segments, read from its spool. It holds its recording's place
+/// once its route has it, and hands both to its answer.
 struct Clip {
     segments: Vec<Segment>,
     end: End,
-    file: File,
-    /// Held, not read: the clip keeps its recording's place until it is dropped.
-    _place: Option<Arc<Place>>,
-    /// How long its answer waits for the client to take bytes.
-    idle: Duration,
+    spool: Spool,
+    place: Option<Place>,
 }
 
 impl Clip {
@@ -483,8 +675,8 @@ impl Clip {
         size: (u32, u32),
         mut end: End,
         end_ms: u64,
-        file: File,
-    ) -> Result<Clip, String> {
+        spool: Spool,
+    ) -> Outcome {
         let mut segments = Vec::with_capacity(parts.len());
         let mut failed = None;
         let mut offset = 0u64;
@@ -520,60 +712,63 @@ impl Clip {
                 }
                 Err(e) => {
                     log::warn!("recording segment lost: {e}");
-                    end = End::SegmentLost;
                     failed.get_or_insert(e);
                 }
             }
         }
+        if failed.is_some() && !segments.is_empty() {
+            end = End::SegmentLost;
+        }
         match failed {
-            Some(e) if segments.is_empty() => Err(e),
-            _ if segments.is_empty() => Err("no frames were recorded".into()),
+            Some(why) if segments.is_empty() => Err(Failed { end, why }),
+            _ if segments.is_empty() => Err(Failed {
+                end,
+                why: "no frames were recorded".into(),
+            }),
             _ => Ok(Clip {
                 segments,
                 end,
-                file,
-                _place: None,
-                idle: IDLE,
+                spool,
+                place: None,
             }),
         }
     }
+}
 
-    fn manifest(&self) -> serde_json::Value {
-        let segments: Vec<_> = self
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                serde_json::json!({
-                    "file": segment_name(i),
-                    "start_ms": s.start_ms,
-                    "duration_ms": s.duration_ms,
-                    "frames": s.frames,
-                })
+fn manifest(segments: &[Segment], end: End) -> serde_json::Value {
+    let segments: Vec<_> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            serde_json::json!({
+                "file": segment_name(i),
+                "start_ms": s.start_ms,
+                "duration_ms": s.duration_ms,
+                "frames": s.frames,
             })
-            .collect();
-        serde_json::json!({ "end_reason": self.end.name(), "segments": segments })
-    }
+        })
+        .collect();
+    serde_json::json!({ "end_reason": end.name(), "segments": segments })
+}
 
-    /// Writes every segment as an MP4 in a stored zip, with `manifest.json` first, as it
-    /// goes: nothing but a read buffer is held.
-    fn write_zip(&self, out: &mut dyn Write) -> io::Result<()> {
-        use zip::write::SimpleFileOptions;
-        let mut z = zip::ZipWriter::new_stream(out);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored)
-            .large_file(false);
-        z.start_file("manifest.json", opts)
+/// Writes every segment as an MP4 in a stored zip, with `manifest.json` first, as it goes:
+/// nothing but a read buffer is held.
+fn write_zip(segments: &[Segment], end: End, file: &File, out: &mut dyn Write) -> io::Result<()> {
+    use zip::write::SimpleFileOptions;
+    let mut z = zip::ZipWriter::new_stream(out);
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(false);
+    z.start_file("manifest.json", opts)
+        .map_err(io::Error::other)?;
+    z.write_all(manifest(segments, end).to_string().as_bytes())?;
+    for (i, s) in segments.iter().enumerate() {
+        z.start_file(segment_name(i), opts)
             .map_err(io::Error::other)?;
-        z.write_all(self.manifest().to_string().as_bytes())?;
-        for (i, s) in self.segments.iter().enumerate() {
-            z.start_file(segment_name(i), opts)
-                .map_err(io::Error::other)?;
-            copy_segment(&self.file, s, &mut z)?;
-        }
-        z.finish().map_err(io::Error::other)?;
-        Ok(())
+        copy_segment(file, s, &mut z)?;
     }
+    z.finish().map_err(io::Error::other)?;
+    Ok(())
 }
 
 fn segment_name(i: usize) -> String {
@@ -597,13 +792,34 @@ fn copy_segment(file: &File, s: &Segment, out: &mut dyn Write) -> io::Result<()>
     Ok(())
 }
 
-/// A response body written by `write` on a blocking thread as the client reads it: at
-/// most a few chunks are in memory at a time. A client that goes away, or takes no bytes
-/// for `idle`, stops it. `write` owns what it reads from (the whole clip), so the spool
-/// and the recording's place are held until the body is done or stopped.
+/// An answer's hold on its recording: the place and the spool. The body has it until the
+/// body is dropped, or its client takes no bytes for its idle time.
+struct Hold {
+    _place: Option<Place>,
+    _spool: Arc<Spool>,
+}
+
+/// The body's side of its [`Hold`]: let go when the body is dropped.
+struct Holding(Arc<Mutex<Option<Hold>>>);
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let gone = self.0.lock().take();
+        drop(gone);
+    }
+}
+
+/// A response body that `write` produces on a blocking thread from the spool's file as the
+/// client reads it: at most a few chunks are in memory at a time. The body holds the
+/// recording's place and spool ([`Hold`]): they go when it is dropped, or when no bytes
+/// have been taken from it for `idle` (a client that stopped reading, or a spool read that
+/// doesn't return), which ends it as cut. The thread holds only the file, and stops at its
+/// next chunk once nothing takes them.
 fn streamed(
+    place: Option<Place>,
+    spool: Spool,
     idle: Duration,
-    write: impl FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
+    write: impl FnOnce(&File, &mut dyn Write) -> io::Result<()> + Send + 'static,
 ) -> Body {
     struct Chan {
         tx: tokio::sync::mpsc::Sender<Bytes>,
@@ -629,30 +845,96 @@ fn streamed(
             Ok(())
         }
     }
+    let spool = Arc::new(spool);
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
     let (fail_tx, fail) = oneshot::channel::<io::Error>();
     let rt = tokio::runtime::Handle::current();
+    let reader = spool.clone();
     tokio::task::spawn_blocking(move || {
         let chan = Chan { tx, rt, idle };
         let mut out = io::BufWriter::with_capacity(CHUNK, chan);
-        if let Err(e) = write(&mut out).and_then(|()| out.flush()) {
+        if let Err(e) = write(reader.file(), &mut out).and_then(|()| out.flush()) {
             log::warn!("recording answer stopped: {e}");
             let _ = fail_tx.send(e);
         }
     });
-    // The chunks, then the error that stopped them, if one did: the answer ends as cut.
-    Body::from_stream(futures_util::stream::unfold(
-        (rx, Some(fail)),
-        |(mut rx, fail)| async move {
-            match rx.recv().await {
-                Some(c) => Some((Ok(c), (rx, fail))),
-                None => match fail?.await {
-                    Ok(e) => Some((Err(e), (rx, None))),
-                    Err(_) => None,
-                },
+    let hold = Arc::new(Mutex::new(Some(Hold {
+        _place: place,
+        _spool: spool,
+    })));
+    let taken = Arc::new(Mutex::new(Instant::now()));
+    let cut = Arc::new(tokio::sync::Notify::new());
+    {
+        let (hold, taken, cut) = (hold.clone(), taken.clone(), cut.clone());
+        tokio::spawn(async move {
+            loop {
+                let due = *taken.lock() + idle;
+                tokio::time::sleep_until(due.into()).await;
+                let mut h = hold.lock();
+                if h.is_none() {
+                    return;
+                }
+                if taken.lock().elapsed() >= idle {
+                    let gone = h.take();
+                    drop(h);
+                    log::warn!(
+                        "recording answer: no bytes taken for {} s; dropped",
+                        idle.as_secs()
+                    );
+                    drop(gone);
+                    cut.notify_one();
+                    return;
+                }
             }
-        },
-    ))
+        });
+    }
+    struct Stream {
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+        fail: Option<oneshot::Receiver<io::Error>>,
+        holding: Holding,
+        taken: Arc<Mutex<Instant>>,
+        cut: Arc<tokio::sync::Notify>,
+        done: bool,
+    }
+    let state = Stream {
+        rx,
+        fail: Some(fail),
+        holding: Holding(hold),
+        taken,
+        cut,
+        done: false,
+    };
+    // The chunks, then the error that stopped them, if one did: the answer ends as cut.
+    Body::from_stream(futures_util::stream::unfold(state, |mut s| async move {
+        if s.done {
+            return None;
+        }
+        let gone = || io::Error::new(io::ErrorKind::TimedOut, "the answer was idle too long");
+        if s.holding.0.lock().is_none() {
+            s.done = true;
+            return Some((Err(gone()), s));
+        }
+        let next = tokio::select! {
+            c = s.rx.recv() => c,
+            _ = s.cut.notified() => {
+                s.done = true;
+                return Some((Err(gone()), s));
+            }
+        };
+        match next {
+            Some(c) => {
+                *s.taken.lock() = Instant::now();
+                Some((Ok(c), s))
+            }
+            None => match s.fail.take()?.await {
+                Ok(e) => {
+                    s.done = true;
+                    Some((Err(e), s))
+                }
+                Err(_) => None,
+            },
+        }
+    }))
 }
 
 impl Recorder {
@@ -675,6 +957,7 @@ impl Recorder {
             dir,
             limits,
             running: Arc::new(AtomicUsize::new(0)),
+            budget: Arc::default(),
             active: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
@@ -754,17 +1037,38 @@ pub async fn screenshot(State(r): State<Arc<Recorder>>) -> Response {
     }
 }
 
-/// The first segment, as an MP4; the response names what else there was.
-fn first_segment(clip: Clip) -> Response {
-    let n = clip.segments.len();
-    let end = clip.end;
-    let Some(first) = clip.segments.first() else {
+/// The segment count and the end reason, on every answer with a clip.
+fn ends(res: &mut Response, segments: usize, end: End) {
+    crate::compat::insert_header(
+        res.headers_mut(),
+        "x-starfold-segments",
+        header::HeaderValue::from(segments),
+    );
+    crate::compat::insert_header(
+        res.headers_mut(),
+        "x-starfold-record-end",
+        header::HeaderValue::from_static(end.name()),
+    );
+}
+
+/// The first segment, as an MP4; the response names what else there was and why the
+/// recording ended. `idle`: how long the answer waits for its client.
+fn first_segment(clip: Clip, idle: Duration) -> Response {
+    let Clip {
+        mut segments,
+        end,
+        spool,
+        place,
+    } = clip;
+    let n = segments.len();
+    if n == 0 {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "no segments");
-    };
+    }
+    segments.truncate(1);
+    let first = segments.pop().expect("one segment");
     let length = first.header.len() as u64 + first.len;
-    let body = streamed(clip.idle, move |out| {
-        let clip = clip;
-        copy_segment(&clip.file, &clip.segments[0], out)
+    let body = streamed(place, spool, idle, move |file, out| {
+        copy_segment(file, &first, out)
     });
     let mut res = (
         [
@@ -779,18 +1083,51 @@ fn first_segment(clip: Clip) -> Response {
         .into_response();
     res.headers_mut()
         .insert(header::CONTENT_LENGTH, header::HeaderValue::from(length));
-    if n > 1 || end == End::SegmentLost {
-        crate::compat::insert_header(
-            res.headers_mut(),
-            "x-starfold-segments",
-            header::HeaderValue::from(n),
-        );
-        crate::compat::insert_header(
-            res.headers_mut(),
-            "x-starfold-record-end",
-            header::HeaderValue::from_static(end.name()),
-        );
-    }
+    ends(&mut res, n, end);
+    res
+}
+
+/// Every segment and the manifest, as a zip (no Content-Length: it is written as it goes).
+fn all_segments(clip: Clip, idle: Duration) -> Response {
+    let Clip {
+        segments,
+        end,
+        spool,
+        place,
+    } = clip;
+    let n = segments.len();
+    let body = streamed(place, spool, idle, move |file, out| {
+        write_zip(&segments, end, file, out)
+    });
+    let mut res = (
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"starfold.zip\"",
+            ),
+        ],
+        body,
+    )
+        .into_response();
+    ends(&mut res, n, end);
+    res
+}
+
+/// The answer of a recording with no clip: why, with its end reason.
+fn failed(f: Failed) -> Response {
+    let code = match f.end {
+        End::DiskSpace => StatusCode::INSUFFICIENT_STORAGE,
+        End::DiskSlow => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut res = (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": f.why, "end_reason": f.end.name() }).to_string(),
+    )
+        .into_response();
+    ends(&mut res, 0, f.end);
     res
 }
 
@@ -802,32 +1139,18 @@ fn partial_warning(route: &str, id: Option<u64>, n: usize, zip: bool) -> Option<
     })
 }
 
-async fn respond(done: Recording, zip: bool, route: &str, id: Option<u64>) -> Response {
-    let clip = match done.await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+fn respond(out: Outcome, idle: Duration, zip: bool, route: &str, id: Option<u64>) -> Response {
+    let clip = match out {
+        Ok(c) => c,
+        Err(f) => return failed(f),
     };
     if let Some(w) = partial_warning(route, id, clip.segments.len(), zip) {
         log::warn!("{w}");
     }
-    if !zip {
-        return first_segment(clip);
+    match zip {
+        true => all_segments(clip, idle),
+        false => first_segment(clip, idle),
     }
-    (
-        [
-            (header::CONTENT_TYPE, "application/zip"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"starfold.zip\"",
-            ),
-        ],
-        streamed(clip.idle, move |out| {
-            let clip = clip;
-            clip.write_zip(out)
-        }),
-    )
-        .into_response()
 }
 
 /// Whether `format=` asks for the zip of all segments. None for a format we don't have.
@@ -843,12 +1166,12 @@ const BAD_FORMAT: &str = "format must be mp4 or zip";
 
 /// A place for one more recording, or the 429 that refuses it.
 #[allow(clippy::result_large_err)]
-fn place(r: &Recorder) -> Result<Arc<Place>, Response> {
+fn place(r: &Recorder) -> Result<Place, Response> {
     r.running
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_RECORDINGS).then_some(n + 1)
         })
-        .map(|_| Arc::new(Place(r.running.clone())))
+        .map(|_| Place(r.running.clone()))
         .map_err(|_| {
             err(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -868,53 +1191,141 @@ fn refused(why: spool::Refused) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "--recording-dir is in memory (tmpfs or ramfs); recording needs a directory on disk",
         ),
-        spool::Refused::LowSpace => err(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "not enough free space in --recording-dir",
-        ),
+        spool::Refused::LowSpace => {
+            let mut res = err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "not enough free space in --recording-dir",
+            );
+            ends(&mut res, 0, End::DiskSpace);
+            res
+        }
     }
 }
 
-/// Takes one of the places, opens a spool (off the async workers), takes a place beside
-/// the stream ([`tap`]) and records until its tap is ended, `max`, a frame of another size
-/// or a limit.
-#[allow(clippy::type_complexity)]
-async fn begin(
-    r: &Arc<Recorder>,
-    max: Duration,
-) -> Result<(Recording, Arc<Tap>, Arc<Place>), Response> {
-    if r.hub.stripes.lock().len() > 1 {
-        return Err(err(
+#[allow(clippy::result_large_err)]
+fn single_stripe(r: &Recorder) -> Result<(), Response> {
+    match r.hub.stripes.lock().len() > 1 {
+        true => Err(err(
             StatusCode::CONFLICT,
-            "recording needs a single-stripe stream (--stripes 1)",
-        ));
+            "recording needs a single-stripe stream (--stripes 1, and a picture the encoder \
+             doesn't split)",
+        )),
+        false => Ok(()),
     }
+}
+
+/// A running recording as its route holds it: the place, until the clip takes it.
+struct Rec {
+    hub: Arc<Hub>,
+    tap: Arc<Tap>,
+    done: oneshot::Receiver<Outcome>,
+    busy: Arc<Busy>,
+    place: Place,
+    stall: Duration,
+    /// Ends the recording if the route goes away first.
+    _ender: Ender,
+}
+
+/// Ends a recording whose route went away (a `/record` client that left).
+struct Ender(Arc<Tap>);
+
+impl Drop for Ender {
+    fn drop(&mut self) {
+        self.0.end(End::Closed, Instant::now());
+    }
+}
+
+impl Rec {
+    /// The recording's clip, which then holds the place; or why there is none, and the
+    /// place goes with this. A writer that has spent [`STALL`] in one disk operation is left
+    /// to it: the recording ends `disk_slow` at once, its tap leaves the stream, and the
+    /// writer stops at its next frame once the disk returns.
+    async fn outcome(self) -> Outcome {
+        let Rec {
+            hub,
+            tap,
+            mut done,
+            busy,
+            place,
+            stall,
+            _ender,
+        } = self;
+        let mut tick = tokio::time::interval((stall / 4).max(Duration::from_millis(5)));
+        loop {
+            tokio::select! {
+                r = &mut done => return match r {
+                    Ok(Ok(mut c)) => {
+                        c.place = Some(place);
+                        Ok(c)
+                    }
+                    Ok(Err(f)) => Err(f),
+                    Err(_) => Err(Failed {
+                        end: End::Closed,
+                        why: "the recording's writer stopped".into(),
+                    }),
+                },
+                _ = tick.tick() => if busy.stalled(stall) {
+                    busy.abandoned.store(true, Ordering::Release);
+                    hub.taps.remove(&tap, End::DiskSlow);
+                    hub.replan();
+                    log::warn!("recording: one write took over {} s; ended", stall.as_secs());
+                    return Err(Failed {
+                        end: End::DiskSlow,
+                        why: format!("a write to --recording-dir took over {} s", stall.as_secs()),
+                    });
+                },
+            }
+        }
+    }
+}
+
+/// Takes one of the places, opens a spool (off the async workers, the place with it),
+/// takes a place beside the stream ([`tap`]) and records until its tap is ended, `max`, a
+/// frame of another size or a limit.
+async fn begin(r: &Arc<Recorder>, max: Duration) -> Result<Rec, Response> {
+    single_stripe(r)?;
     let place = place(r)?;
-    let (dir, floor) = (r.dir.clone(), r.limits.floor.clone());
-    let file = tokio::task::spawn_blocking(move || spool::open(&dir, &*floor))
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|(why, detail)| {
-            log::warn!("recording refused ({}): {detail}", r.dir.display());
-            refused(why)
-        })?;
-    let cap = (MAX_FPS as f64 * max.as_secs_f64()).ceil() as usize;
+    let (dir, limits, budget) = (r.dir.clone(), r.limits.clone(), r.budget.clone());
+    // The place goes into the open and comes back with it: a start cancelled while the open
+    // blocks leaves the place there until the open returns.
+    let (place, spool) = tokio::task::spawn_blocking(move || {
+        let rules = spool::Rules {
+            floor: &*limits.floor,
+            space: &*limits.space,
+            max_bytes: limits.max_bytes,
+        };
+        (place, spool::open(&dir, &rules, &budget))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let spool = spool.map_err(|(why, detail)| {
+        log::warn!("recording refused ({}): {detail}", r.dir.display());
+        refused(why)
+    })?;
+    // The layout may have changed while the spool opened.
+    single_stripe(r)?;
     let (tap, rx) = r.hub.taps.add();
     r.hub.replan();
-    let w = Writer::new(file, r.dir.clone(), r.limits.clone(), Instant::now(), cap);
-    let (hub, t, idle, p) = (r.hub.clone(), tap.clone(), r.limits.idle, place.clone());
-    let done = tokio::task::spawn_blocking(move || {
-        let clip = run(rx, w, max, |c| t.release(c));
-        t.close();
-        hub.taps.remove(&t);
+    let busy = Arc::new(Busy::new());
+    let w = Writer::new(spool, r.dir.clone(), r.limits.clone(), max, busy.clone());
+    let (tx, done) = oneshot::channel();
+    let (hub, t) = (r.hub.clone(), tap.clone());
+    tokio::task::spawn_blocking(move || {
+        let out = run(rx, w, |c| t.release(c));
+        hub.taps.remove(&t, End::Closed);
         hub.replan();
-        clip.map(|c| Clip {
-            _place: Some(p),
-            idle,
-            ..c
-        })
+        // With nobody to take it, the outcome is dropped here, on this thread.
+        drop(tx.send(out));
     });
-    Ok((done, tap, place))
+    Ok(Rec {
+        hub: r.hub.clone(),
+        tap: tap.clone(),
+        done,
+        busy,
+        place,
+        stall: r.limits.stall,
+        _ender: Ender(tap),
+    })
 }
 
 /// A keyframe's SPS and PPS, the level left out: an MP4 track keeps the first
@@ -963,42 +1374,47 @@ pub async fn record(State(r): State<Arc<Recorder>>, req: Request) -> Response {
     let Some(zip) = wants_zip(&q) else {
         return err(StatusCode::BAD_REQUEST, BAD_FORMAT);
     };
-    // The deadline ends it.
-    let (done, _tap, _place) = match begin(&r, len).await {
+    // The deadline ends it; a client that leaves first ends it as it goes.
+    let rec = match begin(&r, len).await {
         Ok(d) => d,
         Err(e) => return e,
     };
-    respond(done, zip, "/record", None).await
+    respond(rec.outcome().await, r.limits.idle, zip, "/record", None)
 }
 
 pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
     if !r.on {
         return off();
     }
-    let (done, tap, place) = match begin(&r, r.max).await {
+    let rec = match begin(&r, r.max).await {
         Ok(d) => d,
         Err(e) => return e,
     };
     let id = new_id();
     let n = r.next.fetch_add(1, Ordering::Relaxed);
+    let (tx, outcome) = oneshot::channel();
     r.active.lock().insert(
         id.clone(),
         Active {
-            tap,
-            done,
+            tap: rec.tap.clone(),
+            outcome,
             n,
-            _place: place,
         },
     );
     log::info!("recording {n} started");
-    // Nobody may ever stop it: once it has ended on its own, drop it after a grace period
-    // instead of holding its spool forever.
-    let rec = r.clone();
-    let key = id.clone();
+    // Nobody may ever stop it: once it has ended, its clip waits UNCLAIMED, then goes.
+    let (rec_r, key) = (r.clone(), id.clone());
     tokio::spawn(async move {
-        tokio::time::sleep(rec.max + UNCLAIMED).await;
-        if rec.active.lock().remove(&key).is_some() {
+        let out = rec.outcome().await;
+        if let Err(out) = tx.send(out) {
+            off_workers(out);
+            return;
+        }
+        tokio::time::sleep(UNCLAIMED).await;
+        let gone = rec_r.active.lock().remove(&key);
+        if let Some(a) = gone {
             log::info!("recording {n} was never stopped; discarded");
+            off_workers(a);
         }
     });
     (
@@ -1028,9 +1444,15 @@ pub async fn stop(State(r): State<Arc<Recorder>>, req: Request) -> Response {
     let Some(a) = found else {
         return err(StatusCode::NOT_FOUND, "no such recording");
     };
-    a.tap.end(End::Stopped);
+    a.tap.end(End::Stopped, Instant::now());
     log::info!("recording {} stopped", a.n);
-    respond(a.done, zip, "/record/stop", Some(a.n)).await
+    let out = a.outcome.await.unwrap_or_else(|_| {
+        Err(Failed {
+            end: End::Closed,
+            why: "the recording went away".into(),
+        })
+    });
+    respond(out, r.limits.idle, zip, "/record/stop", Some(a.n))
 }
 
 #[cfg(test)]
