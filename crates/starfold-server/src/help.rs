@@ -11,6 +11,32 @@ WebSocket, and prints a link that signs you in. Flags take --name=value or
 
 Server:
   --addr, --port                listen address (default ADDR_DEFAULT, 6901)
+  --listen-tcp                 listen on --addr/--port (default true)
+  --listen-unix                 also serve on a unix socket (Linux only): makes
+                                this directory (or takes one of yours, mode
+                                0700, whose socket nothing listens on) for
+                                this user alone and listens on the socket s in
+                                it; removes both when it exits (not after a
+                                crash or SIGKILL); the host and origin
+                                checks still apply. Only a peer with this
+                                process's uid is let in (SO_PEERCRED); the same
+                                uid is not separated. Refused unless this
+                                user namespace's uid map is the identity
+                                (/proc/self/uid_map 0 0 4294967295), and unless
+                                every directory from / to it belongs to you or
+                                root and lets no other user rename entries
+                                (e.g. under /tmp, sticky, or your home)
+  --listen-unix-mode            the socket's permissions (default 0600); group
+                                or other write access also lets that class
+                                search the directory and connect, and then
+                                only the peer-uid check keeps them out; with
+                                0600 no other uid can connect at all, except
+                                root or a process with CAP_DAC_OVERRIDE,
+                                CAP_DAC_READ_SEARCH, CAP_FOWNER or CAP_SYS_ADMIN
+  --framed                      every WebSocket message binary, its first byte
+                                0 (binary) or 1 (text), for hops that carry
+                                binary only; the page needs ?framed=1
+                                (default false)
   --title                       the page's title (default: starfold)
   --favicon                     the page's icon: an .ico, .png, .gif, .webp or .svg
                                 file (default: starfold's own)
@@ -269,6 +295,11 @@ fn request(args: &[String]) -> Option<Request> {
     } else {
         None
     }
+}
+
+/// The arguments ask for the help or the version (which [`print_if_asked`] prints).
+pub fn asked(args: &[String]) -> bool {
+    request(args).is_some()
 }
 
 /// Prints the help or the version if the arguments ask for either, and says whether it did.

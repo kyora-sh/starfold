@@ -14,6 +14,7 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { FRAMED_SEND_LIMIT, frameBinary, frameText, unframe } from './frame';
 import { NO_COMMON_CODEC, PROTOCOL_ERROR } from './embed/types';
 import { serveLife } from './life';
 import type { LifeUp } from './life';
@@ -63,6 +64,7 @@ let surface: 'video' | 'canvas' | null = null;
 let painted = false;
 let ws: WebSocket | null = null;
 let url = '';
+let framed = false;
 let link: Link | null = null;
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
@@ -151,8 +153,20 @@ const st = {
 	dropped: 0,
 };
 
+const utf8 = new TextEncoder();
+
+/** Framed, a message over `FRAMED_SEND_LIMIT` isn't sent (framing it would fail);
+ * unframed, everything is sent as it always was. */
+function sendable(n: number): boolean {
+	if (!framed || n <= FRAMED_SEND_LIMIT) return true;
+	console.warn(`[starfold] not sent: a ${n}-byte message is over the limit`);
+	return false;
+}
+
 function send(s: string) {
-	if (ws && ws.readyState === WebSocket.OPEN) ws.send(s);
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	if (framed && !sendable(utf8.encode(s).byteLength)) return;
+	ws.send(framed ? frameText(s) : s);
 }
 function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
@@ -211,8 +225,20 @@ function makeLink(mode: LinkMode) {
 			up({ t: 'connectFailed', id });
 		},
 		message(data) {
+			let m = data;
+			if (framed) {
+				try {
+					if (typeof data === 'string') throw new TypeError('a text message');
+					const f = unframe(data);
+					m = f.t === 'text' ? f.s : f.b;
+				} catch (err) {
+					post({ t: 'log', s: `framed socket: ${err}` });
+					ws?.close(4003, 'not a framed message');
+					return;
+				}
+			}
 			try {
-				onMessage(data);
+				onMessage(m);
 			} catch (e) {
 				protocolFailure(e);
 			}
@@ -705,6 +731,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'init':
 			canvas = m.canvas;
 			url = m.url;
+			framed = m.framed === true;
 			presentToMain = m.presentToMain;
 			ctx = get2dContext(canvas);
 			if (m.embed) {
@@ -720,7 +747,8 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			send(m.d);
 			break;
 		case 'sendBin':
-			if (ws && ws.readyState === WebSocket.OPEN) ws.send(m.d);
+			if (ws && ws.readyState === WebSocket.OPEN && sendable(m.d.byteLength))
+				ws.send(framed ? frameBinary(m.d) : m.d);
 			break;
 		case 'video':
 			if (wantVideo !== m.on) {
