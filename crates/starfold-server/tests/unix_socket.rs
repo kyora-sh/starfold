@@ -933,3 +933,571 @@ fn the_shutdown_signals_come_out_as_they_were_given() {
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
+
+/// How long a test waits for anything it reads from attach or its peers.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+/// Waits up to `within` for `fd` to have something to read, or its end.
+fn readable(fd: &impl std::os::fd::AsRawFd, within: Duration) -> std::io::Result<()> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = within.as_millis().min(i32::MAX as u128) as libc::c_int;
+    match unsafe { libc::poll(&mut p, 1, ms) } {
+        0 => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("nothing to read within {within:?}"),
+        )),
+        n if n < 0 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// Reads `from` to its end, which has to come within `within`.
+fn read_all_within(
+    mut from: impl Read + std::os::fd::AsRawFd,
+    within: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let end = Instant::now() + within;
+    let mut all = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        readable(&from, end.saturating_duration_since(Instant::now()))?;
+        match from.read(&mut buf)? {
+            0 => return Ok(all),
+            n => all.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+/// The child's exit within `within`; past that it is killed and the test fails.
+fn finished(child: &mut Child, within: Duration) -> ExitStatus {
+    exited(child, within).unwrap_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("attach still running after {within:?}")
+    })
+}
+
+/// `starfold attach dir` with these stdin and stdout, and stderr piped to this test.
+fn attach_with(dir: &Path, stdin: Stdio, stdout: Stdio) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_starfold"))
+        .arg("attach")
+        .arg(dir)
+        .env("RUST_LOG", "trace")
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// `starfold attach dir` with its stdin, stdout and stderr piped to this test.
+fn attach(dir: &Path) -> Child {
+    attach_with(dir, Stdio::piped(), Stdio::piped())
+}
+
+/// An attach's stdin and stdout as one stream, either end of which can be let go. A read
+/// waits at most [`DEADLINE`].
+struct Piped {
+    out: Option<std::process::ChildStdout>,
+    into: Option<std::process::ChildStdin>,
+}
+
+impl Piped {
+    fn of(child: &mut Child) -> Piped {
+        Piped {
+            out: child.stdout.take(),
+            into: child.stdin.take(),
+        }
+    }
+}
+
+impl Read for Piped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let out = self.out.as_mut().unwrap();
+        readable(out, DEADLINE)?;
+        out.read(buf)
+    }
+}
+
+impl Write for Piped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.into.as_mut().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.into.as_mut().unwrap().flush()
+    }
+}
+
+/// What the child wrote to stderr, once it has exited.
+fn stderr_of(child: &mut Child) -> String {
+    let said = read_all_within(child.stderr.take().unwrap(), DEADLINE).unwrap();
+    String::from_utf8(said).unwrap()
+}
+
+type Relayed = tokio_tungstenite::tungstenite::WebSocket<Piped>;
+
+/// The next message on a WebSocket through attach, and whether it was one of the server's
+/// pings.
+fn next_through(ws: &mut Relayed) -> (tokio_tungstenite::tungstenite::Message, bool) {
+    let m = ws.read().expect("the WebSocket through attach");
+    let ping = matches!(&m, tokio_tungstenite::tungstenite::Message::Text(t) if t.starts_with(r#"{"t":"ping""#));
+    (m, ping)
+}
+
+/// A WebSocket on `/ws` through a new attach to `dir`, past the server's hello.
+fn ws_through(dir: &Path) -> (Child, Relayed) {
+    let mut child = attach(dir);
+    let (mut ws, reply) =
+        tokio_tungstenite::tungstenite::client("ws://localhost/ws", Piped::of(&mut child))
+            .expect("the upgrade through attach");
+    assert_eq!(reply.status(), 101);
+    loop {
+        if let (tokio_tungstenite::tungstenite::Message::Text(t), _) = next_through(&mut ws) {
+            let j: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if j["t"] == "hello" {
+                break;
+            }
+        }
+    }
+    (child, ws)
+}
+
+/// A directory `d/sf` (mode 0700) with a listening socket of this test's at `s` in it.
+fn own_listener(d: &Path) -> (PathBuf, std::os::unix::net::UnixListener) {
+    let dir = d.join("sf");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let l = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
+    (dir, l)
+}
+
+/// No connection is waiting on `l`.
+fn nothing_connected(l: &std::os::unix::net::UnixListener) {
+    l.set_nonblocking(true).unwrap();
+    match l.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a connection reached the listener: {other:?}"),
+    }
+}
+
+/// The first connection to `l`, which has to come within [`DEADLINE`].
+fn accepted(l: &std::os::unix::net::UnixListener) -> UnixStream {
+    readable(l, DEADLINE).expect("attach never connected");
+    let (s, _) = l.accept().unwrap();
+    s.set_read_timeout(Some(DEADLINE)).unwrap();
+    s
+}
+
+/// Through `starfold attach` over a pipe pair: an HTTP GET gets the server's reply, and
+/// nothing else, on stdout, with stdin held open until the server closes, after which
+/// attach exits 0 with nothing on stderr; a WebSocket upgrade then carries the hello, the
+/// server's pings, a ping of ours answered and a key. The end of stdin (no close frame)
+/// ends the server's session, its cleanup runs (the client is logged as disconnected
+/// after the keys are released), and attach exits 0.
+#[test]
+fn attach_relays_http_and_a_websocket() {
+    use tokio_tungstenite::tungstenite::Message;
+    let x = Display::start();
+    let d = scratch("attach", 0o700);
+    let server = Server::start(&x, &d, &["--listen-tcp=false"]);
+    let dir = d.join("sf");
+
+    let mut child = attach(&dir);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(HEALTHZ).unwrap();
+    let reply = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+    let status = finished(&mut child, Duration::from_secs(10));
+    drop(stdin);
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    let reply = String::from_utf8(reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.ends_with("\r\n\r\nok"), "{reply}");
+
+    let (mut child, mut ws) = ws_through(&dir);
+    let mut pings = 0;
+    while pings < 2 {
+        pings += usize::from(next_through(&mut ws).1);
+    }
+    ws.send(Message::Ping(bytes::Bytes::from_static(b"through attach")))
+        .unwrap();
+    loop {
+        if let (Message::Pong(p), _) = next_through(&mut ws) {
+            assert_eq!(&p[..], b"through attach");
+            break;
+        }
+    }
+    ws.send(Message::Text("k,65,1".into())).unwrap();
+    ws.flush().unwrap();
+    let before = read_log(&server.log).matches(" disconnected").count();
+    let pipes = ws.get_mut();
+    drop(pipes.into.take());
+    let out = pipes.out.take().unwrap();
+    let drained = std::thread::spawn(move || read_all_within(out, DEADLINE).map(|_| ()));
+    let status = finished(&mut child, Duration::from_secs(10));
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    drained.join().unwrap().unwrap();
+    wait_for("the session's cleanup", Duration::from_secs(10), || {
+        (read_log(&server.log).matches(" disconnected").count() > before).then_some(())
+    });
+    drop(server);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A peer that answers only once it has read to the end of what attach sent: after the
+/// end of stdin, attach still relays the whole answer, then exits 0 at the socket's end.
+#[test]
+fn attach_relays_the_reply_that_follows_the_end_of_stdin() {
+    let d = scratch("attach-after-eof", 0o700);
+    let (dir, l) = own_listener(&d);
+    let peer = std::thread::spawn(move || {
+        let mut s = accepted(&l);
+        let mut got = Vec::new();
+        s.read_to_end(&mut got).unwrap();
+        s.write_all(format!("after the end: {}", String::from_utf8(got).unwrap()).as_bytes())
+            .unwrap();
+    });
+    let mut child = attach(&dir);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"the whole request")
+        .unwrap();
+    let out = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+    let status = finished(&mut child, Duration::from_secs(10));
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    assert_eq!(out, b"after the end: the whole request");
+    peer.join().unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// stdout's reader goes away while the socket keeps sending: attach exits 1 promptly,
+/// saying so on stderr.
+#[test]
+fn attach_ends_nonzero_when_stdout_breaks() {
+    let d = scratch("attach-stdout-gone", 0o700);
+    let (dir, l) = own_listener(&d);
+    let peer = std::thread::spawn(move || {
+        let mut s = accepted(&l);
+        let end = Instant::now() + DEADLINE;
+        while Instant::now() < end && s.write_all(b"more").is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let mut child = attach(&dir);
+    let stdin = child.stdin.take().unwrap();
+    drop(child.stdout.take());
+    let status = finished(&mut child, Duration::from_secs(10));
+    let said = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(said.contains("writing stdout"), "{said}");
+    drop(stdin);
+    peer.join().unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// stdin and stdout are pipes set O_NONBLOCK, as a host may hand them over: an empty
+/// stdin and a stdout that fills up are waited on, not errors. An echoing peer gets 1 MiB
+/// back whole, and attach exits 0.
+#[test]
+fn attach_relays_through_nonblocking_pipes() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let pipe = || {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    };
+    let nonblocking = |fd: &OwnedFd| {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+    };
+    let d = scratch("attach-nonblocking", 0o700);
+    let (dir, l) = own_listener(&d);
+    let peer = std::thread::spawn(move || {
+        let mut s = accepted(&l);
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf).unwrap() {
+                0 => break,
+                n => s.write_all(&buf[..n]).unwrap(),
+            }
+        }
+    });
+    let (stdin_r, stdin_w) = pipe();
+    let (stdout_r, stdout_w) = pipe();
+    nonblocking(&stdin_r);
+    nonblocking(&stdout_w);
+    let mut child = attach_with(&dir, Stdio::from(stdin_r), Stdio::from(stdout_w));
+    std::thread::sleep(Duration::from_millis(500));
+    let sent: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
+    let writer = {
+        let sent = sent.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::File::from(stdin_w).write_all(&sent)
+        })
+    };
+    let back = read_all_within(std::fs::File::from(stdout_r), DEADLINE).unwrap();
+    writer.join().unwrap().unwrap();
+    let status = finished(&mut child, Duration::from_secs(10));
+    let said = stderr_of(&mut child);
+    assert!(status.success(), "{status}: {said}");
+    assert_eq!(said, "");
+    assert!(back == sent, "{} bytes back of {}", back.len(), sent.len());
+    peer.join().unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// `DIR` is a symlink (ours, to a directory of ours with a listener in it), or `DIR/s` is
+/// one (to another listener of ours): attach refuses, naming the symlink, with exit 1,
+/// nothing on stdout, and neither listener was connected to.
+#[test]
+fn attach_refuses_a_symlinked_dir_or_socket() {
+    let d = scratch("attach-symlinks", 0o700);
+    let (target, l) = own_listener(&d);
+    let link = d.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let other = d.join("other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(target.join("s"), other.join("s")).unwrap();
+    for (dir, named) in [(&link, link.clone()), (&other, other.join("s"))] {
+        let mut child = attach(dir);
+        let out = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+        let status = finished(&mut child, Duration::from_secs(10));
+        let said = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(1), "{}: {said}", dir.display());
+        assert!(
+            said.contains(&format!("{} is a symlink", named.display())),
+            "{}: {said}",
+            dir.display()
+        );
+        assert!(out.is_empty(), "{}: stdout {out:?}", dir.display());
+        nothing_connected(&l);
+        l.set_nonblocking(false).unwrap();
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A listener whose backlog is full: attach doesn't wait for room, it exits 1 at once,
+/// saying so, with nothing on stdout.
+#[test]
+fn attach_reports_a_full_backlog() {
+    use std::os::fd::AsRawFd;
+    let d = scratch("attach-backlog", 0o700);
+    let (dir, l) = own_listener(&d);
+    assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+    let mut queued = Vec::new();
+    for _ in 0..64 {
+        let s = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(s >= 0);
+        let s = unsafe { std::os::fd::OwnedFd::from_raw_fd(s) };
+        let path = dir.join("s");
+        let path = path.as_os_str().as_encoded_bytes();
+        let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, b) in sun.sun_path.iter_mut().zip(path) {
+            *d = *b as libc::c_char;
+        }
+        let r = unsafe {
+            libc::connect(
+                s.as_raw_fd(),
+                (&raw const sun).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if r < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+            break;
+        }
+        queued.push(s);
+    }
+    let mut child = attach(&dir);
+    let status = finished(&mut child, Duration::from_secs(10));
+    let out = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+    let said = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(said.contains("backlog is full"), "{said}");
+    assert!(out.is_empty(), "stdout {out:?}");
+    drop(queued);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Attach to a directory with nothing listening in it, or with a bad command line: exit 1
+/// (2 for the command line), the error on stderr and not a byte on stdout.
+#[test]
+fn attach_errors_go_to_stderr_alone() {
+    let d = scratch("attach-nothing", 0o700);
+    std::fs::create_dir(d.join("sf")).unwrap();
+    std::fs::set_permissions(d.join("sf"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (args, code, want) in [
+        (
+            vec![d.join("sf").into_os_string()],
+            1,
+            format!("starfold attach {0}: {0}/s: ", d.join("sf").display()),
+        ),
+        (vec![], 2, "usage: starfold attach DIR".to_string()),
+        (
+            vec!["a".into(), "b".into()],
+            2,
+            "usage: starfold attach DIR".to_string(),
+        ),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_starfold"))
+            .arg("attach")
+            .args(&args)
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+        let status = finished(&mut child, Duration::from_secs(10));
+        let said = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(code), "{args:?}: {said}");
+        assert!(said.starts_with(&want), "{args:?}: {said}");
+        assert!(out.is_empty(), "{args:?}: stdout {out:?}");
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Another user puts a listening socket at `DIR/s` (here `DIR` is ours and sticky, so
+/// the walk passes and anyone may add an entry), and sends on every connection at once:
+/// attach connects, reads the listener's uid, refuses with exit 1 naming that uid, and
+/// relays nothing either way: its stdout stays empty and the impostor reads 0 bytes.
+#[test]
+fn attach_refuses_a_listener_of_another_uid() {
+    sudo_works();
+    let user = Throwaway::create();
+    assert_ne!(user.uid, own_uid());
+    let d = scratch("attach-impostor", 0o711);
+    let dir = d.join("sf");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let socket = dir.join("s");
+    let impostor = "import os, socket, sys\n\
+        s = socket.socket(socket.AF_UNIX)\n\
+        s.bind(sys.argv[1])\n\
+        os.chmod(sys.argv[1], 0o666)\n\
+        s.listen(1)\n\
+        print('listening', flush=True)\n\
+        s.settimeout(30)\n\
+        c, _ = s.accept()\n\
+        c.settimeout(10)\n\
+        try:\n    c.sendall(b'from another user')\nexcept OSError:\n    pass\n\
+        data = b''\n\
+        try:\n    \
+        while True:\n        b = c.recv(100)\n        if not b:\n            break\n        \
+        data += b\n\
+        except (ConnectionResetError, TimeoutError):\n    pass\n\
+        print(len(data), flush=True)\n";
+    let mut them = Command::new("sudo")
+        .args(["-n", "-u", &user.name, "--", "python3", "-c", impostor])
+        .arg(&socket)
+        .current_dir("/")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut said_by_them = them.stdout.take().unwrap();
+    let mut line = Vec::new();
+    while !line.ends_with(b"listening\n") {
+        readable(&said_by_them, DEADLINE).expect("the impostor never listened");
+        let mut b = [0u8];
+        assert_eq!(said_by_them.read(&mut b).unwrap(), 1, "the impostor ended");
+        line.push(b[0]);
+    }
+    let mut child = attach(&dir);
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(HEALTHZ);
+    let out = read_all_within(child.stdout.take().unwrap(), DEADLINE).unwrap();
+    let status = finished(&mut child, Duration::from_secs(10));
+    drop(stdin);
+    let said = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(
+        said.contains(&format!(
+            "refusing: the listener is uid {}, not this process's uid {}",
+            user.uid,
+            own_uid()
+        )),
+        "{said}"
+    );
+    assert!(out.is_empty(), "stdout {out:?}");
+    let count = read_all_within(said_by_them, DEADLINE).unwrap();
+    let status = finished(&mut them, Duration::from_secs(10));
+    let their_err = read_all_within(them.stderr.take().unwrap(), DEADLINE).unwrap();
+    assert!(status.success(), "{}", String::from_utf8_lossy(&their_err));
+    assert_eq!(String::from_utf8_lossy(&count).trim(), "0");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A WebSocket through attach left idle by its client for ten minutes stays up: the
+/// server's pings keep arriving through it, and a ping of ours is still answered at the
+/// end. Ignored by default for its length: `cargo test --test unix_socket -- --ignored
+/// attach_keeps_an_idle_websocket_up --nocapture`.
+#[test]
+#[ignore = "takes ten minutes"]
+fn attach_keeps_an_idle_websocket_up() {
+    use tokio_tungstenite::tungstenite::Message;
+    let x = Display::start();
+    let d = scratch("attach-idle", 0o700);
+    let server = Server::start(&x, &d, &["--listen-tcp=false"]);
+    let (mut child, mut ws) = ws_through(&d.join("sf"));
+    let start = Instant::now();
+    let (mut pings, mut last) = (0u64, Instant::now());
+    let mut longest = Duration::ZERO;
+    while start.elapsed() < Duration::from_secs(600) {
+        if next_through(&mut ws).1 {
+            pings += 1;
+            longest = longest.max(last.elapsed());
+            last = Instant::now();
+        }
+    }
+    println!(
+        "idle {:?} through attach: {pings} server pings, longest gap {longest:?}",
+        start.elapsed()
+    );
+    assert!(pings >= 600, "{pings} pings");
+    assert!(longest < Duration::from_secs(5), "a gap of {longest:?}");
+    ws.send(Message::Ping(bytes::Bytes::from_static(b"still here")))
+        .unwrap();
+    loop {
+        if let (Message::Pong(p), _) = next_through(&mut ws) {
+            assert_eq!(&p[..], b"still here");
+            break;
+        }
+    }
+    assert!(child.try_wait().unwrap().is_none(), "attach ended");
+    drop(ws);
+    let _ = exited(&mut child, Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(server);
+    std::fs::remove_dir_all(&d).unwrap();
+}

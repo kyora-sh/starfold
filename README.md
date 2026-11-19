@@ -338,6 +338,34 @@ whose own user namespace maps the expected uid and the would-be impostor's: in a
 namespace that doesn't, an unmapped listener reads as the overflow uid, which can equal
 the uid the client expects.
 
+**`starfold attach DIR`** is such a client, for hosts that hand each connection to a
+process of their own (a pod exec stream with no tty, say): it connects to `DIR/s` and
+relays bytes between it and its stdin and stdout, unchanged, one connection per run.
+Before a byte goes either way it checks its own side as the server does (the identity
+uid map, and the walk from `/` to `DIR` by the rules above; `DIR` itself and `DIR/s`
+must not be symlinks) and reads the listener's uid, refusing unless it is its own. That
+uid is the one the kernel recorded when the listener called `listen` (`SO_PEERCRED`): a
+process that listens and then hands the socket to another uid isn't caught by it. A full
+backlog is an error, not a wait. It never takes a socket path, never retries and never
+connects anywhere else. It doesn't parse or authenticate what it relays: the server's
+login and host checks apply to the relayed request, so a host relaying a browser's
+requests sends `Host: localhost` (or a name in `--allowed-hosts`). stdout carries only
+the relayed bytes; errors go to stderr with exit status 1. At the end of stdin it shuts
+the socket's write side down and relays the server's reply until the server closes; at
+the end of the socket it exits 0. It has no idle timeout of its own; a viewer's
+WebSocket carries the server's pings.
+
+```sh
+starfold --listen-unix /run/sf/view --listen-tcp=false   # the server, once
+starfold attach /run/sf/view                             # per connection, same uid
+```
+
+With the default `--listen-unix-mode=0600` only the server's uid can connect, so run
+`attach` as that uid (an exec into the same container usually is). Each connection is
+one run: a viewer's `/ws` holds its own for the viewer's life, and the page's other
+requests need one more (keep-alive) or one each. On other platforms `attach` is refused,
+as `--listen-unix` is.
+
 What isn't claimed:
 
 - **The same uid is not separated.** In a sandbox where other code runs as starfold's
