@@ -3243,8 +3243,12 @@ fn encode_loop(
             })
             .collect();
         deliver(&hub, sh.id, frame_id, all_key, total, &msgs);
-        hub.taps
-            .offer(&mut taps, sh.id, (sh.w, sh.h), all_key, captured_at, &msgs);
+        let from = crate::record::tap::Source {
+            cohort: sh.id,
+            codec: sh.cand.codec,
+            size: (sh.w, sh.h),
+        };
+        hub.taps.offer(&mut taps, from, all_key, captured_at, &msgs);
         finish(force_idr);
         hub.stats
             .send_lat_us

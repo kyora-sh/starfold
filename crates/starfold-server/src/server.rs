@@ -3635,14 +3635,13 @@ mod tests {
         let mut seen = crate::record::tap::Seen::default();
         for frame in [&key, &delta, &delta] {
             let msg = Bytes::copy_from_slice(frame);
-            hub.taps.offer(
-                &mut seen,
-                1,
-                (64, 32),
-                frame[1] == 1,
-                Instant::now(),
-                &[msg],
-            );
+            let from = crate::record::tap::Source {
+                cohort: 1,
+                codec: crate::encoder::Codec::H264,
+                size: (64, 32),
+            };
+            hub.taps
+                .offer(&mut seen, from, frame[1] == 1, Instant::now(), &[msg]);
         }
         let stop = format!("/record/stop?id={id}");
         let (status, clip) = ask(port, "POST", &stop, "").await;

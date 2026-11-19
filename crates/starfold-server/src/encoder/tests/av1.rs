@@ -1,6 +1,6 @@
 //! The web client's `codecs.test.ts` AV1 cases, against the server's port.
 
-use super::super::av1::{codec_string, sequence_header};
+use super::super::av1::{av1c, codec_string, sequence_header};
 
 #[derive(Default)]
 struct BitWriter {
@@ -65,9 +65,15 @@ fn the_8_bit_design_example() {
     ] {
         w = w.f(n, v);
     }
+    let tu = temporal_unit(&w.bytes());
     assert_eq!(
-        codec_string(&temporal_unit(&w.bytes())).as_deref(),
+        codec_string(&tu).as_deref(),
         Some("av01.0.13M.08.0.110.01.13.06.0")
+    );
+    // Profile 0, level 13, main tier, 8-bit 4:2:0, chroma sample position 0.
+    assert_eq!(
+        av1c(sequence_header(&tu).unwrap()),
+        Some([0x81, 13, 0x0c, 0])
     );
 }
 
@@ -133,9 +139,15 @@ fn timing_info_two_operating_points_high_tier_10_bit_full_range() {
     ] {
         w = w.f(n, v);
     }
+    let tu = temporal_unit(&w.bytes());
     assert_eq!(
-        codec_string(&temporal_unit(&w.bytes())).as_deref(),
+        codec_string(&tu).as_deref(),
         Some("av01.0.16H.10.0.112.09.16.09.1")
+    );
+    // Level 16, high tier, 10-bit, 4:2:0, chroma sample position 2.
+    assert_eq!(
+        av1c(sequence_header(&tu).unwrap()),
+        Some([0x81, 16, 0x80 | 0x40 | 0x0c | 2, 0])
     );
 }
 

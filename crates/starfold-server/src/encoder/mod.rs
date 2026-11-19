@@ -3,18 +3,11 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
-#[cfg(any(
-    feature = "libaom",
-    feature = "svt-av1",
-    target_os = "linux",
-    windows,
-    test
-))]
 #[cfg_attr(
     not(any(feature = "libaom", feature = "svt-av1", target_os = "linux", windows)),
     allow(dead_code)
 )]
-mod av1;
+pub(crate) mod av1;
 pub mod caps;
 mod h264;
 #[cfg(any(
