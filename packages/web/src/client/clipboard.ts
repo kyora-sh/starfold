@@ -47,6 +47,10 @@ export function createClipboard(app: App) {
 		noteLocal(text: string) {
 			last = text;
 		},
+		/** Removes the window listener. */
+		dispose() {
+			window.removeEventListener('focus', flush);
+		},
 	};
 }
 

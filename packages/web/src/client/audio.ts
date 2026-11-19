@@ -2,12 +2,15 @@
 // over a MessageChannel, so audio never waits on the main thread.
 import type { App } from './app';
 
-export function createAudio(app: App) {
+/** `worklet`: the player's script, beside the page unless embedded. */
+export function createAudio(app: App, worklet: string | URL = 'audio.js') {
 	let started = false;
+	let closed = false;
 	let ac: AudioContext | null = null;
 
 	/** Starts (or resumes) playback; browsers only allow it after a user gesture. */
 	async function start() {
+		if (closed) return;
 		if (ac && ac.state === 'suspended') {
 			ac.resume().catch(() => {});
 			return;
@@ -16,7 +19,8 @@ export function createAudio(app: App) {
 		started = true;
 		try {
 			ac = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
-			await ac.audioWorklet.addModule('audio.js');
+			await ac.audioWorklet.addModule(worklet);
+			if (closed) return;
 			const node = new AudioWorkletNode(ac, 'pcm-player', {
 				outputChannelCount: [2],
 			});
@@ -29,5 +33,11 @@ export function createAudio(app: App) {
 			console.warn('[starfold] audio unavailable', err);
 		}
 	}
-	return { start };
+	/** Stops playback for good (embedded: on unmount). */
+	function close() {
+		closed = true;
+		ac?.close().catch(() => {});
+		ac = null;
+	}
+	return { start, close };
 }

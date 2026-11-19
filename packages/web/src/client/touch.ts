@@ -132,5 +132,10 @@ export function createTouch(app: App, hooks: Hooks) {
 		pts.delete(e.pointerId);
 		if (pts.size === 0) mode = null;
 	}
-	return { down, move, up, cancel };
+	/** Stops the long-press timer for good (embedded: on unmount). */
+	function dispose() {
+		clearTimeout(timer);
+		timer = undefined;
+	}
+	return { down, move, up, cancel, dispose };
 }

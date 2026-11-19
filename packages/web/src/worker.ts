@@ -14,6 +14,11 @@ import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
+import { PROTOCOL_ERROR } from './embed/types';
+import { serveLife } from './life';
+import type { LifeUp } from './life';
+import { Link } from './link';
+import type { LinkMode } from './link';
 import { FellBehind, StreamRate } from './pace';
 import { configKey, dav1dDecodes, decoderConfig, probe } from './probe';
 import type { Accepted } from './probe';
@@ -58,6 +63,7 @@ let surface: 'video' | 'canvas' | null = null;
 let painted = false;
 let ws: WebSocket | null = null;
 let url = '';
+let link: Link | null = null;
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let audioDecoder: AudioDecoder | null = null;
@@ -152,47 +158,86 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
 	self.postMessage(m, transfer);
 }
 
-function connect() {
-	const sock = new WebSocket(url);
-	ws = sock;
-	conn++;
-	rate = new StreamRate();
-	behind = new FellBehind();
-	hzOwed = false;
-	sock.binaryType = 'arraybuffer';
-	sock.addEventListener('open', () => {
-		post({ t: 'status', s: 'open' });
-		send(cmd.audio(wantAudio));
+/** Embedded: the page's lifecycle port (life.ts); nothing from the server is posted on it. */
+let life: MessagePort | null = null;
+function up(m: LifeUp) {
+	life?.postMessage(m, []);
+}
+
+/**
+ * Something the server sent could not be handled. Embedded, the attempt ends: the socket is
+ * closed and the page hears PROTOCOL_ERROR. The served page goes on as before (the error is
+ * thrown and the stream carries on).
+ */
+function protocolFailure(e: unknown) {
+	if (!life) throw e;
+	link?.abort(PROTOCOL_ERROR.code, PROTOCOL_ERROR.reason);
+}
+
+/** protocolFailure for work started on connection `c`: once a newer socket exists, it is dropped. */
+const failureOf = (c: number) => (e: unknown) => {
+	if (life && c !== conn) return;
+	protocolFailure(e);
+};
+
+function makeLink(mode: LinkMode) {
+	return new Link(url, mode, {
+		opening(sock) {
+			ws = sock;
+			conn++;
+			rate = new StreamRate();
+			behind = new FellBehind();
+			hzOwed = false;
+		},
+		open(id) {
+			if (life) up({ t: 'open', id });
+			else post({ t: 'status', s: 'open' });
+			send(cmd.audio(wantAudio));
+		},
+		closed(id, code, reason) {
+			if (life) up({ t: 'closed', id, code, reason });
+			else post({ t: 'status', s: 'closed' });
+			proto = 0;
+			videoSent = false;
+			epoch = 0;
+			ready = false;
+			encoder = null;
+			resetDecoder();
+		},
+		askPreamble(id) {
+			up({ t: 'preamble', id });
+		},
+		connectFailed(id) {
+			up({ t: 'connectFailed', id });
+		},
+		message(data) {
+			try {
+				onMessage(data);
+			} catch (e) {
+				protocolFailure(e);
+			}
+		},
 	});
-	sock.addEventListener('close', () => {
-		post({ t: 'status', s: 'closed' });
-		proto = 0;
-		videoSent = false;
-		epoch = 0;
-		ready = false;
-		encoder = null;
-		resetDecoder();
-		setTimeout(connect, 1000);
-	});
-	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
-		if (typeof e.data === 'string') return onText(e.data);
-		const b = new Uint8Array(e.data);
-		switch (b[0]) {
-			case Bin.Video:
-			case Bin.VideoV2:
-				onVideo(b);
-				break;
-			case Bin.Audio:
-				onAudio(b);
-				break;
-			case Bin.Cursor:
-				post({ t: 'cursor', buf: e.data }, [e.data]);
-				break;
-			case Bin.ClipImage:
-				post({ t: 'clipImage', buf: e.data }, [e.data]);
-				break;
-		}
-	});
+}
+
+function onMessage(data: string | ArrayBuffer) {
+	if (typeof data === 'string') return onText(data);
+	const b = new Uint8Array(data);
+	switch (b[0]) {
+		case Bin.Video:
+		case Bin.VideoV2:
+			onVideo(b);
+			break;
+		case Bin.Audio:
+			onAudio(b);
+			break;
+		case Bin.Cursor:
+			post({ t: 'cursor', buf: data }, [data]);
+			break;
+		case Bin.ClipImage:
+			post({ t: 'clipImage', buf: data }, [data]);
+			break;
+	}
 }
 
 function onText(s: string) {
@@ -250,7 +295,7 @@ function onHello(m: Hello) {
 	// Each hello (the first, and one per new screen size) is answered with what decodes
 	// at its sizes; the last picture stays up until the server's next `codec`.
 	proto = 2;
-	void answer(conn, ++helloSeq, m.offer, m.videoOffers);
+	answer(conn, ++helloSeq, m.offer, m.videoOffers).catch(failureOf(conn));
 }
 
 async function supported(c: VideoDecoderConfig): Promise<boolean> {
@@ -312,7 +357,7 @@ function onCodec(m: CodecMessage) {
 		post(m);
 		return;
 	}
-	void configure(conn, m);
+	configure(conn, m).catch(failureOf(conn));
 }
 
 async function plan(m: Extract<CodecMessage, { w: number }>) {
@@ -658,7 +703,14 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			url = m.url;
 			presentToMain = m.presentToMain;
 			ctx = get2dContext(canvas);
-			connect();
+			if (m.embed) {
+				life = m.embed.life;
+				link = makeLink({ embed: true, protocols: m.embed.protocols });
+				serveLife(life, link);
+			} else {
+				link = makeLink({ embed: false });
+			}
+			link.start();
 			break;
 		case 'send':
 			send(m.d);
