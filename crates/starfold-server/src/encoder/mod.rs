@@ -460,6 +460,8 @@ impl Backend {
             Backend::OpenH264 => true,
             #[cfg(feature = "x264")]
             Backend::X264 => true,
+            #[cfg(feature = "libaom")]
+            Backend::Libaom => true,
             _ => false,
         }
     }

@@ -1,12 +1,18 @@
 //! libaom (BSD-2-Clause, only with the `libaom` feature, built from source by
 //! starfold-aom-sys): AV1 in realtime mode with the screen-content tools (palette, intra
 //! block copy), as WebRTC AV1 screen share uses it.
+//!
+//! A paint-over is sharpened by QP, as with x264: a refinement frame runs at a fixed
+//! quantizer and predicts from the last picture named as GOLDEN, with LAST itself off.
+//! libaom's real-time path skips a block whose source didn't change only when LAST is a
+//! reference, so this is what makes it re-code a still picture.
 
 use starfold_aom_sys as ffi;
 
+use super::sharpness::Sharpness;
 use super::{
     av1, AccessUnit, BitstreamFormat, Codec, ColorInfo, EncodeError, EncodeOptions, EncoderConfig,
-    FrameView, RateConfig, StreamConfig, VideoEncoder,
+    FrameView, RateConfig, Refine, StreamConfig, VideoEncoder,
 };
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uint};
@@ -15,6 +21,19 @@ use std::ptr;
 const MAX_Q: u32 = 63;
 const UNCAPPED_KBPS: u32 = 200_000;
 const SPEED: c_int = 9;
+/// The quantizer of the ladder's last rung (H.264 QP 12 and below): on video, the one that
+/// settles where x264's paint-over does.
+const FINEST_Q: c_int = 4;
+const FINEST_QP: u8 = 12;
+
+const LAST: usize = 0;
+const GOLDEN: usize = 3;
+/// The buffer slot no frame refreshes, for the reference names a frame doesn't use.
+const SPARE: c_int = 7;
+/// What a frame under rate control records for the blocks it touched: unknown, above any QP a
+/// pass can aim for. libaom skips the blocks whose source didn't change at whatever quantizer
+/// the frame runs, so the frame's own says nothing about them.
+const MOTION_QP: i32 = 52;
 
 pub struct Aom {
     // libaom keeps pointers to the configuration it was given, so neither may move.
@@ -23,9 +42,55 @@ pub struct Aom {
     pts: i64,
     duration: u64,
     announced: bool,
+    fresh: bool,
+    sharpness: Sharpness,
 }
 
 unsafe impl Send for Aom {}
+
+/// The ladder's H.264 QP as libaom's quantizer: `qp * 63 / 51` from QP 16 up, and four
+/// quantizers a step from QP 16's 20 down to the last rung's [`FINEST_Q`] at QP 12.
+pub(crate) fn quantizer(qp: u8) -> c_int {
+    let qp = qp.max(FINEST_QP) as c_int;
+    if qp >= 16 {
+        ((qp * MAX_Q as c_int + 25) / 51).min(MAX_Q as c_int)
+    } else {
+        FINEST_Q + (qp - FINEST_QP as c_int) * 4
+    }
+}
+
+/// Every pass aims at the last rung, whatever rung it was asked for: the pass's budget, not
+/// the ladder, decides how fine it gets, so a picture whose whole repaint fits one budget is
+/// sharp after one pass instead of three, and a larger one goes as far as each budget allows.
+fn finest(r: Refine) -> Refine {
+    Refine { qp: FINEST_QP, ..r }
+}
+
+/// libaom's quantizer `q` as the lowest H.264 QP whose [`quantizer`] is at least `q`: a pass
+/// at any finer QP still sharpens a picture coded at `q`.
+pub(crate) fn as_qp(q: c_int) -> i32 {
+    (FINEST_QP..=51)
+        .find(|&qp| quantizer(qp) >= q)
+        .unwrap_or(51) as i32
+}
+
+/// An inter frame's references: LAST on slot 0, or for a refinement slot 0 named as GOLDEN
+/// with LAST off. Only slot 0 is refreshed, and every name a frame doesn't use points at the
+/// spare slot: a name left on slot 0 would be refreshed with it, and libaom's rate control
+/// would count every frame as a golden one.
+pub(crate) fn references(refine: bool) -> ffi::aom_svc_ref_frame_config_t {
+    let mut c: ffi::aom_svc_ref_frame_config_t = unsafe { std::mem::zeroed() };
+    c.ref_idx = [SPARE; 7];
+    c.ref_idx[LAST] = 0;
+    c.refresh[0] = 1;
+    if refine {
+        c.ref_idx[GOLDEN] = 0;
+        c.reference[GOLDEN] = 1;
+    } else {
+        c.reference[LAST] = 1;
+    }
+    c
+}
 
 fn lowest_q(quality: f32) -> u32 {
     (quality.round().max(0.0) as u32).min(MAX_Q)
@@ -90,6 +155,11 @@ impl Aom {
                 pts: -1,
                 duration: (1000 / c.fps.max(1)).max(1) as u64,
                 announced: false,
+                fresh: true,
+                sharpness: Sharpness::new(
+                    c.width.div_ceil(16) as usize * c.height.div_ceil(16) as usize,
+                    51,
+                ),
             };
             enc.controls(speed)?;
             Ok(enc)
@@ -104,6 +174,80 @@ impl Aom {
         } else {
             Err(self.error(&format!("control {id}")))
         }
+    }
+
+    fn set_references(&mut self, refine: bool) -> Result<(), EncodeError> {
+        let mut c = references(refine);
+        let ctx: *mut ffi::aom_codec_ctx_t = &mut *self.ctx;
+        let r = unsafe {
+            ffi::aom_codec_control(
+                ctx,
+                ffi::aome_enc_control_id_AV1E_SET_SVC_REF_FRAME_CONFIG as c_int,
+                &mut c as *mut ffi::aom_svc_ref_frame_config_t,
+            )
+        };
+        if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
+            Ok(())
+        } else {
+            Err(self.error("reference config"))
+        }
+    }
+
+    pub(crate) fn last_quantizer(&mut self) -> Result<c_int, EncodeError> {
+        let mut q: c_int = 0;
+        let ctx: *mut ffi::aom_codec_ctx_t = &mut *self.ctx;
+        let r = unsafe {
+            ffi::aom_codec_control(
+                ctx,
+                ffi::aome_enc_control_id_AOME_GET_LAST_QUANTIZER_64 as c_int,
+                &mut q as *mut c_int,
+            )
+        };
+        if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
+            Ok(q)
+        } else {
+            Err(self.error("last quantizer"))
+        }
+    }
+
+    /// The last frame's luma as a decoder sees it, `g_w` bytes a row.
+    #[cfg(test)]
+    pub(crate) fn reconstruction(&mut self) -> Result<Vec<u8>, EncodeError> {
+        let mut img: ffi::aom_image_t = unsafe { std::mem::zeroed() };
+        let ctx: *mut ffi::aom_codec_ctx_t = &mut *self.ctx;
+        let r = unsafe {
+            ffi::aom_codec_control(
+                ctx,
+                ffi::aom_com_control_id_AV1_GET_NEW_FRAME_IMAGE as c_int,
+                &mut img as *mut ffi::aom_image_t,
+            )
+        };
+        if r != ffi::aom_codec_err_t_AOM_CODEC_OK || img.planes[0].is_null() {
+            return Err(self.error("reconstruction"));
+        }
+        let (w, h) = (self.cfg.g_w as usize, self.cfg.g_h as usize);
+        let stride = img.stride[0] as usize;
+        let wide = img.fmt & ffi::AOM_IMG_FMT_HIGHBITDEPTH != 0;
+        Ok((0..h)
+            .flat_map(|r| (0..w).map(move |c| (r, c)))
+            .map(|(r, c)| unsafe {
+                if wide {
+                    (img.planes[0].add(r * stride + 2 * c) as *const u16).read_unaligned() as u8
+                } else {
+                    *img.planes[0].add(r * stride + c)
+                }
+            })
+            .collect())
+    }
+
+    /// Back to the stream's rate control after a refinement's fixed quantizer, which also
+    /// turned adaptive quantisation off.
+    fn restore(&mut self) -> Result<(), EncodeError> {
+        let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &*self.cfg) };
+        if r != ffi::aom_codec_err_t_AOM_CODEC_OK {
+            return Err(self.error("rate restore after a refinement"));
+        }
+        self.control(ffi::aome_enc_control_id_AV1E_SET_AQ_MODE, 3)
     }
 
     fn controls(&mut self, speed: c_int) -> Result<(), EncodeError> {
@@ -229,39 +373,92 @@ impl VideoEncoder for Aom {
             )));
         }
         p.check()?;
-        self.pts = opts.pts_ms.max(self.pts + 1);
-        let flags = if opts.force_keyframe {
-            ffi::AOM_EFLAG_FORCE_KF as ffi::aom_enc_frame_flags_t
-        } else {
-            0
-        };
-        unsafe {
-            let mut img: ffi::aom_image_t = std::mem::zeroed();
-            let wrapped = ffi::aom_img_wrap(
+        let mbs = p.width.div_ceil(16) as usize * p.height.div_ceil(16) as usize;
+        if opts.static_mbs.as_ref().is_some_and(|m| m.len() < mbs) {
+            return Err(EncodeError(format!(
+                "macroblock map has fewer than {mbs} entries"
+            )));
+        }
+        let key = opts.force_keyframe || self.fresh;
+        let refine = opts.refine.filter(|_| !key).map(finest);
+        let fixed = refine.and_then(|r| self.sharpness.pick(r));
+        if refine.is_some() && fixed.is_none() {
+            self.sharpness.skipped();
+            return Ok(Vec::new());
+        }
+        let mut img: ffi::aom_image_t = unsafe { std::mem::zeroed() };
+        let wrapped = unsafe {
+            ffi::aom_img_wrap(
                 &mut img,
                 ffi::aom_img_fmt_AOM_IMG_FMT_I420,
                 p.width as c_uint,
                 p.height as c_uint,
                 1,
                 p.y.as_ptr() as *mut u8,
-            );
-            if wrapped.is_null() {
-                return Err(EncodeError("aom_img_wrap failed".into()));
-            }
-            img.planes[0] = p.y.as_ptr() as *mut u8;
-            img.planes[1] = p.u.as_ptr() as *mut u8;
-            img.planes[2] = p.v.as_ptr() as *mut u8;
-            img.stride[0] = p.stride_y as c_int;
-            img.stride[1] = p.stride_uv as c_int;
-            img.stride[2] = p.stride_uv as c_int;
-            img.range = ffi::aom_color_range_AOM_CR_STUDIO_RANGE;
-            let r =
-                ffi::aom_codec_encode(&mut *self.ctx, &img, self.pts, self.duration as _, flags);
-            if r != ffi::aom_codec_err_t_AOM_CODEC_OK {
-                return Err(self.error("encode"));
+            )
+        };
+        if wrapped.is_null() {
+            return Err(EncodeError("aom_img_wrap failed".into()));
+        }
+        img.planes[0] = p.y.as_ptr() as *mut u8;
+        img.planes[1] = p.u.as_ptr() as *mut u8;
+        img.planes[2] = p.v.as_ptr() as *mut u8;
+        img.stride[0] = p.stride_y as c_int;
+        img.stride[1] = p.stride_uv as c_int;
+        img.stride[2] = p.stride_uv as c_int;
+        img.range = ffi::aom_color_range_AOM_CR_STUDIO_RANGE;
+        self.pts = opts.pts_ms.max(self.pts + 1);
+        let flags = if opts.force_keyframe {
+            ffi::AOM_EFLAG_FORCE_KF as ffi::aom_enc_frame_flags_t
+        } else {
+            0
+        };
+        if !key {
+            self.set_references(fixed.is_some())?;
+        }
+        if let Some(qp) = fixed {
+            let q = quantizer(qp as u8);
+            if let Err(e) = self.control(ffi::aome_enc_control_id_AV1E_SET_QUANTIZER_ONE_PASS, q) {
+                let _ = self.restore();
+                return Err(e);
             }
         }
-        self.collect()
+        let r = unsafe {
+            ffi::aom_codec_encode(&mut *self.ctx, &img, self.pts, self.duration as _, flags)
+        };
+        let out = if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
+            self.fresh = false;
+            self.collect()
+        } else {
+            Err(self.error("encode"))
+        };
+        let q = match out {
+            Ok(_) => self.last_quantizer(),
+            Err(_) => Ok(0),
+        };
+        let restored = match fixed {
+            Some(_) => self.restore(),
+            None => Ok(()),
+        };
+        let (out, q) = (out?, q?);
+        restored?;
+        let bytes: usize = out.iter().map(|a| a.data.len()).sum();
+        if bytes > 0 {
+            match fixed {
+                Some(qp) if q == quantizer(qp as u8) => self.sharpness.refined(qp, bytes),
+                Some(_) => self.sharpness.refined(as_qp(q), bytes),
+                None => {
+                    let whole = out.iter().any(|a| a.keyframe);
+                    let map = opts.static_mbs.as_deref().filter(|_| !whole);
+                    self.sharpness.moved(MOTION_QP, map.map(|m| &m[..mbs]));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn refinable(&self, r: Refine) -> bool {
+        self.sharpness.pick(finest(r)).is_some()
     }
 
     fn drain(&mut self) -> Result<Vec<AccessUnit>, EncodeError> {

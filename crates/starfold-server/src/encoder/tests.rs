@@ -1,6 +1,8 @@
 use super::h264::{nal_type, nal_units, ParamSets, NAL_IDR, NAL_PPS, NAL_SPS};
 use super::*;
 
+#[cfg(feature = "libaom")]
+mod aom;
 #[cfg(feature = "sw-arm")]
 mod arms;
 mod av1;
