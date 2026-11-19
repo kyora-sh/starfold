@@ -705,12 +705,12 @@ async fn serve(
     // --enable-basic-auth=false.
     let login =
         login::Login::from_args(&a).map(|(l, generated)| (std::sync::Arc::new(l), generated));
-    let app = base_path::compose(
+    let app = axum::ServiceExt::<axum::extract::Request>::into_make_service(base_path::compose(
         server::router(state),
         base.as_ref(),
         login.as_ref().map(|(l, _)| l.clone()),
         access,
-    );
+    ));
     // A port that can't be had ends the process through `exit`, which removes the unix
     // socket bound before it.
     let tcp = match listen.tcp {

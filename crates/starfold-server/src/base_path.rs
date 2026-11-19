@@ -7,8 +7,9 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, Uri};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::Router;
+use std::convert::Infallible;
 use std::sync::Arc;
+use tower::{Service, ServiceBuilder};
 
 /// The longest prefix taken, in bytes. A prefix is part of every URL the page asks for and
 /// counts against what an HTTP/1.1 request line may hold (the server's parser takes 64 KiB;
@@ -100,29 +101,56 @@ pub fn from_args(args: &[String]) -> Result<Option<BasePath>, String> {
 /// goes through the same checks as `PREFIX/` and is then sent on to it, so the page's
 /// relative URLs resolve under the prefix; any other path goes through them and is then not
 /// found, before any route sees it.
-pub fn compose(
-    routes: Router,
+///
+/// Each check wraps the routes as one service rather than as a layer of their router, so
+/// `settle` answers before routing: a route would add its own headers, such as `Allow`, to
+/// an answer for an outside path. In order, a request meets the prefix, the host and origin
+/// check (a request for the wrong host or from another site's page is turned away before the
+/// login is asked for), the login, then `settle`.
+pub fn compose<S>(
+    routes: S,
     base: Option<&BasePath>,
     login: Option<Arc<Login>>,
     access: Arc<Access>,
-) -> Router {
-    // Under a prefix the routes sit behind one service, so `settle` answers before routing
-    // (a route would add its own headers, such as `Allow`, to an answer for an outside path).
-    let mut app = match base {
-        Some(_) => Router::new()
-            .fallback_service(routes)
-            .layer(from_fn(settle)),
-        None => routes,
-    };
-    if let Some(l) = login {
-        app = app.layer(from_fn_with_state(l, login::check));
-    }
-    // Added last, so it runs first: a request for the wrong host or from another site's
-    // page is turned away before the login is asked for.
-    let app = app.layer(from_fn_with_state(access, access::check));
-    match base {
-        None => app,
-        Some(p) => app.layer(from_fn_with_state(p.0.clone(), mark)),
+) -> impl App
+where
+    S: App,
+{
+    ServiceBuilder::new()
+        .layer(from_fn_with_state(base.map(|p| p.0.clone()), mark))
+        .layer(from_fn_with_state(access, access::check))
+        .layer(from_fn_with_state(login, check_login))
+        .layer(from_fn(settle))
+        .service(routes)
+}
+
+/// What `axum::serve` can serve: the server's routes, and what [`compose`] makes of them.
+pub trait App:
+    Service<Request, Response = Response, Error = Infallible, Future: Send + 'static>
+    + Clone
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<T> App for T where
+    T: Service<Request, Response = Response, Error = Infallible, Future: Send + 'static>
+        + Clone
+        + Send
+        + Sync
+        + 'static
+{
+}
+
+async fn check_login(
+    State(login): State<Option<Arc<Login>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match login {
+        Some(l) => login::check(State(l), req, next).await,
+        None => next.run(req).await,
     }
 }
 
@@ -137,7 +165,10 @@ enum Mark {
 
 /// Strips the prefix, so the checks and routes see the paths they see without one, and
 /// marks the requests that aren't for something under it.
-async fn mark(State(prefix): State<Arc<str>>, mut req: Request, next: Next) -> Response {
+async fn mark(State(prefix): State<Option<Arc<str>>>, mut req: Request, next: Next) -> Response {
+    let Some(prefix) = prefix else {
+        return next.run(req).await;
+    };
     let uri = req.uri();
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let (path, mark) = if uri.path() == &*prefix {

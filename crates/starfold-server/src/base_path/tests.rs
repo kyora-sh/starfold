@@ -2,6 +2,7 @@ use super::*;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::Uri;
 use axum::routing::get;
+use axum::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "pw";
@@ -23,7 +24,7 @@ fn routes() -> Router {
 }
 
 /// What `serve` serves: the routes with the login on and the host check, under `base`.
-fn app(base: Option<&str>) -> Router {
+fn app(base: Option<&str>) -> impl App {
     let login = Arc::new(crate::login::Login::new(None, PASSWORD.into()));
     let access = Arc::new(crate::access::Access::new(None, None));
     let base = base.map(|p| BasePath::parse(p).expect("a valid prefix"));
@@ -34,11 +35,12 @@ fn prefix(p: &str) -> BasePath {
     BasePath::parse(p).expect("a valid prefix")
 }
 
-/// Serves `router` on a loopback port and returns the port.
-async fn serve(router: Router) -> u16 {
+/// Serves `app` on a loopback port and returns the port.
+async fn serve(app: impl App) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = axum::ServiceExt::<Request>::into_make_service(app);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     port
 }
 
