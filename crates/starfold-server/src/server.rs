@@ -174,6 +174,7 @@ pub fn router(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let read_only = state.read_only;
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
@@ -194,6 +195,11 @@ pub fn router(state: AppState) -> Router {
         .merge(record_routes)
         .merge(wait_routes)
         .merge(debug_routes)
+        // --read-only, for every route above (readonly.rs).
+        .layer(axum::middleware::from_fn_with_state(
+            read_only,
+            crate::readonly::check,
+        ))
 }
 
 async fn renegotiate(State(hub): State<Arc<Hub>>) -> Response {
@@ -337,32 +343,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     };
     let mut rtts: std::collections::VecDeque<u32> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
-        match msg {
-            Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
-            // Every binary message from a viewer acts on the desktop (clipboard images,
-            // microphone audio), so a read-only viewer's are all dropped.
-            Message::Binary(_) if s.read_only => {}
-            // 0x11: clipboard image (PNG) pasted on the client.
-            Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
-                if let Some(tx) = s.hub.input.lock().as_ref() {
-                    let _ = tx.send(InputEvent::Clipboard(crate::desktop::ClipContent::Image(
-                        b[1..].to_vec(),
-                    )));
-                }
-            }
-            // 0x12: microphone Opus packet, 0x13: microphone PCM (s16le mono 48 kHz).
-            Message::Binary(b) if matches!(b.first(), Some(0x12 | 0x13)) && b.len() > 1 => {
-                if let Some(tx) = &s.mic {
-                    let data = b.slice(1..);
-                    let _ = tx.send(if b[0] == 0x12 {
-                        crate::mic::MicMsg::Opus(client.id, data)
-                    } else {
-                        crate::mic::MicMsg::Pcm(client.id, data)
-                    });
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
+        if !handle_message(&s, &client, msg, &mut rtts) {
+            break;
         }
     }
     pinger.abort();
@@ -377,14 +359,47 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     log::info!("client {} disconnected", client.id);
 }
 
+/// One message a viewer sent on /ws; false when it closes the socket.
+fn handle_message(
+    s: &AppState,
+    client: &Arc<Client>,
+    msg: Message,
+    rtts: &mut std::collections::VecDeque<u32>,
+) -> bool {
+    match msg {
+        Message::Text(t) => handle_text(s, client, t.as_str(), rtts),
+        // --read-only decides binary messages in readonly.rs (all of them act).
+        Message::Binary(b)
+            if s.read_only
+                && crate::readonly::binary(b.first().copied()) != crate::readonly::Kind::Watch => {}
+        // 0x11: clipboard image (PNG) pasted on the client.
+        Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
+            if let Some(tx) = s.hub.input.lock().as_ref() {
+                let _ = tx.send(InputEvent::Clipboard(crate::desktop::ClipContent::Image(
+                    b[1..].to_vec(),
+                )));
+            }
+        }
+        // 0x12: microphone Opus packet, 0x13: microphone PCM (s16le mono 48 kHz).
+        Message::Binary(b) if matches!(b.first(), Some(0x12 | 0x13)) && b.len() > 1 => {
+            if let Some(tx) = &s.mic {
+                let data = b.slice(1..);
+                let _ = tx.send(if b[0] == 0x12 {
+                    crate::mic::MicMsg::Opus(client.id, data)
+                } else {
+                    crate::mic::MicMsg::Pcm(client.id, data)
+                });
+            }
+        }
+        Message::Close(_) => return false,
+        _ => {}
+    }
+    true
+}
+
 fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
     it.next()?.trim().parse().ok()
 }
-
-/// Commands a --read-only viewer may send: acks, video and audio on/off, keyframe
-/// requests and ping replies. Everything else acts on the desktop (input, clipboard,
-/// microphone, resizing) and is dropped. The web client keeps the same list.
-const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
 /// The display rate a client measured, if it is a sensible number.
 fn set_hz(c: &Client, hz: Option<serde_json::Value>) {
@@ -393,9 +408,12 @@ fn set_hz(c: &Client, hz: Option<serde_json::Value>) {
     }
 }
 
-/// Protocol 2's JSON messages. All of them are about watching (capabilities, decoder
-/// state, acks and keyframe requests), so read-only viewers send them too.
+/// Protocol 2's JSON messages; readonly.rs says which a read-only viewer may send (all
+/// of them are about its own stream).
 fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
+    if s.read_only && crate::readonly::json(&m) != crate::readonly::Kind::Watch {
+        return;
+    }
     match m {
         ClientMsg::Hello {
             v,
@@ -462,10 +480,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         return;
     }
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
-    // --read-only: accept only what watching needs, right where commands are applied,
-    // so a client that ignores the hello flag cannot drive the desktop, whatever
-    // commands are added later.
-    if s.read_only && !READ_ONLY_COMMANDS.contains(&cmd) {
+    // --read-only: only what readonly.rs calls watching, right where commands are applied,
+    // so a client that ignores the hello flag cannot drive the desktop; a command with no
+    // decision there is dropped too.
+    if s.read_only && crate::readonly::command(cmd) != Some(crate::readonly::Kind::Watch) {
         return;
     }
     let input = |ev: InputEvent| {
@@ -711,7 +729,7 @@ mod tests {
             mic,
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1), true),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
@@ -719,8 +737,8 @@ mod tests {
         }
     }
 
-    /// Sends every command to a server that has input, a microphone and resizing wired
-    /// up, and returns (input events, microphone messages, a resize was asked for).
+    /// Sends every command, a clipboard image and two microphone packets, as /ws messages,
+    /// to a server that has input, a microphone and resizing wired up, and returns (input events, microphone messages, a resize was asked for).
     fn drive(read_only: bool) -> (usize, usize, bool) {
         let hub = Hub::new();
         hub.width.store(1280, Ordering::Relaxed);
@@ -733,8 +751,14 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
-        for c in ALL {
-            handle_text(&s, &client, c, &mut rtts);
+        let binary = [&[0x11u8, 0x89, b'P'][..], &[0x12, 1, 2], &[0x13, 1, 2]];
+        let messages = ALL.iter().map(|c| Message::Text((*c).into())).chain(
+            binary
+                .iter()
+                .map(|b| Message::Binary(Bytes::copy_from_slice(b))),
+        );
+        for m in messages {
+            assert!(handle_message(&s, &client, m, &mut rtts));
         }
         let resized = hub.resize_req.lock().is_some();
         (
@@ -780,8 +804,8 @@ mod tests {
         // The same commands do reach the desktop without --read-only, so the test above
         // checks the guard rather than an unwired server.
         let (input, mic, resized) = drive(false);
-        assert!(input >= 9, "{input} input events");
-        assert_eq!(mic, 1);
+        assert!(input >= 10, "{input} input events");
+        assert_eq!(mic, 3, "the mi command and two binary packets");
         assert!(resized);
     }
 
@@ -877,5 +901,132 @@ mod tests {
         assert!(favicon(Some(dir.join("icon.txt").to_str().unwrap())).is_err());
         assert!(favicon(Some(dir.join("missing.ico").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The whole router for `app(hub, read_only, None)`, served on a loopback port.
+    async fn served(read_only: bool) -> u16 {
+        let s = app(&Hub::new(), read_only, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
+        port
+    }
+
+    /// The status and the body of a request, with JSON when `json` is set.
+    async fn ask(port: u16, method: &str, target: &str, json: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = format!(
+            "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nx-starfold-upload: 1\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = text
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, b)| b)
+            .to_string();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_refuses_recording_input_and_uploads() {
+        let port = served(true).await;
+        for (method, target, body) in [
+            ("POST", "/record/start", ""),
+            ("POST", "/record/stop?id=1", ""),
+            ("GET", "/record?seconds=1", ""),
+            ("POST", "/input", r#"{"type":"click","x":1,"y":1}"#),
+            ("PUT", "/files/upload?name=a", "x"),
+        ] {
+            let (status, text) = ask(port, method, target, body).await;
+            assert_eq!(status, 403, "{method} {target}: {text}");
+            assert!(
+                text.contains("\"read_only\":true"),
+                "{method} {target}: {text}"
+            );
+        }
+        assert_eq!(ask(port, "GET", "/healthz", "").await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn without_the_flag_no_recording_starts() {
+        let hub = Hub::new();
+        let mut s = app(&hub, false, None);
+        let flags = crate::parse_args(["--port".to_string(), "6901".to_string()]);
+        s.recorder = crate::recorder_from_args(&flags, &hub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
+        for (method, target) in [
+            ("POST", "/record/start"),
+            ("GET", "/record?seconds=1"),
+            ("POST", "/record/stop?id=1"),
+        ] {
+            let (status, text) = ask(port, method, target, "").await;
+            assert_eq!(status, 403, "{method} {target}: {text}");
+            assert!(text.contains("\"recording\":false"), "{text}");
+        }
+        assert!(hub.clients.lock().is_empty(), "nothing joined the stream");
+    }
+
+    #[tokio::test]
+    async fn a_recording_stops_only_with_the_id_it_was_given() {
+        let port = served(false).await;
+        let (status, text) = ask(port, "POST", "/record/start", "").await;
+        assert_eq!(status, 200, "{text}");
+        for guess in ["1", "0", "2"] {
+            let (status, text) = ask(port, "POST", &format!("/record/stop?id={guess}"), "").await;
+            assert_eq!(status, 404, "id {guess}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recording_stopped_with_its_id_returns_its_clip_once() {
+        let hub = Hub::new();
+        hub.width.store(64, Ordering::Relaxed);
+        hub.height.store(32, Ordering::Relaxed);
+        let mut s = app(&hub, false, None);
+        s.recorder = crate::record::Recorder::new(hub.clone(), Duration::from_secs(30), true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(s)).await.unwrap() });
+        let (status, text) = ask(port, "POST", "/record/start", "").await;
+        assert_eq!(status, 200, "{text}");
+        let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        // Three H.264 access units as the hub sends them: a keyframe with SPS and PPS, then
+        // two more frames.
+        let recorder = hub.clients.lock()[0].clone();
+        let mut key = vec![0x01, 1, 0, 0, 0, 1];
+        key.resize(16, 0);
+        key.extend_from_slice(&[
+            0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
+        ]);
+        let mut delta = vec![0x01, 0, 0, 0, 0, 2];
+        delta.resize(16, 0);
+        delta.extend_from_slice(&[0, 0, 0, 1, 0x41, 0xbb]);
+        for frame in [&key, &delta, &delta] {
+            recorder.send(Out::Bin(Bytes::copy_from_slice(frame)));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stop = format!("/record/stop?id={id}");
+        let (status, clip) = ask(port, "POST", &stop, "").await;
+        assert_eq!(status, 200, "{clip}");
+        assert!(clip.len() > 100, "a clip of {} bytes", clip.len());
+        assert_eq!(clip.get(4..8), Some("ftyp"), "an MP4");
+        assert!(clip.contains("moov") && clip.contains("mdat"));
+        let (status, text) = ask(port, "POST", &stop, "").await;
+        assert_eq!(status, 404, "a second stop: {text}");
     }
 }

@@ -29,6 +29,7 @@ mod mac;
 mod mic;
 mod mp4;
 mod negotiate;
+mod readonly;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -136,6 +137,32 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     }
     #[cfg(not(target_os = "macos"))]
     rt.block_on(serve(a));
+}
+
+/// The shared folder `serve` uses. --file-transfers=upload,download (as in selkies);
+/// "none" turns both off. Whether it was given matters under --read-only (files.rs).
+/// No --files-root, no file transfer: there is no default folder to share.
+fn files_from_args(a: &HashMap<String, String>, read_only: bool) -> Result<files::Files, String> {
+    files::Files::new(
+        a.get("files-root").map(String::as_str),
+        a.get("file-transfers").map(String::as_str),
+        read_only,
+        a.get("upload-dir").map_or("Downloads", String::as_str),
+        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    )
+}
+
+/// The recorder `serve` uses: GET /screenshot; /record* only with --enable-recording (off
+/// by default); --max-record-seconds caps a recording's length.
+fn recorder_from_args(
+    a: &HashMap<String, String>,
+    hub: &std::sync::Arc<hub::Hub>,
+) -> std::sync::Arc<record::Recorder> {
+    record::Recorder::new(
+        hub.clone(),
+        std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
+        record::enabled(a),
+    )
 }
 
 async fn serve(a: HashMap<String, String>) {
@@ -371,26 +398,18 @@ async fn serve(a: HashMap<String, String>) {
         audio::spawn(dev, br, hub.clone());
     }
 
-    // --file-transfers=upload,download (as in selkies); "none" turns both off.
-    let transfers = a
-        .get("file-transfers")
-        .cloned()
-        .unwrap_or_else(|| "upload,download".into());
-    // No --files-root, no file transfer: there is no default folder to share.
-    let files = files::Files::new(
-        a.get("files-root").map(String::as_str),
-        &transfers,
-        read_only,
-        a.get("upload-dir").map_or("Downloads", String::as_str),
-        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
-    )
-    .unwrap_or_else(|e| {
+    let files = files_from_args(&a, read_only).unwrap_or_else(|e| {
         log::error!("{e}");
         std::process::exit(2);
     });
     let files = std::sync::Arc::new(files);
     match &files.root {
-        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        Some(root) => log::info!(
+            "file transfer under {}: upload {}, download {}",
+            root.path().display(),
+            if files.upload { "on" } else { "off" },
+            if files.download { "on" } else { "off" },
+        ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
     }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
@@ -443,11 +462,7 @@ async fn serve(a: HashMap<String, String>) {
         mic,
         resize: resize_on,
         read_only,
-        // GET /screenshot, /record; --max-record-seconds caps a recording's length.
-        recorder: record::Recorder::new(
-            hub.clone(),
-            std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
-        ),
+        recorder: recorder_from_args(&a, &hub),
         // --title: the browser tab's title.
         index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,

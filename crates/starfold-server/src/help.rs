@@ -132,6 +132,9 @@ Files and recordings:
                                 (default Downloads)
   --max-upload-mb               largest upload, 0 for no limit (default 0)
   --max-record-seconds          longest recording (default 300)
+  --enable-recording            allow /record; recordings are held in memory and
+                                not bounded beyond --max-record-seconds
+                                (default false)
 
   -h, --help                    print this and exit
   -V, --version                 print the version and exit
