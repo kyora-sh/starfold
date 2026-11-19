@@ -3,6 +3,7 @@
 import { Bin, cmd } from '../protocol';
 import type { App } from './app';
 import type { Clipboard } from './clipboard';
+import { listeners } from './listeners';
 
 const NAMED: Record<string, number> = {
 	Backspace: 0xff08,
@@ -47,12 +48,20 @@ async function toPng(file: File): Promise<ArrayBuffer> {
 	return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
 }
 
+/**
+ * `embedded`: focus waits for the user instead of being taken at once on a top-level page, and
+ * when focus moves to another field of the page each held key is released and a paste
+ * shortcut still waiting for its paste is dropped.
+ */
 export function setupKeyboard(
 	app: App,
 	clipboard: Clipboard,
-	onInteract: () => void
+	onInteract: () => void,
+	embedded = false
 ) {
 	const { kbd, surface, send, isMac } = app;
+	const ls = listeners();
+	let disposed = false;
 	const XK_CONTROL_L = 0xffe3,
 		XK_CONTROL_R = 0xffe4,
 		XK_SUPER_L = 0xffeb,
@@ -94,11 +103,20 @@ export function setupKeyboard(
 	}
 
 	const down = new Map<string, number>(); // code -> keysym
-	let pendingPaste: {
+	/**
+	 * A paste shortcut held back until its paste lands on the remote clipboard. `converting`:
+	 * its image is being converted; `released`: its key went up meanwhile, so it is sent whole.
+	 */
+	type PendingPaste = {
 		code: string;
 		ks: number;
 		timer: ReturnType<typeof setTimeout>;
-	} | null = null;
+		converting: boolean;
+		released: boolean;
+	};
+	let pendingPaste: PendingPaste | null = null;
+	/** Bumped by every paste event and every blur: an image converting from before is stale. */
+	let pasteSeq = 0;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
 		send(cmd.key(ks, true));
@@ -117,12 +135,24 @@ export function setupKeyboard(
 		down.clear();
 		send(cmd.releaseAll);
 	}
-	function flushPaste() {
-		if (!pendingPaste) return;
-		const p = pendingPaste;
+	function dropPaste() {
+		if (pendingPaste) clearTimeout(pendingPaste.timer);
+		pendingPaste = null;
+	}
+	function flushPaste(p = pendingPaste) {
+		if (!p || pendingPaste !== p) return;
 		pendingPaste = null;
 		clearTimeout(p.timer);
-		press(p.code, p.ks);
+		if (!p.released) return press(p.code, p.ks);
+		const accelHeld = [...down.keys()].some((c) =>
+			isMac ? /^(Meta|OS)/.test(c) : c.startsWith('Control')
+		);
+		const accel = accelHeld
+			? undefined
+			: modifierKeysym(isMac ? 'MetaLeft' : 'ControlLeft');
+		if (accel) send(cmd.key(accel, true));
+		tap(p.ks);
+		if (accel) send(cmd.key(accel, false));
 	}
 
 	function onKeyDown(e: KeyboardEvent) {
@@ -131,10 +161,22 @@ export function setupKeyboard(
 		const ks = keysymOf(e);
 		if (!ks) return;
 		const accel = isMac ? e.metaKey : e.ctrlKey;
+		if (e.repeat && pendingPaste?.code === e.code) {
+			e.preventDefault();
+			return;
+		}
 		if (accel && !e.altKey && (e.key === 'v' || e.key === 'V') && !e.repeat) {
 			// Let the browser deliver a paste event to the hidden textarea first, so the
 			// remote clipboard holds the local contents before the shortcut lands.
-			pendingPaste = { code: e.code, ks, timer: setTimeout(flushPaste, 150) };
+			dropPaste();
+			const p: PendingPaste = {
+				code: e.code,
+				ks,
+				timer: setTimeout(() => flushPaste(p), 150),
+				converting: false,
+				released: false,
+			};
+			pendingPaste = p;
 			return;
 		}
 		e.preventDefault();
@@ -147,7 +189,10 @@ export function setupKeyboard(
 	}
 	function onKeyUp(e: KeyboardEvent) {
 		e.preventDefault();
-		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
+		if (pendingPaste?.code === e.code) {
+			if (pendingPaste.converting) pendingPaste.released = true;
+			else flushPaste();
+		}
 		release(e.code);
 		// macOS swallows keyups of keys released while Cmd is held.
 		if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
@@ -156,12 +201,13 @@ export function setupKeyboard(
 		}
 	}
 	for (const target of [kbd, surface]) {
-		target.addEventListener('keydown', onKeyDown);
-		target.addEventListener('keyup', onKeyUp);
+		ls.on(target, 'keydown', onKeyDown);
+		ls.on(target, 'keyup', onKeyUp);
 	}
 
-	kbd.addEventListener('paste', (e) => {
+	ls.on<ClipboardEvent>(kbd, 'paste', (e) => {
 		e.preventDefault();
+		const seq = ++pasteSeq;
 		const dt = e.clipboardData;
 		const text = dt?.getData('text/plain');
 		if (text) {
@@ -180,14 +226,23 @@ export function setupKeyboard(
 			return;
 		}
 		// Hold the paste shortcut until the image is on the remote clipboard.
-		if (pendingPaste) {
-			clearTimeout(pendingPaste.timer);
-			pendingPaste.timer = setTimeout(flushPaste, 3000);
+		const own = pendingPaste;
+		if (own) {
+			clearTimeout(own.timer);
+			own.converting = true;
+			own.timer = setTimeout(() => flushPaste(own), 3000);
 		}
-		toPng(file)
-			.then((png) => app.sendBin(Bin.ClipImageUp, new Uint8Array(png)))
-			.catch((err) => console.warn('[starfold] image paste failed', err))
-			.finally(flushPaste);
+		// Upload and shortcut run in one continuation, so no blur can fall between them.
+		function upload(png: ArrayBuffer) {
+			if (disposed || seq !== pasteSeq) return;
+			app.sendBin(Bin.ClipImageUp, new Uint8Array(png));
+			if (own) flushPaste(own);
+		}
+		function failed(err: unknown) {
+			console.warn('[starfold] image paste failed', err);
+			if (own && pendingPaste === own) dropPaste();
+		}
+		toPng(file).then(upload, failed);
 	});
 
 	// Text that arrives without usable keydowns (IME, dead-key composition, mobile
@@ -196,11 +251,11 @@ export function setupKeyboard(
 		for (const ch of text)
 			tap(ch === '\n' ? XK_RETURN : charKeysym(ch.codePointAt(0)!));
 	}
-	kbd.addEventListener('compositionend', (e) => {
+	ls.on<CompositionEvent>(kbd, 'compositionend', (e) => {
 		if (e.data) typeText(e.data);
 		kbd.value = '';
 	});
-	kbd.addEventListener('input', (e) => {
+	ls.on(kbd, 'input', (e) => {
 		const ie = e as InputEvent;
 		if (ie.isComposing) return;
 		// On-screen keyboards often deliver text and edits only as input events.
@@ -214,9 +269,23 @@ export function setupKeyboard(
 			tap(XK_RETURN);
 		kbd.value = '';
 	});
-	window.addEventListener('blur', releaseAll);
-	surface.addEventListener('focus', () => kbd.focus({ preventScroll: true }));
-	if (!app.inIframe) kbd.focus({ preventScroll: true });
+	ls.on(window, 'blur', releaseAll);
+	if (embedded)
+		ls.on(kbd, 'blur', () => {
+			dropPaste();
+			pasteSeq++;
+			for (const code of down.keys()) release(code);
+		});
+	ls.on(surface, 'focus', () => kbd.focus({ preventScroll: true }));
+	if (!embedded && !app.inIframe) kbd.focus({ preventScroll: true });
 
-	return { releaseAll };
+	return {
+		releaseAll,
+		/** Removes every listener and a pending paste's timer; a paste still converting sends nothing. */
+		dispose() {
+			disposed = true;
+			ls.off();
+			dropPaste();
+		},
+	};
 }

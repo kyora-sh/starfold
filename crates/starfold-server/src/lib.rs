@@ -6,6 +6,7 @@
 
 mod access;
 mod actions;
+mod attach;
 #[cfg(target_os = "linux")]
 mod audio;
 mod base_path;
@@ -20,6 +21,7 @@ mod corners;
 mod desktop;
 pub mod encoder;
 mod files;
+mod frame;
 mod help;
 mod hub;
 #[cfg(target_os = "linux")]
@@ -30,6 +32,7 @@ mod mac;
 mod mic;
 mod mp4;
 mod negotiate;
+mod readonly;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -48,6 +51,7 @@ use mac::{audio, capture, desktop, input, screen};
 use win::{audio, capture, desktop, input, screen};
 
 use std::collections::HashMap;
+use std::future::IntoFuture;
 use std::time::Instant;
 
 /// Parses `--key=value` / `--key value` / `--flag`; unknown options are accepted so the
@@ -101,9 +105,45 @@ pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Where the server listens: TCP on --addr/--port unless --listen-tcp=false, and a
+/// unix socket in the new directory --listen-unix with permissions --listen-unix-mode
+/// (octal, default 0600).
+#[derive(Debug, PartialEq)]
+struct Listen {
+    tcp: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    unix: Option<(std::path::PathBuf, u32)>,
+}
+
+fn listen_config(a: &HashMap<String, String>) -> Result<Listen, String> {
+    if a.contains_key("listen-unix") && cfg!(not(target_os = "linux")) {
+        return Err("--listen-unix is not available on this platform yet".into());
+    }
+    let tcp = truthy(a.get("listen-tcp"), true);
+    let mode = match a.get("listen-unix-mode") {
+        None => 0o600,
+        Some(m) => u32::from_str_radix(m.trim_start_matches("0o"), 8)
+            .ok()
+            .filter(|m| *m <= 0o777)
+            .ok_or_else(|| {
+                format!("--listen-unix-mode {m}: expected octal permissions like 0600")
+            })?,
+    };
+    let unix = match a.get("listen-unix").map(String::as_str) {
+        None => None,
+        Some("" | "true") => return Err("--listen-unix needs a path".into()),
+        Some(p) => Some((p.into(), mode)),
+    };
+    if !tcp && unix.is_none() {
+        return Err("--listen-tcp=false needs --listen-unix: nothing to listen on".into());
+    }
+    Ok(Listen { tcp, unix })
+}
+
 /// The `starfold` binary's `main`: [`run`] with the process's arguments, probing the
-/// hardware encoders in child processes that run this executable again. A program that
-/// embeds the server can call it from its own `main` to get the same isolation.
+/// hardware encoders in child processes that run this executable again, or `starfold
+/// attach DIR` (see attach.rs). A program that embeds the server can call it from its own
+/// `main` to get the same isolation.
 pub fn main() {
     let args = match utf8_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
@@ -112,6 +152,9 @@ pub fn main() {
             std::process::exit(2);
         }
     };
+    if args.first().map(String::as_str) == Some("attach") {
+        std::process::exit(attach::main(&args[1..]));
+    }
     if args.first().map(String::as_str) == Some(encoder::isolate::FLAG) {
         std::process::exit(encoder::isolate::child_main(&args[1..]));
     }
@@ -119,16 +162,114 @@ pub fn main() {
     if args.first().map(String::as_str) == Some(encoder::HELPER_FLAG) {
         std::process::exit(encoder::helper_main(&args[1..]));
     }
+    let prebound = prebind(&args);
     encoder::isolate::enable();
-    run(args);
+    run_with(args, prebound);
+}
+
+/// The socket --listen-unix binds before the server starts, what removes it, and which of
+/// SIGTERM and SIGINT were blocked for it (the ones that weren't blocked already).
+#[cfg(target_os = "linux")]
+struct Prebound {
+    listener: std::os::unix::net::UnixListener,
+    file: &'static server::SocketFile,
+    blocked: libc::sigset_t,
+}
+#[cfg(not(target_os = "linux"))]
+type Prebound = std::convert::Infallible;
+
+/// --listen-unix's socket, bound first thing, while this is the process's only thread:
+/// the bind changes the process's working directory and umask for a moment (see
+/// [`server::bind_in`]). It is bound only in a user namespace whose uid map is the identity
+/// ([`server::uid_map_is_identity`]), checked before anything is made. SIGTERM and SIGINT
+/// wait (blocked) from just before the bind until the server's handlers take them, first
+/// thing in [`serve`], so one that comes meanwhile still removes the socket. A bad flag,
+/// a refusal or a bind that fails ends the process here, before any desktop is touched.
+fn prebind(args: &[String]) -> Option<Prebound> {
+    if help::asked(args) {
+        return None;
+    }
+    let listen = listen_config(&parse_args(args.iter().cloned())).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    #[cfg(target_os = "linux")]
+    if let Some((path, mode)) = listen.unix {
+        let threads = std::fs::read_dir("/proc/self/task").map(|d| d.count());
+        if !matches!(threads, Ok(1)) {
+            eprintln!(
+                "--listen-unix {}: it binds while this is the process's only thread, and \
+                 this process has {}",
+                path.display(),
+                match threads {
+                    Ok(n) => format!("{n} threads"),
+                    Err(e) => format!("threads that can't be counted ({e})"),
+                }
+            );
+            std::process::exit(1);
+        }
+        if let Err(e) = server::uid_map_is_identity(std::path::Path::new("/proc")) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        let blocked = block_shutdown_signals();
+        return match server::bind_unix_std(&path, mode) {
+            Ok((listener, file)) => Some(Prebound {
+                listener,
+                file: server::remove_at_exit(file),
+                blocked,
+            }),
+            Err(e) => {
+                eprintln!("--listen-unix {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = listen;
+    None
+}
+
+/// Blocks SIGTERM and SIGINT on the calling thread (and the threads it starts), and returns
+/// those of the two that weren't blocked before: what [`unblock_shutdown_signals`] gives
+/// back, so a caller's own mask comes out as it was.
+#[cfg(target_os = "linux")]
+fn block_shutdown_signals() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        let mut ours: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigemptyset(&mut ours);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut before);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            if libc::sigismember(&before, sig) == 0 {
+                libc::sigaddset(&mut ours, sig);
+            }
+        }
+        ours
+    }
+}
+
+/// Unblocks on the calling thread what [`block_shutdown_signals`] blocked, and nothing else.
+#[cfg(target_os = "linux")]
+fn unblock_shutdown_signals(blocked: &libc::sigset_t) {
+    unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, blocked, std::ptr::null_mut()) };
 }
 
 /// Runs the server with these command-line flags (without the program name) until it's
 /// told to stop. Takes over the calling thread, which on macOS has to be the main thread.
 /// Called directly (not through [`main`]), it probes the hardware encoders in-process, so
-/// a driver that crashes there takes the server with it.
+/// a driver that crashes there takes the server with it; and it refuses --listen-unix,
+/// which binds before any thread starts, something only [`main`] can promise.
 pub fn run(args: impl IntoIterator<Item = String>) {
-    let args: Vec<String> = args.into_iter().collect();
+    run_with(args.into_iter().collect(), None);
+}
+
+fn run_with(args: Vec<String>, prebound: Option<Prebound>) {
     // The one place --base-path is read and checked, before --help and --version: asking
     // for a prefix that can't be served stops here, to stderr whatever the log filter.
     let base = match base_path::from_args(&args) {
@@ -143,6 +284,17 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         return;
     }
     let a = parse_args(args);
+    let listen = listen_config(&a).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    if listen.unix.is_some() && prebound.is_none() {
+        eprintln!(
+            "--listen-unix needs the starfold binary: it binds before any thread starts, \
+             which a program that embeds the server can't promise"
+        );
+        std::process::exit(2);
+    }
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
     // A panic on any thread ends the process, as in starfold's own release build (panic = "abort"),
@@ -164,14 +316,80 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     // main dispatch queue and the server runs beside it.
     #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(move || rt.block_on(serve(a, base)));
+        std::thread::spawn(move || rt.block_on(serve(a, listen, prebound, base)));
         dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a, base));
+    rt.block_on(serve(a, listen, prebound, base));
 }
 
-async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
+/// The shared folder `serve` uses. --file-transfers=upload,download (as in selkies);
+/// "none" turns both off. Whether it was given matters under --read-only (files.rs).
+/// No --files-root, no file transfer: there is no default folder to share.
+fn files_from_args(a: &HashMap<String, String>, read_only: bool) -> Result<files::Files, String> {
+    files::Files::new(
+        a.get("files-root").map(String::as_str),
+        a.get("file-transfers").map(String::as_str),
+        read_only,
+        a.get("upload-dir").map_or("Downloads", String::as_str),
+        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    )
+}
+
+/// The recorder `serve` uses: GET /screenshot; /record* only with --enable-recording (off
+/// by default); --max-record-seconds caps a recording's length.
+fn recorder_from_args(
+    a: &HashMap<String, String>,
+    hub: &std::sync::Arc<hub::Hub>,
+) -> std::sync::Arc<record::Recorder> {
+    record::Recorder::new(
+        hub.clone(),
+        std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
+        record::enabled(a),
+    )
+}
+
+async fn serve(
+    a: HashMap<String, String>,
+    listen: Listen,
+    prebound: Option<Prebound>,
+    base: Option<base_path::BasePath>,
+) {
+    let hub = hub::Hub::new();
+    // SIGTERM and SIGINT lead to the shutdown below (which removes the unix socket) from
+    // here on, before anything that can block; one that came since the socket was bound
+    // (blocked until now) is taken now. Only what prebind blocked is unblocked.
+    #[cfg(target_os = "linux")]
+    let socket_file = prebound.as_ref().map(|p| p.file);
+    #[cfg(unix)]
+    let (mut term, mut int) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate()).unwrap(),
+            signal(SignalKind::interrupt()).unwrap(),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(p) = &prebound {
+        unblock_shutdown_signals(&p.blocked);
+    }
+    let shutdown_hub = hub.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        #[cfg(windows)]
+        let _ = tokio::signal::ctrl_c().await;
+        log::info!("shutting down");
+        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
+            let _ = tx.send(input::InputEvent::Shutdown);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(file) = socket_file {
+            server::remove_unix(file);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
     let display = std::env::var("DISPLAY")
@@ -286,7 +504,6 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
     };
     let audio_on = truthy(a.get("audio-enabled"), true);
 
-    let hub = hub::Hub::new();
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.
@@ -404,26 +621,18 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
         audio::spawn(dev, br, hub.clone());
     }
 
-    // --file-transfers=upload,download (as in selkies); "none" turns both off.
-    let transfers = a
-        .get("file-transfers")
-        .cloned()
-        .unwrap_or_else(|| "upload,download".into());
-    // No --files-root, no file transfer: there is no default folder to share.
-    let files = files::Files::new(
-        a.get("files-root").map(String::as_str),
-        &transfers,
-        read_only,
-        a.get("upload-dir").map_or("Downloads", String::as_str),
-        (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
-    )
-    .unwrap_or_else(|e| {
+    let files = files_from_args(&a, read_only).unwrap_or_else(|e| {
         log::error!("{e}");
         std::process::exit(2);
     });
     let files = std::sync::Arc::new(files);
     match &files.root {
-        Some(root) => log::info!("file transfer: {transfers} under {}", root.path().display()),
+        Some(root) => log::info!(
+            "file transfer under {}: upload {}, download {}",
+            root.path().display(),
+            if files.upload { "on" } else { "off" },
+            if files.download { "on" } else { "off" },
+        ),
         None => log::info!("file transfer: off (share a folder with --files-root)"),
     }
     // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
@@ -468,6 +677,8 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
             log::error!("{e}");
             std::process::exit(1);
         });
+    // --framed: for hops that carry binary WebSocket messages only (see frame.rs).
+    let framed = truthy(a.get("framed"), false);
     let state = server::AppState {
         hub: hub.clone(),
         audio: audio_on,
@@ -476,16 +687,13 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
         mic,
         resize: resize_on,
         read_only,
-        // GET /screenshot, /record; --max-record-seconds caps a recording's length.
-        recorder: record::Recorder::new(
-            hub.clone(),
-            std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
-        ),
+        recorder: recorder_from_args(&a, &hub),
         // --title: the browser tab's title.
         index: server::index_html(a.get("title").map_or("starfold", |t| t.as_str())),
         favicon,
         favicon_type,
         encoders,
+        framed,
     };
     // --allowed-hosts and --allowed-origins: the host names and other sites starfold answers
     // besides IP addresses, localhost and its own page (see access.rs).
@@ -503,11 +711,46 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
         login.as_ref().map(|(l, _)| l.clone()),
         access,
     );
-    let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
-        .await
-        .expect("bind");
-    log::info!("{}", base_path::listening(&addr, port, base.as_ref()));
-    let page = base_path::page(&addr, port, base.as_ref());
+    // A port that can't be had ends the process through `exit`, which removes the unix
+    // socket bound before it.
+    let tcp = match listen.tcp {
+        true => match tokio::net::TcpListener::bind((addr.as_str(), port)).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                log::error!("listening on {addr}:{port}: {e}");
+                std::process::exit(1);
+            }
+        },
+        false => None,
+    };
+    #[cfg(target_os = "linux")]
+    let unix = match (prebound, &listen.unix) {
+        (Some(p), Some((path, mode))) => {
+            let l = server::unix_server(p.listener, p.file).unwrap_or_else(|e| {
+                log::error!("--listen-unix {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            log::info!(
+                "listening on unix:{} (mode {mode:o}; only uid {} is let in)",
+                server::unix_socket_path(path).display(),
+                unsafe { libc::geteuid() }
+            );
+            Some(l)
+        }
+        _ => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = prebound;
+    if tcp.is_some() {
+        log::info!("{}", base_path::listening(&addr, port, base.as_ref()));
+    }
+    let page = match tcp {
+        Some(_) => base_path::page(&addr, port, base.as_ref()),
+        None => format!(
+            "{}/ on the unix socket",
+            base.as_ref().map_or("", |b| b.as_str())
+        ),
+    };
     match &login {
         Some((l, true)) => log::info!(
             "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or STARFOLD_PASSWORD)",
@@ -518,27 +761,93 @@ async fn serve(a: HashMap<String, String>, base: Option<base_path::BasePath>) {
         ),
         None => log::info!("login off (--enable-basic-auth=false): anyone who reaches {page} can use this desktop"),
     }
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|tcp| {
-        let _ = tcp.set_nodelay(true);
-    });
-    let shutdown_hub = hub.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate()).unwrap();
-            let mut int = signal(SignalKind::interrupt()).unwrap();
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    if framed {
+        log::info!("--framed: every WebSocket message is binary with a kind byte");
+    }
+    let mut servers = tokio::task::JoinSet::new();
+    #[cfg(target_os = "linux")]
+    if let Some(l) = unix {
+        servers.spawn(axum::serve(l, app.clone()).into_future());
+    }
+    if let Some(l) = tcp {
+        use axum::serve::ListenerExt;
+        let l = l.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
+        servers.spawn(axum::serve(l, app).into_future());
+    }
+    while let Some(r) = servers.join_next().await {
+        r.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listen(args: &[&str]) -> Result<Listen, String> {
+        listen_config(&parse_args(args.iter().map(|s| s.to_string())))
+    }
+
+    #[test]
+    fn tcp_alone_unless_a_unix_socket_is_asked_for() {
+        let tcp_only = Listen {
+            tcp: true,
+            unix: None,
+        };
+        assert_eq!(listen(&[]), Ok(tcp_only));
+        // --listen-unix is Linux's only; elsewhere asking for it is refused at start.
+        let unix = |args: &[&str], want: Listen| match cfg!(target_os = "linux") {
+            true => assert_eq!(listen(args), Ok(want)),
+            false => assert_eq!(
+                listen(args),
+                Err("--listen-unix is not available on this platform yet".into())
+            ),
+        };
+        unix(
+            &["--listen-unix", "/run/sf.sock"],
+            Listen {
+                tcp: true,
+                unix: Some(("/run/sf.sock".into(), 0o600)),
+            },
+        );
+        unix(
+            &[
+                "--listen-unix=/run/sf.sock",
+                "--listen-tcp=false",
+                "--listen-unix-mode=0660",
+            ],
+            Listen {
+                tcp: false,
+                unix: Some(("/run/sf.sock".into(), 0o660)),
+            },
+        );
+    }
+
+    #[test]
+    fn nothing_to_listen_on_or_a_bad_mode_is_an_error() {
+        assert!(listen(&["--listen-tcp=false"]).is_err());
+        assert!(listen(&["--listen-unix"]).is_err());
+        for mode in ["0999", "rw", "01777"] {
+            assert!(
+                listen(&["--listen-unix=/s", &format!("--listen-unix-mode={mode}")]).is_err(),
+                "{mode}"
+            );
         }
-        #[cfg(windows)]
-        let _ = tokio::signal::ctrl_c().await;
-        log::info!("shutting down");
-        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(input::InputEvent::Shutdown);
+    }
+
+    /// Off Linux the platform refusal comes before anything else said about --listen-unix:
+    /// a bare flag, a bad mode or TCP off all get it.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_the_refusal_comes_first() {
+        let refused = Err("--listen-unix is not available on this platform yet".to_string());
+        for args in [
+            &["--listen-unix"][..],
+            &["--listen-unix=/s", "--listen-unix-mode=rw"],
+            &["--listen-unix=/s", "--listen-tcp=false"],
+        ] {
+            assert_eq!(listen(args), refused, "{args:?}");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::process::exit(0);
-    });
-    axum::serve(listener, app).await.unwrap();
+    }
 }

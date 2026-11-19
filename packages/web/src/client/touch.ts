@@ -19,6 +19,8 @@ interface Hooks {
 	moveTo(x: number, y: number): void;
 	queueScroll(dx: number, dy: number): void;
 	deskPerPx(): number;
+	/** A tap was recognized and clicked. */
+	tapped?(): void;
 }
 
 export function createTouch(app: App, hooks: Hooks) {
@@ -118,6 +120,7 @@ export function createTouch(app: App, hooks: Hooks) {
 			lastTap = { x: at.x, y: at.y, t: now, geometry: g };
 			hooks.moveTo(at.x, at.y);
 			click(1);
+			hooks.tapped?.();
 			mode = 'done';
 		} else if (mode === 'drag') {
 			send(cmd.button(1, false));
@@ -132,5 +135,10 @@ export function createTouch(app: App, hooks: Hooks) {
 		pts.delete(e.pointerId);
 		if (pts.size === 0) mode = null;
 	}
-	return { down, move, up, cancel };
+	/** Stops the long-press timer for good (embedded: on unmount). */
+	function dispose() {
+		clearTimeout(timer);
+		timer = undefined;
+	}
+	return { down, move, up, cancel, dispose };
 }

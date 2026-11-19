@@ -46,6 +46,24 @@ jobs:
         run: bun run typecheck
       - name: Unit tests
         run: bun run test
+      # The embeddable client (packages/web/src/embed), packed per commit; the served page's
+      # bundle stays build.rs's. Named by github.sha, the commit this job checked out and
+      # built: on a pull request that is its merge commit with main, not the head.
+      - name: Embeddable client package
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 update
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 install -y esbuild
+          mkdir -p "$RUNNER_TEMP/embed"
+          bash packages/web/embed/pack.sh "$SHA" "$RUNNER_TEMP/embed"
+          tar -tzf "$RUNNER_TEMP/embed/starfold-web-embed-$SHA.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starfold-web-embed-${{ github.sha }}
+          path: ${{ runner.temp }}/embed/starfold-web-embed-*.tgz
+          retention-days: 90
+          if-no-files-found: error
 
   python:
     name: Python (ruff, pytest)
@@ -86,11 +104,12 @@ jobs:
         working-directory: third_party/x264
         run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
       # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for x264's bindings,
-      # esbuild for build.rs.
+      # esbuild for build.rs, Xvfb for the tests that start the server, bindfs for the one
+      # that needs a FUSE mount.
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -109,7 +128,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       # Unit tests, including the Linux-only ones (dynamic resolution).
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: cargo test --locked
 
   openh264:
@@ -122,7 +144,7 @@ jobs:
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -141,7 +163,10 @@ jobs:
         run: |
           cargo clippy --features openh264 --all-targets --locked -- -D warnings
           cargo clippy --no-default-features --features openh264 --all-targets --locked -- -D warnings
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: |
           cargo test --features openh264 --locked
           cargo test --no-default-features --features openh264 --locked
@@ -157,7 +182,7 @@ jobs:
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm pkg-config libx265-dev xvfb; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm pkg-config libx265-dev xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - id: svt-av1
         uses: actions/cache@v4
@@ -184,7 +209,10 @@ jobs:
         run: |
           source <(bash bench/arms/libs.sh --env)
           cargo clippy --features svt-av1,x265 --all-targets --locked -- -D warnings
+      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
+        env:
+          STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: |
           source <(bash bench/arms/libs.sh --env)
           cargo test --features svt-av1,x265 --locked

@@ -23,6 +23,75 @@ DISPLAY=:1 starfold         # streams display :1 and prints a link that signs yo
 Open the link it prints. On a Mac or a Windows PC, `starfold` streams that machine's own screen
 instead; see [macOS](#macos) and [Windows](#windows).
 
+## Install
+
+### Prebuilt binaries
+
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches two builds per platform
+(`<version>` is the release's, e.g. `0.3.2`; [Licensing](#licensing) has the details):
+
+- **x264, recommended** (`starfold-x264-<version>-<platform>`): GPL-2.0-or-later as a combined work
+  with x264, whose source the release attaches beside it.
+- **OpenH264** (`starfold-<version>-<platform>`): needs no x264 library, and is distributed under
+  MIT. Like any program built with GCC, the Linux and Windows binaries include GCC's runtime code
+  (its startup files on Linux; also the C++ runtime libraries on Windows), which is
+  GPL-3.0-or-later with the GCC Runtime Library Exception: the exception is what lets the binary be
+  distributed under MIT. Linux binaries also include glibc's startup files, which are
+  LGPL-2.1-or-later with permission to link them into any program. These texts are in the
+  `licenses/` of the archives they apply to: GCC's in the Linux and Windows ones, glibc's in the
+  Linux ones.
+
+| Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
+| --------------------- | ---------------------------------------------- | ----------------------------------------- |
+| Linux x86_64          | `starfold-x264-<version>-x86_64-linux.tar.gz`  | `starfold-<version>-x86_64-linux.tar.gz`  |
+| Linux aarch64         | `starfold-x264-<version>-aarch64-linux.tar.gz` | `starfold-<version>-aarch64-linux.tar.gz` |
+| macOS (Apple silicon) | `starfold-x264-<version>-aarch64-macos.tar.gz` | `starfold-<version>-aarch64-macos.tar.gz` |
+| Windows x86_64        | `starfold-x264-<version>-x86_64-windows.zip`   | `starfold-<version>-x86_64-windows.zip`   |
+
+Download an archive and its `.sha256`, check it and unpack it:
+
+```sh
+sha256sum -c starfold-x264-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
+./starfold-x264-<version>-x86_64-linux/starfold --version
+```
+
+`--version` names the version, the software encoders in the binary and the licence it is
+distributed under: `starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
+`starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
+`THIRD_PARTY.md` and `licenses/`: the licence texts of the Rust crates and Rust standard library
+compiled into the binary, of what `THIRD_PARTY.md` lists for that platform, and of each library or runtime object
+linked in statically (OpenH264; glibc's and GCC's startup files on Linux; Opus on macOS and
+Windows; libyuv, the MinGW-w64 runtime and GCC's runtime libraries on Windows). The x264 archives
+add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
+
+What each platform needs at run time:
+
+- **Linux** (built on Ubuntu 24.04, so it needs a distribution at least that new): libyuv, Opus and
+  PulseAudio's client library, plus x264 for the x264 build and the C++ runtime for the OpenH264
+  one. On Ubuntu 24.04: `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for
+  `starfold-x264-*` or `libstdc++6` for `starfold-*` (most systems have it already). Plus an X
+  server to stream, such as Xvfb (see [Usage](#usage)).
+- **macOS**: nothing beyond the system; Opus is linked in, and x264 in the x264 build. The binary is not notarized,
+  so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
+- **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
+
+### From source
+
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on
+Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
+  libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev
+cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
+```
+
+That is the x264 build; `--tag v<version>` installs a release instead of main's head. For the MIT
+build, add `--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
+`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
+[Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
+
 ## Benchmarks
 
 [`bench/results/2026-11-starfold-vs-novnc.md`](bench/results/2026-11-starfold-vs-novnc.md) measures
@@ -66,10 +135,42 @@ DISPLAY=:1 ./target/release/starfold --port=6901
 # prints: open http://localhost:6901/?token=4f1c… to sign in
 ```
 
-Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
-(`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for pixel-precise scroll
-input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag with its default, and
-`starfold --version` prints the version.
+Use the patched Xvfb (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for
+pixel-precise scroll input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag
+with its default, and `starfold --version` prints the version.
+
+starfold captures X11 with MIT-SHM GetImage into a 0600 shared-memory segment of its own. The X
+server has to attach that segment, which it can't over TCP (`DISPLAY=host:N`; use `DISPLAY=:N`),
+from another IPC namespace, or as another user: starfold then stops at start and names these
+causes. After the attach it checks that the server writes into its segment, not into another
+one with the same id on the server's side.
+
+With `STARFOLD_DIRECT_FB=1` in its environment and Xvfb started with `-shmem`, starfold reads the
+screen in place from Xvfb's framebuffer instead. On one VM (4 vCPUs, a 1920x1080 full-screen
+animation at 60 fps) that saved about 1 ms per frame and about a tenth of a core; both paths kept
+60 fps. `STARFOLD_NO_DIRECT_FB` turns it off and wins over `STARFOLD_DIRECT_FB=1`. A segment is
+read only if all of these hold, else starfold uses GetImage and logs why once:
+
+- the X connection is a local socket whose peer credentials give the X server's pid, and
+  `/proc/self` is this process;
+- after starfold attaches the segment, it was created by that pid, has the size listed, and that
+  pid maps it now (the same device and inode in `/proc/<pid>/maps` as starfold's own mapping);
+- its XWD header names the screen being served (Xvfb writes `Xvfb <host>:<display>.<screen>`) and
+  the image fits in the segment;
+- a strip of its pixels matches what the X server returns for that screen.
+
+Its known limits:
+
+- A stale segment whose creator's pid number the live X server now holds passes if that server
+  maps it (a client can make it attach one through MIT-SHM).
+- The X server's maps are read before starfold attaches the segment.
+- `/proc` is checked by pid number: an ancestor pid namespace's `/proc` in which this process has
+  the same number passes.
+- Whatever answers on the X connection (a relay, a process holding the socket's name) is trusted,
+  as on every capture path.
+
+Xvfb creates its `-shmem` segments with mode 0777: every local user can read that screen, whether
+starfold reads it or not. On a host with several users, don't start Xvfb with `-shmem`.
 
 | Flag                                                           | Default                                                               |                                                                                                                                                                                                           |
 | -------------------------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -100,8 +201,8 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--adaptive-threads`                                           | `false`                                                               | encode on one thread, fanning out only under sustained heavy motion                                                                                                                                       |
 | `--stripes`                                                    | `1`                                                                   | encode the screen as N independent horizontal streams (experimental)                                                                                                                                      |
 | `--scroll-px-per-notch`                                        | `180`                                                                 | desktop pixels one wheel notch scrolls (calibrates smooth scrolling)                                                                                                                                      |
-| `--file-transfers`                                             | `upload,download`                                                     | `upload`, `download`, both, or `none`                                                                                                                                                                     |
-| `--read-only`                                                  | `false`                                                               | viewers only watch: input, clipboard writes, the microphone, uploads and resizing (`--enable-resize`) are refused                                                                                         |
+| `--file-transfers`                                             | `upload,download`                                                     | `upload`, `download`, both, or `none`; under `--read-only` uploads stay off, and naming `download` (alone or as `upload,download`) turns on listing and downloads                                         |
+| `--read-only`                                                  | `false`                                                               | a viewer cannot change the desktop, file contents or recordings; files are listed and downloaded only when `--file-transfers` names `download`; watching still influences delivery as any viewer does     |
 | `--allowed-hosts`                                              | none                                                                  | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                                                                                                 |
 | `--allowed-origins`                                            | none                                                                  | other sites whose pages may connect, such as a page that embeds starfold's client (`*` any site)                                                                                                          |
 | `--base-path`                                                  | none                                                                  | serve everything under this path prefix (such as `/desktop`), for a reverse proxy that forwards it unchanged; see [Hosts and origins](#hosts-and-origins)                                                 |
@@ -109,6 +210,7 @@ input; stock Xvfb scrolls by wheel notches. `starfold --help` lists every flag w
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`)                                                                                                                                                                             |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; clips are held in memory and are not yet bounded: do not enable it for viewers you do not trust                                                                                          |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
 ### File transfer
@@ -134,6 +236,14 @@ the limits below.
   started with.
 - On Windows a path is checked and then opened by name, so a folder changed in between can
   affect what is opened.
+- With `--read-only`, uploads are refused whatever `--file-transfers` says, and the panel lists
+  and downloads files only when `--file-transfers` names `download` (`--file-transfers=download`,
+  or `--file-transfers=upload,download`, where uploads stay off). Viewers then cannot change a
+  file's contents, but reading one may update its access time, as any read does on a filesystem
+  mounted with `strictatime`.
+  **Behaviour change:** a server started with `--read-only` and `--files-root` but no
+  `--file-transfers` used to hand out files; it no longer does until `--file-transfers=download`
+  is added.
 
 ### Login
 
@@ -179,7 +289,8 @@ request line may have (64 KiB in starfold, often less in a proxy).
 
 ### For agents and scripts
 
-Screenshots and recordings (start starfold with `STARFOLD_PASSWORD` set, and send it along):
+Screenshots and recordings (start starfold with `STARFOLD_PASSWORD` set, and send it along;
+recordings also need `--enable-recording`):
 
 ```sh
 # the screen as a PNG
@@ -187,10 +298,23 @@ curl -u ":$STARFOLD_PASSWORD" -o shot.png localhost:6901/screenshot
 # an MP4 of the next 10 s
 curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 "localhost:6901/record?seconds=10"
 # or start...
-id=$(curl -u ":$STARFOLD_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
+id=$(curl -u ":$STARFOLD_PASSWORD" -s -X POST localhost:6901/record/start | jq -r .id)
 # ...and stop when done
 curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
 ```
+
+**Breaking change:** recording is off unless starfold runs with `--enable-recording`; without it
+the three `/record` routes answer 403 (`"recording": false`). A recording's id is now a
+32-character string: scripts need `jq -r .id` where they had `jq .id`.
+
+Only a holder of the id that start returned can stop a recording or obtain its clip. The id
+is returned once, to the caller of start, over the same authenticated channel; it is 128 bits
+from the OS and compared in constant time. Treat the id like a secret: anyone who has it and
+can reach the server can stop the recording and take the clip.
+
+With `--enable-recording` the recorder is as it was before the flag: clips are held in memory
+and are not yet bounded; do not enable it for viewers you do not trust. Under `--read-only`
+the three routes are refused even with it.
 
 A recording is the H.264 stream starfold sends to viewers, saved as MP4: it shares the
 encoding with any viewers taking H.264, and with none it starts an H.264 encoding of its
@@ -234,19 +358,147 @@ ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polli
 order) and answers with the `seq` from before them, so `/wait?change&since=` sees what they
 did. A `--read-only` server refuses it with 403. `python/starfold` wraps all of this.
 
+With `--read-only` a viewer cannot change the desktop, file contents or recordings: every
+route and message is decided in one table, and anything not in it is refused. Watching still
+influences delivery as any viewer does (keyframe requests, its refresh rate, its
+acknowledgements).
+
 ```sh
 curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
   -d '[{"type":"click","x":400,"y":300},{"type":"type","text":"hello\n"},{"type":"key","key":"ctrl+s"}]'
 # {"seq":812,"events":19}
 ```
 
-### macOS
+### On a unix socket (Linux only)
 
-starfold also streams a Mac's own screen, with every feature of the Linux version
-(ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
+`--listen-unix DIR` serves the same routes, with the same login and host checks, on a
+unix socket: starfold makes `DIR` for its user alone (mode 0700), or takes one it left
+behind, and listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
+refused: `--listen-unix is not available on this platform yet`. It binds before any
+thread starts, so it works from the `starfold` binary or a program whose own `main` calls
+`starfold::main` first thing (the bind checks that the process has one thread);
+`starfold::run` refuses it.
+
+What keeps other users out, in three parts:
+
+- **Every accepted peer has starfold's uid.** The kernel records each connecting
+  process's credentials at `connect`, and starfold reads them (`SO_PEERCRED`) before it
+  reads or writes a byte, closing any connection from another uid.
+- **That uid is exact.** In a user namespace whose uid map is the identity (the initial
+  namespace, or one root gave the same map) every uid is mapped; elsewhere an unmapped
+  peer reads as the overflow uid, which could be starfold's own. So at start starfold
+  reads `/proc/self/uid_map` (from procfs, checked with `fstatfs`, through no mount
+  point) and refuses `--listen-unix` unless it is the full identity map,
+  `0 0 4294967295`, before anything is made; the refusal quotes what it read. This needs
+  Linux 5.6 or later (`openat2`) built with user namespaces (`CONFIG_USER_NS`, which
+  gives the file).
+- **Nobody else can substitute the path while starfold binds it.** Before it makes `DIR`,
+  starfold walks the path from `/`, one directory at a time without following symlinks
+  on its own: every directory on the way must belong to starfold's user or root and let
+  no other user rename entries in it (writable by no one else unless sticky, as `/tmp`
+  is, and no ACL entry that lets anyone else write). A symlink on the way is followed
+  only if it belongs to starfold's user or root, and its target is held to the same
+  rules. No directory on the way, and not `DIR`, may be on procfs (`/proc/self/cwd`, say,
+  resolves differently for each process) or on another user's FUSE mount (its daemon
+  reports owners and modes as it likes). A directory on a FUSE-type filesystem is judged
+  by its mount (its line in `/proc/self/mountinfo`, found by `statx` mount id and read
+  through the checked procfs): virtiofs is taken, as is a `fuse`/`fuseblk`/`fuse.*` mount
+  whose `user_id=` is root's or starfold's user's (a FUSE mount of root's is the
+  administrator's, like a root-owned directory); any other, or one that can't be found,
+  is refused. This needs a kernel that gives mount ids (Linux 5.8 or later) for any FUSE
+  directory on the path. An existing `DIR` is taken only if it is a real directory (not a
+  symlink) of starfold's user with mode exactly 0700 (or 02700, as under a setgid
+  parent), and starfold holds a lock on it (`flock`) for as long as it serves, so a
+  second instance on it is refused. In it, an existing `s` is replaced only if it is a
+  socket of starfold's user that refuses a connection (nothing listens on it); anything
+  else there, or at `DIR`, is refused. A server that has just died can leave `DIR` held
+  for a moment by a child it forked that has not yet started its program (the child's
+  copies of the lock and the listening socket close when it does); a restart in that
+  moment is refused as another server using it, which fails safe, and once the child has
+  started its program `DIR` can be taken back as above. Any refusal names the directory,
+  symlink or entry at fault, with its owner and mode, and touches nothing of someone
+  else's.
+
+The socket's mode decides who reaches `connect` at all. With the default
+`--listen-unix-mode=0600` no other uid can connect: the kernel refuses it. That holds
+for ordinary processes; root, and any process with a capability that overrides file
+permissions (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`, `CAP_SYS_ADMIN`,
+granted directly or by a file), can between them connect anyway and replace or remove
+`DIR/s`; the peer-uid check still closes their connections if their uid isn't
+starfold's.
+`0660` or `0666` let that group or everyone connect; the kernel accepts the connection
+and starfold closes it unread after the peer-uid check, which is then the only thing
+between other users and the server.
+
+**Clients check the listener.** The path is trusted only while starfold holds it: before
+starfold starts, or after it exits, another user who can write to an ancestor (a sticky
+`/tmp` included) can put something else at `DIR/s`. A client that connects by path reads
+the listener's uid (`SO_PEERCRED` on its own end) and sends nothing, a token least of
+all, unless it is the uid it expects. That check can only be relied on from a client
+whose own user namespace maps the expected uid and the would-be impostor's: in a
+namespace that doesn't, an unmapped listener reads as the overflow uid, which can equal
+the uid the client expects.
+
+**`starfold attach DIR`** is such a client, for hosts that hand each connection to a
+process of their own (a pod exec stream with no tty, say): it connects to `DIR/s` and
+relays bytes between it and its stdin and stdout, unchanged, one connection per run.
+Before a byte goes either way it checks its own side as the server does (the identity
+uid map, and the walk from `/` to `DIR` by the rules above; `DIR` itself and `DIR/s`
+must not be symlinks) and reads the listener's uid, refusing unless it is its own. That
+uid is the one the kernel recorded when the listener called `listen` (`SO_PEERCRED`): a
+process that listens and then hands the socket to another uid isn't caught by it. A full
+backlog is an error, not a wait. It never takes a socket path, never retries and never
+connects anywhere else. It doesn't parse or authenticate what it relays: the server's
+login and host checks apply to the relayed request, so a host relaying a browser's
+requests sends `Host: localhost` (or a name in `--allowed-hosts`). stdout carries only
+the relayed bytes; errors go to stderr with exit status 1. At the end of stdin it shuts
+the socket's write side down and relays the server's reply until the server closes; at
+the end of the socket it exits 0. It has no idle timeout of its own; a viewer's
+WebSocket carries the server's pings.
 
 ```sh
-brew install opus pkgconf esbuild
+starfold --listen-unix /run/sf/view --listen-tcp=false   # the server, once
+starfold attach /run/sf/view                             # per connection, same uid
+```
+
+With the default `--listen-unix-mode=0600` only the server's uid can connect, so run
+`attach` as that uid (an exec into the same container usually is). Each connection is
+one run: a viewer's `/ws` holds its own for the viewer's life, and the page's other
+requests need one more (keep-alive) or one each. On other platforms `attach` is refused,
+as `--listen-unix` is.
+
+What isn't claimed:
+
+- **The same uid is not separated.** In a sandbox where other code runs as starfold's
+  uid, that code can reach starfold.
+- A peer that is let in can hand its connection to another process; the connection keeps
+  the credentials it was opened with.
+- root can do anything, and so can a process with the capabilities above.
+- **ID-mapped mounts report ownership as their mapping says.** An administrator can make
+  another uid's directory look like starfold's through an ID-mapped mount; such a mount
+  on the path is outside what is claimed.
+
+The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` and its
+socket are removed when starfold exits (a stop by SIGTERM or SIGINT, or a startup error
+after the bind); a crash or SIGKILL leaves them, and the next start takes `DIR` back
+(mode 0700, so after a crash of a server with a group or other socket mode, whose `DIR`
+then had search bits, the next start refuses it until it is removed); and starfold checks that it is the process's
+only thread when it binds, since the bind sets the working directory and umask for a
+moment.
+
+`--framed` sends every WebSocket message as binary with a kind byte, for hops that carry
+binary messages only; the page then needs `?framed=1`. Framed, a message from the page is
+at most 64 MiB, kind byte included; the page doesn't send a larger one.
+
+### macOS
+
+starfold also streams a Mac's own screen (ScreenCaptureKit capture, CGEvent input,
+NSPasteboard clipboard, system audio). Not on a Mac: `--listen-unix` and `starfold attach`
+(Linux-only), the VA-API and NVENC encoders (a Mac has VideoToolbox), rounded corners (X11 only),
+and the microphone FIFO (the microphone plays into a loopback device instead, below).
+
+```sh
+brew install x264 opus pkgconf esbuild
 cargo build --release
 ./target/release/starfold --port=6901
 ```
@@ -271,9 +523,12 @@ rounded-corner flags don't apply.
 
 ### Windows
 
-starfold also streams a Windows desktop (Windows 10 or later), with every feature of the
-Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
-WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
+starfold also streams a Windows desktop (Windows 10 version 1703 or later, for per-monitor DPI
+awareness v2; DXGI Desktop Duplication capture,
+SendInput, clipboard text and images, WASAPI system audio). Not on Windows: `--listen-unix` and
+`starfold attach` (Linux-only), the VA-API encoder (Windows has NVENC, Media Foundation and Quick
+Sync), rounded corners (X11 only), and the microphone FIFO (the microphone plays into a virtual
+audio cable instead, below). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
 
 ```powershell
 vcpkg install x264 libyuv opus --triplet x64-windows-static-md
@@ -350,7 +605,12 @@ The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2
 so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
 work. Each release attaches the exact x264 source its builds link
 ([third_party/x264](third_party/x264/README.md)). A build with
-`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead and has
-no GPL component, so the binary stays under starfold's MIT licence; `starfold --version` lists
-the encoders a binary includes and its licence.
+`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead, so the
+binary is distributed under starfold's MIT licence; `starfold --version` lists the encoders a
+binary includes and that licence. A binary built with GCC includes GCC's runtime code (on Linux
+its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under
+GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary
+under MIT; a Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with
+permission to link them into any program. The Linux and Windows release archives carry these
+texts; the macOS ones have neither (Apple's toolchain links no GCC or glibc code).
 [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.

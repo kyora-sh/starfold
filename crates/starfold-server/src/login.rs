@@ -105,7 +105,7 @@ impl Login {
 }
 
 /// Compares in time that depends only on the lengths, not on where the bytes differ.
-fn same(a: &str, b: &str) -> bool {
+pub(crate) fn same(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())

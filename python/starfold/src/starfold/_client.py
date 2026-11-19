@@ -21,6 +21,7 @@ from ._types import (
     NotFoundError,
     ReadOnlyError,
     Recording,
+    RecordingOffError,
     Screenshot,
     Segments,
     StarfoldConnectionError,
@@ -60,8 +61,11 @@ def _error(resp: httpx.Response) -> StarfoldError:
     if code == 401:
         return AuthError(message, code)
     if code == 403:
-        read_only = isinstance(body, dict) and body.get("read_only") is True
-        return (ReadOnlyError if read_only else ForbiddenError)(message, code)
+        if isinstance(body, dict) and body.get("read_only") is True:
+            return ReadOnlyError(message, code)
+        if isinstance(body, dict) and body.get("recording") is False:
+            return RecordingOffError(message, code)
+        return ForbiddenError(message, code)
     if code == 404:
         return NotFoundError(message, code)
     return StarfoldError(f"{code}: {message}", code)
@@ -151,12 +155,16 @@ def _record(seconds: float) -> _Req[Segments]:
 
 def _record_start() -> _Req[Recording]:
     return _Req(
-        "POST", "/record/start", lambda r: Recording(id=int(r.json()["id"]), max_seconds=int(r.json()["max_seconds"]))
+        "POST", "/record/start", lambda r: Recording(id=str(r.json()["id"]), max_seconds=int(r.json()["max_seconds"]))
     )
 
 
-def _record_stop(recording: Recording | int) -> _Req[Segments]:
+def _record_stop(recording: Recording | str) -> _Req[Segments]:
     rid = recording.id if isinstance(recording, Recording) else recording
+    if not isinstance(rid, str):
+        raise TypeError(
+            f"a recording id is a string (the Recording record_start returned, or its .id), not {type(rid).__name__}"
+        )
     return _Req("POST", "/record/stop", _segments, params={"id": rid, "format": "zip"})
 
 
@@ -292,7 +300,7 @@ class Starfold(_Base):
     def record_start(self) -> Recording:
         return self._do(_record_start())
 
-    def record_stop(self, recording: Recording | int) -> Segments:
+    def record_stop(self, recording: Recording | str) -> Segments:
         return self._do(_record_stop(recording))
 
     def files_list(self, path: str = "") -> FileList:
@@ -394,7 +402,7 @@ class AsyncStarfold(_Base):
     async def record_start(self) -> Recording:
         return await self._do(_record_start())
 
-    async def record_stop(self, recording: Recording | int) -> Segments:
+    async def record_stop(self, recording: Recording | str) -> Segments:
         return await self._do(_record_stop(recording))
 
     async def files_list(self, path: str = "") -> FileList:
