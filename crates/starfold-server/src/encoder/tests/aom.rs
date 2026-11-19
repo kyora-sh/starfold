@@ -1,7 +1,7 @@
 //! libaom's paint-over: refinement frames that re-code a still picture, and the references
 //! that keep its rate control on the stream's own frames.
 
-use super::super::aom::{quantizer, references, Aom};
+use super::super::aom::{as_qp, quantizer, references, Aom};
 use super::*;
 
 const W: usize = 640;
@@ -45,6 +45,11 @@ impl Stream {
                 },
             )
             .unwrap();
+        assert!(
+            self.pts == 33 || !aus.iter().any(|a| a.keyframe),
+            "a keyframe at {} ms",
+            self.pts
+        );
         aus.iter().map(|a| a.data.len()).sum()
     }
 
@@ -94,12 +99,18 @@ fn only_slot_0_is_refreshed_and_unused_names_are_on_the_spare_slot() {
 
 #[test]
 fn the_ladder_maps_onto_libaoms_quantizer() {
-    assert_eq!(quantizer(12), 4);
-    assert_eq!(quantizer(0), 4);
-    assert_eq!(quantizer(51), 63);
+    let rungs: Vec<_> = [0u8, 12, 13, 14, 15, 16, 20, 51].map(quantizer).into();
+    assert_eq!(rungs, [4, 4, 8, 12, 16, 20, 25, 63]);
     for qp in 13..=51u8 {
-        assert!(quantizer(qp) >= quantizer(qp - 1), "qp {qp}");
-        assert!(quantizer(qp) <= 63, "qp {qp}");
+        assert!(quantizer(qp) > quantizer(qp - 1), "qp {qp}");
+    }
+    for qp in 12..=51u8 {
+        assert_eq!(as_qp(quantizer(qp)), qp as i32, "qp {qp}");
+    }
+    for q in 0..=63 {
+        let qp = as_qp(q);
+        assert!(quantizer(qp as u8) >= q, "q {q}");
+        assert!(qp == 12 || quantizer(qp as u8 - 1) < q, "q {q}");
     }
 }
 
