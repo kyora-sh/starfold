@@ -57,9 +57,17 @@ pub struct Obu<'a> {
     pub whole: &'a [u8],
 }
 
-/// The OBU starting at `i` and where the next one starts; `None` if it runs past the end.
+/// The most bytes of a sequence header's payload a recording takes; an encoder's is a few
+/// dozen.
+pub const MAX_SEQUENCE_HEADER: usize = 512;
+
+/// The OBU starting at `i` and where the next one starts; `None` if it runs past the end
+/// or sets the forbidden bit.
 fn obu_at(d: &[u8], i: usize) -> Option<(Obu<'_>, usize)> {
     let h = *d.get(i)?;
+    if h & 0x80 != 0 {
+        return None;
+    }
     let header_end = i + 1 + ((h >> 2) & 1) as usize;
     let mut j = header_end;
     let mut size = d.len().checked_sub(j)?;
@@ -76,16 +84,37 @@ fn obu_at(d: &[u8], i: usize) -> Option<(Obu<'_>, usize)> {
     Some((obu, end))
 }
 
-/// Every OBU of a temporal unit, in order; `None` if one runs past the end.
-pub fn obus(d: &[u8]) -> Option<Vec<Obu<'_>>> {
-    let mut v = Vec::new();
-    let mut i = 0;
-    while i < d.len() {
-        let (o, next) = obu_at(d, i)?;
-        v.push(o);
-        i = next;
+/// Every OBU of a temporal unit, in order, read in place; an error for one that runs past
+/// the end or sets the forbidden bit, and nothing after it.
+pub fn obus(d: &[u8]) -> Obus<'_> {
+    Obus { d, i: 0 }
+}
+
+pub struct Obus<'a> {
+    d: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Iterator for Obus<'a> {
+    type Item = Result<Obu<'a>, &'static str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.d.len() {
+            return None;
+        }
+        match obu_at(self.d, self.i) {
+            Some((o, next)) => {
+                self.i = next;
+                Some(Ok(o))
+            }
+            None => {
+                self.i = self.d.len();
+                Some(Err(
+                    "an AV1 frame with an OBU that is malformed or runs past its end",
+                ))
+            }
+        }
     }
-    Some(v)
 }
 
 /// The kind and payload of the first OBU in a temporal unit that `want` takes.
@@ -116,8 +145,11 @@ pub fn sequence_header_obu(d: &[u8]) -> Option<&[u8]> {
 }
 
 /// The four fixed bytes of an `av1C` box (AV1-ISOBMFF section 2.3.3) for a sequence
-/// header's payload; its configOBUs follow them.
+/// header's payload of at most [`MAX_SEQUENCE_HEADER`] bytes; its configOBUs follow them.
 pub fn av1c(sh: &[u8]) -> Option<[u8; 4]> {
+    if sh.len() > MAX_SEQUENCE_HEADER {
+        return None;
+    }
     let s = sequence(sh)?;
     Some([
         0x81,
