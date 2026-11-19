@@ -652,6 +652,7 @@ mod tests {
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
             encoders: Default::default(),
+            framed: false,
         };
         (s, seen)
     }
