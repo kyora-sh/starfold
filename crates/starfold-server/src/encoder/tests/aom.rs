@@ -68,6 +68,15 @@ impl Stream {
         (q, bytes)
     }
 
+    /// `frames` frames of full-picture motion, which a capped stream codes coarsely; scrolled
+    /// text it codes all but losslessly with its screen-content tools.
+    fn play(&mut self, frames: usize) {
+        for f in 0..frames {
+            self.pic.video(f);
+            self.frame(None);
+        }
+    }
+
     fn psnr(&mut self) -> f64 {
         luma_psnr(&self.enc.reconstruction().unwrap(), W, &self.pic)
     }
@@ -116,8 +125,8 @@ fn the_ladder_maps_onto_libaoms_quantizer() {
 
 #[test]
 fn a_still_picture_is_re_coded_by_the_ladder() {
-    let mut s = Stream::new(2000);
-    s.scroll(30);
+    let mut s = Stream::new(1000);
+    s.play(30);
     s.frame(None);
     s.frame(None);
     let still = s.psnr();
