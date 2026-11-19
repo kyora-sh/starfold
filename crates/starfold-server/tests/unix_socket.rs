@@ -236,7 +236,6 @@ struct Throwaway {
 impl Throwaway {
     fn create() -> Throwaway {
         let name = format!("sf-test-{}", std::process::id());
-        let _ = Command::new("sudo").args(["-n", "userdel", &name]).output();
         let made = Command::new("sudo")
             .args([
                 "-n",
@@ -248,9 +247,11 @@ impl Throwaway {
             .arg(&name)
             .output()
             .unwrap();
+        // useradd refuses a name that exists (exit 9): an account this test didn't make is
+        // never touched, and only one it made is deleted on drop.
         assert!(
             made.status.success(),
-            "useradd: {}",
+            "useradd {name}: {}",
             String::from_utf8_lossy(&made.stderr)
         );
         let id = Command::new("id").args(["-u", &name]).output().unwrap();

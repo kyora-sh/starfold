@@ -15,7 +15,8 @@ Server:
   --listen-unix                 also serve on a unix socket (Linux only): makes
                                 this directory, which must not exist yet, for
                                 this user alone and listens on the socket s in
-                                it; removes both on exit; the host and origin
+                                it; removes both when it exits (not after a
+                                crash or SIGKILL); the host and origin
                                 checks still apply. Only a peer with this
                                 process's uid is let in (SO_PEERCRED); the same
                                 uid is not separated. Refused outside the
@@ -25,7 +26,8 @@ Server:
                                 (sticky) or a directory only you can write
   --listen-unix-mode            the socket's permissions (default 0600); group
                                 or other write access also lets that class
-                                search the directory
+                                search the directory and connect, and then
+                                only the peer-uid check keeps them out
   --framed                      every WebSocket message binary, its first byte
                                 0 (binary) or 1 (text), for hops that carry
                                 binary only; the page needs ?framed=1

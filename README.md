@@ -255,9 +255,10 @@ curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901
 `--listen-unix DIR` serves the same routes, with the same login and host checks, on a
 unix socket: starfold makes `DIR` (which must not exist yet) for its user alone and
 listens on `DIR/s`; `--listen-tcp=false` turns TCP off. On other platforms the flag is
-refused: `--listen-unix is not available on this platform yet`. It needs the `starfold`
-binary (it binds before any thread starts); a program that embeds the server gets an
-error for it.
+refused: `--listen-unix is not available on this platform yet`. It binds before any
+thread starts, so it works from the `starfold` binary or a program whose own `main` calls
+`starfold::main` first thing (the bind checks that the process has one thread);
+`starfold::run` refuses it.
 
 What keeps other users out: the server lets in only a peer with its own uid. The kernel
 records each connecting process's credentials at `connect`, and starfold reads them
@@ -274,11 +275,23 @@ refusal quotes what it read. This needs Linux 5.6 or later (`openat2`). What isn
 - A peer that is let in can hand its connection to another process; the connection keeps
   the credentials it was opened with.
 - root can do anything.
+- **Which connections the kernel accepts.** With the default `--listen-unix-mode=0600`,
+  only starfold's uid (and root) can `connect`. `0660` or `0666` let that group or
+  everyone `connect` too: the kernel accepts the connection, and starfold closes it
+  unread after the peer-uid check. With those modes the peer-uid check is the only
+  thing between other users and the server.
+- **That a path leads to starfold.** A client that connects by path trusts every
+  directory on the way: another user who can rename an ancestor, or who creates
+  `DIR/s` before starfold does or after it exits, can serve something else there. A
+  client that has to know it reached starfold checks the listener's uid itself
+  (`SO_PEERCRED` on its own end).
 
 The rest is hygiene, which keeps an honest setup tidy and fails early, not what keeps
 other users out: `DIR`'s parent must not let other users rename entries in it (owned by
 you or root, writable by no one else unless sticky as `/tmp` is, and no ACL entry that
-lets anyone else write); `DIR` is made fresh for this user alone and removed on exit;
+lets anyone else write); `DIR` is made fresh for this user alone and removed when
+starfold exits (a stop by SIGTERM or SIGINT, or a startup error after the bind); a crash
+or SIGKILL leaves it, and the next start on that path is refused until it is removed;
 and starfold checks that it is the process's only thread when it binds, since the bind
 sets the working directory and umask for a moment.
 
