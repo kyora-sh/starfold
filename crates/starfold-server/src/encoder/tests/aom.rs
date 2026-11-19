@@ -124,27 +124,31 @@ fn the_ladder_maps_onto_libaoms_quantizer() {
 }
 
 #[test]
-fn a_still_picture_is_re_coded_by_the_ladder() {
+fn a_still_picture_is_sharp_after_one_pass_whose_budget_fits() {
     let mut s = Stream::new(1000);
     s.play(30);
     s.frame(None);
     s.frame(None);
     let still = s.psnr();
-    let mut psnr = still;
+    assert!(s.refinable(20));
+    let n = s.frame(Some(Refine {
+        qp: 20,
+        max_bytes: None,
+    }));
+    let psnr = s.psnr();
+    eprintln!("one pass: {n} bytes, {psnr:.2} dB (still {still:.2})");
+    assert!(n > 0);
+    assert!(psnr >= still + 3.0, "{psnr:.2} from {still:.2}");
+    assert_eq!(s.enc.last_quantizer().unwrap(), 4);
     for qp in [20u8, 16, 12] {
-        assert!(s.refinable(qp), "qp {qp}");
+        assert!(!s.refinable(qp), "qp {qp}");
         let n = s.frame(Some(Refine {
             qp,
             max_bytes: None,
         }));
-        assert!(n > 0, "qp {qp}");
-        let p = s.psnr();
-        eprintln!("qp {qp}: {n} bytes, {p:.2} dB (still {still:.2})");
-        assert!(p >= psnr - 0.1, "qp {qp}: {p:.2} after {psnr:.2}");
-        psnr = p;
+        assert_eq!(n, 0, "qp {qp}");
     }
-    assert!(psnr >= still + 3.0, "{psnr:.2} from {still:.2}");
-    assert!(!s.refinable(12));
+    assert!((s.psnr() - psnr).abs() < 0.01);
 }
 
 #[test]
@@ -166,13 +170,11 @@ fn motion_after_refinements_keeps_its_quantizer() {
     let (q, bytes) = s.scroll(40);
     for _ in 0..3 {
         s.frame(None);
-        for qp in [20u8, 16, 12] {
-            let n = s.frame(Some(Refine {
-                qp,
-                max_bytes: None,
-            }));
-            assert!(n > 0, "qp {qp}: no refinement went out");
-        }
+        let n = s.frame(Some(Refine {
+            qp: 20,
+            max_bytes: None,
+        }));
+        assert!(n > 0, "no refinement went out");
         let (q_after, bytes_after) = s.scroll(40);
         eprintln!("motion q {q:.1} -> {q_after:.1}, bytes {bytes:.0} -> {bytes_after:.0}");
         assert!(q_after <= q + 6.0, "q {q:.1} -> {q_after:.1}");

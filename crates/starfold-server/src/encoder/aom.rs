@@ -59,12 +59,11 @@ pub(crate) fn quantizer(qp: u8) -> c_int {
     }
 }
 
-/// A pass aiming below the last rung aims at it: [`quantizer`] goes no finer.
+/// Every pass aims at the last rung, whatever rung it was asked for: the pass's budget, not
+/// the ladder, decides how fine it gets, so a picture whose whole repaint fits one budget is
+/// sharp after one pass instead of three, and a larger one goes as far as each budget allows.
 fn finest(r: Refine) -> Refine {
-    Refine {
-        qp: r.qp.max(FINEST_QP),
-        ..r
-    }
+    Refine { qp: FINEST_QP, ..r }
 }
 
 /// libaom's quantizer `q` as the lowest H.264 QP whose [`quantizer`] is at least `q`: a pass
