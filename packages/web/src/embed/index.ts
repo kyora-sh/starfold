@@ -210,7 +210,9 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		void audio?.start();
 		clipboard.flush();
 	};
-	const pointer = setupPointer(app, onInteract);
+	const pointer = setupPointer(app, onInteract, () =>
+		kbd.focus({ preventScroll: true })
+	);
 	disposers.add('pointer', () => pointer.dispose());
 	const keyboard = setupKeyboard(app, clipboard, onInteract, true);
 	disposers.add('keyboard', () => keyboard.dispose());

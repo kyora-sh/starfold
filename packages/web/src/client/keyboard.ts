@@ -50,7 +50,8 @@ async function toPng(file: File): Promise<ArrayBuffer> {
 
 /**
  * `embedded`: focus waits for the user instead of being taken at once on a top-level page, and
- * keys held when focus moves to another field of the page are released.
+ * when focus moves to another field of the page each held key is released and a paste
+ * shortcut still waiting for its paste is dropped.
  */
 export function setupKeyboard(
 	app: App,
@@ -227,7 +228,9 @@ export function setupKeyboard(
 	ls.on(window, 'blur', releaseAll);
 	if (embedded)
 		ls.on(kbd, 'blur', () => {
-			if (down.size) releaseAll();
+			if (pendingPaste) clearTimeout(pendingPaste.timer);
+			pendingPaste = null;
+			for (const code of down.keys()) release(code);
 		});
 	ls.on(surface, 'focus', () => kbd.focus({ preventScroll: true }));
 	if (!embedded && !app.inIframe) kbd.focus({ preventScroll: true });

@@ -57,6 +57,12 @@ function workerSide(w: FakeWorker) {
 
 const tick = () => sleep(0);
 
+/** The input commands the page posted to the worker. */
+const sends = (w: FakeWorker) =>
+	w.posted
+		.filter((m) => m.t === 'send')
+		.map((m) => (m as unknown as { d: string }).d);
+
 /** A Worker constructor that throws, as a cross-origin script URL makes it. */
 function crossOriginWorker(): never {
 	throw new DOMException('cross-origin', 'SecurityError');
@@ -343,11 +349,54 @@ describe('mount', () => {
 				key: 'a',
 			})
 		);
+		const before = sends(w).length;
 		kbd.dispatchEvent(new Event('blur'));
-		const sent = w.posted
-			.filter((m) => m.t === 'send')
-			.map((m) => (m as unknown as { d: string }).d);
-		expect(sent.at(-1)).toBe('r');
+		expect(sends(w).slice(before)).toEqual(['k,97,0']);
+		h.unmount();
+		await tick();
+	});
+
+	test('a paste shortcut still pending when focus leaves the keyboard field is dropped', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const kbd = box.children[1];
+		const key = (type: string, code: string, k: string) =>
+			kbd.dispatchEvent(
+				Object.assign(new Event(type, { cancelable: true }), {
+					code,
+					key: k,
+					ctrlKey: true,
+					metaKey: true,
+				})
+			);
+		key('keydown', 'ControlLeft', 'Control');
+		key('keydown', 'MetaLeft', 'Meta');
+		key('keydown', 'KeyV', 'v');
+		kbd.dispatchEvent(new Event('blur'));
+		await sleep(300);
+		expect(sends(w).filter((s) => s.startsWith('k,118,'))).toEqual([]);
+		h.unmount();
+		await tick();
+	});
+
+	test('a touch tap on the surface focuses the keyboard field', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const [surface, kbd] = box.children;
+		expect(kbd.focused).toBe(0);
+		for (const type of ['pointerdown', 'pointerup'])
+			surface.dispatchEvent(
+				Object.assign(new Event(type, { cancelable: true }), {
+					pointerType: 'touch',
+					pointerId: 1,
+					button: 0,
+					clientX: 5,
+					clientY: 5,
+				})
+			);
+		expect(kbd.focused).toBe(1);
 		h.unmount();
 		await tick();
 	});
