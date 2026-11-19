@@ -140,7 +140,7 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`); at most 600 with `--enable-recording`                                                                                                                                      |
-| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 45 % of a core on a 6-vCPU VM (see below)                |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 50 % of a core on a 6-vCPU VM (see below)                |
 | `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                 | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
 
@@ -234,7 +234,7 @@ control, their frame rate or their bitrate. With viewers taking H.264 it shares 
 and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer would get
 running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
 own: that encode's CPU is the cost of recording an unwatched screen. With x264 at 1920x1080
-and full-screen motion at 60 Hz it was about 45 % of one core on a 6-vCPU VM, against under
+and full-screen motion at 60 Hz it was about 50 % of one core on a 6-vCPU VM, against under
 1 % with nothing recording. It needs a single-stripe stream: `--stripes=1`, and a picture the
 encoder doesn't split into stripes on its own (it does for a picture too large for one; then
 a start gets 409, and a recording running when the split comes ends with `closed`). A frame
