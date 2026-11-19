@@ -37,6 +37,7 @@ GPL-2.0-or-later build with x264; see [Install](README.md#install).
 - Embeddable web client: `mount()` with a per-connect preamble (#77)
 - Recording is off by default and recording ids are visible only to their owner; `--read-only` is decided in one place (#79)
 - The embeddable client works end to end over an exec-style byte bridge (#80)
+- A unix socket listener and a framed WebSocket mode (Linux) (#85)
 
 ### Fixes
 
