@@ -1,8 +1,8 @@
 //! The starfold binary with --listen-unix, started as a server: who gets through the
 //! socket, what a startup that fails or is stopped leaves behind, and the signal mask.
 //! Linux only. These tests need Xvfb, python3, unprivileged user namespaces (`unshare
-//! --user`) and passwordless `sudo -n` (to make a throwaway user and run as it); without
-//! them they fail, they don't skip.
+//! --user`), passwordless `sudo -n` (to make a throwaway user and run as it) and bindfs
+//! (a FUSE mount); without them they fail, they don't skip.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
@@ -439,6 +439,43 @@ fn a_second_instance_is_refused_and_the_first_keeps_serving() {
     assert_eq!(code, Some(1), "{said}");
     assert!(said.contains("another server is using it"), "{said}");
     assert!(healthy(&first.socket), "{}", read_log(&first.log));
+}
+
+/// A path on a FUSE mount (bindfs, mounted by root with allow_other over a directory of
+/// ours, so every owner and mode on it looks like ours) is refused, naming the mount, and
+/// nothing is made in what it mirrors. This test needs bindfs.
+#[test]
+fn a_path_on_a_fuse_mount_is_refused() {
+    sudo_works();
+    let src = scratch("fuse-src", 0o700);
+    let mnt = scratch("fuse-mnt", 0o700);
+    let mounted = Command::new("sudo")
+        .args(["-n", "bindfs", "-o", "allow_other"])
+        .arg(&src)
+        .arg(&mnt)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(mounted, "this test needs bindfs (a FUSE filesystem)");
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(&self.0)
+                .status();
+        }
+    }
+    let unmount = Unmount(mnt.clone());
+    let (code, said) = refused_start(&mnt.join("sf"));
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains(&format!("{} is on a FUSE mount", mnt.display())),
+        "{said}"
+    );
+    assert_eq!(std::fs::read_dir(&src).unwrap().count(), 0);
+    drop(unmount);
+    std::fs::remove_dir_all(&src).unwrap();
+    std::fs::remove_dir_all(&mnt).unwrap();
 }
 
 /// A client running as a throwaway user

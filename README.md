@@ -279,9 +279,12 @@ What keeps other users out, in three parts:
   no other user rename entries in it (writable by no one else unless sticky, as `/tmp`
   is, and no ACL entry that lets anyone else write). A symlink on the way is followed
   only if it belongs to starfold's user or root, and its target is held to the same
-  rules. An existing `DIR` is taken only if it is a real directory (not a symlink) of
-  starfold's user with mode exactly 0700, and starfold holds a lock on it (`flock`) for
-  as long as it serves, so a second instance on it is refused. In it, an existing `s`
+  rules. No directory on the way, and not `DIR`, may be on procfs (`/proc/self/cwd`, say,
+  resolves differently for each process) or on a FUSE mount (its daemon reports owners
+  and modes as it likes): a socket directory can't sit on either. An existing `DIR` is
+  taken only if it is a real directory (not a symlink) of starfold's user with mode
+  exactly 0700, and starfold holds a lock on it (`flock`) for as long as it serves, so a
+  second instance on it is refused. In it, an existing `s`
   is replaced only if it is a socket of starfold's user that refuses a connection
   (nothing listens on it); anything else there, or at `DIR`, is refused. Any refusal
   names the directory, symlink or entry at fault, with its owner and mode, and touches
@@ -314,12 +317,9 @@ What isn't claimed:
 - A peer that is let in can hand its connection to another process; the connection keeps
   the credentials it was opened with.
 - root can do anything, and so can a process with the capabilities above.
-- **Every mount on the way reports ownership truthfully.** The walk trusts the owner, mode
-  and ACL the kernel reports for each directory. A user FUSE mount (`allow_other`) or an
-  ID-mapped mount controlled by another uid can report what it likes, and that uid can
-  then change what is under it; such mounts on the path are outside what is claimed. A
-  path through procfs (`/proc/self/cwd`, say) is refused, since it resolves differently
-  for each process.
+- **ID-mapped mounts report ownership as their mapping says.** An administrator can make
+  another uid's directory look like starfold's through an ID-mapped mount; such a mount
+  on the path is outside what is claimed.
 
 The rest is hygiene, which keeps an honest setup tidy and fails early: `DIR` and its
 socket are removed when starfold exits (a stop by SIGTERM or SIGINT, or a startup error
