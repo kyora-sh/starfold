@@ -461,12 +461,11 @@ pub fn bind_unix_std(
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR || id(&st) != id(&made) {
         return Err(moved());
     }
-    if st.st_uid != me || st.st_mode & 0o7777 != 0o700 {
-        return Err(if fresh {
-            moved()
-        } else {
-            in_the_way(path, describe(&st))
-        });
+    if st.st_uid != me {
+        return Err(moved());
+    }
+    if !fresh && st.st_mode & 0o7777 != 0o700 {
+        return Err(in_the_way(path, describe(&st)));
     }
     // Held for as long as the directory stays open, which is the server's life: a second
     // start on the same directory, live or racing, is turned away here and touches nothing.
@@ -2645,13 +2644,13 @@ mod tests {
             std::fs::create_dir(&at).unwrap();
             std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o700)).unwrap();
             drop(std::os::unix::net::UnixListener::bind(unix_socket_path(&at)).unwrap());
-            let dead = std::fs::symlink_metadata(unix_socket_path(&at))
-                .unwrap()
-                .ino();
+            let refused = std::os::unix::net::UnixStream::connect(unix_socket_path(&at))
+                .unwrap_err()
+                .raw_os_error();
+            assert_eq!(refused, Some(libc::ECONNREFUSED), "the socket left behind is dead");
             let (l, file) = bind_unix(&at, 0o600).unwrap();
             let now = std::fs::symlink_metadata(unix_socket_path(&at)).unwrap();
-            assert_ne!(now.ino(), dead, "the dead socket is still there");
-            assert_eq!(file.socket_id.map(|s| s.1 as u64), Some(now.ino()));
+            assert_eq!(file.socket_id, Some((now.dev(), now.ino())));
             std::os::unix::net::UnixStream::connect(unix_socket_path(&at)).unwrap();
             drop(l);
             remove_unix(&file);
