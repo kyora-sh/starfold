@@ -80,6 +80,11 @@ For smooth scrolling, start that display with the patched server:
   the API and the folder picker, merged and confined to the root; starts its own starfold.
 - `resizedyn.mjs`: dynamic resolution end to end with its own Xvfb (`XVFB`) and starfold:
   desktop follows the window, clamping, decoded size, pointer mapping, zero-copy capture.
+- `embed-bridge.mjs`: the embeddable client (`mount()`) end to end through a stand-in for an
+  integrator that reaches starfold only through an exec-style byte stream (`embed-gateway.mjs`,
+  `embed-relay.mjs`): tickets in the preamble, first frame, a key into an X app (`xev`), 4401
+  on a reused or unknown ticket without reconnecting, a new ticket on `connect()`; its own Xvfb
+  and starfold, with a password.
 - `mictest.mjs`: microphone end to end with a fake 440 Hz microphone, a private PulseAudio
   pipe source and its own starfold (`PULSEAUDIO`: the pulseaudio package).
 

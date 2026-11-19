@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mount } from '../src/embed/index';
 import type { MountOptions } from '../src/embed/index';
 import { STRIPE } from '../src/embed/styles';
-import { UNMOUNTED } from '../src/embed/types';
+import { UNMOUNTED, WORKER_FAILED } from '../src/embed/types';
 import type { LifeDown } from '../src/life';
 import {
 	FakeEl,
@@ -56,6 +56,12 @@ function workerSide(w: FakeWorker) {
 }
 
 const tick = () => sleep(0);
+
+/** The input commands the page posted to the worker. */
+const sends = (w: FakeWorker) =>
+	w.posted
+		.filter((m) => m.t === 'send')
+		.map((m) => (m as unknown as { d: string }).d);
 
 /** A Worker constructor that throws, as a cross-origin script URL makes it. */
 function crossOriginWorker(): never {
@@ -289,6 +295,110 @@ describe('mount', () => {
 			'status:connecting',
 			'status:connect-failed',
 		]);
+	});
+
+	test('a worker error while streaming stops the worker and reports one WORKER_FAILED close', async () => {
+		const { o, calls } = recording();
+		const h = mount(container() as never, o);
+		const w = FakeWorker.all[0];
+		const side = await opened(w);
+		await until(() => calls.some((c) => c.what === 'status:open'));
+		w.dispatchEvent(new Event('error', { cancelable: true }));
+		await tick();
+		expect(w.terminated).toBe(true);
+		side.port.postMessage({ t: 'closed', id: 1, code: 1006, reason: '' }, []);
+		await tick();
+		h.unmount();
+		await tick();
+		expect(calls.map((c) => c.what)).toEqual([
+			'status:connecting',
+			'status:open',
+			`close:${WORKER_FAILED.code}:${WORKER_FAILED.reason}`,
+			'status:closed',
+		]);
+	});
+
+	test('a top-level page keeps its focus at mount; a pointer on the surface takes it', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const [surface, kbd] = box.children;
+		expect(kbd.focused).toBe(0);
+		surface.dispatchEvent(
+			Object.assign(new Event('pointerdown', { cancelable: true }), {
+				pointerType: 'mouse',
+				pointerId: 1,
+				button: 0,
+				clientX: 1,
+				clientY: 1,
+			})
+		);
+		expect(kbd.focused).toBe(1);
+		h.unmount();
+		await tick();
+	});
+
+	test('keys held when focus leaves the keyboard field are released', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const kbd = box.children[1];
+		kbd.dispatchEvent(
+			Object.assign(new Event('keydown', { cancelable: true }), {
+				code: 'KeyA',
+				key: 'a',
+			})
+		);
+		const before = sends(w).length;
+		kbd.dispatchEvent(new Event('blur'));
+		expect(sends(w).slice(before)).toEqual(['k,97,0']);
+		h.unmount();
+		await tick();
+	});
+
+	test('a paste shortcut still pending when focus leaves the keyboard field is dropped', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const w = FakeWorker.all[0];
+		await opened(w);
+		const kbd = box.children[1];
+		const key = (type: string, code: string, k: string) =>
+			kbd.dispatchEvent(
+				Object.assign(new Event(type, { cancelable: true }), {
+					code,
+					key: k,
+					ctrlKey: true,
+					metaKey: true,
+				})
+			);
+		key('keydown', 'ControlLeft', 'Control');
+		key('keydown', 'MetaLeft', 'Meta');
+		key('keydown', 'KeyV', 'v');
+		kbd.dispatchEvent(new Event('blur'));
+		await sleep(300);
+		expect(sends(w).filter((s) => s.startsWith('k,118,'))).toEqual([]);
+		h.unmount();
+		await tick();
+	});
+
+	test('a touch tap on the surface focuses the keyboard field', async () => {
+		const box = container();
+		const h = mount(box as never, recording().o);
+		const [surface, kbd] = box.children;
+		expect(kbd.focused).toBe(0);
+		for (const type of ['pointerdown', 'pointerup'])
+			surface.dispatchEvent(
+				Object.assign(new Event(type, { cancelable: true }), {
+					pointerType: 'touch',
+					pointerId: 1,
+					button: 0,
+					clientX: 5,
+					clientY: 5,
+				})
+			);
+		expect(kbd.focused).toBe(1);
+		h.unmount();
+		await tick();
 	});
 
 	test('a worker that cannot be created leaves nothing in the container', () => {

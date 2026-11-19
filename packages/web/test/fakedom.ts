@@ -76,8 +76,11 @@ export class FakeEl extends Tracked {
 	get isConnected() {
 		return this.parent !== null;
 	}
+	focused = 0;
 	setAttribute() {}
-	focus() {}
+	focus() {
+		this.focused++;
+	}
 	setPointerCapture() {}
 	play() {
 		return Promise.resolve();

@@ -15,7 +15,7 @@ import { avcCodec, familyOf, keyframeCodec } from './codecs';
 import type { Dav1d, Dav1dBundle, Picture, StripeDecoder } from './decoders';
 import { WebCodecsDecoder } from './decoders';
 import { FRAMED_SEND_LIMIT, frameBinary, frameText, unframe } from './frame';
-import { PROTOCOL_ERROR } from './embed/types';
+import { NO_COMMON_CODEC, PROTOCOL_ERROR } from './embed/types';
 import { serveLife } from './life';
 import type { LifeUp } from './life';
 import { Link } from './link';
@@ -379,6 +379,10 @@ function onCodec(m: CodecMessage) {
 	errors = [];
 	resetDecoder();
 	if (m.error !== undefined) {
+		if (life) {
+			link?.abort(NO_COMMON_CODEC.code, NO_COMMON_CODEC.reason);
+			return;
+		}
 		post({ t: 'log', s: `no video: ${m.error}` });
 		post(m);
 		return;
