@@ -4,7 +4,7 @@ use crate::encoder::caps::{Acceleration, Chroma, ProbeStatus, ProfileCapability}
 use crate::encoder::caps::{Registry, Software};
 use crate::encoder::Codec;
 #[cfg(unix)]
-use crate::encoder::SOFTWARE_H264;
+use crate::encoder::{SOFTWARE, SOFTWARE_CODEC};
 
 fn good(backend: Backend) -> EncoderCapability {
     let mut c = EncoderCapability::new(Codec::H264, backend, Acceleration::Hardware, "gpu0");
@@ -102,8 +102,8 @@ fn unreadable_or_foreign_reports_are_diagnostics() {
     assert!(reason(&parse(b"hello\n", b)).contains("unreadable"));
     let other = report(Backend::Nvenc, Vec::new());
     assert!(reason(&parse(other.as_bytes(), b)).contains("nvenc"));
-    let smuggled = report(b, vec![good(Backend::OpenH264)]);
-    assert!(reason(&parse(smuggled.as_bytes(), b)).contains("openh264"));
+    let smuggled = report(b, vec![good(Backend::FakeH264)]);
+    assert!(reason(&parse(smuggled.as_bytes(), b)).contains("fake-h264"));
     let old = report(b, Vec::new()).replace("\"probe\":1", "\"probe\":0");
     assert!(reason(&parse(old.as_bytes(), b)).contains("version 0"));
 }
@@ -186,7 +186,7 @@ fn hung_child_is_killed_at_the_timeout() {
 fn registry_keeps_the_rest_when_children_fail() {
     let vt = report(Backend::VideoToolbox, vec![good(Backend::VideoToolbox)]);
     let providers: Vec<Box<dyn ProbeProvider>> = vec![
-        Box::new(Software(SOFTWARE_H264)),
+        Box::new(Software(SOFTWARE, SOFTWARE_CODEC)),
         Box::new(child(
             Backend::VideoToolbox,
             format!("echo '{vt}'"),
@@ -204,7 +204,7 @@ fn registry_keeps_the_rest_when_children_fail() {
         )),
     ];
     let r = Registry::probe(providers, Duration::from_secs(10));
-    assert!(r.check(SOFTWARE_H264, Codec::H264).is_ok());
+    assert!(r.check(SOFTWARE, SOFTWARE_CODEC).is_ok());
     let vt = r
         .encoders
         .iter()

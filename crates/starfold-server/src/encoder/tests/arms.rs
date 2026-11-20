@@ -301,7 +301,7 @@ fn arm_bench() {
     let crf: f32 = var("CRF", "24").parse().unwrap();
     let (backend, codec) = match Selection::parse(&arm).unwrap() {
         Selection::Arm(_, b, c) => (b, c),
-        Selection::Pinned(b) => (b, Codec::H264),
+        Selection::Pinned(b) => (b, crate::negotiate::base_codec(b)),
         Selection::Auto => panic!("name an arm"),
     };
     let (w, h, fps) = (1920usize, 1080usize, 30u32);

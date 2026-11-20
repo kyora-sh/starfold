@@ -1,8 +1,8 @@
 // What this browser decodes of the server's offers: WebCodecs, hardware preferred, and
-// dav1d-wasm for AV1 only when the browser has no hardware-backed WebCodecs decoder for
-// AV1, HEVC or H.264, WebCodecs decodes no AV1 configuration, and no offer is covered
-// stripe for stripe by WebCodecs. The server ranks every WebCodecs choice above
-// dav1d-wasm, so it is only fetched when it would be picked.
+// dav1d-wasm for every stripe of each AV1 offer it decodes whole, once no offer is
+// covered stripe for stripe by WebCodecs. The server needs one implementation for all
+// stripes of an offer and ranks every WebCodecs choice above dav1d-wasm, so dav1d-wasm
+// is only fetched when it would be picked.
 import type {
 	DecodeEntry,
 	DecoderConfig,
@@ -77,40 +77,22 @@ export async function probe(
 				hardwareAcceleration: t.hw,
 			});
 		}
-	const wasm = tested.filter(
-		(t) => t.av1 && !t.hw && env.dav1dDecodes(t.c.codec)
-	);
 	const covered = offers.some((o) =>
 		o.stripes.every((s) => accepted.has(configKey(s.config)))
 	);
-	const noHardware =
-		!covered &&
-		!tested.some((t) => t.hw === 'prefer-hardware' || (t.av1 && t.hw)) &&
-		wasm.length > 0 &&
-		!(await hardwareElsewhere(wasm[0].c, env));
-	if (noHardware && (await env.dav1d()))
-		for (const t of wasm) {
-			accepted.set(t.k, { implementation: 'dav1d-wasm' });
-			decode.push({ ...t.c, implementation: 'dav1d-wasm' });
+	const wasm = new Map<string, DecoderConfig>();
+	for (const o of offers)
+		if (
+			o.codec === 'av1' &&
+			o.stripes.every((s) => env.dav1dDecodes(s.config.codec))
+		)
+			for (const s of o.stripes) wasm.set(configKey(s.config), s.config);
+	if (!covered && wasm.size > 0 && (await env.dav1d()))
+		for (const [k, c] of wasm) {
+			accepted.set(k, { implementation: 'dav1d-wasm' });
+			decode.push({ ...c, implementation: 'dav1d-wasm' });
 		}
 	return { decode, accepted };
-}
-
-/** Codecs the server may not offer still count: a hardware decoder for any of them
- * means this browser has a native path, and dav1d-wasm stays out. */
-const REPRESENTATIVE = ['av01.0.08M.08', 'hvc1.1.6.L120.90', 'avc1.640028'];
-
-async function hardwareElsewhere(
-	size: DecoderConfig,
-	env: ProbeEnv
-): Promise<boolean> {
-	if (env.noHardware) return false;
-	const found = await Promise.all(
-		REPRESENTATIVE.map((codec) =>
-			env.supported(decoderConfig({ ...size, codec }, 'prefer-hardware'))
-		)
-	);
-	return found.includes(true);
 }
 
 async function webcodecs(

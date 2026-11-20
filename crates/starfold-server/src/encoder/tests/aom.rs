@@ -11,6 +11,7 @@ struct Stream {
     enc: Aom,
     pic: Picture,
     pts: i64,
+    interval_ms: i64,
     scrolled: usize,
 }
 
@@ -25,6 +26,7 @@ impl Stream {
             enc: Aom::new(&cfg).unwrap(),
             pic: Picture::new(W, H),
             pts: 0,
+            interval_ms: 33,
             scrolled: 0,
         };
         assert!(s.frame(None) > 0);
@@ -32,7 +34,7 @@ impl Stream {
     }
 
     fn frame(&mut self, refine: Option<Refine>) -> usize {
-        self.pts += 33;
+        self.pts += self.interval_ms;
         let aus = self
             .enc
             .encode(
@@ -87,6 +89,25 @@ impl Stream {
             max_bytes: None,
         })
     }
+}
+
+#[test]
+fn a_refused_rate_change_keeps_the_rate_in_force() {
+    let mut s = Stream::new(2000);
+    s.enc.cap_quantizer(10).unwrap();
+    let before = s.enc.rate_state();
+    assert!(s.enc.set_rate(RateConfig::new(40.0, 900, 10)).is_err());
+    assert_eq!(s.enc.rate_state(), before);
+    s.enc.set_rate(RateConfig::new(5.0, 900, 10)).unwrap();
+    assert_eq!(s.enc.rate_state(), (900, 5, 100));
+    assert!(s.frame(None) > 0);
+}
+
+/// 150 / 75 / 90 ms: a link that drops keeps scroll's tail near x264's (1000 / 500 / 600
+/// doubled it).
+#[test]
+fn the_rate_buffer_is_150_ms() {
+    assert_eq!(Stream::new(4000).enc.rate_buffer(), (150, 75, 90));
 }
 
 #[test]
@@ -183,4 +204,38 @@ fn motion_after_refinements_keeps_its_quantizer() {
             "bytes {bytes:.0} -> {bytes_after:.0}"
         );
     }
+}
+
+/// Frames now come a third as often: CBR's target is the bitrate times the frame interval,
+/// so each gets about three times the bytes (at least twice, with room for the 150 ms
+/// buffer's correction), and the stream carries on without a keyframe. The bitrate is low
+/// enough that neither rate reaches the quantizer floor, where bytes follow the picture.
+#[test]
+fn a_lower_frame_rate_budgets_more_per_frame_without_a_keyframe() {
+    let mut s = Stream::new(500);
+    let run = |s: &mut Stream, from: usize, step: usize| {
+        let bytes: Vec<usize> = (0..45)
+            .map(|i| {
+                s.pic.video(from + i * step);
+                s.frame(None)
+            })
+            .collect();
+        let tail = &bytes[15..];
+        (
+            tail.iter().sum::<usize>() / tail.len(),
+            s.enc.last_quantizer().unwrap(),
+        )
+    };
+    let (at30, q30) = run(&mut s, 0, 1);
+    s.enc.set_rate(RateConfig::new(24.0, 500, 10)).unwrap();
+    s.interval_ms = 100;
+    let (at10, q10) = run(&mut s, 45, 3);
+    eprintln!(
+        "libaom 500 kbps: {at30} bytes a frame at 30 fps (q {q30}), {at10} at 10 fps (q {q10})"
+    );
+    assert!(q30 > 24 && q10 > 24, "q {q30} and {q10}: on the floor");
+    assert!(
+        at10 >= at30 * 2,
+        "{at30} bytes a frame at 30 fps, {at10} at 10"
+    );
 }

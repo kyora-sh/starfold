@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 pub enum Out {
     Bin(Bytes),
     Text(String),
+    /// Closes the connection with this code and reason.
+    Close(u16, &'static str),
 }
 
 /// Where [`Hub::send_first_hello_with`] is, with the generation of the hello it built.

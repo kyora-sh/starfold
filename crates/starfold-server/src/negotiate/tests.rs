@@ -39,9 +39,31 @@ const HEVC: Candidate = Candidate {
 };
 const H264: Candidate = Candidate {
     codec: Codec::H264,
-    backend: Backend::OpenH264,
+    backend: Backend::FakeH264,
     hardware: false,
 };
+/// This build's software base encoder: libaom's AV1, or x264's H.264 where it is built.
+const SW: Candidate = Candidate {
+    codec: SOFTWARE_CODEC,
+    backend: SOFTWARE,
+    hardware: false,
+};
+
+fn sw() -> EncoderCapability {
+    cap(SOFTWARE_CODEC, SOFTWARE, false)
+}
+
+fn hw264(backend: Backend) -> Candidate {
+    Candidate {
+        codec: Codec::H264,
+        backend,
+        hardware: true,
+    }
+}
+
+fn pairs(c: &[Candidate]) -> Vec<(Codec, Backend)> {
+    c.iter().map(|c| (c.codec, c.backend)).collect()
+}
 
 fn offer(cand: Candidate, codec: &str, stripes: &[(u32, u32)], w: u32) -> Offer {
     Offer {
@@ -120,42 +142,43 @@ fn picks(p: &Plan) -> Vec<Option<Codec>> {
 }
 
 #[test]
-fn candidates_rank_codecs_then_hardware() {
-    let r = reg(vec![
-        cap(Codec::H264, SOFTWARE_H264, false),
+fn candidates_rank_hardware_then_codecs() {
+    let mut caps = vec![
+        cap(Codec::H264, Backend::FakeH264, false),
         cap(Codec::Hevc, Backend::Vaapi, false),
         cap(Codec::Hevc, Backend::VideoToolbox, true),
         cap(Codec::Av1, Backend::Nvenc, true),
         cap(Codec::H264, Backend::VideoToolbox, true),
-    ]);
-    let c = candidates(&r, SOFTWARE_H264);
-    let got: Vec<(Codec, Backend)> = c.iter().map(|c| (c.codec, c.backend)).collect();
+    ];
     assert_eq!(
-        got,
+        pairs(&candidates(&reg(caps.clone()), H264)),
         vec![
             (Codec::Hevc, Backend::VideoToolbox),
-            // H.264 is the configured backend alone, whatever else is eligible.
-            (Codec::H264, SOFTWARE_H264),
+            // H.264 is the base backend alone, whatever else is eligible.
+            (Codec::H264, Backend::FakeH264),
         ]
     );
-    let vt: Vec<(Backend, bool)> = candidates(&r, Backend::VideoToolbox)
-        .iter()
-        .filter(|c| c.codec == Codec::H264)
-        .map(|c| (c.backend, c.hardware))
-        .collect();
+    caps.push(sw());
+    let c = candidates(&reg(caps), hw264(Backend::VideoToolbox));
     assert_eq!(
-        vt,
-        vec![(Backend::VideoToolbox, true), (SOFTWARE_H264, false)],
+        pairs(&c[..2]),
+        vec![
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::VideoToolbox)
+        ]
+    );
+    assert_eq!(
+        c.last(),
+        Some(&SW),
         "a hardware H.264 encoder falls back to the software one"
     );
 }
 
 #[test]
 fn auto_selection() {
-    let sw = || cap(Codec::H264, SOFTWARE_H264, false);
     let vt = || cap(Codec::H264, Backend::VideoToolbox, true);
-    let auto = |caps: Vec<EncoderCapability>| h264_backend(&reg(caps), Selection::Auto);
-    assert_eq!(auto(vec![sw(), vt()]), Ok(Backend::VideoToolbox));
+    let auto = |caps: Vec<EncoderCapability>| base_backend(&reg(caps), Selection::Auto);
+    assert_eq!(auto(vec![sw(), vt()]), Ok(hw264(Backend::VideoToolbox)));
     let mut discovered = vt();
     discovered.status = ProbeStatus::Discovered;
     let mut disabled = cap(Codec::H264, Backend::Vaapi, true);
@@ -167,15 +190,22 @@ fn auto_selection() {
     no_idr.keyframe_control = None;
     assert_eq!(
         auto(vec![discovered, disabled, experimental, no_idr, sw()]),
-        Ok(SOFTWARE_H264)
+        Ok(SW)
     );
-    assert_eq!(auto(vec![sw()]), Ok(SOFTWARE_H264));
+    assert_eq!(auto(vec![sw()]), Ok(SW));
     assert!(auto(vec![]).is_err(), "no software encoder either");
-    let pinned = |b, caps| h264_backend(&reg(caps), Selection::Pinned(b));
-    assert_eq!(pinned(SOFTWARE_H264, vec![sw(), vt()]), Ok(SOFTWARE_H264));
+    let pinned = |b, caps| base_backend(&reg(caps), Selection::Pinned(b));
+    assert_eq!(pinned(SOFTWARE, vec![sw(), vt()]), Ok(SW));
     assert_eq!(
         pinned(Backend::VideoToolbox, vec![sw(), vt()]),
-        Ok(Backend::VideoToolbox)
+        Ok(hw264(Backend::VideoToolbox))
+    );
+    assert_eq!(
+        pinned(
+            Backend::FakeH264,
+            vec![sw(), vt(), cap(Codec::H264, Backend::FakeH264, false)]
+        ),
+        Ok(H264)
     );
     let mut lost = vt();
     lost.status = ProbeStatus::Unavailable("no session".into());
@@ -187,13 +217,9 @@ fn auto_selection() {
     let e = pinned(Backend::VideoToolbox, vec![sw()]).unwrap_err();
     assert!(e.contains("no videotoolbox H264 encoder"), "{e}");
     let r = reg(vec![sw(), vt()]);
-    let h: Vec<Backend> = candidates(&r, SOFTWARE_H264)
-        .iter()
-        .map(|c| c.backend)
-        .collect();
     assert_eq!(
-        h,
-        vec![SOFTWARE_H264],
+        candidates_for(&r, Selection::Pinned(SOFTWARE), SW),
+        vec![SW],
         "the pinned software encoder stays software"
     );
 }
@@ -205,34 +231,30 @@ fn experimental_backends_only_when_pinned() {
         cap(Codec::Hevc, Backend::Vaapi, true),
         cap(Codec::Av1, Backend::Vaapi, true),
         cap(Codec::Hevc, Backend::VideoToolbox, true),
-        cap(Codec::H264, SOFTWARE_H264, false),
+        sw(),
     ]);
-    let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, SOFTWARE_H264, "auto never picks VA-API");
-    assert!(candidates(&r, h264)
+    let base = base_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(base, SW, "auto never picks VA-API");
+    assert!(candidates(&r, base)
         .iter()
         .all(|c| c.backend != Backend::Vaapi));
-    let h264 = h264_backend(&r, Selection::Pinned(Backend::Vaapi)).unwrap();
-    assert_eq!(h264, Backend::Vaapi);
-    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
-        .iter()
-        .map(|c| (c.codec, c.backend))
-        .collect();
+    let base = base_backend(&r, Selection::Pinned(Backend::Vaapi)).unwrap();
+    assert_eq!(base, hw264(Backend::Vaapi));
     assert_eq!(
-        got,
+        pairs(&candidates_for(&r, Selection::Pinned(Backend::Vaapi), base)),
         vec![
             (Codec::Av1, Backend::Vaapi),
             (Codec::Hevc, Backend::Vaapi),
-            (Codec::Hevc, Backend::VideoToolbox),
             (Codec::H264, Backend::Vaapi),
-            (Codec::H264, SOFTWARE_H264),
-        ]
+            (SOFTWARE_CODEC, SOFTWARE),
+        ],
+        "a pinned encoder streams alone, the software one only its fallback"
     );
     let mut off = r.encoders.clone();
     for c in off.iter_mut().filter(|c| c.backend == Backend::Vaapi) {
         c.status = ProbeStatus::Disabled;
     }
-    let e = h264_backend(&reg(off), Selection::Pinned(Backend::Vaapi)).unwrap_err();
+    let e = base_backend(&reg(off), Selection::Pinned(Backend::Vaapi)).unwrap_err();
     assert!(e.contains("--experimental-hw-probes"), "{e}");
 }
 
@@ -242,33 +264,29 @@ fn nvenc_only_when_pinned() {
         cap(Codec::H264, Backend::Nvenc, true),
         cap(Codec::Hevc, Backend::Nvenc, true),
         cap(Codec::Av1, Backend::Nvenc, true),
-        cap(Codec::H264, SOFTWARE_H264, false),
+        sw(),
     ]);
-    let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, SOFTWARE_H264, "auto never picks NVENC");
-    assert!(candidates(&r, h264)
+    let base = base_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(base, SW, "auto never picks NVENC");
+    assert!(candidates(&r, base)
         .iter()
         .all(|c| c.backend != Backend::Nvenc));
-    let h264 = h264_backend(&r, Selection::Pinned(Backend::Nvenc)).unwrap();
-    assert_eq!(h264, Backend::Nvenc);
-    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
-        .iter()
-        .map(|c| (c.codec, c.backend))
-        .collect();
+    let base = base_backend(&r, Selection::Pinned(Backend::Nvenc)).unwrap();
+    assert_eq!(base, hw264(Backend::Nvenc));
     assert_eq!(
-        got,
+        pairs(&candidates_for(&r, Selection::Pinned(Backend::Nvenc), base)),
         vec![
             (Codec::Av1, Backend::Nvenc),
             (Codec::Hevc, Backend::Nvenc),
             (Codec::H264, Backend::Nvenc),
-            (Codec::H264, SOFTWARE_H264),
+            (SOFTWARE_CODEC, SOFTWARE),
         ]
     );
     let mut off = r.encoders.clone();
     for c in off.iter_mut().filter(|c| c.backend == Backend::Nvenc) {
         c.status = ProbeStatus::Disabled;
     }
-    let e = h264_backend(&reg(off), Selection::Pinned(Backend::Nvenc)).unwrap_err();
+    let e = base_backend(&reg(off), Selection::Pinned(Backend::Nvenc)).unwrap_err();
     assert!(e.contains("--experimental-hw-probes"), "{e}");
 }
 
@@ -278,26 +296,26 @@ fn mediafoundation_only_when_pinned() {
         cap(Codec::H264, Backend::MediaFoundation, true),
         cap(Codec::Hevc, Backend::MediaFoundation, true),
         cap(Codec::Av1, Backend::MediaFoundation, true),
-        cap(Codec::H264, SOFTWARE_H264, false),
+        sw(),
     ]);
-    let h264 = h264_backend(&r, Selection::Auto).unwrap();
-    assert_eq!(h264, SOFTWARE_H264, "auto never picks Media Foundation");
-    assert!(candidates(&r, h264)
+    let base = base_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(base, SW, "auto never picks Media Foundation");
+    assert!(candidates(&r, base)
         .iter()
         .all(|c| c.backend != Backend::MediaFoundation));
-    let h264 = h264_backend(&r, Selection::Pinned(Backend::MediaFoundation)).unwrap();
-    assert_eq!(h264, Backend::MediaFoundation);
-    let got: Vec<(Codec, Backend)> = candidates(&r, h264)
-        .iter()
-        .map(|c| (c.codec, c.backend))
-        .collect();
+    let base = base_backend(&r, Selection::Pinned(Backend::MediaFoundation)).unwrap();
+    assert_eq!(base, hw264(Backend::MediaFoundation));
     assert_eq!(
-        got,
+        pairs(&candidates_for(
+            &r,
+            Selection::Pinned(Backend::MediaFoundation),
+            base
+        )),
         vec![
             (Codec::Av1, Backend::MediaFoundation),
             (Codec::Hevc, Backend::MediaFoundation),
             (Codec::H264, Backend::MediaFoundation),
-            (Codec::H264, SOFTWARE_H264),
+            (SOFTWARE_CODEC, SOFTWARE),
         ]
     );
     let mut off = r.encoders.clone();
@@ -307,19 +325,19 @@ fn mediafoundation_only_when_pinned() {
     {
         c.status = ProbeStatus::Disabled;
     }
-    let e = h264_backend(&reg(off), Selection::Pinned(Backend::MediaFoundation)).unwrap_err();
+    let e = base_backend(&reg(off), Selection::Pinned(Backend::MediaFoundation)).unwrap_err();
     assert!(e.contains("--experimental-hw-probes"), "{e}");
 }
 
 #[test]
 fn chosen_is_each_codecs_first_candidate() {
     let r = reg(vec![
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, Backend::FakeH264, false),
         cap(Codec::H264, Backend::VideoToolbox, true),
         cap(Codec::Hevc, Backend::Vaapi, false),
         cap(Codec::Hevc, Backend::VideoToolbox, true),
     ]);
-    let c: Vec<(Codec, Backend)> = chosen(&candidates(&r, Backend::VideoToolbox))
+    let c: Vec<(Codec, Backend)> = chosen(&candidates(&r, hw264(Backend::VideoToolbox)))
         .iter()
         .map(|c| (c.codec, c.backend))
         .collect();
@@ -335,11 +353,22 @@ fn chosen_is_each_codecs_first_candidate() {
 #[test]
 fn selection_parse() {
     assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
-    #[cfg(feature = "openh264")]
+    let e = Selection::parse("openh264").unwrap_err();
+    assert!(e.contains("no longer has OpenH264"), "{e}");
+    #[cfg(feature = "libaom")]
     assert_eq!(
-        Selection::parse("openh264"),
-        Ok(Selection::Pinned(Backend::OpenH264))
+        Selection::parse("libaom"),
+        Ok(Selection::Pinned(Backend::Libaom))
     );
+    #[cfg(feature = "x264")]
+    assert_eq!(
+        Selection::parse("x264"),
+        Ok(Selection::Pinned(Backend::X264))
+    );
+    #[cfg(not(feature = "x264"))]
+    assert!(Selection::parse("x264")
+        .unwrap_err()
+        .contains("--features x264"));
     #[cfg(target_os = "linux")]
     assert_eq!(
         Selection::parse("vaapi"),
@@ -376,28 +405,23 @@ fn only_eligible_encoders_are_candidates() {
     let mut no_idr = cap(Codec::Av1, Backend::Vaapi, true);
     no_idr.keyframe_control = None;
     let r = reg(vec![unverified, unimplemented, ten_bit, no_idr]);
-    let c = candidates(&r, Backend::OpenH264);
-    assert_eq!(c.len(), 1);
-    assert_eq!(c[0].codec, Codec::H264);
+    assert_eq!(candidates(&r, H264), vec![H264]);
 }
 
 #[cfg(feature = "x264")]
 #[test]
 fn x264_only_when_configured() {
     let r = reg(vec![
-        cap(Codec::H264, Backend::OpenH264, false),
+        cap(Codec::H264, Backend::FakeH264, false),
         cap(Codec::H264, Backend::X264, false),
     ]);
-    let h: Vec<Backend> = candidates(&r, Backend::OpenH264)
-        .iter()
-        .map(|c| c.backend)
-        .collect();
-    assert_eq!(h, vec![Backend::OpenH264]);
-    let h: Vec<Backend> = candidates(&r, Backend::X264)
-        .iter()
-        .map(|c| c.backend)
-        .collect();
-    assert_eq!(h, vec![Backend::X264]);
+    assert_eq!(candidates(&r, H264), vec![H264]);
+    let x264 = Candidate {
+        codec: Codec::H264,
+        backend: Backend::X264,
+        hardware: false,
+    };
+    assert_eq!(candidates(&r, x264), vec![x264]);
 }
 
 #[test]
@@ -697,29 +721,39 @@ fn video_v2_layout() {
 }
 
 /// What `--encoder auto` picks on this host: VideoToolbox H.264 and HEVC on the
-/// kyora-macos runner, the software one alone where no hardware encoder is default-safe yet.
+/// kyora-macos runner ahead of libaom's AV1, the software ones alone where no hardware
+/// encoder is default-safe yet.
 #[test]
 fn auto_on_this_host() {
     use crate::encoder::caps::{host_providers, PROBE_TIMEOUT};
     let reg = Registry::probe(host_providers(true, false, true), PROBE_TIMEOUT);
-    let h264 = h264_backend(&reg, Selection::Auto).unwrap();
-    let got: Vec<(Codec, Backend, bool)> = chosen(&candidates(&reg, h264))
+    let base = base_backend(&reg, Selection::Auto).unwrap();
+    let got: Vec<(Codec, Backend, bool)> = chosen(&candidates(&reg, base))
         .iter()
         .map(|c| (c.codec, c.backend, c.hardware))
         .collect();
     println!("--encoder auto: {got:?}");
     if cfg!(target_os = "macos") {
         if std::env::var_os("STARFOLD_EXPECT_HW").is_some() {
-            assert_eq!(
-                got,
-                vec![
-                    (Codec::Hevc, Backend::VideoToolbox, true),
-                    (Codec::H264, Backend::VideoToolbox, true)
-                ]
-            );
+            let want: Vec<(Codec, Backend, bool)> = [
+                (Codec::Hevc, Backend::VideoToolbox, true),
+                (Codec::H264, Backend::VideoToolbox, true),
+                #[cfg(feature = "libaom")]
+                (Codec::Av1, Backend::Libaom, false),
+            ]
+            .into();
+            assert_eq!(got, want);
         }
     } else {
-        assert_eq!(got, vec![(Codec::H264, SOFTWARE_H264, false)]);
+        let mut want: Vec<(Codec, Backend, bool)> = [
+            #[cfg(feature = "libaom")]
+            (Codec::Av1, Backend::Libaom, false),
+        ]
+        .into();
+        if SOFTWARE_CODEC == Codec::H264 {
+            want.push((Codec::H264, SOFTWARE, false));
+        }
+        assert_eq!(got, want);
     }
 }
 
@@ -765,8 +799,8 @@ fn the_other_h264_encoder_serves_viewers_that_cant_decode_the_first() {
         got,
         vec![
             Some(Backend::VideoToolbox),
-            Some(Backend::OpenH264),
-            Some(Backend::OpenH264),
+            Some(Backend::FakeH264),
+            Some(Backend::FakeH264),
             Some(Backend::VideoToolbox)
         ]
     );
@@ -783,4 +817,188 @@ fn the_other_h264_encoder_serves_viewers_that_cant_decode_the_first() {
         "the earliest viewer decides the second cohort"
     );
     assert_eq!(p.picks[1].1, None);
+}
+
+const FAKE_AV1: Candidate = Candidate {
+    codec: Codec::Av1,
+    backend: Backend::FakeAv1,
+    hardware: false,
+};
+
+#[cfg(feature = "libaom")]
+const LIBAOM: Candidate = Candidate {
+    codec: Codec::Av1,
+    backend: Backend::Libaom,
+    hardware: false,
+};
+
+#[cfg(all(feature = "x264", feature = "libaom"))]
+#[test]
+fn the_base_chain_falls_back_from_hardware_to_x264() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::VideoToolbox, true),
+        cap(Codec::H264, Backend::X264, false),
+        cap(Codec::Av1, Backend::Libaom, false),
+    ]);
+    let base = base_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(base, hw264(Backend::VideoToolbox));
+    let x264 = Candidate {
+        codec: Codec::H264,
+        backend: Backend::X264,
+        hardware: false,
+    };
+    assert_eq!(base_chain(&candidates(&r, base)), vec![base, x264, LIBAOM]);
+    let pinned = candidates_for(&r, Selection::Pinned(Backend::VideoToolbox), base);
+    assert_eq!(pinned, vec![base, x264, LIBAOM]);
+    assert_eq!(base_chain(&pinned), vec![base, x264, LIBAOM]);
+    let alone = base_backend(&r, Selection::Pinned(Backend::X264)).unwrap();
+    assert_eq!(alone, x264);
+    assert_eq!(
+        candidates_for(&r, Selection::Pinned(Backend::X264), alone),
+        vec![x264],
+        "a pinned x264 streams H.264 to every viewer"
+    );
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn a_pinned_hardware_encoder_leads_libaom() {
+    let r = reg(vec![
+        cap(Codec::Av1, Backend::Libaom, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::Hevc, Backend::Vaapi, true),
+        cap(Codec::H264, Backend::Vaapi, true),
+    ]);
+    let sel = Selection::Pinned(Backend::Vaapi);
+    let base = base_backend(&r, sel).unwrap();
+    assert_eq!(
+        pairs(&candidates_for(&r, sel, base)),
+        vec![
+            (Codec::Hevc, Backend::Vaapi),
+            (Codec::H264, Backend::Vaapi),
+            (Codec::Av1, Backend::Libaom),
+        ]
+    );
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn a_pinned_libaom_streams_only_av1() {
+    let r = reg(vec![
+        cap(Codec::Av1, Backend::Libaom, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::H264, Backend::VideoToolbox, true),
+    ]);
+    let sel = Selection::Pinned(Backend::Libaom);
+    let base = base_backend(&r, sel).unwrap();
+    assert_eq!(candidates_for(&r, sel, base), vec![LIBAOM]);
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn the_base_chain_falls_back_from_hardware_to_libaom_without_x264() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::VideoToolbox, true),
+        cap(Codec::Av1, Backend::Libaom, false),
+    ]);
+    let base = base_backend(&r, Selection::Auto).unwrap();
+    assert_eq!(base, hw264(Backend::VideoToolbox));
+    assert_eq!(base_chain(&candidates(&r, base)), vec![base, LIBAOM]);
+}
+
+#[test]
+fn a_pinned_backend_streams_its_base_codec() {
+    #[cfg(feature = "libaom")]
+    assert_eq!(base_codec(Backend::Libaom), Codec::Av1);
+    #[cfg(feature = "x264")]
+    assert_eq!(base_codec(Backend::X264), Codec::H264);
+    assert_eq!(base_codec(Backend::FakeAv1), Codec::Av1);
+    assert_eq!(base_codec(Backend::Nvenc), Codec::H264);
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn libaom_alone_is_the_base_chain() {
+    let r = reg(vec![cap(Codec::Av1, Backend::Libaom, false)]);
+    let auto = base_backend(&r, Selection::Auto);
+    if cfg!(feature = "x264") {
+        assert!(auto.unwrap_err().contains("no x264 H264 encoder"));
+    } else {
+        assert_eq!(auto, Ok(LIBAOM));
+    }
+    let base = base_backend(&r, Selection::Pinned(Backend::Libaom)).unwrap();
+    assert_eq!(base, LIBAOM);
+    assert_eq!(
+        candidates_for(&r, Selection::Pinned(Backend::Libaom), base),
+        vec![LIBAOM]
+    );
+    assert_eq!(base_chain(&candidates(&r, base)), vec![LIBAOM]);
+}
+
+#[test]
+fn a_legacy_viewer_gets_nothing_while_the_base_is_av1() {
+    let o = vec![offer(FAKE_AV1, "av01.0.13M.08", &[(0, 1600)], 2560)];
+    let a = [av1()];
+    let v = [
+        Viewer {
+            id: 1,
+            legacy: true,
+            caps: &[],
+            rejected: &[],
+        },
+        viewer(2, &a),
+    ];
+    let p = plan(&v, &o, FAKE_AV1, None);
+    assert_eq!(p.best, None);
+    assert_eq!(
+        p.picks,
+        vec![
+            (1, None),
+            (2, Some(choice(FAKE_AV1, Implementation::WebCodecs)))
+        ]
+    );
+}
+
+#[test]
+fn both_rank_orders_on_a_host_with_hardware() {
+    let r = reg(vec![
+        cap(Codec::H264, Backend::VideoToolbox, true),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::Av1, Backend::FakeAv1, false),
+    ]);
+    let base = hw264(Backend::VideoToolbox);
+    assert_eq!(
+        pairs(&ranked(&r, base, true)),
+        vec![
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::VideoToolbox),
+            (Codec::Av1, Backend::FakeAv1),
+        ],
+        "hardware first: the software AV1 encoder ranks last"
+    );
+    assert_eq!(
+        pairs(&ranked(&r, base, false)),
+        vec![
+            (Codec::Av1, Backend::FakeAv1),
+            (Codec::Hevc, Backend::VideoToolbox),
+            (Codec::H264, Backend::VideoToolbox),
+        ],
+        "codec first: the software AV1 encoder leads"
+    );
+    assert_eq!(candidates(&r, base), ranked(&r, base, HARDWARE_FIRST));
+}
+
+#[test]
+fn both_rank_orders_on_a_host_without_hardware() {
+    let r = reg(vec![
+        cap(Codec::Av1, Backend::FakeAv1, false),
+        cap(Codec::H264, Backend::FakeH264, false),
+    ]);
+    for hardware_first in [true, false] {
+        assert_eq!(
+            ranked(&r, H264, hardware_first),
+            vec![FAKE_AV1, H264],
+            "hardware first: {hardware_first}"
+        );
+    }
 }

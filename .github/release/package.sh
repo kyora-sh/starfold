@@ -62,8 +62,8 @@ for f in "$@"; do
 done
 
 # What each binary compiles in, by platform and flavour: the Rust crates and standard library
-# everywhere (std's COPYRIGHT and every licence text it refers to); OpenH264 without x264; Opus
-# statically on macOS and Windows; on Linux glibc's and GCC's startup and runtime objects; on
+# everywhere (std's COPYRIGHT and every licence text it refers to); libaom's notices everywhere
+# (notices.list); Opus statically on macOS and Windows; on Linux glibc's and GCC's startup and runtime objects; on
 # Windows libyuv, the MinGW-w64 runtime and GCC's runtime libraries. GCC's are GPL-3.0 with the GCC
 # Runtime Library Exception, glibc's LGPL-2.1 with its own linking permission.
 required+=(licenses/rust-crates.txt licenses/rust-std/COPYRIGHT-library.html)
@@ -84,8 +84,6 @@ https://github.com/kyora-sh/starfold/releases/tag/v${version}, and kept in the r
 third_party/x264 (licenses/x264-source-README.md says which file each platform's build uses).
 EOF
 	required+=(COPYING X264-SOURCE.txt)
-else
-	required+=(licenses/OpenH264-LICENSE.txt)
 fi
 case $platform in
 linux) required+=(licenses/glibc-copyright.txt licenses/LGPL-2.1.txt licenses/GCC-runtime-copyright.txt licenses/GPL-3.0.txt) ;;

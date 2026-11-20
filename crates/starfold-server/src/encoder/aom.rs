@@ -20,6 +20,13 @@ use std::ptr;
 
 const MAX_Q: u32 = 63;
 const UNCAPPED_KBPS: u32 = 200_000;
+/// The rate buffer (ms): its size, its fill at the start, and the fill rate control aims at.
+/// A larger one lets frames run above a link that just got thinner for up to its length:
+/// at 1000 ms, scroll's key-to-paint p95 after a drop from 2 to 1 Mbit/s was 1060 ms, at
+/// 150 ms 582 (x264 544), with the median and the rate unchanged.
+const BUF_MS: u32 = 150;
+const BUF_INITIAL_MS: u32 = 75;
+const BUF_OPTIMAL_MS: u32 = 90;
 const SPEED: c_int = 9;
 /// The quantizer of the ladder's last rung (H.264 QP 12 and below): on video, the one that
 /// settles where x264's paint-over does.
@@ -114,6 +121,15 @@ fn level(w: u32, h: u32) -> c_int {
     }
 }
 
+/// Threads for each of `live` libaom encoders sharing `cpus`, at `pixels` a picture: four up
+/// to level 4.0's picture size (1080p), eight above it, at most the CPUs, but never under
+/// two per encoder (so two on a 1-CPU host). At speed 9 one thread doesn't hold 1080p30, four don't hold 4K30 where
+/// eight do, and eight at 1080p save a millisecond a frame for 1.7% more bytes.
+pub fn threads(pixels: u64, cpus: u32, live: u32) -> u32 {
+    let budget = if pixels <= 2_228_224 { 4 } else { 8 };
+    (budget.min(cpus) / live.max(1)).max(2)
+}
+
 impl Aom {
     pub fn new(c: &EncoderConfig) -> Result<Self, EncodeError> {
         if c.codec != Codec::Av1 {
@@ -139,9 +155,9 @@ impl Aom {
             cfg.rc_resize_mode = 0;
             cfg.rc_superres_mode = 0;
             cfg.rc_max_quantizer = MAX_Q;
-            cfg.rc_buf_sz = 1000;
-            cfg.rc_buf_initial_sz = 500;
-            cfg.rc_buf_optimal_sz = 600;
+            cfg.rc_buf_sz = BUF_MS;
+            cfg.rc_buf_initial_sz = BUF_INITIAL_MS;
+            cfg.rc_buf_optimal_sz = BUF_OPTIMAL_MS;
             cfg.kf_mode = ffi::aom_kf_mode_AOM_KF_DISABLED;
             apply(&mut cfg, c.rate);
             let mut ctx: Box<ffi::aom_codec_ctx_t> = Box::new(std::mem::zeroed());
@@ -238,6 +254,34 @@ impl Aom {
                 }
             })
             .collect())
+    }
+
+    /// Its rate control as applied: target kbit/s, lowest quantizer, frame duration (ms).
+    #[cfg(test)]
+    pub(super) fn rate_state(&self) -> (u32, u32, u64) {
+        (
+            self.cfg.rc_target_bitrate,
+            self.cfg.rc_min_quantizer,
+            self.duration,
+        )
+    }
+
+    /// Lowers the highest quantizer, so a rate whose lowest one is above it is refused.
+    #[cfg(test)]
+    pub(super) fn cap_quantizer(&mut self, q: u32) -> Result<(), EncodeError> {
+        self.cfg.rc_max_quantizer = q;
+        self.cfg.rc_min_quantizer = self.cfg.rc_min_quantizer.min(q);
+        self.restore()
+    }
+
+    /// The rate buffer it opened with (ms): size, initial fill, optimal fill.
+    #[cfg(test)]
+    pub(super) fn rate_buffer(&self) -> (u32, u32, u32) {
+        (
+            self.cfg.rc_buf_sz,
+            self.cfg.rc_buf_initial_sz,
+            self.cfg.rc_buf_optimal_sz,
+        )
     }
 
     /// Back to the stream's rate control after a refinement's fixed quantizer, which also
@@ -352,13 +396,15 @@ impl Aom {
 
 impl VideoEncoder for Aom {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
-        apply(&mut self.cfg, rate);
-        let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &*self.cfg) };
-        if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
-            Ok(())
-        } else {
-            Err(self.error("rate change"))
+        let mut cfg = *self.cfg;
+        apply(&mut cfg, rate);
+        let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &cfg) };
+        if r != ffi::aom_codec_err_t_AOM_CODEC_OK {
+            return Err(self.error("rate change"));
         }
+        *self.cfg = cfg;
+        self.duration = (1000 / rate.fps.max(1)).max(1) as u64;
+        Ok(())
     }
 
     fn encode(

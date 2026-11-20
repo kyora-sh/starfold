@@ -1379,11 +1379,16 @@ async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response
     ws.on_upgrade(move |socket| handle_socket(socket, s))
 }
 
+/// How long a socket the server closed waits for the peer's close frame; nothing it sends
+/// meanwhile is handled.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
 async fn handle_socket(socket: WebSocket, s: AppState) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let (close_tx, mut close_rx) = oneshot::channel::<FrameError>();
+    let (closed_tx, mut closed_rx) = oneshot::channel::<()>();
     let framed = s.framed;
     let client = s.hub.add_client(tx);
     log::info!("client {} connected", client.id);
@@ -1410,12 +1415,23 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
                     None => break,
                 },
             };
+            if let Out::Close(code, reason) = m {
+                let _ = closed_tx.send(());
+                let _ = sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                break;
+            }
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
             let msg = if framed {
                 let f = match &m {
                     Out::Bin(b) => frame::encode_binary(b),
                     Out::Text(t) => frame::encode_text(t),
+                    Out::Close(..) => continue,
                 };
                 match f {
                     Ok(f) => Message::Binary(f),
@@ -1428,6 +1444,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
                 match m {
                     Out::Bin(b) => Message::Binary(b),
                     Out::Text(t) => Message::Text(t.into()),
+                    Out::Close(..) => continue,
                 }
             };
             if sink.send(msg).await.is_err() {
@@ -1456,7 +1473,27 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     };
     let mut rtts: std::collections::VecDeque<u32> = Default::default();
     let mut refused = None;
-    while let Some(msg) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            sent = &mut closed_rx => {
+                if sent.is_ok() {
+                    let _ = tokio::time::timeout(CLOSE_GRACE, async {
+                        while let Some(Ok(m)) = stream.next().await {
+                            if matches!(m, Message::Close(_)) {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                }
+                break;
+            }
+            m = stream.next() => match m {
+                Some(m) => m,
+                None => break,
+            },
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -2071,11 +2108,134 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    mod close {
+        use super::*;
+        use futures_util::{SinkExt, StreamExt};
+        use std::future::IntoFuture;
+        use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        use tokio_tungstenite::WebSocketStream;
+
+        pub(super) fn wired() -> (Arc<Hub>, std::sync::mpsc::Receiver<InputEvent>) {
+            let hub = Hub::new();
+            hub.width.store(1280, Ordering::Relaxed);
+            hub.height.store(800, Ordering::Relaxed);
+            let (tx, rx) = std::sync::mpsc::channel();
+            *hub.input.lock() = Some(tx);
+            (hub, rx)
+        }
+
+        pub(super) async fn raw<S: AsyncRead + AsyncWrite + Unpin>(
+            ws: &mut WebSocketStream<S>,
+        ) -> Ws {
+            tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("nothing within 5 s")
+                .expect("the server hung up")
+                .expect("a WebSocket error")
+        }
+
+        pub(super) async fn gone(hub: &Hub) {
+            for _ in 0..500 {
+                if hub.clients.lock().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the client was never removed");
+        }
+
+        /// A protocol 1 viewer on a server that streams only AV1, with its hello read.
+        async fn legacy_viewer() -> (
+            Arc<Hub>,
+            std::sync::mpsc::Receiver<InputEvent>,
+            WebSocketStream<tokio::net::TcpStream>,
+            Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let (hub, input) = wired();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let server = tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (mut ws, _) =
+                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
+                    .await
+                    .unwrap();
+            let Ws::Text(hello) = raw(&mut ws).await else {
+                panic!("the hello is a text message");
+            };
+            assert_eq!(hello.as_str(), hub.hello());
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
+            (hub, input, ws, stop, engine, server)
+        }
+
+        async fn close_frame(
+            ws: &mut WebSocketStream<tokio::net::TcpStream>,
+        ) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            loop {
+                match raw(ws).await {
+                    Ws::Close(c) => break c.expect("a close frame with a code"),
+                    Ws::Binary(b) => panic!("protocol 1 got {} bytes of video", b.len()),
+                    _ => {}
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_protocol_1_viewer_of_an_av1_server_is_closed_with_4406() {
+            let (hub, _input, mut ws, stop, engine, server) = legacy_viewer().await;
+            let close = close_frame(&mut ws).await;
+            assert_eq!(
+                (u16::from(close.code), close.reason.as_str()),
+                (
+                    crate::negotiate::NO_H264_CLOSE,
+                    crate::negotiate::NO_H264_REASON
+                )
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await
+            .expect("the socket never closed");
+            gone(&hub).await;
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            engine.join().unwrap();
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_ignores_the_close_is_dropped_and_its_input_ignored() {
+            let (hub, input, mut ws, stop, engine, server) = legacy_viewer().await;
+            close_frame(&mut ws).await;
+            let key = b"k,65,1";
+            let mut f = vec![0x81, 0x80 | key.len() as u8, 0, 0, 0, 0];
+            f.extend_from_slice(key);
+            ws.get_mut().write_all(&f).await.unwrap();
+            gone(&hub).await;
+            assert!(
+                !input
+                    .try_iter()
+                    .any(|e| matches!(e, InputEvent::Key { .. })),
+                "input taken after the server closed the socket"
+            );
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            engine.join().unwrap();
+            server.abort();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     mod socket {
+        use super::close::{gone, raw, wired};
         use super::*;
         use crate::frame::Payload;
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::SinkExt;
         use std::future::IntoFuture;
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::{AsyncRead, AsyncWrite};
@@ -2125,23 +2285,6 @@ mod tests {
                 .unwrap()
         }
 
-        fn wired() -> (Arc<Hub>, std::sync::mpsc::Receiver<InputEvent>) {
-            let hub = Hub::new();
-            hub.width.store(1280, Ordering::Relaxed);
-            hub.height.store(800, Ordering::Relaxed);
-            let (tx, rx) = std::sync::mpsc::channel();
-            *hub.input.lock() = Some(tx);
-            (hub, rx)
-        }
-
-        async fn raw<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>) -> Ws {
-            tokio::time::timeout(Duration::from_secs(5), ws.next())
-                .await
-                .expect("nothing within 5 s")
-                .expect("the server hung up")
-                .expect("a WebSocket error")
-        }
-
         /// The next message other than a ping, as plain WebSockets would carry it.
         async fn next<S: AsyncRead + AsyncWrite + Unpin>(
             ws: &mut WebSocketStream<S>,
@@ -2186,16 +2329,6 @@ mod tests {
             })
             .await
             .unwrap()
-        }
-
-        async fn gone(hub: &Hub) {
-            for _ in 0..500 {
-                if hub.clients.lock().is_empty() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!("the client was never removed");
         }
 
         #[tokio::test]

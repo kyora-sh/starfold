@@ -6,8 +6,8 @@ const USAGE: &str = "
 Usage: starfold [--flag=value]...
        starfold attach DIR
 
-Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
-WebSocket, and prints a link that signs you in. Flags take --name=value or
+Streams this machine's desktop to a browser at http://ADDR:PORT/ as AV1 or H.264 over
+a WebSocket, and prints a link that signs you in. Flags take --name=value or
 --name value; true/false flags also work on their own (--read-only).
 
 Server:
@@ -79,7 +79,7 @@ ENCODER_ENTRY
                                 Foundation and Quick Sync, each in a child
                                 process (default false)
 PRESET_ENTRY
-  --encoder-threads             sliced threads (default cores/4, from 1 to 4)
+THREADS_ENTRY
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
 PAINTOVER_ENTRY
@@ -175,8 +175,9 @@ Files and recordings:
                                 --enable-recording (default 300)
   --enable-recording            allow /record; at most 2 recordings at once, each
                                 written to --recording-dir as it runs; with no
-                                H.264 viewer a recording runs an H.264 encode of
-                                its own, up to --framerate (default false)
+                                viewer of the base stream a recording runs that
+                                encode of its own, up to --framerate (default
+                                false)
   --recording-dir               where recordings are written, in files with no
                                 name; not memory (tmpfs), not inside --files-root
                                 (default /var/tmp on Linux, else the system
@@ -215,23 +216,30 @@ fn entry(flag: &str, text: &str) -> String {
 
 /// The entries that name software encoders, from what this build includes.
 fn encoder_entries(usage: &str) -> String {
-    let sw = build_facts::software_h264();
+    let sw = build_facts::software_base();
     let arms = build_facts::bench_arms();
     let arms = match arms.is_empty() {
         true => String::new(),
         false => format!(
-            "; or a bench arm, streamed beside {sw}: {}",
+            "; or a bench arm, streamed beside the base stream: {}",
             arms.join(", ")
         ),
     };
+    let fallback = match build_facts::software_h264() {
+        true => format!("H.264 from {sw} where there is no hardware one"),
+        false => format!(
+            "AV1 from {sw} where there is no hardware H.264 one, which protocol 1 viewers \
+             can't decode"
+        ),
+    };
     let encoder = format!(
-        "auto: each codec from its hardware encoder, H.264 from {sw} where there is none \
-         (default); or the H.264 encoder: {}, videotoolbox (macOS hardware), vaapi (Linux), \
-         nvenc (Linux, Windows), mediafoundation (Windows) or qsv (64-bit Windows, Intel Quick \
-         Sync){arms}; \
+        "auto: each codec from its hardware encoder; the base stream (recordings, protocol 1 \
+         viewers, fallback) as {fallback} (default); or pin the base encoder: {}, videotoolbox \
+         (macOS hardware), vaapi (Linux), nvenc (Linux, Windows), mediafoundation (Windows) or \
+         qsv (64-bit Windows, Intel Quick Sync){arms}; \
          vaapi, nvenc, mediafoundation and qsv are experimental, need --experimental-hw-probes \
          and auto never picks them; /stats shows what the probe found",
-        build_facts::h264_encoders().join(", ")
+        build_facts::base_encoders().join(", ")
     );
     let crf: Vec<String> = build_facts::readers("crf")
         .into_iter()
@@ -276,7 +284,16 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
+    let threads = match cfg!(feature = "libaom") {
+        true => {
+            "sliced threads (default cores/4, from 1 to 4; libaom picks its own: 4 up to \
+                 1080p, 8 above, at most the cores but never under 2 per encoder, so 2 on \
+                 a 1-core host)"
+        }
+        false => "sliced threads (default cores/4, from 1 to 4)",
+    };
     usage
+        .replace("THREADS_ENTRY\n", &entry("--encoder-threads", threads))
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
         .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
@@ -381,11 +398,20 @@ mod tests {
         }
         assert_eq!(lower.contains("x264"), cfg!(feature = "x264"), "{text}");
         assert_eq!(lower.contains("x265"), cfg!(feature = "x265"), "{text}");
+        let codec = match build_facts::software_h264() {
+            true => "H.264",
+            false => "AV1",
+        };
         assert!(
             words.contains(&format!(
-                "H.264 from {} where there is none",
-                build_facts::software_h264()
+                "{codec} from {} where there is no hardware",
+                build_facts::software_base()
             )),
+            "{text}"
+        );
+        assert_eq!(
+            words.contains("libaom picks its own: 4 up to 1080p, 8 above"),
+            cfg!(feature = "libaom"),
             "{text}"
         );
         assert!(!text.contains("_ENTRY"), "{text}");

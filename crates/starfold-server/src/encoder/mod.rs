@@ -3,6 +3,8 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
+#[cfg(feature = "libaom")]
+pub use aom::threads as aom_threads;
 #[cfg_attr(
     not(any(feature = "libaom", feature = "svt-av1", target_os = "linux", windows)),
     allow(dead_code)
@@ -29,14 +31,12 @@ mod kvazaar;
 mod mf;
 #[cfg(any(target_os = "linux", windows))]
 mod nvenc;
-#[cfg(feature = "openh264")]
-pub(crate) mod openh264;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test, target_os = "linux")))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod qsv;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use qsv::{helper_main, HELPER_FLAG};
-#[cfg(any(feature = "openh264", feature = "x264"))]
+#[cfg(any(feature = "libaom", feature = "x264"))]
 pub(crate) mod sharpness;
 #[cfg(feature = "svt-av1")]
 mod svt;
@@ -229,9 +229,9 @@ pub trait VideoEncoder: Send {
     }
 }
 
-#[cfg(not(any(feature = "x264", feature = "openh264")))]
+#[cfg(not(any(feature = "x264", feature = "libaom")))]
 compile_error!(
-    "starfold needs a software H.264 encoder: the `x264` (default) or `openh264` feature"
+    "starfold needs a software encoder: the `libaom` (default, AV1) or `x264` (H.264) feature"
 );
 
 #[cfg(all(
@@ -243,19 +243,32 @@ compile_error!(
      read past the end of a frame plane (its MIPS MSA and PowerPC AltiVec input copies do)"
 );
 
-/// Level 5.2's frame size: OpenH264's limit for one picture, and VideoToolbox's.
+/// Level 5.2's frame size: VideoToolbox's limit for one picture.
 const MAX_MBS: usize = 36864;
 
-/// The software H.264 encoder: x264, or OpenH264 in a build without it.
+/// The software encoder the base cohort falls back to: x264 for H.264 where it is built,
+/// else libaom for AV1.
 #[cfg(feature = "x264")]
-pub const SOFTWARE_H264: Backend = Backend::X264;
+pub const SOFTWARE: Backend = Backend::X264;
 #[cfg(not(feature = "x264"))]
-pub const SOFTWARE_H264: Backend = Backend::OpenH264;
+pub const SOFTWARE: Backend = Backend::Libaom;
+/// The codec [`SOFTWARE`] encodes.
+#[cfg(feature = "x264")]
+pub const SOFTWARE_CODEC: Codec = Codec::H264;
+#[cfg(not(feature = "x264"))]
+pub const SOFTWARE_CODEC: Codec = Codec::Av1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
-    OpenH264,
+    /// The tests' stand-in for a software H.264 encoder.
+    #[cfg(test)]
+    #[serde(rename = "fake-h264")]
+    FakeH264,
+    /// The tests' stand-in for libaom in a build without it.
+    #[cfg(test)]
+    #[serde(rename = "fake-av1")]
+    FakeAv1,
     #[cfg(feature = "x264")]
     X264,
     #[cfg(feature = "libvpx")]
@@ -278,12 +291,15 @@ pub enum Backend {
 impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
-            #[cfg(feature = "openh264")]
-            "openh264" => Ok(Backend::OpenH264),
-            #[cfg(not(feature = "openh264"))]
-            "openh264" => {
-                Err("this build has no OpenH264 (build with `--features openh264`)".into())
-            }
+            "openh264" => Err(
+                "starfold no longer has OpenH264: the default build streams AV1 \
+                 from libaom, and x264 is the H.264 encoder (build with `--features x264`)"
+                    .into(),
+            ),
+            #[cfg(feature = "libaom")]
+            "libaom" => Ok(Backend::Libaom),
+            #[cfg(not(feature = "libaom"))]
+            "libaom" => Err("this build has no libaom (build with `--features libaom`)".into()),
             #[cfg(feature = "x264")]
             "x264" => Ok(Backend::X264),
             #[cfg(not(feature = "x264"))]
@@ -322,7 +338,10 @@ impl Backend {
 
     pub fn name(self) -> &'static str {
         match self {
-            Backend::OpenH264 => "openh264",
+            #[cfg(test)]
+            Backend::FakeH264 => "fake-h264",
+            #[cfg(test)]
+            Backend::FakeAv1 => "fake-av1",
             #[cfg(feature = "x264")]
             Backend::X264 => "x264",
             #[cfg(feature = "libvpx")]
@@ -346,7 +365,10 @@ impl Backend {
     /// Whether this build has an encoder for `codec` on this backend.
     pub fn implements(self, codec: Codec) -> bool {
         match self {
-            Backend::OpenH264 => cfg!(feature = "openh264") && codec == Codec::H264,
+            #[cfg(test)]
+            Backend::FakeH264 => codec == Codec::H264,
+            #[cfg(test)]
+            Backend::FakeAv1 => codec == Codec::Av1,
             #[cfg(feature = "x264")]
             Backend::X264 => codec == Codec::H264,
             #[cfg(feature = "libvpx")]
@@ -382,7 +404,10 @@ impl Backend {
     /// The most 16x16 macroblocks one encoder takes, if it has a limit.
     pub fn max_mbs(self) -> Option<usize> {
         match self {
-            Backend::OpenH264 => Some(MAX_MBS),
+            #[cfg(test)]
+            Backend::FakeH264 => Some(MAX_MBS),
+            #[cfg(test)]
+            Backend::FakeAv1 => None,
             #[cfg(feature = "x264")]
             Backend::X264 => None,
             #[cfg(feature = "libvpx")]
@@ -404,7 +429,8 @@ impl Backend {
     /// The smallest width and height one encoder takes.
     pub fn min_side(self) -> u32 {
         match self {
-            Backend::OpenH264 => 16,
+            #[cfg(test)]
+            Backend::FakeH264 | Backend::FakeAv1 => 16,
             #[cfg(feature = "x264")]
             Backend::X264 => 2,
             #[cfg(feature = "libvpx")]
@@ -450,7 +476,8 @@ impl Backend {
     /// Sharpens a paint-over with `EncodeOptions::refine`, not `RateConfig::quality`.
     pub fn refines_by_qp(self) -> bool {
         match self {
-            Backend::OpenH264 => true,
+            #[cfg(test)]
+            Backend::FakeH264 | Backend::FakeAv1 => true,
             #[cfg(feature = "x264")]
             Backend::X264 => true,
             #[cfg(feature = "libaom")]
@@ -465,13 +492,13 @@ impl Backend {
     }
 }
 
-/// `--encoder`: `auto` streams each codec from its eligible hardware encoder (H.264
-/// from [`SOFTWARE_H264`] where there is none); a backend name pins the H.264 one.
+/// `--encoder`: `auto` streams each codec from its eligible hardware encoder (the base
+/// cohort from [`SOFTWARE`] where there is no H.264 one); a backend name pins the base one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     Auto,
     Pinned(Backend),
-    /// A bench arm: this encoder, with the [`SOFTWARE_H264`] cohort beside it.
+    /// A bench arm: this encoder, with the base cohort beside it.
     #[cfg(feature = "sw-arm")]
     Arm(&'static str, Backend, Codec),
 }
@@ -495,8 +522,6 @@ pub const ARMS: &[(&str, Backend, Codec)] = &[
     ("libvpx-vp8", Backend::Libvpx, Codec::Vp8),
     #[cfg(feature = "libvpx")]
     ("libvpx-vp9", Backend::Libvpx, Codec::Vp9),
-    #[cfg(feature = "libaom")]
-    ("libaom", Backend::Libaom, Codec::Av1),
     #[cfg(feature = "svt-av1")]
     ("svt-av1", Backend::SvtAv1, Codec::Av1),
     #[cfg(feature = "kvazaar")]
@@ -535,10 +560,10 @@ impl Selection {
     }
 
     /// The encoder `--preset` is given for: the pinned one or the bench arm, and under
-    /// `auto` [`SOFTWARE_H264`]. Every other encoder opens with [`DEFAULT_PRESET`].
+    /// `auto` [`SOFTWARE`]. Every other encoder opens with [`DEFAULT_PRESET`].
     pub fn preset_backend(self) -> Backend {
         match self {
-            Selection::Auto => SOFTWARE_H264,
+            Selection::Auto => SOFTWARE,
             Selection::Pinned(b) => b,
             #[cfg(feature = "sw-arm")]
             Selection::Arm(_, b, _) => b,
@@ -559,7 +584,7 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub threads: u32,
     pub rate: RateConfig,
-    /// OpenH264's lowest QP: its bitrate mode otherwise spends the whole cap.
+    /// The lowest QP of an encoder whose bitrate mode otherwise spends the whole cap.
     pub best_quality: f32,
     /// x264's preset; a bench arm's preset or speed.
     pub preset: String,
@@ -643,8 +668,6 @@ pub fn open(cfg: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, EncodeError> {
         ..cfg.clone()
     };
     let inner: Box<dyn VideoEncoder> = match cfg.backend {
-        #[cfg(feature = "openh264")]
-        Backend::OpenH264 => Box::new(openh264::OpenH264::new(&coded)?),
         #[cfg(feature = "x264")]
         Backend::X264 => Box::new(x264::X264::new(&coded)?),
         #[cfg(feature = "libvpx")]
