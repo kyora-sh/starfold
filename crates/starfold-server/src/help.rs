@@ -6,8 +6,8 @@ const USAGE: &str = "
 Usage: starfold [--flag=value]...
        starfold attach DIR
 
-Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
-WebSocket, and prints a link that signs you in. Flags take --name=value or
+Streams this machine's desktop to a browser at http://ADDR:PORT/ as AV1 or H.264 over
+a WebSocket, and prints a link that signs you in. Flags take --name=value or
 --name value; true/false flags also work on their own (--read-only).
 
 Server:
@@ -79,7 +79,7 @@ ENCODER_ENTRY
                                 Foundation and Quick Sync, each in a child
                                 process (default false)
 PRESET_ENTRY
-  --encoder-threads             sliced threads (default cores/4, from 1 to 4)
+THREADS_ENTRY
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
 PAINTOVER_ENTRY
@@ -175,8 +175,9 @@ Files and recordings:
                                 --enable-recording (default 300)
   --enable-recording            allow /record; at most 2 recordings at once, each
                                 written to --recording-dir as it runs; with no
-                                H.264 viewer a recording runs an H.264 encode of
-                                its own, up to --framerate (default false)
+                                viewer of the base stream a recording runs that
+                                encode of its own, up to --framerate (default
+                                false)
   --recording-dir               where recordings are written, in files with no
                                 name; not memory (tmpfs), not inside --files-root
                                 (default /var/tmp on Linux, else the system
@@ -283,7 +284,13 @@ fn encoder_entries(usage: &str) -> String {
     let paintover =
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
+    let threads = match cfg!(feature = "libaom") {
+        true => "sliced threads (default cores/4, from 1 to 4; libaom picks its own: 4 up to \
+                 1080p, 8 above, never more than the cores or fewer than 2)",
+        false => "sliced threads (default cores/4, from 1 to 4)",
+    };
     usage
+        .replace("THREADS_ENTRY\n", &entry("--encoder-threads", threads))
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
         .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
@@ -397,6 +404,11 @@ mod tests {
                 "{codec} from {} where there is no hardware",
                 build_facts::software_base()
             )),
+            "{text}"
+        );
+        assert_eq!(
+            words.contains("libaom picks its own: 4 up to 1080p, 8 above"),
+            cfg!(feature = "libaom"),
             "{text}"
         );
         assert!(!text.contains("_ENTRY"), "{text}");

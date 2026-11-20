@@ -8,18 +8,15 @@
   [packages/web/inter-LICENSE.txt](packages/web/inter-LICENSE.txt).
 - **Geist** (SIL Open Font License 1.1, The Geist Project Authors,
   [vercel/geist-font](https://github.com/vercel/geist-font)): the lettering in `assets/` uses its outlines.
-- **x264** (GPL-2.0-or-later), linked by the default build (the `x264` feature). A binary built with
+- **x264** (GPL-2.0-or-later), linked only by a build with the `x264` feature. A binary built with
   x264 is distributed under GPL-2.0-or-later as a combined work; starfold's own source stays MIT. Each
-  release attaches the exact x264 source of its Linux, macOS and Windows builds, kept in
+  release attaches the exact x264 source of its Linux, macOS and Windows x264 builds, kept in
   [third_party/x264](third_party/x264/README.md).
-- **OpenH264** (BSD-2-Clause), built from source and linked only by a build with the `openh264`
-  feature. `--no-default-features --features openh264` builds without x264, and that binary stays
-  under starfold's MIT licence.
 - **libaom** (BSD-2-Clause, Copyright Alliance for Open Media, with the Alliance for Open Media
   Patent License 1.0), [aomedia.googlesource.com/aom](https://aomedia.googlesource.com/aom)
   v3.15.3, commit b141d9c45db236335351c8a4b2a14b3ade27c937: the AV1 encoder, built from that
-  source (the git submodule `crates/starfold-aom-sys/aom`) and linked statically only by a build
-  with the `libaom` feature. Licence and patent licence:
+  source (the git submodule `crates/starfold-aom-sys/aom`) and linked statically by the default
+  build (the `libaom` feature), which stays under starfold's MIT licence. Licence and patent licence:
   [third_party/libaom/LICENSE](third_party/libaom/LICENSE) and
   [third_party/libaom/PATENTS](third_party/libaom/PATENTS); a binary distribution must carry both.
   The library starfold builds also contains three components libaom bundles in its

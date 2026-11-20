@@ -8,15 +8,16 @@
 <img src="assets/starfold-demo.gif" width="100%" alt="a terminal and starfold's help text, typed in and scrolled through a starfold stream">
 
 kyora starfold streams a desktop to a plain browser tab over one WebSocket: an X11 display (Xvfb
-included), a Mac's screen or a Windows desktop. The browser decodes with WebCodecs. H.264 is the
-baseline, and the server and the browser negotiate HEVC or AV1 where both have them. It carries the
+included), a Mac's screen or a Windows desktop. The browser decodes with WebCodecs. The default
+encoder is AV1 from libaom, built in; on a host with a hardware H.264 encoder that isn't
+experimental (VideoToolbox on a Mac) it is that one, and the server and the browser negotiate HEVC or AV1 where both have them. It carries the
 mouse, keyboard and touch, the clipboard, audio and the microphone, file transfer and dynamic resolution.
 Agents get HTTP APIs for screenshots, recordings, input and waiting until the screen settles.
 
 ## Quick start
 
 ```sh
-cargo install --locked --path crates/starfold-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Build)
+cargo install --locked --path crates/starfold-server   # needs libyuv, Opus, PulseAudio, esbuild, cmake and nasm (see Build)
 DISPLAY=:1 starfold         # streams display :1 and prints a link that signs you in
 ```
 
@@ -30,49 +31,52 @@ instead; see [macOS](#macos) and [Windows](#windows).
 Each [release](https://github.com/kyora-sh/starfold/releases) attaches two builds per platform
 (`<version>` is the release's, e.g. `0.3.2`; [Licensing](#licensing) has the details):
 
-- **x264, recommended** (`starfold-x264-<version>-<platform>`): GPL-2.0-or-later as a combined work
-  with x264, whose source the release attaches beside it.
-- **OpenH264** (`starfold-<version>-<platform>`): needs no x264 library, and is distributed under
-  MIT. Like any program built with GCC, the Linux and Windows binaries include GCC's runtime code
+- **Default** (`starfold-<version>-<platform>`): where the host has no hardware H.264 encoder, it
+  streams AV1 from libaom, which is linked in statically. Viewers need a protocol 2 client that
+  decodes AV1 (see [Which browsers](#faq)). It is distributed under MIT. Like any program built with GCC, the Linux and Windows binaries include GCC's runtime code
   (its startup files on Linux; also the C++ runtime libraries on Windows), which is
   GPL-3.0-or-later with the GCC Runtime Library Exception: the exception is what lets the binary be
   distributed under MIT. Linux binaries also include glibc's startup files, which are
   LGPL-2.1-or-later with permission to link them into any program. These texts are in the
   `licenses/` of the archives they apply to: GCC's in the Linux and Windows ones, glibc's in the
   Linux ones.
+- **x264** (`starfold-x264-<version>-<platform>`): adds x264, so where the host has no hardware
+  H.264 encoder the stream is H.264 from x264, which protocol 1 viewers and browsers without AV1
+  decode too. GPL-2.0-or-later as a combined work with x264, whose source the release attaches
+  beside it.
 
-| Platform              | x264 (GPL-2.0-or-later)                        | OpenH264 (MIT)                            |
-| --------------------- | ---------------------------------------------- | ----------------------------------------- |
-| Linux x86_64          | `starfold-x264-<version>-x86_64-linux.tar.gz`  | `starfold-<version>-x86_64-linux.tar.gz`  |
-| Linux aarch64         | `starfold-x264-<version>-aarch64-linux.tar.gz` | `starfold-<version>-aarch64-linux.tar.gz` |
-| macOS (Apple silicon) | `starfold-x264-<version>-aarch64-macos.tar.gz` | `starfold-<version>-aarch64-macos.tar.gz` |
-| Windows x86_64        | `starfold-x264-<version>-x86_64-windows.zip`   | `starfold-<version>-x86_64-windows.zip`   |
+| Platform              | Default (MIT)                             | x264 (GPL-2.0-or-later)                        |
+| --------------------- | ----------------------------------------- | ---------------------------------------------- |
+| Linux x86_64          | `starfold-<version>-x86_64-linux.tar.gz`  | `starfold-x264-<version>-x86_64-linux.tar.gz`  |
+| Linux aarch64         | `starfold-<version>-aarch64-linux.tar.gz` | `starfold-x264-<version>-aarch64-linux.tar.gz` |
+| macOS (Apple silicon) | `starfold-<version>-aarch64-macos.tar.gz` | `starfold-x264-<version>-aarch64-macos.tar.gz` |
+| Windows x86_64        | `starfold-<version>-x86_64-windows.zip`   | `starfold-x264-<version>-x86_64-windows.zip`   |
 
 Download an archive and its `.sha256`, check it and unpack it:
 
 ```sh
-sha256sum -c starfold-x264-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
-tar -xzf starfold-x264-<version>-x86_64-linux.tar.gz
-./starfold-x264-<version>-x86_64-linux/starfold --version
+sha256sum -c starfold-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+tar -xzf starfold-<version>-x86_64-linux.tar.gz
+./starfold-<version>-x86_64-linux/starfold --version
 ```
 
 `--version` names the version, the software encoders in the binary and the licence it is
-distributed under: `starfold <version> (encoders: x264; licence: GPL-2.0-or-later)` or
-`starfold <version> (encoders: openh264; licence: MIT)`. Each archive also holds `LICENSE`,
+distributed under: `starfold <version> (encoders: libaom; licence: MIT)` or
+`starfold <version> (encoders: x264, libaom; licence: GPL-2.0-or-later)`. Each archive also holds `LICENSE`,
 `THIRD_PARTY.md` and `licenses/`: the licence texts of the Rust crates and Rust standard library
 compiled into the binary, of what `THIRD_PARTY.md` lists for that platform, and of each library or runtime object
-linked in statically (OpenH264; glibc's and GCC's startup files on Linux; Opus on macOS and
+linked in statically (libaom; glibc's and GCC's startup files on Linux; Opus on macOS and
 Windows; libyuv, the MinGW-w64 runtime and GCC's runtime libraries on Windows). The x264 archives
 add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
 
 What each platform needs at run time:
 
 - **Linux** (built on Ubuntu 24.04, so it needs a distribution at least that new): libyuv, Opus and
-  PulseAudio's client library, plus x264 for the x264 build and the C++ runtime for the OpenH264
+  PulseAudio's client library, plus x264 for the x264 build and the C++ runtime for the default
   one. On Ubuntu 24.04: `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for
   `starfold-x264-*` or `libstdc++6` for `starfold-*` (most systems have it already). Plus an X
   server to stream, such as Xvfb (see [Usage](#usage)).
-- **macOS**: nothing beyond the system; Opus is linked in, and x264 in the x264 build. The binary is not notarized,
+- **macOS**: nothing beyond the system; Opus and libaom are linked in, and x264 in the x264 build. The binary is not notarized,
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
 
@@ -82,14 +86,15 @@ Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the n
 Ubuntu 24.04:
 
 ```sh
-sudo apt install build-essential clang libclang-dev pkg-config esbuild nasm \
-  libx264-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev
+sudo apt install build-essential clang libclang-dev pkg-config esbuild cmake perl nasm \
+  libyuv-dev libopus-dev libpulse-dev libxcb1-dev
 cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
 ```
 
-That is the x264 build; `--tag v<version>` installs a release instead of main's head. For the MIT
-build, add `--no-default-features --features openh264` (libx264-dev isn't needed then). On a Mac,
-`brew install x264 opus pkgconf esbuild` gives the libraries; Windows builds with vcpkg (see
+That is the default build, with libaom and under MIT; `--tag v<version>` installs a release
+instead of main's head. For x264, add `--features x264` and install `libx264-dev`; that binary is
+GPL-2.0-or-later. On a Mac, `brew install opus pkgconf esbuild cmake nasm` (plus `x264` for
+`--features x264`) gives the libraries; Windows builds with vcpkg (see
 [Windows](#windows)). [Build](#build) has the details, and a Nix shell with everything.
 
 ## Benchmarks
@@ -106,19 +111,16 @@ caveats and raw cells are in the results file.
 
 ## Build
 
-Rust, a C++ compiler, clang, pkg-config, x264, libyuv, libopus, libpulse and esbuild;
+Rust, a C++ compiler, clang, pkg-config, libyuv, libopus, libpulse and esbuild;
 `nix-shell --arg withRust true` provides them all (plain `nix-shell` all but Rust, for your own
-toolchain). The H.264 encoder is x264, on x86_64 and aarch64 only: on other architectures the
-`x264` feature refuses to build. OpenH264, built from source (needs nasm), is optional:
-`--features openh264` adds it beside x264 (`--encoder openh264`), and
-`--no-default-features --features openh264` builds without x264 (see [Licensing](#licensing)).
+toolchain).
 
-The AV1 encoder libaom (BSD-2-Clause) is optional: `--features libaom` adds it
-(`--encoder libaom`). It is built from source, libaom v3.15.3 at commit
+The default software encoder is libaom (BSD-2-Clause), for AV1 (the `libaom` feature, on by
+default; `--encoder libaom`). It is built from source, libaom v3.15.3 at commit
 `b141d9c45db236335351c8a4b2a14b3ade27c937`, which is the git submodule
-`crates/starfold-aom-sys/aom`, and is linked statically, so no system libaom is used. That build
-also needs git, cmake 3.16 or newer, perl and, on x86_64, nasm (or yasm); the build stops before
-compiling and names any that are missing:
+`crates/starfold-aom-sys/aom`, and is linked statically, so no system libaom is used and the
+binary stays under MIT. That build also needs git, cmake 3.16 or newer, perl and, on x86_64, nasm
+(or yasm); the build stops before compiling and names any that are missing:
 
 | System         | Install                                                                          |
 | -------------- | -------------------------------------------------------------------------------- |
@@ -130,6 +132,18 @@ Clone with the submodule (`git clone --recursive`, or `git submodule update --in
 clone). The build checks that the submodule is at that commit with no file changed, so it needs
 the submodule's git metadata: GitHub's "Download ZIP" and its automatic source archives contain
 neither the submodule nor that, and can't build libaom.
+
+H.264 in software is x264, an optional feature: `--features x264` adds it (`--encoder x264`) and
+makes it the base stream's encoder where there is no hardware H.264 one. It needs the x264
+library (`libx264-dev` on Debian and Ubuntu, `brew install x264` on a Mac, or
+`x264` in vcpkg on Windows), builds on x86_64 and aarch64 only (on other architectures the
+feature refuses to build), and makes the binary GPL-2.0-or-later (see [Licensing](#licensing)).
+
+OpenH264 is no longer part of starfold: there is no `openh264` feature, and `--encoder openh264`
+stops with an error that says so. A build without an H.264 encoder (the default, on a host
+without hardware H.264) closes a protocol 1 viewer, which decodes only H.264, with WebSocket
+close code 4406 and a reason that names AV1 and the protocol 2 client. To keep protocol 1
+viewers, build with `--features x264` or run where a hardware H.264 encoder is found.
 
 ```sh
 nix-shell --arg withRust true
@@ -202,15 +216,15 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--basic-auth-user`                                            | any                                                                   | the user name a browser's sign-in has to give                                                                                                                                                             |
 | `--framerate`                                                  | `60`                                                                  | max frames per second (`60-60` style ranges accepted)                                                                                                                                                     |
 | `--high-fps`                                                   | `false`                                                               | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60                                                                         |
-| `--encoder`                                                    | `auto`                                                                | `auto`: each codec's hardware encoder that isn't experimental, else software; or the H.264 one: `x264`, `openh264` (if built in), `videotoolbox`; experimental `vaapi`, `nvenc`, `mediafoundation`, `qsv` |
+| `--encoder`                                                    | `auto`                                                                | hardware unless experimental; the base stream from hardware H.264, else x264 (if built), else libaom (AV1); or `libaom`, `x264`, `videotoolbox`; experimental `vaapi`, `nvenc`, `mediafoundation`, `qsv`  |
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
 | `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC, Media Foundation and Quick Sync, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                         |
-| `--preset`                                                     | `ultrafast`                                                           | the preset or speed of the encoder `--encoder` names (under `auto`, of the software H.264 one); others keep their default; `--help` lists what each built-in encoder takes                                |
-| `--encoder-threads`                                            | `ncpu/4`, from 1 to 4                                                 | sliced encoder threads                                                                                                                                                                                    |
-| `--crf`                                                        | `24`                                                                  | x264's base quality; OpenH264's lowest QP in motion; most bench arms' lowest quantizer or QP; a hardware encoder's constant QP when it runs one (`--max-kbps 0`, or as VA-API's driver allows)            |
+| `--preset`                                                     | `ultrafast`                                                           | the preset or speed of the encoder `--encoder` names (under `auto`, of the software base one); others keep their default; `--help` lists what each built-in encoder takes                                 |
+| `--encoder-threads`                                            | `ncpu/4`, from 1 to 4; libaom: 4 or 8                                 | sliced encoder threads; libaom takes 4 up to 1080p and 8 above, never more than the CPUs or fewer than 2 (see [Encoder threads](#encoder-threads))                                                        |
+| `--crf`                                                        | `24`                                                                  | x264's base quality; libaom's and most bench arms' lowest quantizer or QP; a hardware encoder's constant QP when it runs one (`--max-kbps 0`, or as VA-API's driver allows)                               |
 | `--max-kbps` / `--video-bitrate`                               | `30000`                                                               | adaptive bitrate ceiling                                                                                                                                                                                  |
 | `--min-kbps`                                                   | `2000`                                                                | adaptive bitrate floor                                                                                                                                                                                    |
-| `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                                                      | sharpening when the screen goes still (`--paintover-crf` reaches x264, the libvpx and libaom arms if built in, and a hardware encoder at constant QP; also the finest QP x264 refines to, default 12)     |
+| `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                                                      | sharpening when the screen goes still (`--paintover-crf` reaches x264, libaom, the libvpx arm if built in, and a hardware encoder at constant QP; also the finest QP x264 refines to, default 12)         |
 | `--enable-clipboard`                                           | `true`                                                                | `true`, `in`, `out` or `false`                                                                                                                                                                            |
 | `--audio-enabled`, `--audio-device-name`, `--audio-bitrate`    | `true`, `output.monitor`, `128000`                                    | desktop audio                                                                                                                                                                                             |
 | `--enable-resize`, `--resize-scale`                            | `false`, `1.5`                                                        | desktop follows the viewer's window; desktop pixels per CSS pixel                                                                                                                                         |
@@ -229,9 +243,19 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--upload-dir`                                                 | `Downloads`                                                           | folder, relative to the root, the panel opens and uploads into; created on first upload                                                                                                                   |
 | `--max-upload-mb`                                              | `0` (no limit)                                                        | largest accepted upload                                                                                                                                                                                   |
 | `--max-record-seconds`                                         | `300`                                                                 | longest recording (`/record`); at most 600 with `--enable-recording`                                                                                                                                      |
-| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no H.264 viewer it runs an H.264 encode of its own: about 50 % of a core on a 6-vCPU VM (see below)                |
+| `--enable-recording`                                           | `false`                                                               | allow `/record`; at most 2 at once, each written to `--recording-dir` as it runs; with no viewer of the base stream it runs that encode of its own (see below)                                            |
 | `--recording-dir`                                              | `/var/tmp` on Linux, else the system temporary folder                 | where recordings are written, in files with no name; refused if it is memory (tmpfs, ramfs) and, at startup, if it is inside `--files-root`                                                               |
 | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                                              | tuning                                                                                                                                                                                                    |
+
+### Encoder threads
+
+Unless `--encoder-threads` is given, libaom picks its own thread count from the picture size and
+the host's CPUs: 4 for a picture up to 1080p, 8 above it (1440p, 4K), never more than the CPUs and
+never fewer than 2; two libaom encoders running at once share the CPUs, each with at least 2.
+4K at 30 fps with libaom needs 8 or more CPUs. On fewer, the server sends fewer frames: it never
+queues captures behind a slow encode (one running, at most one waiting), skips the rest and
+carries what changed in them into the next frame. Other software encoders take `ncpu/4` threads,
+from 1 to 4.
 
 ### File transfer
 
@@ -336,15 +360,15 @@ Under `--read-only` the three routes are refused even with `--enable-recording`.
 
 A recording is the stream starfold sends to viewers, saved as MP4 without re-encoding: H.264
 (`avc1`) from an H.264 encoder, AV1 (`av01`, ISO/IEC 14496-12 with the AV1 codec ISO media
-file format binding) from an AV1 one. An AV1 MP4 plays in Chrome, Edge and Firefox, in VLC,
-and with ffmpeg and ffprobe; Safari and QuickTime play it only on a Mac or iPhone whose
-hardware decodes AV1 (Apple M3 or A17 Pro and later), so on an older Mac open it in a browser
-other than Safari or in VLC, or convert it with `ffmpeg -i clip.mp4 -c:v libx264 clip-h264.mp4`.
-Today the recorded encode is the H.264 one a protocol 1 viewer would get. It takes each
-encoded frame beside the viewers, never as one of them, so it has no part in their flow
-control, their frame rate or their bitrate. With viewers taking H.264 it shares their encode
-and adds none. With none, it keeps the H.264 encode a single protocol 1 viewer would get
-running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
+file format binding) from an AV1 one, so with the default build on a host without hardware
+H.264 it is AV1. An AV1 MP4 plays in current Chrome, Edge and Firefox, in VLC and mpv, and with
+ffmpeg; Safari and QuickTime play it only on a Mac or iPhone whose hardware decodes AV1 (Apple
+M3 or A17 Pro and later), so on an older Mac open it in a browser other than Safari or in VLC,
+or convert it with `ffmpeg -i clip.mp4 -c:v libx264 clip-h264.mp4`.
+The recorded encode is the base stream: the one a protocol 1 viewer gets when it is H.264. It
+takes each encoded frame beside the viewers, never as one of them, so it has no part in their
+flow control, their frame rate or their bitrate. With viewers taking that stream it shares their
+encode and adds none. With none, it keeps that encode running while it lasts, at up to `--framerate` frames a second and at a bitrate target of its
 own: that encode's CPU is the cost of recording an unwatched screen. With x264 at 1920x1080
 and full-screen motion at 60 Hz it was about 50 % of one core on a 6-vCPU VM, against under
 1 % with nothing recording. It needs a single-stripe stream: `--stripes=1`, and a picture the
@@ -353,7 +377,7 @@ a start gets 409, and a recording running when the split comes ends with `closed
 of another size (a resize) ends it. It doesn't include the cursor, which viewers draw, except on macOS
 when the cursor is in the video: with `--show-cursor` (the default with `--read-only`), or when the system cursor can't be read.
 
-A recording starts at a keyframe. It asks the H.264 encode for one through the viewers' own
+A recording starts at a keyframe. It asks the base encode for one through the viewers' own
 flow control: the keyframe comes with the first frame every viewer of that encode has room
 for, so a viewer that is behind gets no extra keyframe. With no viewer behind, that is the
 next capture; with one behind, as soon as it has caught up (or after 4 s, when the server
@@ -568,7 +592,7 @@ NSPasteboard clipboard, system audio). Not on a Mac: `--listen-unix` and `starfo
 and the microphone FIFO (the microphone plays into a loopback device instead, below).
 
 ```sh
-brew install x264 opus pkgconf esbuild
+brew install opus pkgconf esbuild cmake nasm   # plus x264 for --features x264
 cargo build --release
 ./target/release/starfold --port=6901
 ```
@@ -598,10 +622,11 @@ awareness v2; DXGI Desktop Duplication capture,
 SendInput, clipboard text and images, WASAPI system audio). Not on Windows: `--listen-unix` and
 `starfold attach` (Linux-only), the VA-API encoder (Windows has NVENC, Media Foundation and Quick
 Sync), rounded corners (X11 only), and the microphone FIFO (the microphone plays into a virtual
-audio cable instead, below). Build it with Rust, [vcpkg](https://vcpkg.io), nasm and esbuild:
+audio cable instead, below). Build it with Rust, [vcpkg](https://vcpkg.io), cmake, perl, nasm
+and esbuild (add `x264` to the `vcpkg install` for `--features x264`):
 
 ```powershell
-vcpkg install x264 libyuv opus --triplet x64-windows-static-md
+vcpkg install libyuv opus --triplet x64-windows-static-md
 $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
 npm install -g esbuild
 cargo build --release
@@ -655,28 +680,33 @@ localhost:
 | Safari 16.4+ and any browser on iPhone or iPad (sound needs Safari 26) | Yes   |
 | Firefox for Android                                                    | No    |
 
+Where the stream is AV1 (the default build on a host without hardware H.264), the viewer needs a
+protocol 2 client, such as starfold's own web page, in a browser whose WebCodecs decodes AV1:
+current Chrome, Edge and Firefox do; Safari, and any browser on iPhone or iPad, only on a device
+whose hardware decodes AV1. For the others, use the x264 build or a host with hardware H.264.
+
 Phones and tablets get touch input and an on-screen keyboard.
 
 **Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
-**Does it use the GPU?** On Linux, not by default: H.264 is encoded on the CPU with x264
-(OpenH264 in a build without x264).
+**Does it use the GPU?** On Linux, not by default: the stream is encoded on the CPU, AV1 with
+libaom (H.264 with x264 in a build with x264).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
 macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, 64-bit Windows) encoders are
 experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,
 `mediafoundation` or `qsv`; `/stats` shows what the probe found.
 
-**What's the license?** The code is MIT; a default build links x264 and is
-GPL-2.0-or-later. See [Licensing](#licensing).
+**What's the license?** The code is MIT, and so is a default build (libaom); a build with x264
+is GPL-2.0-or-later. See [Licensing](#licensing).
 
 ## Licensing
 
-The source code is MIT ([LICENSE](LICENSE)). The default build links x264 (GPL-2.0-or-later),
-so a binary built with x264, and anything that bundles one, is GPL-2.0-or-later as a combined
-work. Each release attaches the exact x264 source its builds link
-([third_party/x264](third_party/x264/README.md)). A build with
-`--no-default-features --features openh264` links OpenH264 (BSD-2-Clause) instead, so the
-binary is distributed under starfold's MIT licence; `starfold --version` lists the encoders a
+The source code is MIT ([LICENSE](LICENSE)). The default build links libaom (BSD-2-Clause, with
+the Alliance for Open Media Patent License 1.0) statically, so the binary is distributed under
+starfold's MIT licence. A build with `--features x264` links x264 (GPL-2.0-or-later), so that
+binary, and anything that bundles one, is GPL-2.0-or-later as a combined work. Each release
+attaches the exact x264 source its x264 builds link
+([third_party/x264](third_party/x264/README.md)). `starfold --version` lists the encoders a
 binary includes and that licence. A binary built with GCC includes GCC's runtime code (on Linux
 its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under
 GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary
