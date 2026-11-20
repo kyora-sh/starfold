@@ -4,8 +4,8 @@ name: Release
 # (v0.4.0, ...) attaches them to a GitHub release with GitHub's generated notes (the pull requests
 # merged since the previous tag). Nothing is published to a registry.
 #
-# Each binary comes in two flavours: starfold-<version>-<platform> links OpenH264 (BSD-2-Clause)
-# and is distributed under MIT; starfold-x264-<version>-<platform> links x264 and is
+# Each binary comes in two flavours: starfold-<version>-<platform> links libaom (BSD-2-Clause)
+# and is distributed under MIT; starfold-x264-<version>-<platform> links libaom and x264 and is
 # GPL-2.0-or-later as a combined work. The release also attaches the exact x264 source of every
 # platform's build, from third_party/x264 (hash-checked, nothing fetched).
 #
@@ -67,8 +67,8 @@ jobs:
       - id: flavours
         run: |
           flavours=(
-            '{"name": "starfold-x264", "licence": "GPL-2.0-or-later", "features": "", "x264": true}'
-            '{"name": "starfold", "licence": "MIT", "features": "--no-default-features --features openh264", "x264": false}'
+            '{"name": "starfold-x264", "licence": "GPL-2.0-or-later", "features": "--features x264", "x264": true}'
+            '{"name": "starfold", "licence": "MIT", "features": "", "x264": false}'
           )
           echo "flavours=[$(IFS=,; echo "${flavours[*]}")]" >> "$GITHUB_OUTPUT"
           echo "names=$(printf '%s\n' "${flavours[@]}" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
@@ -123,7 +123,7 @@ jobs:
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev cmake nasm perl esbuild; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -170,9 +170,6 @@ jobs:
           .github/release/linux-runtime-notices.sh cc "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
-          if [ '${{ matrix.flavour.x264 }}' != true ]; then
-            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
-          fi
           ls -l "$RUNNER_TEMP/licenses"
       - name: Package
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
@@ -239,7 +236,7 @@ jobs:
           SRC
           sudo dpkg --add-architecture arm64
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && apt-cache policy libsystemd0 libsystemd0:arm64 && aptq 720 install -y libsystemd0 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64 libxcb1-dev:arm64; }
+          deps() { aptq 180 update && apt-cache policy libsystemd0 libsystemd0:arm64 && aptq 720 install -y libsystemd0 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev cmake perl esbuild qemu-user-static "${LIBX264_DEB/libx264-dev/libx264-dev:arm64}" libyuv-dev:arm64 libopus-dev:arm64 libpulse-dev:arm64 libxcb1-dev:arm64; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -285,9 +282,6 @@ jobs:
           .github/release/linux-runtime-notices.sh aarch64-linux-gnu-gcc "$RUNNER_TEMP/licenses"
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
-          if [ '${{ matrix.flavour.x264 }}' != true ]; then
-            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
-          fi
           ls -l "$RUNNER_TEMP/licenses"
       - name: Package
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/aarch64-unknown-linux-gnu/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
@@ -344,7 +338,7 @@ jobs:
       # pkg-config sees only the .pc files of Homebrew's Opus (and x264): the build links the
       # libraries of those kegs and no other.
       - run: |
-          brew install opus pkgconf esbuild ${{ matrix.flavour.x264 && 'x264' || '' }}
+          brew install opus pkgconf esbuild cmake nasm ${{ matrix.flavour.x264 && 'x264' || '' }}
           libdir=$(brew --prefix opus)/lib/pkgconfig
           if [ '${{ matrix.flavour.x264 }}' = true ]; then
             [ "$(brew list --versions x264)" = "$BREW_X264" ] || { echo "::error::Homebrew has $(brew list --versions x264), pinned $BREW_X264"; exit 1; }
@@ -418,9 +412,6 @@ jobs:
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-apple-darwin \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           cp "$(brew --prefix opus)/COPYING" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
-          if [ '${{ matrix.flavour.x264 }}' != true ]; then
-            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
-          fi
           ls -l "$RUNNER_TEMP/licenses"
       - name: Package
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
@@ -466,7 +457,7 @@ jobs:
       - name: MinGW, NASM and vcpkg's build tools
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build perl pkg-config libclang-dev esbuild zip unzip; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
@@ -513,9 +504,8 @@ jobs:
           fi
           ~/cargo-about/bin/cargo-about --version
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
-      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs. The cc
-      # crate links OpenH264's C++ with -lstdc++; a directory holding only libstdc++.a, searched
-      # first, makes that the static archive.
+      # The MinGW C and C++ runtimes linked in, so starfold.exe needs only Windows' own DLLs. A
+      # directory holding only libstdc++.a, searched first, makes any -lstdc++ the static archive.
       - name: Build
         run: |
           static=$RUNNER_TEMP/static-libstdcxx
@@ -566,9 +556,6 @@ jobs:
           cp /usr/share/doc/gcc-mingw-w64-base/copyright "$RUNNER_TEMP/licenses/GCC-runtime-copyright.txt"
           cp /usr/share/common-licenses/GPL-3 "$RUNNER_TEMP/licenses/GPL-3.0.txt"
           echo "winpthreads symbols in starfold.exe: $(x86_64-w64-mingw32-nm target/x86_64-pc-windows-gnu/release/starfold.exe 2>/dev/null | grep -c -E ' (pthread_|_pthread)' || true)"
-          if [ '${{ matrix.flavour.x264 }}' != true ]; then
-            cp ~/.cargo/registry/src/*/openh264-sys2-0.9.9/upstream/LICENSE "$RUNNER_TEMP/licenses/OpenH264-LICENSE.txt"
-          fi
           ls -l "$RUNNER_TEMP/licenses"
       - name: Package
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/x86_64-pc-windows-gnu/release/starfold.exe zip dist "$RUNNER_TEMP"/licenses/*
@@ -745,7 +732,7 @@ jobs:
           ## Downloads
 
           `starfold-x264-<version>-<platform>` binaries link x264 and are GPL-2.0-or-later as a combined work.
-          `starfold-<version>-<platform>` binaries link OpenH264 and are distributed under MIT. Each archive's
+          `starfold-<version>-<platform>` binaries link libaom and are distributed under MIT. Each archive's
           `licenses/` has the texts of what it includes; that is GCC's runtime code (GPL-3.0 with the GCC Runtime
           Library Exception) on Linux and Windows, and glibc's startup files (LGPL-2.1, with permission to link
           them) on Linux. Every file has a `.sha256` beside it, and the README's Install section lists what each
@@ -754,9 +741,9 @@ jobs:
 
           ## x264 source
 
-          A default build of this release links x264 and is GPL-2.0-or-later as a combined work; an
-          OpenH264-only build (`--no-default-features --features openh264`) has no x264.
-          The source of each x264 a default build links is attached (see `third_party/x264/README.md`):
+          A build with x264 (`--features x264`) is GPL-2.0-or-later as a combined work; a default build
+          has no x264.
+          The source of each x264 the x264 builds link is attached (see `third_party/x264/README.md`):
           - Linux: Ubuntu 24.04's `x264 2:0.164.3108+git31e19f9-1` (`.orig.tar.gz`, `.debian.tar.xz`, `.dsc`),
             upstream commit 31e19f92f00c7003fa115047ce50978bc98c3a0d.
           - Windows (vcpkg) and macOS (Homebrew): upstream r3222, commit b35605ace3ddf7c1a5d67a2eb553f034aef41d55

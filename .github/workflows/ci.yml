@@ -97,21 +97,18 @@ jobs:
   rust:
     name: Rust (rustfmt, clippy, test)
     runs-on: kyora-8x16
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: x264 source hashes
-        working-directory: third_party/x264
-        run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
-      # x264, libyuv, Opus, PulseAudio and xcb for linking, libclang for x264's bindings,
-      # esbuild for build.rs, Xvfb for the tests that start the server, bindfs for the one
-      # that needs a FUSE mount.
+      # libyuv, Opus, PulseAudio and xcb for linking, cmake, nasm and perl to build libaom,
+      # libclang for its bindings, esbuild for build.rs, Xvfb for the tests that start the
+      # server, bindfs for the one that needs a FUSE mount.
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild xvfb bindfs; }
+          deps() { aptq 180 update && aptq 720 install -y libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev cmake nasm perl esbuild xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -136,19 +133,22 @@ jobs:
           STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: cargo test --locked
 
-  openh264:
-    name: Rust with OpenH264 (clippy, test)
+  x264:
+    name: Rust with x264 (clippy, test)
     runs-on: kyora-8x16
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      # As above, plus nasm for OpenH264.
+      - name: x264 source hashes
+        working-directory: third_party/x264
+        run: sha256sum -c --quiet SHA256SUMS && sha512sum -c --quiet SHA512SUMS
+      # As above, plus x264 and ffmpeg, which decodes what the x264 tests encode.
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild xvfb bindfs; }
+          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev cmake nasm perl ffmpeg esbuild xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -160,20 +160,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-openh264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-openh264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
-      # Both encoders, then the build without x264 (BSD-licensed dependencies only).
+          key: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
       - name: Clippy
-        run: |
-          cargo clippy --features openh264 --all-targets --locked -- -D warnings
-          cargo clippy --no-default-features --features openh264 --all-targets --locked -- -D warnings
-      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
+        run: cargo clippy --features x264 --all-targets --locked -- -D warnings
+      # The x264 tests fail rather than skip without ffmpeg. Lets the FUSE test change
+      # /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
         env:
+          STARFOLD_REQUIRE_FFMPEG: '1'
           STARFOLD_TEST_SYSTEM_FUSE: '1'
-        run: |
-          cargo test --features openh264 --locked
-          cargo test --no-default-features --features openh264 --locked
+        run: cargo test --features x264 --locked
 
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
@@ -188,7 +185,7 @@ jobs:
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm pkg-config libx265-dev xvfb bindfs; }
+          deps() { aptq 180 update && aptq 720 install -y libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild build-essential cmake nasm yasm perl pkg-config libx265-dev xvfb bindfs; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - id: svt-av1
         uses: actions/cache@v4
@@ -248,7 +245,7 @@ jobs:
           DISPLAY=:99 STARFOLD_SERVE_TESTS=1 cargo test --features svt-av1,x265 --locked --test base_path_cli
 
   libaom:
-    name: Rust with libaom (clippy, test, startup, aarch64 and Windows builds)
+    name: libaom (clippy, test, static link, startup, aarch64 and Windows builds)
     runs-on: kyora-8x16
     timeout-minutes: 60
     steps:
@@ -257,12 +254,12 @@ jobs:
           submodules: true
       - name: libaom's commit
         run: test "$(git -C crates/starfold-aom-sys/aom rev-parse HEAD)" = b141d9c45db236335351c8a4b2a14b3ade27c937
-      # The Rust job's libraries, libaom's build tools, and for the cross builds the aarch64 and
-      # MinGW compilers and qemu to run the aarch64 tests.
+      # The Rust job's libraries, and for the cross builds the aarch64 and MinGW compilers and
+      # qemu to run the aarch64 tests.
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild cmake nasm perl xvfb bindfs gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user mingw-w64; }
+          deps() { aptq 180 update && aptq 720 install -y libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev esbuild cmake nasm perl xvfb bindfs gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user mingw-w64; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -277,21 +274,15 @@ jobs:
             target
           key: cargo-libaom-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-libaom-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      # The server with libaom, the default, is the Rust job's.
       - name: Clippy
-        run: |
-          cargo clippy -p starfold-aom-sys --all-targets --locked -- -D warnings
-          cargo clippy --features libaom --all-targets --locked -- -D warnings
-      # Lets the FUSE test change /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
+        run: cargo clippy -p starfold-aom-sys --all-targets --locked -- -D warnings
       - name: Test
-        env:
-          STARFOLD_TEST_SYSTEM_FUSE: '1'
-        run: |
-          cargo test -p starfold-aom-sys --locked
-          cargo test --features libaom --locked
+        run: cargo test -p starfold-aom-sys --locked
       # The binary carries libaom's encoder, statically; the library built has no decoder.
       - name: libaom linked statically
         run: |
-          cargo build --features libaom --locked
+          cargo build --locked
           ldd target/debug/starfold > "$RUNNER_TEMP/ldd.txt"
           if grep -i aom "$RUNNER_TEMP/ldd.txt"; then echo "::error::a shared libaom is linked"; exit 1; fi
           nm target/debug/starfold > "$RUNNER_TEMP/nm.txt"
@@ -337,12 +328,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      # Checked, not linked: musl-gcc for the C dependencies, the host g++ for OpenH264's C++,
-      # x264's headers and libclang for its bindings.
+      # Checked, not linked: musl-gcc for the C dependencies, the host g++ for the C++ compiler
+      # libaom's cmake asks for, cmake, nasm and perl to build libaom and libclang for its bindings.
       - name: Native libraries
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y "$LIBX264_DEB" libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev nasm esbuild musl-tools g++; }
+          deps() { aptq 180 update && aptq 720 install -y libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev cmake nasm perl esbuild musl-tools g++; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -381,7 +372,7 @@ jobs:
       - name: MinGW, NASM and vcpkg's build tools
         run: |
           aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
-          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build pkg-config libclang-dev esbuild zip unzip; }
+          deps() { aptq 180 update && aptq 720 install -y mingw-w64 nasm cmake ninja-build perl pkg-config libclang-dev esbuild zip unzip; }
           deps || { echo "::warning::package install failed or stalled; repairing and retrying once"; sudo timeout -k 10 180 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true; deps; }
       - uses: actions/cache@v4
         with:
@@ -412,12 +403,13 @@ jobs:
           key: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-windows-gnu-${{ env.RUST_TOOLCHAIN }}-
       - name: Clippy
-        run: cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
-      # libaom cross-compiled with its MinGW toolchain file, and starfold.exe linked with it.
-      - name: With libaom
         run: |
-          cargo clippy --target x86_64-pc-windows-gnu --features libaom --all-targets --locked -- -D warnings
-          cargo build --target x86_64-pc-windows-gnu --features libaom --locked
+          cargo clippy --target x86_64-pc-windows-gnu --all-targets --locked -- -D warnings
+          cargo clippy --target x86_64-pc-windows-gnu --features x264 --all-targets --locked -- -D warnings
+      # libaom cross-compiled with its MinGW toolchain file, and starfold.exe linked with it.
+      - name: Linked with libaom
+        run: |
+          cargo build --target x86_64-pc-windows-gnu --locked
           x86_64-w64-mingw32-nm target/x86_64-pc-windows-gnu/debug/starfold.exe | grep ' T aom_codec_av1_cx$'
 
   macos:
@@ -466,12 +458,13 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-      # libaom built from the submodule for arm64, and the server with it.
+      # libaom built from the submodule for arm64.
       - name: libaom
+        run: cargo test -p starfold-aom-sys --locked
+      - name: x264
         run: |
-          cargo test -p starfold-aom-sys --locked
-          cargo clippy --features libaom --all-targets --locked -- -D warnings
-          cargo test --features libaom --locked --lib encoder
+          cargo clippy --features x264 --all-targets --locked -- -D warnings
+          cargo test --features x264 --locked --lib encoder
       # What the startup probe finds on this host's hardware encoders.
       - name: Encoder probe
         run: cargo test --locked --lib videotoolbox_probe -- --nocapture
