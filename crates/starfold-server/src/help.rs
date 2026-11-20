@@ -285,8 +285,10 @@ fn encoder_entries(usage: &str) -> String {
         format!("sharpening once the screen goes still (default 16, 3, 150); {paintover}{finest}");
     let paintover_flags = "--paintover-crf, --paintover-burst, --paintover-delay-ms";
     let threads = match cfg!(feature = "libaom") {
-        true => "sliced threads (default cores/4, from 1 to 4; libaom picks its own: 4 up to \
-                 1080p, 8 above, never more than the cores or fewer than 2)",
+        true => {
+            "sliced threads (default cores/4, from 1 to 4; libaom picks its own: 4 up to \
+                 1080p, 8 above, never more than the cores or fewer than 2)"
+        }
         false => "sliced threads (default cores/4, from 1 to 4)",
     };
     usage
