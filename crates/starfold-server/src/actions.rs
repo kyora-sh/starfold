@@ -427,6 +427,9 @@ pub async fn input(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -
         for step in steps {
             match step {
                 Step::Event(e) => {
+                    if hub.closing() {
+                        return None;
+                    }
                     let ev = e.event();
                     hub.note_input(&ev);
                     tx.send(ev).ok()?;
@@ -674,6 +677,23 @@ mod tests {
     }
 
     const CLICK: &str = r#"{"type":"click","x":1,"y":2}"#;
+
+    #[tokio::test]
+    async fn a_batch_stops_at_the_shutdown() {
+        let (s, seen) = state(false, Duration::ZERO);
+        let body = format!(r#"[{CLICK},{{"type":"pause","ms":500}},{CLICK}]"#);
+        let run = tokio::spawn({
+            let s = s.clone();
+            async move { post(&s, "application/json", &body).await }
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let before = evs(&seen);
+        assert!(!before.is_empty(), "the first click never arrived");
+        s.hub.begin_close();
+        let (code, _) = run.await.unwrap();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(evs(&seen), before, "input after the shutdown began");
+    }
 
     #[tokio::test]
     async fn only_keys_count_as_typing() {

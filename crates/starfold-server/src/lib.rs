@@ -359,7 +359,8 @@ fn recorder_from_args(
 
 /// How long a shutdown waits for the viewers' sockets to close once 1012 is queued for them,
 /// and then how long it leaves the desktop's input to be released ([`server::shut_down`]).
-/// A thread of its own exits 1.2 s after the signal however the rest is held up.
+/// Once the signal is taken, a thread of its own queues the input release 1 s later and
+/// exits 200 ms after that, however the runtime is held up.
 const SHUTDOWN_SOCKETS: std::time::Duration = std::time::Duration::from_millis(800);
 const SHUTDOWN_RELEASE: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -393,10 +394,11 @@ async fn serve(
         tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         #[cfg(windows)]
         let _ = tokio::signal::ctrl_c().await;
-        let hard = shutdown_hub.clone();
+        shutdown_hub.begin_close();
+        let release = shutdown_hub.input.lock().clone();
         std::thread::spawn(move || {
             std::thread::sleep(SHUTDOWN_SOCKETS + SHUTDOWN_RELEASE);
-            if let Some(tx) = hard.input.lock().as_ref() {
+            if let Some(tx) = release {
                 let _ = tx.send(input::InputEvent::Shutdown);
             }
             std::thread::sleep(SHUTDOWN_RELEASE);

@@ -605,9 +605,12 @@ impl Hub {
 
     /// Queues 1012 (service restart) for every viewer, after what is already queued for
     /// it, and for each one that joins from now on; their input is ignored from now on.
+    /// Called again, it does nothing.
     pub fn begin_close(&self) {
         let clients = self.clients.lock();
-        self.closing.store(true, Ordering::Relaxed);
+        if self.closing.swap(true, Ordering::Relaxed) {
+            return;
+        }
         for c in clients.iter() {
             c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
         }

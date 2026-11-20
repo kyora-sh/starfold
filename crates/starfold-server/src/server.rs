@@ -1382,9 +1382,11 @@ async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response
     ws.on_upgrade(move |socket| handle_socket(socket, s))
 }
 
-/// A shutdown up to its exit: every viewer is sent 1012 and its input ignored; then, once
-/// all of them are gone or `sockets` has passed, upgrades are refused, the desktop's input
-/// is released, and `release` is left for that before the caller exits.
+/// A shutdown up to its exit: 1012 is queued for every viewer ([`Hub::begin_close`]) and
+/// input from viewers and `POST /input` is ignored; then, once all of them are gone or
+/// `sockets` has passed, upgrades are refused, the input thread is asked to release
+/// what is held, and `release` is left for that before the caller exits. Neither the close
+/// frames nor the release is confirmed.
 pub async fn shut_down(hub: &Hub, sockets: Duration, release: Duration) {
     hub.begin_close();
     hub.wait_closed(tokio::time::Instant::now() + sockets).await;

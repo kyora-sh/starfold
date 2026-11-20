@@ -355,9 +355,9 @@ and `onStatus('closed')`. The close's reason, the server's or a gateway's own te
 | 4000, 4001, 4002      | the client itself: a protocol error, no common codec, a failed worker                                          | no                                                                                           |
 | any other             |                                                                                                                | no                                                                                           |
 
-A starfold server that shuts down (SIGTERM, SIGINT, Ctrl-C) sends 1012 to every viewer after
-what is already queued for it, and exits within 1.2 s; a viewer too far behind to read it by then
-sees 1006.
+A starfold server that shuts down (SIGTERM, SIGINT, Ctrl-C) queues 1012 for every viewer after
+what is already queued for it and exits about 1.2 s later at most; a viewer too far behind to
+read it by then sees 1006.
 
 `shouldReconnect(code, reason)` replaces the table; the limits still apply. It is called at
 once, not queued; one that throws counts as no. The delay before attempt n is a random time
