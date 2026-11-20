@@ -1001,8 +1001,13 @@ impl Engine {
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            if *self.hub.stripes.lock() != stripes {
+            let restripe = *self.hub.stripes.lock() != stripes;
+            if restripe {
                 *self.hub.stripes.lock() = stripes;
+            }
+            if restripe || n.codec != old.codec {
+                self.hub.next_offer_gen();
+                self.publish();
                 self.hub.restart_clients();
             }
             return;

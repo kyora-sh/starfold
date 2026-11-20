@@ -1420,6 +1420,30 @@ fn the_test_hook_fails_the_h264_encoder() {
     );
 }
 
+#[test]
+fn a_base_falling_back_to_another_codec_sends_new_offers() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[H264_HW, FAKE_AV1_SW], Opts::default());
+    let (n, mut rn) = client(&hub);
+    join_v2(&hub, &n, &[Codec::H264]);
+    push(&mut eng);
+    ready(&n, &acked(&n, &mut rn));
+    assert_eq!(eng.base, H264_HW);
+    let gen = hub.offer_gen.load(Ordering::Relaxed);
+    hub.fail_h264.store(true, Ordering::Release);
+    hub.replan();
+    push(&mut eng);
+    assert_eq!(eng.base, FAKE_AV1_SW);
+    let now = hub.offer_gen.load(Ordering::Relaxed);
+    assert!(now > gen, "the offers changed but kept generation {gen}");
+    let m = drain(&mut rn);
+    assert!(
+        m.iter()
+            .any(|m| matches!(m, Msg::Json(j) if j["t"] == "hello" && j["offer"] == now)),
+        "{m:?}"
+    );
+}
+
 /// Answers the current offers with WebCodecs support for `backend`'s, and turns video on.
 fn join_v2_from(hub: &Hub, c: &Client, backend: Backend) {
     let caps = hub
