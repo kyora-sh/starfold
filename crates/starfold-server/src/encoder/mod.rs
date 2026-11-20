@@ -294,9 +294,9 @@ impl Backend {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "openh264" => Err(
-                "OpenH264 is gone from starfold: use `--encoder libaom` (AV1, the default \
-                 software encoder) or `--encoder x264` (H.264, in an optional build: the \
-                 starfold-x264 release or `--features x264`)"
+                "OpenH264 is gone from starfold: `--encoder libaom` (AV1) is the default \
+                 build's software encoder, and `--encoder x264` (H.264) needs an optional \
+                 build: the starfold-x264 release or `--features x264`"
                     .into(),
             ),
             #[cfg(feature = "libaom")]
