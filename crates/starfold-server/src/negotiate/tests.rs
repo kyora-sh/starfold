@@ -354,7 +354,7 @@ fn chosen_is_each_codecs_first_candidate() {
 fn selection_parse() {
     assert_eq!(Selection::parse("auto"), Ok(Selection::Auto));
     let e = Selection::parse("openh264").unwrap_err();
-    assert!(e.contains("no longer has OpenH264"), "{e}");
+    assert!(e.contains("OpenH264 is gone"), "{e}");
     #[cfg(feature = "libaom")]
     assert_eq!(
         Selection::parse("libaom"),

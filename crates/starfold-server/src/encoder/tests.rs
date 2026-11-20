@@ -694,9 +694,10 @@ fn idr_missing_parameter_sets_gets_cached_ones() {
 
 #[test]
 fn unknown_encoder_names() {
-    assert!(Backend::parse("openh264")
-        .unwrap_err()
-        .contains("no longer has OpenH264"));
+    let e = Backend::parse("openh264").unwrap_err();
+    for part in ["OpenH264 is gone", "--encoder libaom", "--encoder x264"] {
+        assert!(e.contains(part), "{e}");
+    }
     assert!(Backend::parse("x265").is_err());
     #[cfg(not(feature = "x264"))]
     assert!(Backend::parse("x264")
