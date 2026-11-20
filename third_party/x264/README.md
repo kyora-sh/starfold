@@ -1,8 +1,7 @@
 # x264 source
 
-A default starfold build links x264, which is GPL-2.0-or-later, so a binary built with x264 is
-GPL-2.0-or-later as a combined work; an OpenH264-only build (`--no-default-features --features
-openh264`) has no x264 and stays MIT. These files are the exact x264 source of each platform's build, kept here so that every
+A starfold build with the `x264` feature links x264, which is GPL-2.0-or-later, so that binary is
+GPL-2.0-or-later as a combined work; the default build has no x264 and stays MIT. These files are the exact x264 source of each platform's build, kept here so that every
 release can attach them (GPL source offer) without fetching anything. Nothing builds from them.
 
 | Platform | x264 | Files | Fetched from |

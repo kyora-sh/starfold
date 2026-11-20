@@ -4,10 +4,12 @@ name: Release
 # (v0.4.0, ...) attaches them to a GitHub release with GitHub's generated notes (the pull requests
 # merged since the previous tag). Nothing is published to a registry.
 #
-# Each binary comes in two flavours: starfold-<version>-<platform> links libaom (BSD-2-Clause)
-# and is distributed under MIT; starfold-x264-<version>-<platform> links libaom and x264 and is
-# GPL-2.0-or-later as a combined work. The release also attaches the exact x264 source of every
-# platform's build, from third_party/x264 (hash-checked, nothing fetched).
+# Each binary comes in exactly two flavours: starfold-<version>-<platform> links libaom
+# (BSD-2-Clause, with the Alliance for Open Media Patent License 1.0) and is distributed under MIT;
+# starfold-x264-<version>-<platform> links libaom and x264 and is GPL-2.0-or-later as a combined
+# work. THIRD_PARTY.md, in every archive, lists the licences each flavour's binary carries. The
+# release also attaches the exact x264 source of every platform's build, from third_party/x264
+# (hash-checked, nothing fetched).
 #
 # A dry run builds and checks everything and uploads the files as workflow artifacts only: a push
 # to a branch other than main that changes this workflow or the scripts it runs, or a manual run.
@@ -180,7 +182,7 @@ jobs:
         run: |
           docker run --rm --network host -v "$PWD:/src:ro" -w /src ubuntu:24.04 \
             .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.flavour.licence }}' \
-            libyuv0 libopus0 libpulse0 ${{ matrix.flavour.x264 && 'libx264-164' || 'libstdc++6' }}
+            libyuv0 libopus0 libpulse0 ${{ matrix.flavour.x264 && 'libx264-164' || '' }}
       - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
       - uses: actions/upload-artifact@v4
         with:

@@ -10,7 +10,6 @@ distributed under MIT and a GPL-2.0-or-later build with x264; see [Install](READ
 
 - The default encoder is AV1 from libaom, built from source and linked statically; the default build is distributed under MIT. On a host with a hardware H.264 encoder that isn't experimental, the default stays that encoder. Viewers need a protocol 2 client: WebCodecs decodes AV1 in current Chrome, Edge and Firefox, and in Safari where the device decodes AV1; elsewhere the web client decodes it with dav1d-wasm on the CPU, which on 4 vCPUs holds 30 fps up to 1600x900 and about 26 fps at 1080p in Chromium (#94)
 - x264 is an optional feature, `--features x264` (needs the x264 library, e.g. `libx264-dev`); a build with it is GPL-2.0-or-later. Where there is no hardware H.264 encoder its base stream (recordings, protocol 1, viewers without AV1) is H.264 from x264 and browsers that decode AV1 get AV1 from libaom; with `--encoder x264` every viewer gets x264 (#94)
-- OpenH264 is removed: there is no `openh264` feature, and `--encoder openh264` is an error (#94)
 - A build without an H.264 encoder closes a protocol 1 viewer with close code 4406 and a reason; build with x264, or use hardware H.264, to keep protocol 1 viewers (#94)
 - libaom picks its own thread count unless `--encoder-threads` is given: 4 up to 1080p, 8 above, at most the CPUs, but never under 2 per encoder (so 2 on a 1-CPU host). 4K at 30 fps needs 8 or more CPUs; on fewer the server sends fewer frames, dropping captures instead of queueing them (#94)
 - Recordings of an AV1 stream are AV1 in MP4: they play in current Chrome, Edge and Firefox, VLC, mpv and ffmpeg, and in Safari and QuickTime only on Apple devices with AV1 hardware decode (#94)
@@ -69,7 +68,6 @@ distributed under MIT and a GPL-2.0-or-later build with x264; see [Install](READ
 - An encoder that holds its bitrate cap gets exactly its share of the area (#65)
 - A viewer that connects during a resize ends on the newest hello (#67)
 - Hellos no longer offer a backend that is off (#66)
-- OpenH264's forced intra frame gets the layer id it expects (#73)
 - A paint-over doubles the bitrate cap only on an encoder that doesn't hold it (#70)
 - The embeddable client signals when there is no common codec, ends the session on a worker error and keeps the host page's focus (#81)
 - A paste in the embeddable client that a blur drops sends nothing; unmounting after a worker error still reports a close (#83)

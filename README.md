@@ -73,10 +73,9 @@ add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
 What each platform needs at run time:
 
 - **Linux** (built on Ubuntu 24.04, so it needs a distribution at least that new): libyuv, Opus and
-  PulseAudio's client library, plus x264 for the x264 build and the C++ runtime for the default
-  one. On Ubuntu 24.04: `sudo apt install libyuv0 libopus0 libpulse0`, plus `libx264-164` for
-  `starfold-x264-*` or `libstdc++6` for `starfold-*` (most systems have it already). Plus an X
-  server to stream, such as Xvfb (see [Usage](#usage)).
+  PulseAudio's client library, plus x264 for the x264 build. On Ubuntu 24.04:
+  `sudo apt install libyuv0 libopus0 libpulse0` for `starfold-*`, plus `libx264-164` for
+  `starfold-x264-*`. Plus an X server to stream, such as Xvfb (see [Usage](#usage)).
 - **macOS**: nothing beyond the system; Opus and libaom are linked in, and x264 in the x264 build. The binary is not notarized,
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
@@ -140,10 +139,8 @@ library (`libx264-dev` on Debian and Ubuntu, `brew install x264` on a Mac, or
 `x264` in vcpkg on Windows), builds on x86_64 and aarch64 only (on other architectures the
 feature refuses to build), and makes the binary GPL-2.0-or-later (see [Licensing](#licensing)).
 
-OpenH264 is no longer part of starfold: there is no `openh264` feature, and `--encoder openh264`
-stops with an error that says so. A build without an H.264 encoder (the default, on a host
-without hardware H.264) closes a protocol 1 viewer, which decodes only H.264, with WebSocket
-close code 4406 and a reason that names AV1 and the protocol 2 client. To keep protocol 1
+A build without an H.264 encoder (the default, on a host without hardware H.264) closes a
+protocol 1 viewer, which decodes only H.264, with WebSocket close code 4406 and a reason that names AV1 and the protocol 2 client. To keep protocol 1
 viewers, build with `--features x264` or run where a hardware H.264 encoder is found.
 
 ```sh

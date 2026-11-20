@@ -32,3 +32,28 @@
   [third_party/libvpl/LICENSE](third_party/libvpl/LICENSE).
 
 `starfold --version` lists the encoders a binary includes and its licence.
+
+## What each release binary carries
+
+Each release has exactly two flavours of the binary for each platform. The archive's root holds
+the binary, `LICENSE` (starfold's MIT licence), this file and `README.md`, and in an x264 archive
+`COPYING` and `X264-SOURCE.txt`; `licenses/` holds every other text named here.
+
+- **Default** (`starfold-<version>-<platform>`), distributed under MIT: starfold (MIT); libaom
+  (BSD-2-Clause and the Alliance for Open Media Patent License 1.0) with fastfeat (BSD-3-Clause),
+  vector (MIT) and, on x86_64, x86inc.asm (ISC); dav1d (BSD-2-Clause) and wasi-libc (MIT, with
+  parts under BSD-2-Clause and CC0); Inter (OFL-1.1); the Rust crates in `licenses/rust-crates.txt`
+  (MIT, Apache-2.0, BSD-3-Clause, ISC, Unicode-3.0 and Zlib, each crate under the first of these
+  it offers) and the Rust standard library (`licenses/rust-std/`). By platform: on Linux, glibc's
+  startup files (LGPL-2.1-or-later, with permission to link them into any program) and GCC's
+  (GPL-3.0-or-later with the GCC Runtime Library Exception); on macOS, Opus (BSD-3-Clause); on
+  Windows, Opus and libyuv (both BSD-3-Clause), the MinGW-w64 runtime (ZPL-2.1, with parts under
+  MIT-style licences and in the public domain; `licenses/MinGW-w64-copyright.txt`), GCC's runtime
+  libraries (GPL-3.0-or-later with the GCC Runtime Library Exception;
+  `licenses/GCC-runtime-copyright.txt`), and what is transcribed from
+  the Intel libvpl API headers (MIT). On Linux, libyuv, Opus and
+  PulseAudio's client library are the system's shared libraries and are not part of the binary.
+- **x264** (`starfold-x264-<version>-<platform>`), distributed under GPL-2.0-or-later as a combined
+  work: all of the above plus x264 (GPL-2.0-or-later; `COPYING`, and `X264-SOURCE.txt` for where
+  its source is). On Linux x264 is the system's shared library, `libx264.so.164`; on macOS and
+  Windows it is linked in.
