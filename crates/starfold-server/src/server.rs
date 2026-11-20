@@ -2414,10 +2414,7 @@ mod tests {
             (u16::from(close.code), close.reason.as_str()) == (1012, "server restarting")
         }
 
-        fn shut_down_task(
-            hub: &Arc<Hub>,
-            sockets: Duration,
-        ) -> tokio::task::JoinHandle<Duration> {
+        fn shut_down_task(hub: &Arc<Hub>, sockets: Duration) -> tokio::task::JoinHandle<Duration> {
             let hub = hub.clone();
             let t = Instant::now();
             tokio::spawn(async move {
@@ -2472,8 +2469,7 @@ mod tests {
             let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
-            match tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock).await
-            {
+            match tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock).await {
                 Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
                     assert_eq!(r.status(), 503)
                 }
