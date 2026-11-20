@@ -2228,23 +2228,28 @@ mod tests {
             assert_eq!(first["offer"], 0);
             assert_eq!(first["videoOffers"], serde_json::json!([]));
             ws.send(Ws::Text(answer(&first).into())).await.unwrap();
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
-            let offered = loop {
-                let h = json_of(&mut ws, "hello").await;
-                if h["offer"].as_u64() > Some(0) {
-                    break h;
+            let codec = tokio::time::timeout(Duration::from_secs(10), async {
+                let offered = loop {
+                    let h = json_of(&mut ws, "hello").await;
+                    if h["offer"].as_u64() > Some(0) {
+                        break h;
+                    }
+                };
+                assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
+                assert_eq!(offered["videoOffers"][0]["codec"], "av1");
+                ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
+                loop {
+                    let c = json_of(&mut ws, "codec").await;
+                    if c.get("error").is_none() {
+                        break c;
+                    }
                 }
-            };
-            assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
-            assert_eq!(offered["videoOffers"][0]["codec"], "av1");
-            ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
-            let codec = loop {
-                let c = json_of(&mut ws, "codec").await;
-                if c.get("error").is_none() {
-                    break c;
-                }
-            };
+            })
+            .await
+            .expect("no AV1 stream within 10 s of the first offers");
             assert_eq!(codec["codec"], "av1");
             ws.close(None).await.unwrap();
             gone(&hub).await;
