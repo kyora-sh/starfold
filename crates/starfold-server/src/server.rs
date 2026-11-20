@@ -2185,19 +2185,43 @@ mod tests {
             (ws, server)
         }
 
-        /// The next JSON message whose `t` is `t`, skipping everything else.
+        /// The next JSON message whose `t` is `t`, skipping everything else; a close
+        /// before it fails the test with its code and reason.
         async fn json_of(
             ws: &mut WebSocketStream<tokio::net::TcpStream>,
             t: &str,
         ) -> serde_json::Value {
             loop {
-                if let Ws::Text(m) = raw(ws).await {
-                    let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
-                    if j["t"] == t {
-                        return j;
+                match raw(ws).await {
+                    Ws::Text(m) => {
+                        let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
+                        if j["t"] == t {
+                            return j;
+                        }
                     }
+                    Ws::Close(c) => panic!("closed before a {t:?} message: {c:?}"),
+                    _ => {}
                 }
             }
+        }
+
+        /// Everything queued to `c` so far reaches the viewer: a marker is queued behind
+        /// it and read back, failing the test on a close before it.
+        async fn flushed(c: &Client, ws: &mut WebSocketStream<tokio::net::TcpStream>) {
+            c.send(Out::Text(r#"{"t":"marker"}"#.into()));
+            json_of(ws, "marker").await;
+        }
+
+        /// Waits, without sleeping, until the server has handled what the viewer sent:
+        /// `done` reads the state that the last message sets.
+        async fn handled(done: impl Fn() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !done() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the server never handled the message");
         }
 
         /// A protocol 2 viewer's answer to a hello: every stripe of every offer decodes.
@@ -2217,44 +2241,50 @@ mod tests {
                 .to_string()
         }
 
-        /// A viewer that connects before the stream's first offers exist is greeted with
-        /// none; when the stream starts it gets a hello at the next generation offering
-        /// AV1, and its answer to that one gets it the AV1 stream.
-        #[tokio::test]
-        async fn a_viewer_that_connects_before_the_first_offer_gets_it_when_the_stream_starts() {
+        /// A protocol 2 viewer connected to a server whose stream has not started, with
+        /// the stream started after its empty hello at generation 0 was read: the hello at
+        /// the new generation is queued to it, unanswered.
+        async fn viewer_at_startup() -> (
+            Arc<Hub>,
+            crate::video::tests::Av1Engine,
+            Arc<Client>,
+            WebSocketStream<tokio::net::TcpStream>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+            serde_json::Value,
+        ) {
             let (hub, _input) = wired();
             let (mut ws, server) = viewer(&hub).await;
             let first = json_of(&mut ws, "hello").await;
             assert_eq!(first["offer"], 0);
             assert_eq!(first["videoOffers"], serde_json::json!([]));
+            let c = hub.clients.lock()[0].clone();
+            let eng = crate::video::tests::Av1Engine::new(&hub);
+            assert!(hub.offer_gen.load(Ordering::SeqCst) > 0);
+            (hub, eng, c, ws, server, first)
+        }
+
+        /// A viewer that connects as the stream starts answers the empty hello of
+        /// generation 0 and turns its video on, both reaching the server after the first
+        /// offers moved the generation on. It is still a protocol 2 viewer: not closed with
+        /// 4406, and its answer to the hello at the new generation gets it the AV1 stream.
+        #[tokio::test]
+        async fn a_viewer_whose_first_answer_crosses_the_first_offer_still_gets_av1() {
+            let (hub, mut eng, c, mut ws, server, first) = viewer_at_startup().await;
             ws.send(Ws::Text(answer(&first).into())).await.unwrap();
             ws.send(Ws::Text("v,1".into())).await.unwrap();
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
-            let codec = tokio::time::timeout(Duration::from_secs(10), async {
-                let offered = loop {
-                    let h = json_of(&mut ws, "hello").await;
-                    if h["offer"].as_u64() > Some(0) {
-                        break h;
-                    }
-                };
-                assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
-                assert_eq!(offered["videoOffers"][0]["codec"], "av1");
-                ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
-                loop {
-                    let c = json_of(&mut ws, "codec").await;
-                    if c.get("error").is_none() {
-                        break c;
-                    }
-                }
-            })
-            .await
-            .expect("no AV1 stream within 10 s of the first offers");
-            assert_eq!(codec["codec"], "av1");
+            handled(|| c.video.load(Ordering::Relaxed)).await;
+            eng.replan();
+            let offered = json_of(&mut ws, "hello").await;
+            flushed(&c, &mut ws).await;
+            assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
+            assert_eq!(offered["videoOffers"][0]["codec"], "av1");
+            ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
+            handled(|| !c.route.lock().caps.is_empty()).await;
+            eng.replan();
+            let codec = json_of(&mut ws, "codec").await;
+            assert_eq!(codec["codec"], "av1", "{codec}");
             ws.close(None).await.unwrap();
             gone(&hub).await;
-            stop.store(true, std::sync::atomic::Ordering::Release);
-            engine.join().unwrap();
             server.abort();
         }
 

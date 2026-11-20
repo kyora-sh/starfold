@@ -390,7 +390,7 @@ fn engine(hub: &Arc<Hub>, cands: &[Candidate], o: Opts) -> Engine {
 pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     let (started, ready) = std::sync::mpsc::channel();
     let t = std::thread::spawn(move || {
-        let mut eng = engine(&hub, &[FAKE_AV1_SW], Opts::default());
+        let mut eng = Av1Engine::new(&hub);
         started.send(()).unwrap();
         while !stop.load(Ordering::Acquire) {
             eng.replan();
@@ -399,6 +399,22 @@ pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thre
     });
     ready.recv().expect("the engine failed to start");
     t
+}
+
+/// An engine whose only encoder is a software AV1 one, replanned only when the caller
+/// says, for tests that order its steps against a viewer's messages.
+pub(crate) struct Av1Engine(Engine);
+
+impl Av1Engine {
+    /// Starts the stream: its first offers, at the next offer generation.
+    pub(crate) fn new(hub: &Arc<Hub>) -> Self {
+        Self(engine(hub, &[FAKE_AV1_SW], Opts::default()))
+    }
+
+    pub(crate) fn replan(&mut self) {
+        self.0.hub.replan();
+        self.0.replan();
+    }
 }
 
 const FAKE_AV1_SW: Candidate = Candidate {
