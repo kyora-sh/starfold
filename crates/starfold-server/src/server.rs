@@ -2157,22 +2157,100 @@ mod tests {
             let (hub, input) = wired();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = l.local_addr().unwrap().port();
-            let server = tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
-            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let (mut ws, _) =
-                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
-                    .await
-                    .unwrap();
+            let (mut ws, server) = viewer(&hub).await;
             let Ws::Text(hello) = raw(&mut ws).await else {
                 panic!("the hello is a text message");
             };
             assert_eq!(hello.as_str(), hub.hello());
             ws.send(Ws::Text("v,1".into())).await.unwrap();
             (hub, input, ws, stop, engine, server)
+        }
+
+        async fn viewer(
+            hub: &Arc<Hub>,
+        ) -> (
+            WebSocketStream<tokio::net::TcpStream>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let server = tokio::spawn(axum::serve(l, router(app(hub, false, None))).into_future());
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (ws, _) =
+                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
+                    .await
+                    .unwrap();
+            (ws, server)
+        }
+
+        /// The next JSON message whose `t` is `t`, skipping everything else.
+        async fn json_of(
+            ws: &mut WebSocketStream<tokio::net::TcpStream>,
+            t: &str,
+        ) -> serde_json::Value {
+            loop {
+                if let Ws::Text(m) = raw(ws).await {
+                    let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
+                    if j["t"] == t {
+                        return j;
+                    }
+                }
+            }
+        }
+
+        /// A protocol 2 viewer's answer to a hello: every stripe of every offer decodes.
+        fn answer(hello: &serde_json::Value) -> String {
+            let decode: Vec<serde_json::Value> = hello["videoOffers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|o| o["stripes"].as_array().unwrap().iter())
+                .map(|s| {
+                    let mut c = s["config"].clone();
+                    c["implementation"] = "webcodecs".into();
+                    c
+                })
+                .collect();
+            serde_json::json!({"t": "hello", "v": 2, "offer": hello["offer"], "decode": decode})
+                .to_string()
+        }
+
+        /// A viewer that connects before the stream's first offers exist is greeted with
+        /// none; when the stream starts it gets a hello at the next generation offering
+        /// AV1, and its answer to that one gets it the AV1 stream.
+        #[tokio::test]
+        async fn a_viewer_that_connects_before_the_first_offer_gets_it_when_the_stream_starts() {
+            let (hub, _input) = wired();
+            let (mut ws, server) = viewer(&hub).await;
+            let first = json_of(&mut ws, "hello").await;
+            assert_eq!(first["offer"], 0);
+            assert_eq!(first["videoOffers"], serde_json::json!([]));
+            ws.send(Ws::Text(answer(&first).into())).await.unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
+            let offered = loop {
+                let h = json_of(&mut ws, "hello").await;
+                if h["offer"].as_u64() > Some(0) {
+                    break h;
+                }
+            };
+            assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
+            assert_eq!(offered["videoOffers"][0]["codec"], "av1");
+            ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
+            let codec = loop {
+                let c = json_of(&mut ws, "codec").await;
+                if c.get("error").is_none() {
+                    break c;
+                }
+            };
+            assert_eq!(codec["codec"], "av1");
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            engine.join().unwrap();
+            server.abort();
         }
 
         async fn close_frame(
