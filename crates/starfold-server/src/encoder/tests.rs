@@ -7,24 +7,41 @@ mod aom;
 mod arms;
 mod av1;
 
+/// The software encoders built here, which every contract test below runs on.
 fn backends() -> Vec<Backend> {
     vec![
         #[cfg(feature = "x264")]
         Backend::X264,
+        #[cfg(feature = "libaom")]
+        Backend::Libaom,
     ]
 }
 
+/// The codec `b` streams in these tests: AV1 from libaom, H.264 from the rest.
+fn codec_of(b: Backend) -> Codec {
+    #[cfg(feature = "libaom")]
+    if b == Backend::Libaom {
+        return Codec::Av1;
+    }
+    let _ = b;
+    Codec::H264
+}
+
 fn config(backend: Backend, width: u32, height: u32, max_kbps: u32) -> EncoderConfig {
+    let codec = codec_of(backend);
     EncoderConfig {
         backend,
-        codec: Codec::H264,
+        codec,
         width,
         height,
         fps: 30,
         threads: 1,
         rate: RateConfig::new(24.0, max_kbps, 30),
         best_quality: 16.0,
-        preset: "ultrafast".into(),
+        preset: match codec {
+            Codec::Av1 => String::new(),
+            _ => "ultrafast".into(),
+        },
     }
 }
 
@@ -264,13 +281,17 @@ fn without_ffmpeg(test: &str) -> bool {
     true
 }
 
-/// What ffmpeg decodes from an Annex-B H.264 stream: the picture size, how many pictures came
-/// out, and the last one's luma.
-fn decode(stream: &[u8]) -> ((usize, usize), usize, Vec<u8>) {
+/// What ffmpeg decodes from a stream of `codec` (Annex-B H.264, or AV1 in low-overhead
+/// OBUs): the picture size, how many pictures came out, and the last one's luma.
+fn decode_as(stream: &[u8], codec: Codec) -> ((usize, usize), usize, Vec<u8>) {
     use std::io::{BufRead, Read, Write};
     use std::process::{Command, Stdio};
+    let format = match codec {
+        Codec::Av1 => "obu",
+        _ => "h264",
+    };
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-xerror", "-f", "h264", "-i", "-"])
+        .args(["-v", "error", "-xerror", "-f", format, "-i", "-"])
         .args(["-autoscale", "0", "-fps_mode", "passthrough"])
         .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
         .stdin(Stdio::piped())
@@ -319,9 +340,9 @@ fn decode(stream: &[u8]) -> ((usize, usize), usize, Vec<u8>) {
     ((w, h), frames, luma)
 }
 
-fn decode_all(aus: &[AccessUnit]) -> Vec<(usize, usize)> {
+fn decode_all_as(aus: &[AccessUnit], codec: Codec) -> Vec<(usize, usize)> {
     let stream: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
-    let (size, frames, _) = decode(&stream);
+    let (size, frames, _) = decode_as(&stream, codec);
     vec![size; frames]
 }
 
@@ -340,21 +361,34 @@ fn idr_on_request_with_parameter_sets() {
             assert_eq!(got.len(), 1, "{b:?} frame {f}");
             aus.extend(got);
         }
+        let codec = codec_of(b);
         for (f, au) in aus.iter().enumerate() {
-            let t = types(au);
             let want_key = f == 0 || f == 7;
-            assert_eq!(au.keyframe, want_key, "{b:?} frame {f}: {t:?}");
-            assert_eq!(t.contains(&NAL_IDR), want_key, "{b:?} frame {f}");
-            if want_key {
-                let sps = t.iter().position(|&x| x == NAL_SPS).expect("SPS");
-                let pps = t.iter().position(|&x| x == NAL_PPS).expect("PPS");
-                let idr = t.iter().position(|&x| x == NAL_IDR).unwrap();
-                assert!(sps < idr && pps < idr, "{b:?} frame {f}: {t:?}");
+            assert_eq!(au.keyframe, want_key, "{b:?} frame {f}");
+            if codec == Codec::Av1 {
+                assert_eq!(
+                    super::av1::sequence_header(&au.data).is_some(),
+                    want_key,
+                    "{b:?} frame {f}: a sequence header exactly on keyframes"
+                );
+            } else {
+                let t = types(au);
+                assert_eq!(t.contains(&NAL_IDR), want_key, "{b:?} frame {f}");
+                if want_key {
+                    let sps = t.iter().position(|&x| x == NAL_SPS).expect("SPS");
+                    let pps = t.iter().position(|&x| x == NAL_PPS).expect("PPS");
+                    let idr = t.iter().position(|&x| x == NAL_IDR).unwrap();
+                    assert!(sps < idr && pps < idr, "{b:?} frame {f}: {t:?}");
+                }
             }
             assert_eq!(au.config.is_some(), f == 0, "{b:?} frame {f}");
         }
-        assert_eq!(decode_all(&aus).len(), aus.len(), "{b:?}");
-        assert_eq!(decode_all(&aus[7..]).len(), aus.len() - 7, "{b:?}");
+        assert_eq!(decode_all_as(&aus, codec).len(), aus.len(), "{b:?}");
+        assert_eq!(
+            decode_all_as(&aus[7..], codec).len(),
+            aus.len() - 7,
+            "{b:?}"
+        );
     }
 }
 
@@ -405,13 +439,37 @@ fn odd_and_tiny_sizes_pad() {
                 let got = enc.encode(&p.view(), opts);
                 aus.extend(got.unwrap_or_else(|e| panic!("{b:?} {w}x{h} frame {f}: {e}")));
             }
+            let codec = codec_of(b);
+            let refined = (codec == Codec::Av1).then(|| {
+                let r = Refine {
+                    qp: 12,
+                    max_bytes: None,
+                };
+                assert!(enc.refinable(r), "{b:?} {w}x{h}");
+                let opts = EncodeOptions {
+                    pts_ms: 66,
+                    refine: Some(r),
+                    ..Default::default()
+                };
+                enc.encode(&p.view(), opts)
+                    .unwrap_or_else(|e| panic!("{b:?} {w}x{h} refinement: {e}"))
+            });
+            if let Some(r) = refined {
+                assert!(
+                    !r.is_empty() && r.iter().all(|a| !a.keyframe),
+                    "{b:?} {w}x{h}: a refinement pass through the padding"
+                );
+                aus.extend(r);
+            }
             let side = |v: u32| (v.max(b.min_side()) + 1) & !1;
             let even = (side(w), side(h));
             let c = aus[0].config.clone().unwrap();
             assert_eq!((c.coded, c.display), (even, (w, h)), "{b:?} {w}x{h}");
-            assert_eq!(sps_of(&aus[0]).display, even, "{b:?} {w}x{h}");
-            let sizes = decode_all(&aus);
-            assert_eq!(sizes.len(), 2, "{b:?} {w}x{h}");
+            if codec == Codec::H264 {
+                assert_eq!(sps_of(&aus[0]).display, even, "{b:?} {w}x{h}");
+            }
+            let sizes = decode_all_as(&aus, codec);
+            assert_eq!(sizes.len(), aus.len(), "{b:?} {w}x{h}");
             assert!(
                 sizes
                     .iter()
@@ -420,6 +478,17 @@ fn odd_and_tiny_sizes_pad() {
             );
         }
     }
+}
+
+#[test]
+fn oversized_picture_fails_cleanly() {
+    let e = open(&config(Backend::FakeH264, 8192, 4608, 20_000))
+        .err()
+        .expect("too large");
+    assert!(e.0.contains("--stripes"), "{e}");
+    assert!(Backend::FakeH264.fits(3840, 2160));
+    assert!(Backend::FakeH264.fits(4096, 2304));
+    assert!(!Backend::FakeH264.fits(4096, 2320));
 }
 
 #[test]
@@ -885,8 +954,11 @@ fn videotoolbox_encodes_h264_and_hevc() {
                 assert_eq!(sps.profile, 100);
                 assert_eq!(sps.display, (w as u32, h as u32));
                 assert_eq!(sps.color, Some((false, 1, 13, 6)));
-                assert_eq!(decode_all(&aus).len(), aus.len());
-                assert_eq!(decode_all(&aus[30..]).len(), aus.len() - 30);
+                assert_eq!(decode_all_as(&aus, Codec::H264).len(), aus.len());
+                assert_eq!(
+                    decode_all_as(&aus[30..], Codec::H264).len(),
+                    aus.len() - 30
+                );
             }
             _ => assert!(c.codec_string.starts_with("hvc1.1."), "{}", c.codec_string),
         }
@@ -1135,7 +1207,7 @@ impl Refining {
                 return psnr;
             }
         }
-        let (size, frames, luma) = decode(&self.stream);
+        let (size, frames, luma) = decode_as(&self.stream, Codec::H264);
         assert_eq!(frames, self.frames, "pictures decoded");
         assert_eq!(size, (self.pic.w, self.pic.h));
         let psnr = luma_psnr(&luma, size.0, &self.shown);
