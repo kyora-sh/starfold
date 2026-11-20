@@ -2235,7 +2235,7 @@ mod tests {
         use super::close::{gone, raw, wired};
         use super::*;
         use crate::frame::Payload;
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::SinkExt;
         use std::future::IntoFuture;
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::{AsyncRead, AsyncWrite};

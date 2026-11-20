@@ -906,6 +906,16 @@ fn the_base_chain_falls_back_from_hardware_to_libaom_without_x264() {
     assert_eq!(base_chain(&candidates(&r, base)), vec![base, LIBAOM]);
 }
 
+#[test]
+fn a_pinned_backend_streams_its_base_codec() {
+    #[cfg(feature = "libaom")]
+    assert_eq!(base_codec(Backend::Libaom), Codec::Av1);
+    #[cfg(feature = "x264")]
+    assert_eq!(base_codec(Backend::X264), Codec::H264);
+    assert_eq!(base_codec(Backend::FakeAv1), Codec::Av1);
+    assert_eq!(base_codec(Backend::Nvenc), Codec::H264);
+}
+
 #[cfg(feature = "libaom")]
 #[test]
 fn libaom_alone_is_the_base_chain() {

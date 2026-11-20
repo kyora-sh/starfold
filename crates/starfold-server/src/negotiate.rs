@@ -169,15 +169,21 @@ pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String>
         #[cfg(feature = "sw-arm")]
         Selection::Arm(..) => SOFTWARE,
     };
-    let codec = match !b.implements(Codec::H264) && b.implements(Codec::Av1) {
-        true => Codec::Av1,
-        false => Codec::H264,
-    };
+    let codec = base_codec(b);
     reg.check(b, codec).map(|e| Candidate {
         codec,
         backend: b,
         hardware: e.acceleration == Acceleration::Hardware,
     })
+}
+
+/// The codec `b` streams as the base encoder: AV1 if this build encodes AV1 with it and not
+/// H.264, else H.264.
+pub fn base_codec(b: Backend) -> Codec {
+    match !b.implements(Codec::H264) && b.implements(Codec::Av1) {
+        true => Codec::Av1,
+        false => Codec::H264,
+    }
 }
 
 /// The encoders a stream may use for `sel`: [`candidates`] for `auto`, [`pinned_candidates`]
@@ -225,20 +231,29 @@ pub fn pinned_candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
     v
 }
 
+const SOFTWARE_CANDIDATE: Candidate = Candidate {
+    codec: SOFTWARE_CODEC,
+    backend: SOFTWARE,
+    hardware: false,
+};
+
 /// The software encoders a hardware base one falls back through, in that order.
+#[cfg(all(feature = "x264", feature = "libaom"))]
 fn software_fallbacks() -> Vec<Candidate> {
-    let mut v = vec![Candidate {
-        codec: SOFTWARE_CODEC,
-        backend: SOFTWARE,
-        hardware: false,
-    }];
-    #[cfg(all(feature = "x264", feature = "libaom"))]
-    v.push(Candidate {
-        codec: Codec::Av1,
-        backend: Backend::Libaom,
-        hardware: false,
-    });
-    v
+    vec![
+        SOFTWARE_CANDIDATE,
+        Candidate {
+            codec: Codec::Av1,
+            backend: Backend::Libaom,
+            hardware: false,
+        },
+    ]
+}
+
+/// The software encoder a hardware base one falls back to.
+#[cfg(not(all(feature = "x264", feature = "libaom")))]
+fn software_fallbacks() -> Vec<Candidate> {
+    vec![SOFTWARE_CANDIDATE]
 }
 
 fn ranked(reg: &Registry, base: Candidate, hardware_first: bool) -> Vec<Candidate> {
