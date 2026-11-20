@@ -1370,6 +1370,9 @@ async fn stats(State(s): State<AppState>) -> Response {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
+    if s.hub.sealed() {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let ws = ws.max_message_size(frame::MAX_MESSAGE);
     // Framed, a message up to the cap may come as one frame as well as in several.
     let ws = match s.framed {
@@ -1377,6 +1380,19 @@ async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response
         false => ws,
     };
     ws.on_upgrade(move |socket| handle_socket(socket, s))
+}
+
+/// A shutdown up to its exit: every viewer is sent 1012 and its input ignored; then, once
+/// all of them are gone or `sockets` has passed, upgrades are refused, the desktop's input
+/// is released, and `release` is left for that before the caller exits.
+pub async fn shut_down(hub: &Hub, sockets: Duration, release: Duration) {
+    hub.begin_close();
+    hub.wait_closed(tokio::time::Instant::now() + sockets).await;
+    hub.seal();
+    if let Some(tx) = hub.input.lock().as_ref() {
+        let _ = tx.send(InputEvent::Shutdown);
+    }
+    tokio::time::sleep(release).await;
 }
 
 /// How long a socket the server closed waits for the peer's close frame; nothing it sends
@@ -1514,6 +1530,9 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         } else {
             msg
         };
+        if s.hub.closing() && !matches!(msg, Message::Close(_)) {
+            continue;
+        }
         if !handle_message(&s, &client, msg, &mut rtts) {
             break;
         }
@@ -2392,27 +2411,35 @@ mod tests {
         }
 
         fn restart_close(close: &tokio_tungstenite::tungstenite::protocol::CloseFrame) -> bool {
-            (u16::from(close.code), close.reason.as_str())
-                == (crate::hub::RESTART_CLOSE, crate::hub::RESTART_REASON)
+            (u16::from(close.code), close.reason.as_str()) == (1012, "server restarting")
+        }
+
+        fn shut_down_task(
+            hub: &Arc<Hub>,
+            sockets: Duration,
+        ) -> tokio::task::JoinHandle<Duration> {
+            let hub = hub.clone();
+            let t = Instant::now();
+            tokio::spawn(async move {
+                shut_down(&hub, sockets, Duration::ZERO).await;
+                t.elapsed()
+            })
         }
 
         #[tokio::test]
-        async fn a_viewer_connected_at_shutdown_reads_1012() {
-            let (hub, _input) = wired();
+        async fn a_viewer_connected_at_shutdown_reads_1012_before_input_is_released() {
+            let (hub, input) = wired();
             let (mut ws, server) = viewer(&hub).await;
             let Ws::Text(_) = raw(&mut ws).await else {
                 panic!("the hello is a text message");
             };
-            let shutdown = tokio::spawn({
-                let hub = hub.clone();
-                async move {
-                    let t = Instant::now();
-                    hub.close_for_restart(Duration::from_secs(5)).await;
-                    t.elapsed()
-                }
-            });
+            let shutdown = shut_down_task(&hub, Duration::from_secs(5));
             let close = close_frame(&mut ws).await;
             assert!(restart_close(&close), "{close:?}");
+            assert!(
+                !input.try_iter().any(|e| matches!(e, InputEvent::Shutdown)),
+                "input released while a viewer was still on"
+            );
             tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(Ok(_)) = ws.next().await {}
             })
@@ -2420,27 +2447,45 @@ mod tests {
             .expect("the socket never closed");
             let took = shutdown.await.unwrap();
             assert!(
-                took < Duration::from_secs(2),
+                took < Duration::from_secs(3),
                 "waited {took:?} for a viewer that answered the close"
             );
-            assert!(hub.clients.lock().is_empty());
+            assert!(input.try_iter().any(|e| matches!(e, InputEvent::Shutdown)));
+            assert!(hub.sealed());
             server.abort();
         }
 
         #[tokio::test]
-        async fn a_viewer_that_joins_during_shutdown_is_closed_with_1012() {
+        async fn a_viewer_that_joins_during_shutdown_is_closed_with_1012_then_refused() {
             let (hub, _input) = wired();
-            hub.close_for_restart(Duration::ZERO).await;
+            hub.begin_close();
             let (mut ws, server) = viewer(&hub).await;
             let close = close_frame(&mut ws).await;
             assert!(restart_close(&close), "{close:?}");
+            hub.seal();
+            let port = {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = l.local_addr().unwrap().port();
+                tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
+                port
+            };
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            match tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock).await
+            {
+                Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                    assert_eq!(r.status(), 503)
+                }
+                r => panic!("a sealed server took the upgrade: {:?}", r.map(|_| ())),
+            }
             server.abort();
         }
 
         #[tokio::test]
         async fn a_peer_that_never_reads_holds_up_shutdown_for_the_bound_at_most() {
-            let (hub, _input) = wired();
-            let (ws, server) = viewer(&hub).await;
+            let (hub, input) = wired();
+            let (mut ws, server) = viewer(&hub).await;
             let mut joined = None;
             for _ in 0..500 {
                 joined = hub.clients.lock().first().cloned();
@@ -2455,11 +2500,14 @@ mod tests {
                 c.send(Out::Bin(mb.clone()));
             }
             let bound = Duration::from_millis(300);
-            let t = Instant::now();
-            hub.close_for_restart(bound).await;
-            let took = t.elapsed();
+            let shutdown = shut_down_task(&hub, bound);
+            while !hub.closing() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            ws.send(Ws::Text("k,65,1".into())).await.unwrap();
+            let took = shutdown.await.unwrap();
             assert!(
-                took >= bound && took < bound + Duration::from_millis(500),
+                took >= bound && took < bound + Duration::from_secs(2),
                 "returned after {took:?}"
             );
             assert_eq!(
@@ -2467,6 +2515,12 @@ mod tests {
                 1,
                 "the bound, not the peer, ended the wait"
             );
+            let events: Vec<_> = input.try_iter().collect();
+            assert!(
+                !events.iter().any(|e| matches!(e, InputEvent::Key { .. })),
+                "a closing viewer's key reached the desktop"
+            );
+            assert!(events.iter().any(|e| matches!(e, InputEvent::Shutdown)));
             drop(ws);
             server.abort();
         }

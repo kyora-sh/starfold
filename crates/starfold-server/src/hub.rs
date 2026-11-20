@@ -438,6 +438,8 @@ pub struct Hub {
     /// Set with `clients` locked once the server shuts down: a viewer that joins later is
     /// closed at once.
     closing: AtomicBool,
+    /// Set when the shutdown stops waiting for viewers: no more upgrades.
+    sealed: AtomicBool,
     pub next_id: AtomicU64,
     pub stats: Stats,
     pub width: AtomicU32,
@@ -500,6 +502,7 @@ impl Hub {
         Arc::new(Hub {
             clients: Mutex::new(Vec::new()),
             closing: AtomicBool::new(false),
+            sealed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stats: Stats::default(),
             width: AtomicU32::new(0),
@@ -600,22 +603,34 @@ impl Hub {
         self.replan();
     }
 
-    /// Closes every viewer, and each one that joins from now on, with 1012 (service
-    /// restart), after what is already queued for it. Returns once all of them are gone or
-    /// `within` has passed, whichever is first: a peer that reads nothing holds it up for
-    /// `within` at most.
-    pub async fn close_for_restart(&self, within: Duration) {
-        let end = tokio::time::Instant::now() + within;
-        {
-            let clients = self.clients.lock();
-            self.closing.store(true, Ordering::Relaxed);
-            for c in clients.iter() {
-                c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
-            }
+    /// Queues 1012 (service restart) for every viewer, after what is already queued for
+    /// it, and for each one that joins from now on; their input is ignored from now on.
+    pub fn begin_close(&self) {
+        let clients = self.clients.lock();
+        self.closing.store(true, Ordering::Relaxed);
+        for c in clients.iter() {
+            c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
         }
-        while !self.clients.lock().is_empty() && tokio::time::Instant::now() < end {
+    }
+
+    pub fn closing(&self) -> bool {
+        self.closing.load(Ordering::Relaxed)
+    }
+
+    /// Waits until every viewer is gone or `until`, whichever is first.
+    pub async fn wait_closed(&self, until: tokio::time::Instant) {
+        while tokio::time::Instant::now() < until && !self.clients.lock().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// No more upgrades: the WebSocket route answers 503 from now on.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn sealed(&self) -> bool {
+        self.sealed.load(Ordering::Relaxed)
     }
 
     pub fn video_clients(&self) -> Vec<Arc<Client>> {

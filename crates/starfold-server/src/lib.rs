@@ -357,9 +357,11 @@ fn recorder_from_args(
     Ok(record::Recorder::new(hub.clone(), s.max, s.on, s.dir))
 }
 
-/// How long a shutdown waits for the viewers' sockets to close after sending them 1012;
-/// it exits no sooner than 200 ms after the signal either way.
-const SHUTDOWN_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a shutdown waits for the viewers' sockets to close once 1012 is queued for them,
+/// and then how long it leaves the desktop's input to be released ([`server::shut_down`]).
+/// A thread of its own exits 1.2 s after the signal however the rest is held up.
+const SHUTDOWN_SOCKETS: std::time::Duration = std::time::Duration::from_millis(800);
+const SHUTDOWN_RELEASE: std::time::Duration = std::time::Duration::from_millis(200);
 
 async fn serve(
     a: HashMap<String, String>,
@@ -391,17 +393,21 @@ async fn serve(
         tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         #[cfg(windows)]
         let _ = tokio::signal::ctrl_c().await;
+        let hard = shutdown_hub.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SHUTDOWN_SOCKETS + SHUTDOWN_RELEASE);
+            if let Some(tx) = hard.input.lock().as_ref() {
+                let _ = tx.send(input::InputEvent::Shutdown);
+            }
+            std::thread::sleep(SHUTDOWN_RELEASE);
+            std::process::exit(0);
+        });
         log::info!("shutting down");
-        let at_least = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(input::InputEvent::Shutdown);
-        }
         #[cfg(target_os = "linux")]
         if let Some(file) = socket_file {
             server::remove_unix(file);
         }
-        shutdown_hub.close_for_restart(SHUTDOWN_CLOSE_WAIT).await;
-        tokio::time::sleep_until(at_least).await;
+        server::shut_down(&shutdown_hub, SHUTDOWN_SOCKETS, SHUTDOWN_RELEASE).await;
         std::process::exit(0);
     });
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
