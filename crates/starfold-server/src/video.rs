@@ -615,7 +615,7 @@ fn stripe_threads(
     if let (encoder::Backend::Libaom, Some(cpus)) = (cand.backend, cfg.cpus) {
         return encoder::aom_threads(width as u64 * picture_h as u64, cpus, stripes as u32);
     }
-    let _ = (cand, width, picture_h);
+    let _ = (cand, width, picture_h, cfg.cpus);
     (cfg.threads / stripes.max(1) as u32).max(1)
 }
 
