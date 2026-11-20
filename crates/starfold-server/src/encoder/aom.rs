@@ -369,6 +369,7 @@ impl Aom {
 
 impl VideoEncoder for Aom {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
+        self.duration = (1000 / rate.fps.max(1)).max(1) as u64;
         apply(&mut self.cfg, rate);
         let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &*self.cfg) };
         if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
