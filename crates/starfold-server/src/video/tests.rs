@@ -383,6 +383,23 @@ fn engine(hub: &Arc<Hub>, cands: &[Candidate], o: Opts) -> Engine {
     Engine::new(config(), hub.clone(), W, H, cands, fakes(o)).unwrap()
 }
 
+/// An engine whose only encoder is a software AV1 one, as on a server without H.264,
+/// replanning on its own thread until `stop` is set.
+pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let av1 = Candidate {
+            codec: Codec::Av1,
+            backend: Backend::FakeAv1,
+            hardware: false,
+        };
+        let mut eng = engine(&hub, &[av1], Opts::default());
+        while !stop.load(Ordering::Acquire) {
+            eng.replan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+}
+
 fn client(hub: &Hub) -> (Arc<Client>, UnboundedReceiver<Out>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (hub.add_client(tx), rx)

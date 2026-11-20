@@ -2478,6 +2478,51 @@ mod tests {
             server.abort();
         }
 
+        #[tokio::test]
+        async fn a_protocol_1_viewer_of_an_av1_server_is_closed_with_4406() {
+            let (hub, _input) = wired();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let server = tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (mut ws, _) =
+                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
+                    .await
+                    .unwrap();
+            let Ws::Text(hello) = raw(&mut ws).await else {
+                panic!("the hello is a text message");
+            };
+            assert_eq!(hello.as_str(), hub.hello());
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
+            let close = loop {
+                match raw(&mut ws).await {
+                    Ws::Close(c) => break c.expect("a close frame with a code"),
+                    Ws::Binary(b) => panic!("protocol 1 got {} bytes of video", b.len()),
+                    _ => {}
+                }
+            };
+            assert_eq!(
+                (u16::from(close.code), close.reason.as_str()),
+                (
+                    crate::negotiate::NO_H264_CLOSE,
+                    crate::negotiate::NO_H264_REASON
+                )
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await
+            .expect("the socket never closed");
+            gone(&hub).await;
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            engine.join().unwrap();
+            server.abort();
+        }
+
         #[test]
         fn a_path_that_exists_is_refused_and_left_as_it_was() {
             let rt = runtime();

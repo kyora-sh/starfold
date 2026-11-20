@@ -741,17 +741,21 @@ fn auto_on_this_host() {
     println!("--encoder auto: {got:?}");
     if cfg!(target_os = "macos") {
         if std::env::var_os("STARFOLD_EXPECT_HW").is_some() {
-            assert_eq!(
-                got,
-                vec![
-                    (Codec::Hevc, Backend::VideoToolbox, true),
-                    (Codec::H264, Backend::VideoToolbox, true),
-                    (Codec::Av1, Backend::Libaom, false)
-                ]
-            );
+            let want: Vec<(Codec, Backend, bool)> = [
+                (Codec::Hevc, Backend::VideoToolbox, true),
+                (Codec::H264, Backend::VideoToolbox, true),
+                #[cfg(feature = "libaom")]
+                (Codec::Av1, Backend::Libaom, false),
+            ]
+            .into();
+            assert_eq!(got, want);
         }
     } else {
-        let mut want = vec![(Codec::Av1, Backend::Libaom, false)];
+        let mut want: Vec<(Codec, Backend, bool)> = [
+            #[cfg(feature = "libaom")]
+            (Codec::Av1, Backend::Libaom, false),
+        ]
+        .into();
         if SOFTWARE_CODEC == Codec::H264 {
             want.push((Codec::H264, SOFTWARE, false));
         }

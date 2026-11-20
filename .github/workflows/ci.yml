@@ -163,7 +163,9 @@ jobs:
           key: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-x264-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
       - name: Clippy
-        run: cargo clippy --features x264 --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --features x264 --all-targets --locked -- -D warnings
+          cargo clippy -p starfold-server --all-targets --locked --no-default-features --features x264 -- -D warnings
       # The x264 tests fail rather than skip without ffmpeg. Lets the FUSE test change
       # /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
