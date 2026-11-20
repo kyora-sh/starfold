@@ -460,6 +460,8 @@ async fn serve(
         }
     }
     let threads: Option<u32> = a.get("encoder-threads").and_then(|v| v.parse().ok());
+    #[cfg(feature = "libaom")]
+    encoder::set_stored_screens(truthy(a.get("stored-screens"), true));
     let vcfg = video::VideoConfig {
         display: display.clone(),
         selection,

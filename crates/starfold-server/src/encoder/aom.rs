@@ -6,6 +6,13 @@
 //! quantizer and predicts from the last picture named as GOLDEN, with LAST itself off.
 //! libaom's real-time path skips a block whose source didn't change only when LAST is a
 //! reference, so this is what makes it re-code a still picture.
+//!
+//! Stored screens: a refinement also keeps its picture in one of slots 1 to 6, keyed by a
+//! hash of its luma, and a frame that replaces most of the screen with one stored there
+//! predicts from that slot (named as GOLDEN), so switching back to a page or closing a menu
+//! costs a few bytes instead of the page again. The reference is only a prediction: the
+//! residual is coded as always, so a hash that matches the wrong screen costs bytes, never
+//! a wrong picture. Every keyframe clears the table, as libaom refreshes all slots with it.
 
 use starfold_aom_sys as ffi;
 
@@ -17,6 +24,7 @@ use super::{
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uint};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_Q: u32 = 63;
 const UNCAPPED_KBPS: u32 = 200_000;
@@ -35,8 +43,105 @@ const FINEST_QP: u8 = 12;
 
 const LAST: usize = 0;
 const GOLDEN: usize = 3;
+const ALTREF: usize = 6;
 /// The buffer slot no frame refreshes, for the reference names a frame doesn't use.
 const SPARE: c_int = 7;
+/// The slots that keep stored screens: 1 to `SCREENS`.
+pub(crate) const SCREENS: usize = 6;
+
+static STORED_SCREENS: AtomicBool = AtomicBool::new(true);
+
+/// `--stored-screens`: whether the libaom encoders opened from now on keep settled screens.
+pub fn set_stored_screens(on: bool) {
+    STORED_SCREENS.store(on, Ordering::Relaxed);
+}
+
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+/// A 64-bit FNV-1a hash of every 4th luma row, never 0: equal for the same screen.
+pub(crate) fn screen_hash(p: &FrameView<'_>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let w = p.width as usize;
+    for y in (0..p.height as usize).step_by(4) {
+        let row = &p.y[y * p.stride_y..y * p.stride_y + w];
+        let mut words = row.chunks_exact(8);
+        for c in &mut words {
+            h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(FNV_PRIME);
+        }
+        for &b in words.remainder() {
+            h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
+        }
+    }
+    h | 1
+}
+
+/// Whether more than half of the macroblocks changed, by the capture's map (nonzero where
+/// nothing did); with no map, every one did.
+fn most_changed(static_mbs: Option<&[u8]>) -> bool {
+    static_mbs.is_none_or(|m| m.iter().filter(|&&s| s == 0).count() * 2 > m.len())
+}
+
+/// The screens kept in slots 1 to [`SCREENS`]: each one's hash (0 when empty) and when it
+/// was last stored or referenced.
+#[derive(Default)]
+pub(crate) struct Screens {
+    slots: [(u64, u64); SCREENS],
+    tick: u64,
+}
+
+impl Screens {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The slot that holds the screen hashing to `h`.
+    pub(crate) fn find(&self, h: u64) -> Option<usize> {
+        (0..SCREENS).find(|&i| self.slots[i].0 == h).map(|i| i + 1)
+    }
+
+    /// Where a screen hashing to `h` is stored: its own slot, else an empty one, else the
+    /// least recently used.
+    pub(crate) fn place(&self, h: u64) -> usize {
+        self.find(h).unwrap_or_else(|| {
+            1 + (0..SCREENS)
+                .min_by_key(|&i| (self.slots[i].0 != 0, self.slots[i].1))
+                .unwrap()
+        })
+    }
+
+    pub(crate) fn store(&mut self, slot: usize, h: u64) {
+        self.tick += 1;
+        self.slots[slot - 1] = (h, self.tick);
+    }
+
+    pub(crate) fn used(&mut self, slot: usize) {
+        self.tick += 1;
+        self.slots[slot - 1].1 = self.tick;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hashes(&self) -> [u64; SCREENS] {
+        self.slots.map(|s| s.0)
+    }
+
+    /// A stored screen other than `h`'s, for a test of what a wrong match shows.
+    #[cfg(test)]
+    fn other(&self, h: u64) -> Option<usize> {
+        (0..SCREENS)
+            .find(|&i| self.slots[i].0 != 0 && self.slots[i].0 != h)
+            .map(|i| i + 1)
+    }
+}
+
+/// What an inter frame does with the stored screens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Screen {
+    None,
+    /// A refinement that also refreshes this slot.
+    Store(usize),
+    /// A frame that predicts from this slot alone.
+    Back(usize),
+}
 /// What a frame under rate control records for the blocks it touched: unknown, above any QP a
 /// pass can aim for. libaom skips the blocks whose source didn't change at whatever quantizer
 /// the frame runs, so the frame's own says nothing about them.
@@ -51,6 +156,14 @@ pub struct Aom {
     announced: bool,
     fresh: bool,
     sharpness: Sharpness,
+    /// None with `--stored-screens=false`.
+    screens: Option<Screens>,
+    /// The hash of the last frame that ran it, 0 if a frame since changed without it.
+    prev_hash: u64,
+    #[cfg(test)]
+    hashed: u64,
+    #[cfg(test)]
+    wrong_match: bool,
 }
 
 unsafe impl Send for Aom {}
@@ -84,12 +197,26 @@ pub(crate) fn as_qp(q: c_int) -> i32 {
 /// An inter frame's references: LAST on slot 0, or for a refinement slot 0 named as GOLDEN
 /// with LAST off. Only slot 0 is refreshed, and every name a frame doesn't use points at the
 /// spare slot: a name left on slot 0 would be refreshed with it, and libaom's rate control
-/// would count every frame as a golden one.
-pub(crate) fn references(refine: bool) -> ffi::aom_svc_ref_frame_config_t {
+/// would count every frame as a golden one. A refinement that stores its screen also
+/// refreshes that slot, named as ALTREF; a frame back on a stored screen names that slot as
+/// GOLDEN and references it alone.
+pub(crate) fn references(refine: bool, screen: Screen) -> ffi::aom_svc_ref_frame_config_t {
     let mut c: ffi::aom_svc_ref_frame_config_t = unsafe { std::mem::zeroed() };
     c.ref_idx = [SPARE; 7];
     c.ref_idx[LAST] = 0;
     c.refresh[0] = 1;
+    match screen {
+        Screen::Back(k) if !refine => {
+            c.ref_idx[GOLDEN] = k as c_int;
+            c.reference[GOLDEN] = 1;
+            return c;
+        }
+        Screen::Store(k) if refine => {
+            c.ref_idx[ALTREF] = k as c_int;
+            c.refresh[k] = 1;
+        }
+        _ => {}
+    }
     if refine {
         c.ref_idx[GOLDEN] = 0;
         c.reference[GOLDEN] = 1;
@@ -176,6 +303,14 @@ impl Aom {
                     c.width.div_ceil(16) as usize * c.height.div_ceil(16) as usize,
                     51,
                 ),
+                screens: STORED_SCREENS
+                    .load(Ordering::Relaxed)
+                    .then(Screens::default),
+                prev_hash: 0,
+                #[cfg(test)]
+                hashed: 0,
+                #[cfg(test)]
+                wrong_match: false,
             };
             enc.controls(speed)?;
             Ok(enc)
@@ -192,8 +327,72 @@ impl Aom {
         }
     }
 
-    fn set_references(&mut self, refine: bool) -> Result<(), EncodeError> {
-        let mut c = references(refine);
+    /// What an inter frame does with the stored screens, and the hash it runs on. The hash
+    /// runs only for a refinement, which stores its screen, and for a frame that changed most
+    /// of the screen, which may be back on a stored one.
+    fn screen(&mut self, p: &FrameView<'_>, damage: Option<&[u8]>, refine: bool) -> (Screen, u64) {
+        let Some(screens) = self.screens.as_ref() else {
+            return (Screen::None, 0);
+        };
+        if !refine && !most_changed(damage) {
+            self.prev_hash = 0;
+            return (Screen::None, 0);
+        }
+        let h = screen_hash(p);
+        #[cfg(test)]
+        {
+            self.hashed += 1;
+        }
+        let prev = std::mem::replace(&mut self.prev_hash, h);
+        if refine {
+            return (Screen::Store(screens.place(h)), h);
+        }
+        if h == prev {
+            return (Screen::None, h);
+        }
+        #[cfg(test)]
+        if self.wrong_match {
+            return (screens.other(h).map_or(Screen::None, Screen::Back), h);
+        }
+        (screens.find(h).map_or(Screen::None, Screen::Back), h)
+    }
+
+    /// The table once a frame is out: a keyframe empties it, a stored screen goes in.
+    fn screen_coded(&mut self, key: bool, screen: Screen, h: u64) {
+        let Some(screens) = self.screens.as_mut() else {
+            return;
+        };
+        match screen {
+            _ if key => screens.clear(),
+            Screen::Store(k) => screens.store(k, h),
+            Screen::Back(k) => screens.used(k),
+            Screen::None => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_screens(&mut self, on: bool) {
+        self.screens = on.then(Screens::default);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn screens(&self) -> Option<[u64; SCREENS]> {
+        self.screens.as_ref().map(Screens::hashes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hashed(&self) -> u64 {
+        self.hashed
+    }
+
+    /// Every frame back on a stored screen is pointed at another one instead.
+    #[cfg(test)]
+    pub(crate) fn force_wrong_match(&mut self) {
+        self.wrong_match = true;
+    }
+
+    fn set_references(&mut self, refine: bool, screen: Screen) -> Result<(), EncodeError> {
+        let mut c = references(refine, screen);
         let ctx: *mut ffi::aom_codec_ctx_t = &mut *self.ctx;
         let r = unsafe {
             ffi::aom_codec_control(
@@ -459,8 +658,12 @@ impl VideoEncoder for Aom {
         } else {
             0
         };
+        let (screen, h) = match key {
+            true => (Screen::None, 0),
+            false => self.screen(p, opts.static_mbs.as_deref().map(|m| &m[..mbs]), fixed.is_some()),
+        };
         if !key {
-            self.set_references(fixed.is_some())?;
+            self.set_references(fixed.is_some(), screen)?;
         }
         if let Some(qp) = fixed {
             let q = quantizer(qp as u8);
@@ -474,8 +677,14 @@ impl VideoEncoder for Aom {
         };
         let out = if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
             self.fresh = false;
-            self.collect()
+            let out = self.collect();
+            let whole = out.as_ref().is_ok_and(|o| o.iter().any(|a| a.keyframe));
+            self.screen_coded(key || whole || out.is_err(), screen, h);
+            out
         } else {
+            if let Some(s) = self.screens.as_mut() {
+                s.clear();
+            }
             Err(self.error("encode"))
         };
         let q = match out {
