@@ -180,21 +180,71 @@ pub fn base_backend(reg: &Registry, sel: Selection) -> Result<Candidate, String>
     })
 }
 
-/// The encoders a stream may use, best first ([`rank`]: hardware before software, then
-/// AV1, HEVC, H.264): the eligible AV1 and HEVC ones and the base one (`base_backend`),
-/// then [`SOFTWARE`] for when a hardware base one fails. An experimental backend takes part only when it is the base one,
-/// i.e. pinned with `--encoder`.
+/// The encoders a stream may use for `sel`: [`candidates`] for `auto`, [`pinned_candidates`]
+/// for a backend named with `--encoder`.
+pub fn candidates_for(reg: &Registry, sel: Selection, base: Candidate) -> Vec<Candidate> {
+    match sel {
+        Selection::Pinned(_) => pinned_candidates(reg, base),
+        _ => candidates(reg, base),
+    }
+}
+
+/// The encoders an `auto` stream may use, best first ([`rank`]: hardware before software,
+/// then AV1, HEVC, H.264): the eligible AV1 and HEVC ones that aren't experimental and the
+/// base one (`base_backend`), then [`SOFTWARE`] for when a hardware base one fails.
 pub fn candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
     ranked(reg, base, HARDWARE_FIRST)
+}
+
+/// The encoders a stream pinned to `base`'s backend may use: that backend's eligible AV1,
+/// HEVC and H.264 encoders in that order, then, when it is hardware, the software ones it
+/// falls back to ([`SOFTWARE`], then libaom's AV1 where x264 is the software one).
+pub fn pinned_candidates(reg: &Registry, base: Candidate) -> Vec<Candidate> {
+    let mut v: Vec<Candidate> = [Codec::Av1, Codec::Hevc, Codec::H264]
+        .into_iter()
+        .filter_map(|codec| {
+            reg.eligible(codec)
+                .find(|e| e.backend == base.backend)
+                .map(|e| Candidate {
+                    codec,
+                    backend: e.backend,
+                    hardware: e.acceleration == Acceleration::Hardware,
+                })
+        })
+        .collect();
+    if !v.contains(&base) {
+        v.push(base);
+    }
+    if base.hardware {
+        for f in software_fallbacks() {
+            if !v.contains(&f) && reg.eligible(f.codec).any(|e| e.backend == f.backend) {
+                v.push(f);
+            }
+        }
+    }
+    v
+}
+
+/// The software encoders a hardware base one falls back through, in that order.
+fn software_fallbacks() -> Vec<Candidate> {
+    let mut v = vec![Candidate {
+        codec: SOFTWARE_CODEC,
+        backend: SOFTWARE,
+        hardware: false,
+    }];
+    #[cfg(all(feature = "x264", feature = "libaom"))]
+    v.push(Candidate {
+        codec: Codec::Av1,
+        backend: Backend::Libaom,
+        hardware: false,
+    });
+    v
 }
 
 fn ranked(reg: &Registry, base: Candidate, hardware_first: bool) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::new();
     for codec in [Codec::Av1, Codec::Hevc] {
-        for e in reg
-            .eligible(codec)
-            .filter(|e| !e.backend.experimental() || e.backend == base.backend)
-        {
+        for e in reg.eligible(codec).filter(|e| !e.backend.experimental()) {
             let c = Candidate {
                 codec,
                 backend: e.backend,
@@ -228,30 +278,26 @@ fn ranked(reg: &Registry, base: Candidate, hardware_first: bool) -> Vec<Candidat
     v
 }
 
-/// Whether every eligible hardware candidate (not an experimental one, which only a pin
-/// brings in) ranks before every software one: a CPU encoder ahead of an idle hardware one
-/// costs cores for every viewer. False ranks by codec first, so libaom's AV1 would lead on
-/// a host with hardware H.264 or HEVC.
+/// Whether every eligible hardware candidate ranks before every software one: a CPU
+/// encoder ahead of an idle hardware one costs cores for every viewer. False ranks by
+/// codec first, so libaom's AV1 would lead on a host with hardware H.264 or HEVC.
 const HARDWARE_FIRST: bool = true;
 
 /// A candidate's place in [`candidates`], lowest first, in the order [`HARDWARE_FIRST`]
 /// names.
 fn rank(c: Candidate, hardware_first: bool) -> (bool, u8, bool) {
-    let leads = c.hardware && !c.backend.experimental();
-    (hardware_first && !leads, codec_rank(c.codec), !c.hardware)
+    (hardware_first && !c.hardware, codec_rank(c.codec), !c.hardware)
 }
 
 /// The base cohort's encoders in the order it falls back through them: the H.264 ones in
-/// `cands`' order, then, where none of them is software, libaom's AV1.
+/// `cands`' order (hardware, then x264), then libaom's AV1.
 pub fn base_chain(cands: &[Candidate]) -> Vec<Candidate> {
     let mut v: Vec<Candidate> = cands
         .iter()
         .copied()
         .filter(|c| c.codec == Codec::H264)
         .collect();
-    if !v.iter().any(|c| !c.hardware) {
-        v.extend(cands.iter().copied().filter(|c| software_av1(*c)).take(1));
-    }
+    v.extend(cands.iter().copied().filter(|c| software_av1(*c)).take(1));
     v
 }
 

@@ -544,7 +544,7 @@ async fn serve(
     #[cfg(windows)]
     let default_scale = win::dpi_scale();
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
-    let mut candidates = negotiate::candidates(&encoders, cohort);
+    let mut candidates = negotiate::candidates_for(&encoders, selection, cohort);
     // STARFOLD_TEST_HOOKS: always something for POST /debug/fail-h264 (the base cohort's
     // encoder) to fall back to.
     if crate::compat::is_set("STARFOLD_TEST_HOOKS") && encoder != encoder::SOFTWARE {

@@ -65,17 +65,6 @@ fn pairs(c: &[Candidate]) -> Vec<(Codec, Backend)> {
     c.iter().map(|c| (c.codec, c.backend)).collect()
 }
 
-/// `hw` (with at least one AV1 encoder) and this build's software encoder where it ranks
-/// behind a hardware base: libaom right after the AV1 ones, x264 last.
-fn with_sw(hw: &[(Codec, Backend)]) -> Vec<(Codec, Backend)> {
-    let mut v = hw.to_vec();
-    let at = match SOFTWARE_CODEC {
-        Codec::Av1 => v.iter().rposition(|c| c.0 == Codec::Av1).unwrap() + 1,
-        _ => v.len(),
-    };
-    v.insert(at, (SOFTWARE_CODEC, SOFTWARE));
-    v
-}
 
 fn offer(cand: Candidate, codec: &str, stripes: &[(u32, u32)], w: u32) -> Offer {
     Offer {
@@ -230,7 +219,7 @@ fn auto_selection() {
     assert!(e.contains("no videotoolbox H264 encoder"), "{e}");
     let r = reg(vec![sw(), vt()]);
     assert_eq!(
-        candidates(&r, SW),
+        candidates_for(&r, Selection::Pinned(SOFTWARE), SW),
         vec![SW],
         "the pinned software encoder stays software"
     );
@@ -253,14 +242,14 @@ fn experimental_backends_only_when_pinned() {
     let base = base_backend(&r, Selection::Pinned(Backend::Vaapi)).unwrap();
     assert_eq!(base, hw264(Backend::Vaapi));
     assert_eq!(
-        pairs(&candidates(&r, base)),
-        with_sw(&[
-            (Codec::Hevc, Backend::VideoToolbox),
+        pairs(&candidates_for(&r, Selection::Pinned(Backend::Vaapi), base)),
+        vec![
             (Codec::Av1, Backend::Vaapi),
             (Codec::Hevc, Backend::Vaapi),
             (Codec::H264, Backend::Vaapi),
-        ]),
-        "a pinned experimental encoder takes part, after the hardware one that may lead"
+            (SOFTWARE_CODEC, SOFTWARE),
+        ],
+        "a pinned encoder streams alone, the software one only its fallback"
     );
     let mut off = r.encoders.clone();
     for c in off.iter_mut().filter(|c| c.backend == Backend::Vaapi) {
@@ -286,12 +275,13 @@ fn nvenc_only_when_pinned() {
     let base = base_backend(&r, Selection::Pinned(Backend::Nvenc)).unwrap();
     assert_eq!(base, hw264(Backend::Nvenc));
     assert_eq!(
-        pairs(&candidates(&r, base)),
-        with_sw(&[
+        pairs(&candidates_for(&r, Selection::Pinned(Backend::Nvenc), base)),
+        vec![
             (Codec::Av1, Backend::Nvenc),
             (Codec::Hevc, Backend::Nvenc),
             (Codec::H264, Backend::Nvenc),
-        ])
+            (SOFTWARE_CODEC, SOFTWARE),
+        ]
     );
     let mut off = r.encoders.clone();
     for c in off.iter_mut().filter(|c| c.backend == Backend::Nvenc) {
@@ -317,12 +307,17 @@ fn mediafoundation_only_when_pinned() {
     let base = base_backend(&r, Selection::Pinned(Backend::MediaFoundation)).unwrap();
     assert_eq!(base, hw264(Backend::MediaFoundation));
     assert_eq!(
-        pairs(&candidates(&r, base)),
-        with_sw(&[
+        pairs(&candidates_for(
+            &r,
+            Selection::Pinned(Backend::MediaFoundation),
+            base
+        )),
+        vec![
             (Codec::Av1, Backend::MediaFoundation),
             (Codec::Hevc, Backend::MediaFoundation),
             (Codec::H264, Backend::MediaFoundation),
-        ])
+            (SOFTWARE_CODEC, SOFTWARE),
+        ]
     );
     let mut off = r.encoders.clone();
     for c in off
@@ -853,7 +848,51 @@ fn the_base_chain_falls_back_from_hardware_to_x264() {
         backend: Backend::X264,
         hardware: false,
     };
-    assert_eq!(base_chain(&candidates(&r, base)), vec![base, x264]);
+    assert_eq!(base_chain(&candidates(&r, base)), vec![base, x264, LIBAOM]);
+    let pinned = candidates_for(&r, Selection::Pinned(Backend::VideoToolbox), base);
+    assert_eq!(pinned, vec![base, x264, LIBAOM]);
+    assert_eq!(base_chain(&pinned), vec![base, x264, LIBAOM]);
+    let alone = base_backend(&r, Selection::Pinned(Backend::X264)).unwrap();
+    assert_eq!(alone, x264);
+    assert_eq!(
+        candidates_for(&r, Selection::Pinned(Backend::X264), alone),
+        vec![x264],
+        "a pinned x264 streams H.264 to every viewer"
+    );
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn a_pinned_hardware_encoder_leads_libaom() {
+    let r = reg(vec![
+        cap(Codec::Av1, Backend::Libaom, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::Hevc, Backend::Vaapi, true),
+        cap(Codec::H264, Backend::Vaapi, true),
+    ]);
+    let sel = Selection::Pinned(Backend::Vaapi);
+    let base = base_backend(&r, sel).unwrap();
+    assert_eq!(
+        pairs(&candidates_for(&r, sel, base)),
+        vec![
+            (Codec::Hevc, Backend::Vaapi),
+            (Codec::H264, Backend::Vaapi),
+            (Codec::Av1, Backend::Libaom),
+        ]
+    );
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn a_pinned_libaom_streams_only_av1() {
+    let r = reg(vec![
+        cap(Codec::Av1, Backend::Libaom, false),
+        cap(Codec::Hevc, Backend::VideoToolbox, true),
+        cap(Codec::H264, Backend::VideoToolbox, true),
+    ]);
+    let sel = Selection::Pinned(Backend::Libaom);
+    let base = base_backend(&r, sel).unwrap();
+    assert_eq!(candidates_for(&r, sel, base), vec![LIBAOM]);
 }
 
 #[cfg(feature = "libaom")]
@@ -880,7 +919,7 @@ fn libaom_alone_is_the_base_chain() {
     }
     let base = base_backend(&r, Selection::Pinned(Backend::Libaom)).unwrap();
     assert_eq!(base, LIBAOM);
-    assert_eq!(candidates(&r, base), vec![LIBAOM]);
+    assert_eq!(candidates_for(&r, Selection::Pinned(Backend::Libaom), base), vec![LIBAOM]);
     assert_eq!(base_chain(&candidates(&r, base)), vec![LIBAOM]);
 }
 
