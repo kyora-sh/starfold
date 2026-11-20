@@ -386,20 +386,37 @@ fn engine(hub: &Arc<Hub>, cands: &[Candidate], o: Opts) -> Engine {
 
 /// An engine whose only encoder is a software AV1 one, as on a server without H.264,
 /// replanning on its own thread until `stop` is set.
-#[cfg(target_os = "linux")]
 pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let av1 = Candidate {
-            codec: Codec::Av1,
-            backend: Backend::FakeAv1,
-            hardware: false,
-        };
-        let mut eng = engine(&hub, &[av1], Opts::default());
+        let mut eng = engine(&hub, &[FAKE_AV1_SW], Opts::default());
         while !stop.load(Ordering::Acquire) {
             eng.replan();
             std::thread::sleep(Duration::from_millis(5));
         }
     })
+}
+
+const FAKE_AV1_SW: Candidate = Candidate {
+    codec: Codec::Av1,
+    backend: Backend::FakeAv1,
+    hardware: false,
+};
+
+#[test]
+fn a_protocol_1_viewer_is_closed_once() {
+    let hub = Hub::new();
+    let mut eng = engine(&hub, &[FAKE_AV1_SW], Opts::default());
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    for _ in 0..5 {
+        hub.replan();
+        eng.replan();
+    }
+    let closes = drain(&mut rx)
+        .into_iter()
+        .filter(|m| matches!(m, Msg::Json(j) if j["t"] == "close"))
+        .count();
+    assert_eq!(closes, 1);
 }
 
 fn client(hub: &Hub) -> (Arc<Client>, UnboundedReceiver<Out>) {

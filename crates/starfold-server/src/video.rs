@@ -1279,7 +1279,11 @@ impl Engine {
             });
             let Some((p, sh)) = target else {
                 if r.proto == Proto::Legacy && pick.is_none() {
+                    if r.phase == Phase::NoCodec {
+                        continue;
+                    }
                     r.detach();
+                    r.phase = Phase::NoCodec;
                     c.send(Out::Close(
                         negotiate::NO_H264_CLOSE,
                         negotiate::NO_H264_REASON,
