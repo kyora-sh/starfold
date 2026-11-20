@@ -627,14 +627,16 @@ describe('reconnect, opt-in', () => {
 
 	test('the same 44xx close twice right after open gives up with that code, then closed', async () => {
 		const { s, page, seen, events } = reconnecting({ preamble: () => 't' });
-		page.connect();
-		for (const i of [0, 1]) {
+		const reject = async (i: number) => {
 			await until(() => !!s.conns[i]?.ws && (s.conns[i]?.got.length ?? 0) >= 1);
 			await until(
 				() => statuses(seen).filter((x) => x === 'open').length === i + 1
 			);
 			s.conns[i].ws!.close(4401, 'ticket rejected');
-		}
+		};
+		page.connect();
+		await reject(0);
+		await reject(1);
 		await until(() => statuses(seen).at(-1) === 'closed');
 		expect(statuses(seen).slice(-2)).toEqual(['gave-up', 'closed']);
 		expect(events.at(-1)).toEqual({

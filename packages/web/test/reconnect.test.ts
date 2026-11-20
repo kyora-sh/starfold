@@ -46,7 +46,7 @@ function fakeEnv(random = 0.5) {
 			for (;;) {
 				const due = [...timers.entries()]
 					.filter(([, t]) => t.at <= end)
-					.sort((a, b) => a[1].at - b[1].at)[0];
+					.toSorted((a, b) => a[1].at - b[1].at)[0];
 				if (!due) break;
 				now = due[1].at;
 				timers.delete(due[0]);
@@ -55,7 +55,7 @@ function fakeEnv(random = 0.5) {
 			now = end;
 		},
 		wake() {
-			for (const f of [...wakes]) f();
+			for (const f of wakes) f();
 		},
 	};
 }
@@ -120,13 +120,13 @@ describe('backoff', () => {
 	});
 });
 
-describe('the limits of a run', () => {
-	/** A close right after an open, with a code that never trips another rule. */
-	const dropAfterOpen = (r: Reconnector) => {
-		r.opened();
-		return r.closed(1012, 'restart');
-	};
+/** A close right after an open, with a code that never trips another rule. */
+function dropAfterOpen(r: Reconnector) {
+	r.opened();
+	return r.closed(1012, 'restart');
+}
 
+describe('the limits of a run', () => {
 	test('gives up after maxAttempts', () => {
 		const { r } = reconnector({ maxAttempts: 3 });
 		expect([1, 2, 3, 4].map(() => dropAfterOpen(r).t)).toEqual([
