@@ -377,7 +377,10 @@ fn a_wrong_match_decodes_to_the_right_picture() {
     s.pic.texture(1 << 29, 0, 0, W, H, 0);
     let n = s.frame(None);
     let Screen::Back(k) = s.enc.last_screen() else {
-        panic!("{:?}: the frame did not predict from a stored screen", s.enc.last_screen());
+        panic!(
+            "{:?}: the frame did not predict from a stored screen",
+            s.enc.last_screen()
+        );
     };
     assert_eq!(s.enc.screens().unwrap()[k - 1], screen_hash(&page2.view()));
     let recon = s.enc.reconstruction().unwrap();
