@@ -256,6 +256,24 @@ impl Aom {
             .collect())
     }
 
+    /// Its rate control as applied: target kbit/s, lowest quantizer, frame duration (ms).
+    #[cfg(test)]
+    pub(super) fn rate_state(&self) -> (u32, u32, u64) {
+        (
+            self.cfg.rc_target_bitrate,
+            self.cfg.rc_min_quantizer,
+            self.duration,
+        )
+    }
+
+    /// Lowers the highest quantizer, so a rate whose lowest one is above it is refused.
+    #[cfg(test)]
+    pub(super) fn cap_quantizer(&mut self, q: u32) -> Result<(), EncodeError> {
+        self.cfg.rc_max_quantizer = q;
+        self.cfg.rc_min_quantizer = self.cfg.rc_min_quantizer.min(q);
+        self.restore()
+    }
+
     /// The rate buffer it opened with (ms): size, initial fill, optimal fill.
     #[cfg(test)]
     pub(super) fn rate_buffer(&self) -> (u32, u32, u32) {
@@ -378,14 +396,15 @@ impl Aom {
 
 impl VideoEncoder for Aom {
     fn set_rate(&mut self, rate: RateConfig) -> Result<(), EncodeError> {
-        self.duration = (1000 / rate.fps.max(1)).max(1) as u64;
-        apply(&mut self.cfg, rate);
-        let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &*self.cfg) };
-        if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
-            Ok(())
-        } else {
-            Err(self.error("rate change"))
+        let mut cfg = *self.cfg;
+        apply(&mut cfg, rate);
+        let r = unsafe { ffi::aom_codec_enc_config_set(&mut *self.ctx, &cfg) };
+        if r != ffi::aom_codec_err_t_AOM_CODEC_OK {
+            return Err(self.error("rate change"));
         }
+        *self.cfg = cfg;
+        self.duration = (1000 / rate.fps.max(1)).max(1) as u64;
+        Ok(())
     }
 
     fn encode(

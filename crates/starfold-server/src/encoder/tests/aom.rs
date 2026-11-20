@@ -91,6 +91,18 @@ impl Stream {
     }
 }
 
+#[test]
+fn a_refused_rate_change_keeps_the_rate_in_force() {
+    let mut s = Stream::new(2000);
+    s.enc.cap_quantizer(10).unwrap();
+    let before = s.enc.rate_state();
+    assert!(s.enc.set_rate(RateConfig::new(40.0, 900, 10)).is_err());
+    assert_eq!(s.enc.rate_state(), before);
+    s.enc.set_rate(RateConfig::new(5.0, 900, 10)).unwrap();
+    assert_eq!(s.enc.rate_state(), (900, 5, 100));
+    assert!(s.frame(None) > 0);
+}
+
 /// 150 / 75 / 90 ms: a link that drops keeps scroll's tail near x264's (1000 / 500 / 600
 /// doubled it).
 #[test]
