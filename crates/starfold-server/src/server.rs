@@ -1613,6 +1613,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
     if s.read_only && crate::readonly::json(&m) != crate::readonly::Kind::Watch {
         return;
     }
+    if !matches!(m, ClientMsg::Hello { .. }) {
+        c.speaks_v2();
+    }
     match m {
         ClientMsg::Hello {
             v,

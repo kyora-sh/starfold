@@ -205,9 +205,10 @@ impl Client {
         self.needs_keyframe.store(false, Ordering::Relaxed);
     }
 
-    /// A protocol 2 message the server did not act on (an answer to offers that have
-    /// since changed, or one it could not read): the client speaks protocol 2 all the
-    /// same, so a later `v,1` does not make it protocol 1. It is negotiated once it
+    /// A protocol 2 message other than an answer to the offers in force (one to offers
+    /// that have since changed, one the server could not read, or any other protocol 2
+    /// message, acted on or not): the client speaks protocol 2, so a later `v,1` does not
+    /// make it protocol 1. It is negotiated once it
     /// answers the offers in force.
     pub fn speaks_v2(&self) {
         let mut r = self.route.lock();
