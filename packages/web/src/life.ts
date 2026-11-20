@@ -15,7 +15,14 @@ export type LifeDown =
 export type LifeUp =
 	| { t: 'preamble'; id: number }
 	| { t: 'open'; id: number }
-	| { t: 'closed'; id: number; code: number; reason: string }
+	| {
+			t: 'closed';
+			id: number;
+			code: number;
+			reason: string;
+			/** How long the socket was open, by the worker's clock; null if it never opened. */
+			openMs?: number | null;
+	  }
 	| { t: 'connectFailed'; id: number };
 
 /** The worker's side: the page's requests go to `link`. */

@@ -4,6 +4,8 @@ import { PageLife } from '../src/embed/attempts';
 import type { LifeOptions } from '../src/embed/attempts';
 import { Dispatcher } from '../src/embed/dispatch';
 import { CONNECT_FAILED, callPreamble } from '../src/embed/preamble';
+import { Reconnector } from '../src/embed/reconnect';
+import type { Env } from '../src/embed/reconnect';
 import { onStream } from '../src/embed/stream';
 import type { StreamSink } from '../src/embed/stream';
 import {
@@ -14,7 +16,12 @@ import {
 	assetBaseUrl,
 } from '../src/embed/styles';
 import { UNMOUNTED } from '../src/embed/types';
-import type { ConnectFailure, Status } from '../src/embed/types';
+import type {
+	ConnectFailure,
+	ReconnectEvent,
+	ReconnectOptions,
+	Status,
+} from '../src/embed/types';
 import { serveLife } from '../src/life';
 import type { LifeUp } from '../src/life';
 import { Link } from '../src/link';
@@ -58,6 +65,7 @@ function embedded(
 	};
 	const ch = new MessageChannel();
 	let sock: WebSocket | null = null;
+	let openedAt: number | null = null;
 	const up = (m: LifeUp) => ch.port2.postMessage(m);
 	const link = new Link(
 		url,
@@ -65,8 +73,10 @@ function embedded(
 		{
 			opening(s) {
 				sock = s;
+				openedAt = null;
 			},
 			open(id) {
+				openedAt = performance.now();
 				up({ t: 'open', id });
 				sock!.send('client-first');
 			},
@@ -74,7 +84,9 @@ function embedded(
 				if (typeof d === 'string') seen.stream.push(d);
 			},
 			closed(id, code, reason) {
-				up({ t: 'closed', id, code, reason });
+				const openMs = openedAt === null ? null : performance.now() - openedAt;
+				openedAt = null;
+				up({ t: 'closed', id, code, reason, openMs });
 			},
 			askPreamble(id) {
 				up({ t: 'preamble', id });
@@ -556,5 +568,271 @@ describe('the embed renders without the served page', () => {
 		expect(
 			new URL('worker.js', assetBaseUrl('/static/starfold', mod)).href
 		).toBe('https://cdn.example/static/starfold/worker.js');
+	});
+});
+
+/**
+ * Real timers, a page the test can hide (`page.hidden`, then `page.wake()`), and the delay's
+ * jitter at `random`; `live` counts the timers and wake listeners still set.
+ */
+function liveEnv(random: number) {
+	const live = { timers: new Set<unknown>(), wakes: 0 };
+	const listeners = new Set<() => void>();
+	const page = {
+		hidden: false,
+		wake() {
+			for (const f of listeners) f();
+		},
+	};
+	const env: Env = {
+		now: () => Date.now(),
+		setTimeout(f, ms) {
+			const h = setTimeout(() => {
+				live.timers.delete(h);
+				f();
+			}, ms);
+			live.timers.add(h);
+			return h;
+		},
+		clearTimeout(h) {
+			live.timers.delete(h);
+			clearTimeout(h as ReturnType<typeof setTimeout>);
+		},
+		random: () => random,
+		hidden: () => page.hidden,
+		online: () => true,
+		onWake(f) {
+			live.wakes++;
+			listeners.add(f);
+			return () => {
+				live.wakes--;
+				listeners.delete(f);
+			};
+		},
+	};
+	return { env, live, page };
+}
+
+function reconnecting(
+	o: LifeOptions,
+	r: true | ReconnectOptions = true,
+	random = 0
+) {
+	const events: ReconnectEvent[] = [];
+	const log: string[] = [];
+	const { env, live, page: tab } = liveEnv(random);
+	const e = setup({
+		...o,
+		reconnect: new Reconnector(r, env),
+		onReconnect: (ev) => {
+			events.push(ev);
+			log.push(`event ${ev.kind}`);
+		},
+		onStatus: (st) => log.push(`status ${st}`),
+		onClose: (code) => log.push(`close ${code}`),
+	});
+	return { ...e, events, log, live, tab };
+}
+
+describe('reconnect, opt-in', () => {
+	test('a restart close reconnects with a fresh preamble and reports reconnecting, then reconnected', async () => {
+		let calls = 0;
+		const { s, page, events, log } = reconnecting({
+			preamble: () => `ticket-${++calls}`,
+		});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && log.includes('status open'));
+		s.conns[0].ws!.close(1012, 'restarting');
+		await until(() => (s.conns[1]?.got.length ?? 0) >= 1);
+		expect(s.conns[1].got[0]).toBe('ticket-2');
+		await until(() => events.length === 2);
+		expect(log).toEqual([
+			'status connecting',
+			'status open',
+			'close 1012',
+			'status reconnecting',
+			'event reconnecting',
+			'status connecting',
+			'status open',
+			'event reconnected',
+		]);
+		expect(events).toEqual([
+			{ kind: 'reconnecting', attempt: 1, delayMs: 0, code: 1012 },
+			{ kind: 'reconnected', attempt: 1, code: 1012 },
+		]);
+	});
+
+	test('the same 44xx close twice right after open gives up with that code, then closed', async () => {
+		const { s, page, seen, events } = reconnecting({ preamble: () => 't' });
+		const reject = async (i: number) => {
+			await until(() => !!s.conns[i]?.ws && (s.conns[i]?.got.length ?? 0) >= 1);
+			await until(
+				() => statuses(seen).filter((x) => x === 'open').length === i + 1
+			);
+			s.conns[i].ws!.close(4401, 'ticket rejected');
+		};
+		page.connect();
+		await reject(0);
+		await reject(1);
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen).slice(-2)).toEqual(['gave-up', 'closed']);
+		expect(events.at(-1)).toEqual({
+			kind: 'gave-up',
+			why: 'repeated-close',
+			code: 4401,
+		});
+		expect(JSON.stringify(events)).not.toContain('ticket rejected');
+		await sleep(300);
+		expect(s.conns.length).toBe(2);
+	});
+
+	test('a close not worth another attempt gives up at once', async () => {
+		const { s, page, seen, events } = reconnecting({});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1000, 'done');
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen)).toEqual(['connecting', 'open', 'gave-up', 'closed']);
+		expect(events).toEqual([{ kind: 'gave-up', why: 'code', code: 1000 }]);
+		await sleep(300);
+		expect(s.conns.length).toBe(1);
+	});
+
+	test('a preamble that fails on a reconnect ends the run: preamble-failed, gave-up, closed', async () => {
+		let calls = 0;
+		const { s, page, seen, events } = reconnecting({
+			preamble: () => {
+				if (++calls > 1) throw new Error(SECRET);
+				return 't';
+			},
+		});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen).slice(-4)).toEqual([
+			'connecting',
+			'preamble-failed',
+			'gave-up',
+			'closed',
+		]);
+		expect(events.at(-1)).toEqual({
+			kind: 'gave-up',
+			why: 'preamble-failed',
+			code: 1012,
+		});
+		expect(JSON.stringify([seen.status, events])).not.toContain(SECRET);
+		expect(s.conns.length).toBe(1);
+	});
+
+	test("the host's connect() during the delay connects now; unmount during it ends everything", async () => {
+		const { s, page, seen, unmount, live } = reconnecting(
+			{ preamble: () => 't' },
+			{ initialMs: 60_000 },
+			0.99
+		);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'reconnecting');
+		page.connect();
+		await until(() => !!s.conns[1]?.ws && statuses(seen).at(-1) === 'open');
+		s.conns[1].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'reconnecting');
+		expect([live.timers.size, live.wakes]).toEqual([2, 1]);
+		const before = seen.status.length;
+		unmount();
+		expect([live.timers.size, live.wakes]).toEqual([0, 0]);
+		await sleep(300);
+		expect(seen.status.length).toBe(before);
+		expect(s.conns.length).toBe(2);
+	});
+
+	test('a shouldReconnect that unmounts leaves no timer, listener or later callback', async () => {
+		const ref: { unmount?: () => void } = {};
+		const { s, page, seen, unmount, live, events } = reconnecting(
+			{ preamble: () => 't' },
+			{
+				initialMs: 60_000,
+				shouldReconnect: () => {
+					ref.unmount!();
+					return true;
+				},
+			},
+			0.99
+		);
+		ref.unmount = unmount;
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => seen.closes.length === 1);
+		await sleep(100);
+		expect([live.timers.size, live.wakes]).toEqual([0, 0]);
+		expect(statuses(seen)).toEqual(['connecting', 'open']);
+		expect(seen.closes).toEqual([[1001, 'unmounted']]);
+		expect(events).toEqual([]);
+		expect(s.conns.length).toBe(1);
+	});
+
+	test('a shouldReconnect that throws counts as no: gave-up, closed, and the throw is reported', async () => {
+		const reported: unknown[] = [];
+		const { s, page, seen, events } = reconnecting(
+			{ preamble: () => 't', report: (e) => reported.push(e) },
+			{
+				shouldReconnect: () => {
+					throw new Error('policy broke');
+				},
+			}
+		);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen).slice(-2)).toEqual(['gave-up', 'closed']);
+		expect(events).toEqual([{ kind: 'gave-up', why: 'code', code: 1012 }]);
+		expect(String(reported[0])).toContain('policy broke');
+	});
+
+	test('a reconnect attempt whose preamble resolves in a hidden tab opens its socket only once visible', async () => {
+		const ticket = deferred<string>();
+		let calls = 0;
+		const { s, page, seen, tab } = reconnecting({
+			preamble: () => (++calls === 1 ? 't1' : ticket.promise),
+		});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => calls === 2);
+		tab.hidden = true;
+		tab.wake();
+		ticket.resolve('t2');
+		await sleep(300);
+		expect(s.conns.length).toBe(1);
+		tab.hidden = false;
+		tab.wake();
+		await until(() => (s.conns[1]?.got.length ?? 0) >= 1);
+		expect(s.conns[1].got[0]).toBe('t2');
+	});
+
+	test('a reconnect attempt whose preamble is still pending at the deadline gives up', async () => {
+		let calls = 0;
+		const { s, page, seen, events } = reconnecting(
+			{
+				preamble: () => (++calls === 1 ? 't1' : new Promise<string>(() => {})),
+			},
+			{ maxMs: 400 }
+		);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'closed', 3000);
+		expect(statuses(seen).slice(-4)).toEqual([
+			'reconnecting',
+			'connecting',
+			'gave-up',
+			'closed',
+		]);
+		expect(events.at(-1)).toEqual({ kind: 'gave-up', why: 'time', code: 1012 });
+		expect(s.conns.length).toBe(1);
 	});
 });
