@@ -344,16 +344,16 @@ and `onReconnect({ kind: 'reconnecting', attempt, delayMs, code })`, an attempt 
 and `onStatus('closed')`. The close's reason, the server's or a gateway's own text, goes only to
 `onClose` and `shouldReconnect`.
 
-| Close code            | Sent by                                                                                                        | Reconnects                                                                                   |
-| --------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| 1006 (no close frame) | the browser: a network drop, a server that crashed or was killed, or an upgrade the server refused (401, 403)  | yes; three in a row that never reached open give up (`never-opened`)                         |
-| 1001, 1012, 1013      | a server or proxy going away, restarting, or busy                                                              | yes                                                                                          |
-| 44xx (but 4406)       | the host's gateway (4401: a ticket missing or rejected) or a server                                            | yes; the same code twice in a row, each within 10 s of its open, gives up (`repeated-close`) |
-| 4406                  | starfold: a protocol 1 viewer when the base stream is not H.264                                                | no                                                                                           |
-| 1000                  | a server or proxy closing on purpose                                                                           | no                                                                                           |
-| 1003, 1007, 1009      | starfold: a frame the client should not have sent                                                              | no                                                                                           |
-| 4000, 4001, 4002      | the client itself: a protocol error, no common codec, a failed worker                                          | no                                                                                           |
-| any other             |                                                                                                                | no                                                                                           |
+| Close code            | Sent by                                                                                                       | Reconnects                                                                                   |
+| --------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1006 (no close frame) | the browser: a network drop, a server that crashed or was killed, or an upgrade the server refused (401, 403) | yes; three in a row that never reached open give up (`never-opened`)                         |
+| 1001, 1012, 1013      | a server or proxy going away, restarting, or busy                                                             | yes                                                                                          |
+| 44xx (but 4406)       | the host's gateway (4401: a ticket missing or rejected) or a server                                           | yes; the same code twice in a row, each within 10 s of its open, gives up (`repeated-close`) |
+| 4406                  | starfold: a protocol 1 viewer when the base stream is not H.264                                               | no                                                                                           |
+| 1000                  | a server or proxy closing on purpose                                                                          | no                                                                                           |
+| 1003, 1007, 1009      | starfold: a frame the client should not have sent                                                             | no                                                                                           |
+| 4000, 4001, 4002      | the client itself: a protocol error, no common codec, a failed worker                                         | no                                                                                           |
+| any other             |                                                                                                               | no                                                                                           |
 
 A starfold server that shuts down (SIGTERM, SIGINT, Ctrl-C) queues 1012 for every viewer after
 what is already queued for it and exits about 1.2 s later at most; a viewer too far behind to
