@@ -49,7 +49,7 @@ const SPARE: c_int = 7;
 /// The slots that keep stored screens: 1 to `SCREENS`.
 pub(crate) const SCREENS: usize = 6;
 
-static STORED_SCREENS: AtomicBool = AtomicBool::new(true);
+static STORED_SCREENS: AtomicBool = AtomicBool::new(false);
 
 /// `--stored-screens`: whether the libaom encoders opened from now on keep settled screens.
 pub fn set_stored_screens(on: bool) {
