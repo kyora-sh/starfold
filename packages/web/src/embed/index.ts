@@ -1,6 +1,7 @@
 // The embeddable client: `mount(container, options)` shows a starfold desktop inside an element of
 // another page. The worker opens the socket to `connect.url` exactly as given, sends the
-// preamble's messages before anything of starfold's, and never reconnects on its own. The
+// preamble's messages before anything of starfold's, and reconnects only with the opt-in
+// `reconnect` option (reconnect.ts). The
 // connection's lifecycle runs over a port of its own (life.ts, attempts.ts), apart from the
 // server's data; every embedder callback goes through one queued dispatcher (dispatch.ts); and
 // everything mount() sets up is undone by one disposer list (disposers.ts) on unmount(), which
@@ -20,6 +21,7 @@ import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
 import { PageLife } from './attempts';
 import { Disposers } from './disposers';
+import { Reconnector, pageEnv } from './reconnect';
 import { onStream } from './stream';
 import {
 	KBD,
@@ -29,9 +31,22 @@ import {
 	applyStyle,
 	assetBaseUrl,
 } from './styles';
-import type { ConnectFailure, Preamble, Status } from './types.js';
+import type {
+	ConnectFailure,
+	Preamble,
+	ReconnectEvent,
+	ReconnectOptions,
+	Status,
+} from './types.js';
 
-export type { ConnectFailure, Preamble, Status } from './types.js';
+export type {
+	ConnectFailure,
+	Preamble,
+	ReconnectEvent,
+	ReconnectOptions,
+	ReconnectWhy,
+	Status,
+} from './types.js';
 export {
 	NO_COMMON_CODEC,
 	PROTOCOL_ERROR,
@@ -80,16 +95,34 @@ export interface MountOptions {
 	 * preamble's own error. Each connect ends in exactly one of `onClose`, `preamble-failed`
 	 * or `connect-failed`, unless a newer `connect()` or `unmount()` came first while it was
 	 * still waiting for its preamble. After `onClose`, `onStatus('closed')` follows, except
-	 * after `unmount()`.
+	 * after `unmount()`; with `reconnect`, `reconnecting` follows instead while another attempt
+	 * is coming (it then reports `connecting` and `open` as any connect), and `gave-up` then
+	 * `closed` when none is. A reconnect attempt that ends in `preamble-failed` or
+	 * `connect-failed` is followed by `gave-up`.
 	 */
 	onStatus?(status: Status, detail?: ConnectFailure): void;
+	/**
+	 * Reconnect after a close worth another attempt, as the host would: the same `connect()`,
+	 * the preamble called again for each attempt. `true` takes the defaults; an object sets the
+	 * limits (`ReconnectOptions`). Default off: every close ends the connection, as before. Which
+	 * close codes reconnect is in the README's embedding section. A reconnect is a new viewer to
+	 * the server (a new negotiation, then a keyframe).
+	 */
+	reconnect?: boolean | ReconnectOptions;
+	/**
+	 * With `reconnect`: `reconnecting` (the attempt number, its delay and the close that caused
+	 * it), `reconnected` (an attempt reached open) and `gave-up` (why, and the last close's code
+	 * and reason). Each comes after the `onStatus` of the same name (`open` for `reconnected`).
+	 */
+	onReconnect?(e: ReconnectEvent): void;
 }
 
 export interface Handle {
 	/**
 	 * Connects, calling the preamble first. While the preamble of an earlier connect is
-	 * pending, starts over (the earlier answer is dropped); while a socket is open or being
-	 * made, does nothing; after `unmount()`, does nothing.
+	 * pending, starts over (the earlier answer is dropped); while waiting to reconnect,
+	 * connects now and the reconnect count starts over; while a socket is open or being made,
+	 * does nothing; after `unmount()`, does nothing.
 	 */
 	connect(): void;
 	/**
@@ -249,6 +282,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		preamble: options.connect.preamble,
 		onClose: options.onClose,
 		onStatus: options.onStatus,
+		onReconnect: options.onReconnect,
+		reconnect: options.reconnect
+			? new Reconnector(options.reconnect, pageEnv())
+			: undefined,
 		opened: () => updateVisibility(true),
 	});
 	const onWorkerError = (e: Event) => {

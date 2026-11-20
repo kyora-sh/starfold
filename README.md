@@ -331,6 +331,38 @@ flag out to serve at the root. (This is about starting the server; the encoder-p
 the server runs for itself opens no listener and ignores the flag.) The prefix is part of every request line, so it counts against the length a
 request line may have (64 KiB in starfold, often less in a proxy).
 
+### Embedding: reconnecting
+
+The embeddable client (`mount()` in `packages/web/src/embed`) reconnects only when asked to:
+`reconnect: true` takes the defaults below, an object sets them
+(`{ initialMs, factor, capMs, maxAttempts, maxMs, shouldReconnect }`). It does what a careful
+host would: the same `connect()`, with the preamble called again for every attempt, so a
+ticket is minted for each. Each close still reaches `onClose`; then `onStatus('reconnecting')`
+and `onReconnect({ kind: 'reconnecting', attempt, delayMs, code, reason })`, an attempt
+(`connecting`, `open`, then `onReconnect({ kind: 'reconnected', attempt })`), or, once it
+stops, `onStatus('gave-up')`, `onReconnect({ kind: 'gave-up', why, code, reason })` with the
+last close's code and reason, and `onStatus('closed')`.
+
+| Close code | Sent by | Reconnects |
+|---|---|---|
+| 1006 (no close frame) | the browser: a network drop, a server that crashed or was stopped, or an upgrade the server refused (401, 403) | yes; three in a row that never reached open give up (`never-opened`) |
+| 1001, 1012, 1013 | a server or proxy going away, restarting, or busy | yes |
+| 44xx (but 4406) | the host's gateway (4401: a ticket missing or rejected) or a server | yes; the same code twice in a row, each within 10 s of its open, gives up (`repeated-close`) |
+| 4406 | starfold: a protocol 1 viewer on a build without H.264 | no |
+| 1000 | a server or proxy closing on purpose | no |
+| 1003, 1007, 1009 | starfold: a frame the client should not have sent | no |
+| 4000, 4001, 4002 | the client itself: a protocol error, no common codec, a failed worker | no |
+| any other | | no |
+
+`shouldReconnect(code, reason)` replaces the table; the limits still apply. The delay before
+attempt n is a random time below min(`capMs`, `initialMs` x `factor`^(n-1)) (defaults 500 ms,
+2, 30 s), and a run gives up after `maxAttempts` attempts (10) or `maxMs` since its first close
+(5 min, time offline not counted). A connection that stays open for 10 s ends the run. A hidden
+tab waits to be visible again and an offline page for the network before an attempt, then
+connects at once. A reconnect attempt whose preamble fails, or whose socket can't be made, gives
+up (`preamble-failed`, `connect-failed`). The host's own `connect()` while waiting connects at
+once and starts the count over; `unmount()` cancels it.
+
 ### For agents and scripts
 
 Screenshots and recordings (start starfold with `STARFOLD_PASSWORD` set, and send it along;

@@ -8,18 +8,30 @@
 //   ignores connect() from then until that attempt's close: the port is FIFO, so a reply
 //   never follows a newer attempt's connect;
 // - every callback goes through the Dispatcher; end() seals it, so after end() the only
-//   callback is the onClose it reports for a socket it was waiting on.
+//   callback is the onClose it reports for a socket it was waiting on;
+// - with a Reconnector, a close is followed by 'reconnecting' and a later attempt of the
+//   lifecycle's own, or by 'gave-up' and then 'closed'; the host's connect() starts counting over.
 import type { LifeDown, LifeUp } from '../life';
 import { Dispatcher } from './dispatch';
 import type { Report } from './dispatch';
 import { CONNECT_FAILED, callPreamble } from './preamble';
+import type { Reconnector } from './reconnect';
 import { UNMOUNTED, WORKER_FAILED } from './types';
-import type { ConnectFailure, Preamble, Status } from './types';
+import type {
+	ConnectFailure,
+	Preamble,
+	ReconnectEvent,
+	ReconnectWhy,
+	Status,
+} from './types';
 
 export interface LifeOptions {
 	preamble?: Preamble;
 	onClose?(code: number, reason: string): void;
 	onStatus?(status: Status, detail?: ConnectFailure): void;
+	onReconnect?(e: ReconnectEvent): void;
+	/** Set when the embedder asked for `reconnect`; absent, a close ends it as before. */
+	reconnect?: Reconnector;
 	/** The client's own reaction to an open socket (not an embedder callback; run at once). */
 	opened?(): void;
 	/** Where a throwing callback's error goes (default: reportError). */
@@ -46,9 +58,20 @@ export class PageLife {
 		port.start();
 	}
 
-	/** A new attempt, unless a socket is open or being made; it replaces one waiting for its preamble. */
+	/** The last close, for a gave-up that follows a later attempt's failure. */
+	private lastClose = { code: 0, reason: '' };
+
+	/**
+	 * A new attempt, unless a socket is open or being made; it replaces one waiting for its
+	 * preamble, and one waiting to reconnect, whose count starts over.
+	 */
 	connect() {
 		if (!this.live || this.phase === 'socket') return;
+		this.o.reconnect?.reset();
+		this.attempt();
+	}
+
+	private attempt() {
 		this.id++;
 		this.phase = 'asking';
 		this.down({ t: 'connect', id: this.id });
@@ -63,12 +86,15 @@ export class PageLife {
 	workerFailed() {
 		if (!this.live) return;
 		const was = this.phase;
+		const waiting = this.o.reconnect?.pending ?? false;
 		this.phase = 'idle';
 		this.live = false;
 		this.port.removeEventListener('message', this.listener);
 		this.port.close();
 		if (was === 'socket') this.closed(WORKER_FAILED.code, WORKER_FAILED.reason);
-		else if (was === 'asking') this.status('connect-failed', CONNECT_FAILED);
+		else if (was === 'asking') this.failed('connect-failed', CONNECT_FAILED);
+		else if (waiting) this.giveUp('connect-failed');
+		this.o.reconnect?.reset();
 	}
 
 	/**
@@ -79,6 +105,7 @@ export class PageLife {
 	end() {
 		if (this.ended) return;
 		this.ended = true;
+		this.o.reconnect?.reset();
 		const had = (this.live && this.phase === 'socket') || this.closeQueued;
 		this.live = false;
 		this.phase = 'idle';
@@ -102,6 +129,12 @@ export class PageLife {
 				if (this.phase !== 'socket') return;
 				this.o.opened?.();
 				this.status('open');
+				if (this.o.reconnect) {
+					const r = this.o.reconnect;
+					if (r.reconnecting)
+						this.event({ kind: 'reconnected', attempt: r.attempt });
+					r.opened();
+				}
 				break;
 			case 'closed':
 				if (this.phase !== 'socket') return;
@@ -111,7 +144,7 @@ export class PageLife {
 			case 'connectFailed':
 				if (this.phase !== 'socket') return;
 				this.phase = 'idle';
-				this.status('connect-failed', CONNECT_FAILED);
+				this.failed('connect-failed', CONNECT_FAILED);
 				break;
 		}
 	}
@@ -122,14 +155,27 @@ export class PageLife {
 		if (!r.ok) {
 			this.phase = 'idle';
 			this.down({ t: 'preambleFailed', id });
-			this.status('preamble-failed', r.failure);
+			this.failed('preamble-failed', r.failure);
 			return;
 		}
 		this.phase = 'socket';
 		this.down({ t: 'preamble', id, msgs: r.msgs });
 	}
 
-	/** onClose, then onStatus('closed'), each queued on its own: one throwing can't skip the other. */
+	/** An attempt that ended before a socket; one made to reconnect ends the run. */
+	private failed(s: 'preamble-failed' | 'connect-failed', detail: ConnectFailure) {
+		const r = this.o.reconnect;
+		const run = r?.reconnecting ?? false;
+		this.status(s, detail);
+		if (run) this.giveUp(s);
+		r?.reset();
+	}
+
+	/**
+	 * onClose, then what follows it: onStatus('closed'), or with reconnect 'reconnecting' and an
+	 * attempt later, or 'gave-up' and 'closed'. Each is queued on its own: one throwing can't skip
+	 * another.
+	 */
 	private closed(code: number, reason: string) {
 		const onClose = this.o.onClose;
 		if (onClose) {
@@ -139,7 +185,39 @@ export class PageLife {
 				onClose(code, reason);
 			});
 		}
+		this.lastClose = { code, reason };
+		const r = this.o.reconnect;
+		if (r && this.live) {
+			const d = r.closed(code, reason);
+			if (d.t === 'retry') {
+				this.status('reconnecting');
+				this.event({
+					kind: 'reconnecting',
+					attempt: d.attempt,
+					delayMs: d.delayMs,
+					code,
+					reason,
+				});
+				r.schedule(d.delayMs, () => {
+					if (this.live && this.phase === 'idle') this.attempt();
+				});
+				return;
+			}
+			this.giveUp(d.why);
+		}
 		this.status('closed');
+	}
+
+	/** 'gave-up' with the last close's code and reason; the run is over. */
+	private giveUp(why: ReconnectWhy) {
+		this.o.reconnect?.reset();
+		this.status('gave-up');
+		this.event({ kind: 'gave-up', why, ...this.lastClose });
+	}
+
+	private event(e: ReconnectEvent) {
+		const onReconnect = this.o.onReconnect;
+		if (onReconnect) this.dispatch.call(() => onReconnect(e));
 	}
 
 	private status(s: Status, detail?: ConnectFailure) {

@@ -4,6 +4,8 @@ import { PageLife } from '../src/embed/attempts';
 import type { LifeOptions } from '../src/embed/attempts';
 import { Dispatcher } from '../src/embed/dispatch';
 import { CONNECT_FAILED, callPreamble } from '../src/embed/preamble';
+import { Reconnector } from '../src/embed/reconnect';
+import type { Env } from '../src/embed/reconnect';
 import { onStream } from '../src/embed/stream';
 import type { StreamSink } from '../src/embed/stream';
 import {
@@ -14,7 +16,12 @@ import {
 	assetBaseUrl,
 } from '../src/embed/styles';
 import { UNMOUNTED } from '../src/embed/types';
-import type { ConnectFailure, Status } from '../src/embed/types';
+import type {
+	ConnectFailure,
+	ReconnectEvent,
+	ReconnectOptions,
+	Status,
+} from '../src/embed/types';
 import { serveLife } from '../src/life';
 import type { LifeUp } from '../src/life';
 import { Link } from '../src/link';
@@ -556,5 +563,147 @@ describe('the embed renders without the served page', () => {
 		expect(
 			new URL('worker.js', assetBaseUrl('/static/starfold', mod)).href
 		).toBe('https://cdn.example/static/starfold/worker.js');
+	});
+});
+
+/** Real timers, a visible page that is online, and the delay's jitter at `random`. */
+function liveEnv(random: number): Env {
+	return {
+		now: () => performance.now(),
+		setTimeout: (f, ms) => setTimeout(f, ms),
+		clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+		random: () => random,
+		hidden: () => false,
+		online: () => true,
+		onWake: () => () => {},
+	};
+}
+
+function reconnecting(
+	o: LifeOptions,
+	r: true | ReconnectOptions = true,
+	random = 0
+) {
+	const events: ReconnectEvent[] = [];
+	const e = setup({
+		...o,
+		reconnect: new Reconnector(r, liveEnv(random)),
+		onReconnect: (ev) => events.push(ev),
+	});
+	return { ...e, events };
+}
+
+describe('reconnect, opt-in', () => {
+	test('a restart close reconnects with a fresh preamble and reports reconnecting, then reconnected', async () => {
+		let calls = 0;
+		const { s, page, seen, events } = reconnecting({
+			preamble: () => `ticket-${++calls}`,
+		});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, 'restarting');
+		await until(() => (s.conns[1]?.got.length ?? 0) >= 1);
+		expect(s.conns[1].got[0]).toBe('ticket-2');
+		await until(() => events.length === 2);
+		expect(statuses(seen)).toEqual([
+			'connecting',
+			'open',
+			'reconnecting',
+			'connecting',
+			'open',
+		]);
+		expect(seen.closes).toEqual([[1012, 'restarting']]);
+		expect(events).toEqual([
+			{
+				kind: 'reconnecting',
+				attempt: 1,
+				delayMs: 0,
+				code: 1012,
+				reason: 'restarting',
+			},
+			{ kind: 'reconnected', attempt: 1 },
+		]);
+	});
+
+	test('the same 44xx close twice right after open gives up with that code, then closed', async () => {
+		const { s, page, seen, events } = reconnecting({ preamble: () => 't' });
+		page.connect();
+		for (const i of [0, 1]) {
+			await until(() => !!s.conns[i]?.ws && (s.conns[i]?.got.length ?? 0) >= 1);
+			await until(() => statuses(seen).filter((x) => x === 'open').length === i + 1);
+			s.conns[i].ws!.close(4401, 'ticket rejected');
+		}
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen).slice(-2)).toEqual(['gave-up', 'closed']);
+		expect(events.at(-1)).toEqual({
+			kind: 'gave-up',
+			why: 'repeated-close',
+			code: 4401,
+			reason: 'ticket rejected',
+		});
+		await sleep(300);
+		expect(s.conns.length).toBe(2);
+	});
+
+	test('a close not worth another attempt gives up at once', async () => {
+		const { s, page, seen, events } = reconnecting({});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1000, 'done');
+		await until(() => statuses(seen).at(-1) === 'closed');
+		expect(statuses(seen)).toEqual(['connecting', 'open', 'gave-up', 'closed']);
+		expect(events).toEqual([
+			{ kind: 'gave-up', why: 'code', code: 1000, reason: 'done' },
+		]);
+		await sleep(300);
+		expect(s.conns.length).toBe(1);
+	});
+
+	test('a preamble that fails on a reconnect ends the run: preamble-failed, then gave-up', async () => {
+		let calls = 0;
+		const { s, page, seen, events } = reconnecting({
+			preamble: () => {
+				if (++calls > 1) throw new Error(SECRET);
+				return 't';
+			},
+		});
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'gave-up');
+		expect(statuses(seen).slice(-3)).toEqual([
+			'connecting',
+			'preamble-failed',
+			'gave-up',
+		]);
+		expect(events.at(-1)).toEqual({
+			kind: 'gave-up',
+			why: 'preamble-failed',
+			code: 1012,
+			reason: '',
+		});
+		expect(JSON.stringify([seen.status, events])).not.toContain(SECRET);
+		expect(s.conns.length).toBe(1);
+	});
+
+	test("the host's connect() during the delay connects now; unmount during it ends everything", async () => {
+		const { s, page, seen, unmount } = reconnecting(
+			{ preamble: () => 't' },
+			{ initialMs: 60_000 },
+			0.99
+		);
+		page.connect();
+		await until(() => !!s.conns[0]?.ws && statuses(seen).includes('open'));
+		s.conns[0].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'reconnecting');
+		page.connect();
+		await until(() => !!s.conns[1]?.ws && statuses(seen).at(-1) === 'open');
+		s.conns[1].ws!.close(1012, '');
+		await until(() => statuses(seen).at(-1) === 'reconnecting');
+		const before = seen.status.length;
+		unmount();
+		await sleep(300);
+		expect(seen.status.length).toBe(before);
+		expect(s.conns.length).toBe(2);
 	});
 });
