@@ -98,7 +98,8 @@ export interface MountOptions {
 	 * after `unmount()`; with `reconnect`, `reconnecting` follows instead while another attempt
 	 * is coming (it then reports `connecting` and `open` as any connect), and `gave-up` then
 	 * `closed` when none is. A reconnect attempt that ends in `preamble-failed` or
-	 * `connect-failed` is followed by `gave-up`.
+	 * `connect-failed` is followed by `gave-up` and `closed`, and so is a worker that fails
+	 * while reconnect is on.
 	 */
 	onStatus?(status: Status, detail?: ConnectFailure): void;
 	/**
@@ -108,11 +109,12 @@ export interface MountOptions {
 	 * close codes reconnect is in the README's embedding section. A reconnect is a new viewer to
 	 * the server (a new negotiation, then a keyframe).
 	 */
-	reconnect?: boolean | ReconnectOptions;
+	reconnect?: true | ReconnectOptions;
 	/**
 	 * With `reconnect`: `reconnecting` (the attempt number, its delay and the close that caused
-	 * it), `reconnected` (an attempt reached open) and `gave-up` (why, and the last close's code
-	 * and reason). Each comes after the `onStatus` of the same name (`open` for `reconnected`).
+	 * it), `reconnected` (an attempt reached open, with the close it followed) and `gave-up` (why,
+	 * and the last close's code and reason). Each comes after the `onStatus` of the same name
+	 * (`open` for `reconnected`).
 	 */
 	onReconnect?(e: ReconnectEvent): void;
 }
@@ -144,6 +146,10 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 			'starfold: browsers only decode video on secure pages (HTTPS or localhost)'
 		);
 	const base = assetBaseUrl(options.assetBase, import.meta.url);
+	// Before anything exists: limits that are not numbers throw here.
+	const reconnect = options.reconnect
+		? new Reconnector(options.reconnect, pageEnv())
+		: undefined;
 	const canvas = document.createElement('canvas');
 	if (!canvas.transferControlToOffscreen)
 		throw new Error('starfold: this browser lacks OffscreenCanvas support');
@@ -283,9 +289,7 @@ export function mount(container: HTMLElement, options: MountOptions): Handle {
 		onClose: options.onClose,
 		onStatus: options.onStatus,
 		onReconnect: options.onReconnect,
-		reconnect: options.reconnect
-			? new Reconnector(options.reconnect, pageEnv())
-			: undefined,
+		reconnect,
 		opened: () => updateVisibility(true),
 	});
 	const onWorkerError = (e: Event) => {

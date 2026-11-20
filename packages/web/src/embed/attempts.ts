@@ -10,12 +10,13 @@
 // - every callback goes through the Dispatcher; end() seals it, so after end() the only
 //   callback is the onClose it reports for a socket it was waiting on;
 // - with a Reconnector, a close is followed by 'reconnecting' and a later attempt of the
-//   lifecycle's own, or by 'gave-up' and then 'closed'; the host's connect() starts counting over.
+//   lifecycle's own, or by 'gave-up' and then 'closed', and so is a reconnect attempt that
+//   ended in preamble-failed or connect-failed; the host's connect() starts counting over.
 import type { LifeDown, LifeUp } from '../life';
 import { Dispatcher } from './dispatch';
 import type { Report } from './dispatch';
 import { CONNECT_FAILED, callPreamble } from './preamble';
-import type { Reconnector } from './reconnect';
+import type { Decision, Reconnector } from './reconnect';
 import { UNMOUNTED, WORKER_FAILED } from './types';
 import type {
 	ConnectFailure,
@@ -132,7 +133,11 @@ export class PageLife {
 				if (this.o.reconnect) {
 					const r = this.o.reconnect;
 					if (r.reconnecting)
-						this.event({ kind: 'reconnected', attempt: r.attempt });
+						this.event({
+							kind: 'reconnected',
+							attempt: r.attempt,
+							...this.lastClose,
+						});
 					r.opened();
 				}
 				break;
@@ -158,8 +163,16 @@ export class PageLife {
 			this.failed('preamble-failed', r.failure);
 			return;
 		}
-		this.phase = 'socket';
-		this.down({ t: 'preamble', id, msgs: r.msgs });
+		const send = () => {
+			if (!this.live || id !== this.id || this.phase !== 'asking') return;
+			this.phase = 'socket';
+			this.down({ t: 'preamble', id, msgs: r.msgs });
+		};
+		// A reconnect attempt opens no socket while the page is hidden or offline, even if the
+		// page went so while its preamble was pending.
+		const re = this.o.reconnect;
+		if (re?.reconnecting) re.hold(send);
+		else send();
 	}
 
 	/** An attempt that ended before a socket; one made to reconnect ends the run. */
@@ -190,32 +203,56 @@ export class PageLife {
 		}
 		this.lastClose = { code, reason };
 		const r = this.o.reconnect;
-		if (r && this.live) {
-			const d = r.closed(code, reason);
-			if (d.t === 'retry') {
-				this.status('reconnecting');
-				this.event({
-					kind: 'reconnecting',
-					attempt: d.attempt,
-					delayMs: d.delayMs,
-					code,
-					reason,
-				});
-				r.schedule(d.delayMs, () => {
-					if (this.live && this.phase === 'idle') this.attempt();
-				});
-				return;
-			}
-			this.giveUp(d.why);
+		if (!r) {
+			this.status('closed');
+			return;
 		}
-		this.status('closed');
+		// A failed worker: nothing can follow.
+		if (!this.live) {
+			this.giveUp('code');
+			return;
+		}
+		const id = this.id;
+		let d: Decision;
+		try {
+			d = r.closed(code, reason);
+		} catch (err) {
+			this.dispatch.call(() => {
+				throw err;
+			});
+			d = { t: 'give-up', why: 'code' };
+		}
+		// shouldReconnect called unmount() or connect(): that call decides what follows.
+		if (!this.live || this.id !== id || this.phase !== 'idle') return;
+		if (d.t === 'give-up') {
+			this.giveUp(d.why);
+			return;
+		}
+		this.status('reconnecting');
+		this.event({
+			kind: 'reconnecting',
+			attempt: d.attempt,
+			delayMs: d.delayMs,
+			code,
+			reason,
+		});
+		r.schedule(
+			d.delayMs,
+			() => {
+				if (this.live && this.phase === 'idle') this.attempt();
+			},
+			() => {
+				if (this.live && this.phase === 'idle') this.giveUp('time');
+			}
+		);
 	}
 
-	/** 'gave-up' with the last close's code and reason; the run is over. */
+	/** 'gave-up' with the last close's code and reason, then 'closed': the run is over. */
 	private giveUp(why: ReconnectWhy) {
 		this.o.reconnect?.reset();
 		this.status('gave-up');
 		this.event({ kind: 'gave-up', why, ...this.lastClose });
+		this.status('closed');
 	}
 
 	private event(e: ReconnectEvent) {

@@ -23,15 +23,17 @@ export const RECONNECT_DEFAULTS = {
  * Whether a close is worth another attempt, by its code alone. 1006 (no close frame: a network
  * drop, a server that crashed or was stopped, or an upgrade the server refused), 1001 (going
  * away), 1012 (service restart) and 1013 (try again later) are; so is a 44xx code from the host's
- * gateway or the server, except 4406 (a protocol 1 viewer this server's build can't serve). 1000
- * (closed on purpose), the client's own 4000 to 4002, a bad frame (1003, 1007, 1009), 4406 and
- * every other code are not.
+ * gateway or the server, except 4406 (a protocol 1 viewer this server can't serve). 1000 (closed
+ * on purpose), the client's own 4000 to 4002, a bad frame (1003, 1007, 1009), 4406 and every
+ * other code are not.
  */
 export function retryable(code: number): boolean {
 	if (code === 1006 || code === 1001 || code === 1012 || code === 1013)
 		return true;
-	return code >= 4400 && code <= 4499 && code !== 4406;
+	return is44xx(code) && code !== 4406;
 }
+
+const is44xx = (code: number) => code >= 4400 && code <= 4499;
 
 /** Full jitter: a delay in [0, min(cap, initial * factor^(attempt - 1))). */
 export function backoff(
@@ -66,9 +68,11 @@ export function pageEnv(): Env {
 		onWake(f) {
 			document.addEventListener('visibilitychange', f);
 			window.addEventListener('online', f);
+			window.addEventListener('offline', f);
 			return () => {
 				document.removeEventListener('visibilitychange', f);
 				window.removeEventListener('online', f);
+				window.removeEventListener('offline', f);
 			};
 		},
 	};
@@ -78,38 +82,58 @@ export type Decision =
 	| { t: 'retry'; attempt: number; delayMs: number }
 	| { t: 'give-up'; why: ReconnectWhy };
 
+type Limits = Required<Omit<ReconnectOptions, 'shouldReconnect'>>;
+
+/** The limits with their defaults; a limit that is not a positive number (factor: >= 1) throws. */
+export function limits(options: true | ReconnectOptions): Limits {
+	const o = options === true ? {} : options;
+	const out: Limits = {
+		initialMs: o.initialMs ?? RECONNECT_DEFAULTS.initialMs,
+		factor: o.factor ?? RECONNECT_DEFAULTS.factor,
+		capMs: o.capMs ?? RECONNECT_DEFAULTS.capMs,
+		maxAttempts: o.maxAttempts ?? RECONNECT_DEFAULTS.maxAttempts,
+		maxMs: o.maxMs ?? RECONNECT_DEFAULTS.maxMs,
+	};
+	for (const [k, v] of Object.entries(out)) {
+		const min = k === 'factor' ? 1 : 0;
+		if (typeof v !== 'number' || !Number.isFinite(v) || v < min || (min === 0 && v === 0))
+			throw new TypeError(`starfold: reconnect.${k} must be a positive number`);
+	}
+	return out;
+}
+
 interface Run {
 	start: number;
 	attempts: number;
-	/** Time spent offline, which does not count toward maxMs. */
+	/** Time spent offline while waiting, which does not count toward maxMs. */
 	pausedMs: number;
 	neverOpened: number;
 	/** The 44xx code of the last close if it came right after an open. */
 	last44xx: number | null;
 }
 
+/** An attempt waiting for its delay and for the page to be visible and online. */
+interface Wait {
+	timer: unknown;
+	due: boolean;
+	stop: () => void;
+	go: () => void;
+}
+
 export class Reconnector {
-	private readonly o: Required<Omit<ReconnectOptions, 'shouldReconnect'>> &
-		Pick<ReconnectOptions, 'shouldReconnect'>;
+	private readonly o: Limits;
+	private readonly should?: ReconnectOptions['shouldReconnect'];
 	private run: Run | null = null;
 	private openedAt: number | null = null;
-	private timer: unknown = null;
-	private stopWake: (() => void) | null = null;
+	private wait: Wait | null = null;
 	private offlineSince: number | null = null;
 
 	constructor(
 		options: true | ReconnectOptions,
 		private readonly env: Env
 	) {
-		const o = options === true ? {} : options;
-		this.o = {
-			initialMs: o.initialMs ?? RECONNECT_DEFAULTS.initialMs,
-			factor: o.factor ?? RECONNECT_DEFAULTS.factor,
-			capMs: o.capMs ?? RECONNECT_DEFAULTS.capMs,
-			maxAttempts: o.maxAttempts ?? RECONNECT_DEFAULTS.maxAttempts,
-			maxMs: o.maxMs ?? RECONNECT_DEFAULTS.maxMs,
-			shouldReconnect: o.shouldReconnect,
-		};
+		this.o = limits(options);
+		this.should = options === true ? undefined : options.shouldReconnect;
 	}
 
 	/** Whether the attempt now under way is one this made (not the host's). */
@@ -122,12 +146,21 @@ export class Reconnector {
 		return this.run?.attempts ?? 0;
 	}
 
+	/** Whether an attempt is waiting: its delay, or the page to wake. */
+	get pending(): boolean {
+		return this.wait !== null;
+	}
+
 	opened() {
 		this.openedAt = this.env.now();
 		if (this.run) this.run.neverOpened = 0;
 	}
 
-	/** What to do after a socket closed with `code`; with `retry`, the attempt is counted. */
+	/**
+	 * What to do after a socket closed with `code`; with `retry`, the attempt is counted. Calls
+	 * the embedder's `shouldReconnect`, which may throw or call back into the client: the caller
+	 * handles both.
+	 */
 	closed(code: number, reason: string): Decision {
 		const now = this.env.now();
 		const openFor = this.openedAt === null ? null : now - this.openedAt;
@@ -140,23 +173,18 @@ export class Reconnector {
 			neverOpened: 0,
 			last44xx: null,
 		});
-		const wanted = this.o.shouldReconnect
-			? this.o.shouldReconnect(code, reason)
-			: retryable(code);
+		const short = openFor !== null && openFor < STABLE_MS;
+		const repeat = short && is44xx(code) && run.last44xx === code;
+		run.last44xx = short && is44xx(code) ? code : null;
+		run.neverOpened = code === 1006 && openFor === null ? run.neverOpened + 1 : 0;
+		const wanted = this.should ? this.should(code, reason) : retryable(code);
 		if (!wanted) return { t: 'give-up', why: 'code' };
-		if (code >= 4400 && code <= 4499 && openFor !== null) {
-			if (run.last44xx === code) return { t: 'give-up', why: 'repeated-close' };
-			run.last44xx = code;
-		} else run.last44xx = null;
-		if (code === 1006 && openFor === null) {
-			run.neverOpened++;
-			if (run.neverOpened >= NEVER_OPENED_MAX)
-				return { t: 'give-up', why: 'never-opened' };
-		}
+		if (repeat) return { t: 'give-up', why: 'repeated-close' };
+		if (run.neverOpened >= NEVER_OPENED_MAX)
+			return { t: 'give-up', why: 'never-opened' };
 		if (run.attempts >= this.o.maxAttempts)
 			return { t: 'give-up', why: 'attempts' };
-		if (now - run.start - run.pausedMs >= this.o.maxMs)
-			return { t: 'give-up', why: 'time' };
+		if (this.left() <= 0) return { t: 'give-up', why: 'time' };
 		run.attempts++;
 		return {
 			t: 'retry',
@@ -165,51 +193,99 @@ export class Reconnector {
 		};
 	}
 
-	/**
-	 * Calls `connect` after `delayMs`; then, while the page is hidden or offline, waits until it is
-	 * neither, and connects at once.
-	 */
-	schedule(delayMs: number, connect: () => void) {
-		this.cancel();
-		this.timer = this.env.setTimeout(() => {
-			this.timer = null;
-			this.whenAwake(connect);
-		}, delayMs);
+	/** What is left of the run's maxMs, time offline not counted. */
+	private left(): number {
+		if (!this.run) return this.o.maxMs;
+		const now = this.env.now();
+		const offline = this.offlineSince === null ? 0 : now - this.offlineSince;
+		return (
+			this.o.maxMs - (now - this.run.start - this.run.pausedMs - offline)
+		);
 	}
 
-	private whenAwake(connect: () => void) {
-		const awake = () => !this.env.hidden() && this.env.online();
-		const offline = () => {
-			if (!this.env.online()) this.offlineSince ??= this.env.now();
+	/** Starts or ends a stretch offline as `navigator.onLine` says; the stretch is not counted. */
+	private network() {
+		const now = this.env.now();
+		if (!this.env.online()) this.offlineSince ??= now;
+		else if (this.offlineSince !== null) {
+			if (this.run) this.run.pausedMs += now - this.offlineSince;
+			this.offlineSince = null;
+		}
+	}
+
+	private awake(): boolean {
+		return !this.env.hidden() && this.env.online();
+	}
+
+	/**
+	 * Calls `connect` once `delayMs` is up and the page is visible and online; coming back online
+	 * connects at once, delay or not. If maxMs runs out first, calls `expire` instead (at the
+	 * deadline, or on waking past it).
+	 */
+	schedule(delayMs: number, connect: () => void, expire: () => void) {
+		this.cancel();
+		this.network();
+		const w: Wait = {
+			timer: null,
+			due: false,
+			stop: () => {},
+			go: () => {
+				this.cancel();
+				if (this.left() <= 0) expire();
+				else connect();
+			},
 		};
-		if (awake()) {
-			connect();
+		const left = this.left();
+		w.timer = this.env.setTimeout(
+			() => {
+				w.timer = null;
+				w.due = true;
+				if (this.left() <= 0 && this.env.online()) w.go();
+				else if (this.awake()) w.go();
+			},
+			Math.max(0, Math.min(delayMs, left))
+		);
+		w.stop = this.env.onWake(() => {
+			const wasOffline = this.offlineSince !== null;
+			this.network();
+			const back = wasOffline && this.offlineSince === null;
+			if ((w.due || back) && this.awake()) w.go();
+		});
+		this.wait = w;
+	}
+
+	/** Calls `f` now if the page is visible and online, else once it is (dropped by cancel/reset). */
+	hold(f: () => void) {
+		if (this.awake()) {
+			f();
 			return;
 		}
-		offline();
-		this.stopWake = this.env.onWake(() => {
-			if (this.offlineSince !== null && this.env.online()) {
-				if (this.run) this.run.pausedMs += this.env.now() - this.offlineSince;
-				this.offlineSince = null;
-			}
-			offline();
-			if (!awake()) return;
-			this.cancel();
-			connect();
+		this.cancel();
+		this.network();
+		const w: Wait = {
+			timer: null,
+			due: true,
+			stop: () => {},
+			go: () => {
+				this.cancel();
+				f();
+			},
+		};
+		w.stop = this.env.onWake(() => {
+			this.network();
+			if (this.awake()) w.go();
 		});
-	}
-
-	/** Whether an attempt is waiting: its delay, or the page to wake. */
-	get pending(): boolean {
-		return this.timer !== null || this.stopWake !== null;
+		this.wait = w;
 	}
 
 	/** Drops a waiting attempt. */
 	cancel() {
-		if (this.timer !== null) this.env.clearTimeout(this.timer);
-		this.timer = null;
-		this.stopWake?.();
-		this.stopWake = null;
+		const w = this.wait;
+		this.wait = null;
+		if (w) {
+			if (w.timer !== null) this.env.clearTimeout(w.timer);
+			w.stop();
+		}
 		if (this.offlineSince !== null && this.run)
 			this.run.pausedMs += this.env.now() - this.offlineSince;
 		this.offlineSince = null;
@@ -219,5 +295,6 @@ export class Reconnector {
 	reset() {
 		this.cancel();
 		this.run = null;
+		this.openedAt = null;
 	}
 }

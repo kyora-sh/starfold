@@ -29,7 +29,8 @@ export type Status =
  * The `reconnect` option's limits. The delay before attempt n is a random time below
  * min(capMs, initialMs * factor^(n-1)); a run gives up after maxAttempts attempts or maxMs
  * since its first close (time offline not counted), whichever comes first. A connection that
- * stays open for 10 s ends the run.
+ * stays open for 10 s ends the run. Each limit is a positive number (factor at least 1), or
+ * mount() throws.
  */
 export interface ReconnectOptions {
 	/** Default 500. */
@@ -42,7 +43,10 @@ export interface ReconnectOptions {
 	maxAttempts?: number;
 	/** Default 300000 (5 min). */
 	maxMs?: number;
-	/** Whether a close with this code and reason is worth another attempt; replaces the default table. */
+	/**
+	 * Whether a close with this code and reason is worth another attempt; replaces the default
+	 * table. Called at once, not queued; one that throws counts as false (and is reported).
+	 */
 	shouldReconnect?(code: number, reason: string): boolean;
 }
 
@@ -62,7 +66,10 @@ export type ReconnectWhy =
 	| 'preamble-failed'
 	| 'connect-failed';
 
-/** What `onReconnect` gets; `code` and `reason` are the last close's. */
+/**
+ * What `onReconnect` gets; `code` and `reason` are the last close's, as the server or gateway
+ * sent them (as for onClose: a gateway that echoes a ticket in its reason leaks it itself).
+ */
 export type ReconnectEvent =
 	| {
 			kind: 'reconnecting';
@@ -71,7 +78,7 @@ export type ReconnectEvent =
 			code: number;
 			reason: string;
 	  }
-	| { kind: 'reconnected'; attempt: number }
+	| { kind: 'reconnected'; attempt: number; code: number; reason: string }
 	| { kind: 'gave-up'; why: ReconnectWhy; code: number; reason: string };
 
 /**

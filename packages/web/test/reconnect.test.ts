@@ -185,6 +185,30 @@ describe('the limits of a run', () => {
 		expect(r.closed(4429, '')).toMatchObject({ t: 'retry', attempt: 1 });
 	});
 
+	test('a 44xx close after a stable open is not the first of a repeat', () => {
+		const { r, advance } = reconnector();
+		r.opened();
+		advance(STABLE_MS + 2000);
+		expect(r.closed(4401, '')).toMatchObject({ t: 'retry', attempt: 1 });
+		r.opened();
+		advance(50);
+		expect(r.closed(4401, '')).toMatchObject({ t: 'retry', attempt: 2 });
+		r.opened();
+		expect(r.closed(4401, '')).toEqual({
+			t: 'give-up',
+			why: 'repeated-close',
+		});
+	});
+
+	test('never-opened counts only 1006 closes in a row: another code in between starts it over', () => {
+		const { r } = reconnector();
+		expect(r.closed(1006, '').t).toBe('retry');
+		expect(r.closed(1012, '').t).toBe('retry');
+		expect(r.closed(1006, '').t).toBe('retry');
+		expect(r.closed(1006, '').t).toBe('retry');
+		expect(r.closed(1006, '')).toEqual({ t: 'give-up', why: 'never-opened' });
+	});
+
 	test('a 44xx close that never reached open does not count toward the repeat', () => {
 		const { r } = reconnector({
 			shouldReconnect: () => true,
@@ -206,25 +230,62 @@ describe('the limits of a run', () => {
 });
 
 describe('waiting for the attempt', () => {
+	const never = () => {
+		throw new Error('expired');
+	};
+
 	test('connects when the delay is up, once', () => {
-		const { r, advance } = reconnector();
+		const { r, advance, wakes } = reconnector();
 		let connects = 0;
-		r.schedule(1000, () => connects++);
+		r.schedule(1000, () => connects++, never);
 		expect(r.pending).toBe(true);
 		advance(999);
 		expect(connects).toBe(0);
 		advance(1);
 		expect(connects).toBe(1);
 		expect(r.pending).toBe(false);
+		expect(wakes.size).toBe(0);
 		advance(10_000);
 		expect(connects).toBe(1);
+	});
+
+	test('a delay that ends past maxMs gives up at the deadline instead of connecting', () => {
+		const { r, advance, timers } = reconnector({ maxMs: 1000 });
+		let connects = 0;
+		let expired = 0;
+		expect(r.closed(1006, '').t).toBe('retry');
+		advance(600);
+		r.schedule(5000, () => connects++, () => expired++);
+		advance(399);
+		expect(expired).toBe(0);
+		advance(1);
+		expect([connects, expired, timers.size, r.pending]).toEqual([
+			0,
+			1,
+			0,
+			false,
+		]);
+	});
+
+	test('a hidden page past the deadline gives up instead of connecting', () => {
+		const { r, advance, page, wake } = reconnector({ maxMs: 1000 });
+		let connects = 0;
+		let expired = 0;
+		expect(r.closed(1006, '').t).toBe('retry');
+		page.hidden = true;
+		r.schedule(10, () => connects++, () => expired++);
+		advance(5000);
+		expect(expired).toBe(0);
+		page.hidden = false;
+		wake();
+		expect([connects, expired]).toEqual([0, 1]);
 	});
 
 	test('a hidden page connects only once it is visible again, at once', () => {
 		const { r, advance, page, wake } = reconnector();
 		let connects = 0;
 		page.hidden = true;
-		r.schedule(1000, () => connects++);
+		r.schedule(1000, () => connects++, never);
 		advance(5000);
 		expect(connects).toBe(0);
 		expect(r.pending).toBe(true);
@@ -247,7 +308,7 @@ describe('waiting for the attempt', () => {
 		r.opened();
 		expect(r.closed(1012, '').t).toBe('retry');
 		page.online = false;
-		r.schedule(100, () => connects++);
+		r.schedule(100, () => connects++, never);
 		advance(60_000);
 		expect(connects).toBe(0);
 		page.online = true;
@@ -258,20 +319,100 @@ describe('waiting for the attempt', () => {
 		expect(r.closed(1012, '').t).toBe('retry');
 	});
 
-	test('cancel and reset drop the waiting attempt', () => {
-		const { r, advance, page, wake } = reconnector();
+	test('offline from the start of the delay: back online connects at once, the time not counted', () => {
+		const { r, advance, page, wake, timers } = reconnector({
+			maxMs: 10_000,
+			maxAttempts: 100,
+		});
 		let connects = 0;
-		r.schedule(1000, () => connects++);
+		r.opened();
+		expect(r.closed(1012, '').t).toBe('retry');
+		page.online = false;
+		r.schedule(4000, () => connects++, never);
+		advance(1000);
+		wake();
+		expect(connects).toBe(0);
+		page.online = true;
+		wake();
+		expect([connects, timers.size]).toEqual([1, 0]);
+		r.opened();
+		advance(9500);
+		expect(r.closed(1012, '').t).toBe('retry');
+	});
+
+	test('going offline during the delay is noticed then, not when it ends', () => {
+		const { r, advance, page, wake } = reconnector({
+			maxMs: 10_000,
+			maxAttempts: 100,
+		});
+		let connects = 0;
+		r.opened();
+		expect(r.closed(1012, '').t).toBe('retry');
+		r.schedule(4000, () => connects++, never);
+		advance(500);
+		page.online = false;
+		wake();
+		advance(60_000);
+		expect(connects).toBe(0);
+		page.online = true;
+		wake();
+		expect(connects).toBe(1);
+		r.opened();
+		advance(9000);
+		expect(r.closed(1012, '').t).toBe('retry');
+	});
+
+	test('hold runs at once on a visible page, else once it is visible and online', () => {
+		const { r, page, wake, wakes } = reconnector();
+		let sent = 0;
+		r.hold(() => sent++);
+		expect(sent).toBe(1);
+		page.hidden = true;
+		r.hold(() => sent++);
+		expect([sent, r.pending]).toEqual([1, true]);
+		page.hidden = false;
+		page.online = false;
+		wake();
+		expect(sent).toBe(1);
+		page.online = true;
+		wake();
+		expect([sent, r.pending, wakes.size]).toEqual([2, false, 0]);
+	});
+
+	test('cancel and reset drop the waiting attempt and its listener', () => {
+		const { r, advance, page, wake, wakes, timers } = reconnector();
+		let connects = 0;
+		r.schedule(1000, () => connects++, never);
 		r.cancel();
 		advance(2000);
 		expect(connects).toBe(0);
 		page.hidden = true;
-		r.schedule(10, () => connects++);
+		r.schedule(10, () => connects++, never);
 		advance(20);
 		r.reset();
 		page.hidden = false;
 		wake();
-		expect(connects).toBe(0);
-		expect(r.pending).toBe(false);
+		expect([connects, r.pending, wakes.size, timers.size]).toEqual([
+			0,
+			false,
+			0,
+			0,
+		]);
+	});
+});
+
+describe('the limits themselves', () => {
+	test('a limit that is not a positive number throws; a factor below 1 too', () => {
+		const env = fakeEnv().env;
+		for (const o of [
+			{ maxAttempts: Number.NaN },
+			{ maxMs: Number.POSITIVE_INFINITY },
+			{ capMs: -1 },
+			{ initialMs: 0 },
+			{ factor: 0.5 },
+			{ maxAttempts: '3' as unknown as number },
+		])
+			expect(() => new Reconnector(o, env)).toThrow(TypeError);
+		expect(() => new Reconnector({ factor: 1 }, env)).not.toThrow();
 	});
 });
