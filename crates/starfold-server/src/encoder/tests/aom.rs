@@ -71,7 +71,7 @@ impl Stream {
 
     /// Shows page `seed`, then sharpens it: the refinement stores it. Bytes of its first frame.
     fn page(&mut self, seed: u32) -> usize {
-        self.pic.texture(seed, 0, 0, W, H, 0);
+        self.pic.texture(seed << 29, 0, 0, W, H, 0);
         let n = self.frame(None);
         self.frame(None);
         assert!(self.frame(Some(FINE)) > 0, "page {seed} was not refined");
@@ -309,7 +309,7 @@ fn a_return_to_a_stored_screen_costs_a_fraction_of_the_page() {
         s.enc.stored_screens(on);
         s.page(1);
         s.page(2);
-        s.pic.texture(1, 0, 0, W, H, 0);
+        s.pic.texture(1 << 29, 0, 0, W, H, 0);
         let b = s.frame(None);
         let psnr = s.psnr();
         eprintln!("stored screens {on}: back to page 1 in {b} bytes, {psnr:.2} dB");
@@ -326,7 +326,7 @@ fn a_keyframe_clears_the_stored_screens() {
     s.page(1);
     s.page(2);
     assert_eq!(s.enc.screens().unwrap().iter().filter(|&&h| h != 0).count(), 2);
-    s.pic.texture(1, 0, 0, W, H, 0);
+    s.pic.texture(1 << 29, 0, 0, W, H, 0);
     s.frame(None);
     let (_, key) = s.encode(None, true, None);
     assert!(key);
@@ -342,11 +342,11 @@ fn after_a_requested_keyframe_no_frame_references_a_screen_from_before_it() {
     s.enc.stored_screens(true);
     s.page(1);
     let first = s.page(2);
-    s.pic.texture(1, 0, 0, W, H, 0);
+    s.pic.texture(1 << 29, 0, 0, W, H, 0);
     let back = s.frame(None);
     assert!(back * 4 < first, "back {back}, page {first}");
     assert!(s.encode(None, true, None).1);
-    s.pic.texture(2, 0, 0, W, H, 0);
+    s.pic.texture(2 << 29, 0, 0, W, H, 0);
     let again = s.frame(None);
     let psnr = s.psnr();
     eprintln!("page 2 again after the keyframe: {again} bytes, {psnr:.2} dB");
@@ -365,7 +365,7 @@ fn a_wrong_match_decodes_to_the_right_picture() {
     let page2 = s.pic.clone();
     s.page(3);
     s.enc.force_wrong_match();
-    s.pic.texture(1, 0, 0, W, H, 0);
+    s.pic.texture(1 << 29, 0, 0, W, H, 0);
     let n = s.frame(None);
     let recon = s.enc.reconstruction().unwrap();
     let right = luma_psnr(&recon, W, &s.pic);
@@ -384,16 +384,16 @@ fn the_hash_runs_only_when_most_of_the_screen_changed() {
     let before = s.enc.hashed();
     let mut map = vec![1u8; mbs];
     map[..mbs / 2].fill(0);
-    s.pic.texture(4, 0, 0, W, H / 2, 0);
+    s.pic.texture(4 << 29, 0, 0, W, H / 2, 0);
     s.encode(None, false, Some(&mut map));
     assert_eq!(s.enc.hashed(), before, "half the screen changed");
     let mut map = vec![0u8; mbs];
     map[..mbs / 4].fill(1);
-    s.pic.texture(5, 0, 0, W, H, 0);
+    s.pic.texture(5 << 29, 0, 0, W, H, 0);
     s.encode(None, false, Some(&mut map));
     assert_eq!(s.enc.hashed(), before + 1, "three quarters changed");
     s.enc.stored_screens(false);
-    s.pic.texture(6, 0, 0, W, H, 0);
+    s.pic.texture(6 << 29, 0, 0, W, H, 0);
     s.frame(None);
     assert_eq!(s.enc.hashed(), before + 1, "stored screens off");
 }
@@ -403,7 +403,7 @@ fn the_hash_tells_pages_apart() {
     let a = Picture::new(W, H);
     let mut b = a.clone();
     assert_eq!(screen_hash(&a.view()), screen_hash(&b.view()));
-    b.texture(1, 0, 0, W, H, 0);
+    b.texture(1 << 29, 0, 0, W, H, 0);
     assert_ne!(screen_hash(&a.view()), screen_hash(&b.view()));
     assert_ne!(screen_hash(&a.view()), 0);
 }
@@ -415,7 +415,7 @@ fn stored_screen_hash_cost_at_1080p() {
     let mut p = Picture::new(1920, 1080);
     let mut us: Vec<f64> = (0..2000)
         .map(|f| {
-            p.texture(f as u32 % 7, 0, 0, 1920, 1080, f % 64);
+            p.texture((f as u32 % 7) << 29, 0, 0, 1920, 1080, f % 64);
             let t = std::time::Instant::now();
             std::hint::black_box(screen_hash(&p.view()));
             t.elapsed().as_secs_f64() * 1e6
