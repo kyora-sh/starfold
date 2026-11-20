@@ -9,8 +9,6 @@ mod av1;
 
 fn backends() -> Vec<Backend> {
     vec![
-        #[cfg(feature = "openh264")]
-        Backend::OpenH264,
         #[cfg(feature = "x264")]
         Backend::X264,
     ]
@@ -30,6 +28,7 @@ fn config(backend: Backend, width: u32, height: u32, max_kbps: u32) -> EncoderCo
     }
 }
 
+#[derive(Clone)]
 struct Picture {
     w: usize,
     h: usize,
@@ -121,8 +120,6 @@ fn types(au: &AccessUnit) -> Vec<u8> {
 /// The SPS fields a decoder sizes and colours the picture by.
 #[derive(Debug, PartialEq)]
 struct Sps {
-    profile: u8,
-    constraints: u8,
     display: (u32, u32),
     color: Option<(bool, u8, u8, u8)>,
 }
@@ -168,8 +165,7 @@ fn parse_sps(nal: &[u8]) -> Sps {
     }
     let mut r = Bits { d: &rbsp, pos: 0 };
     let profile = r.bits(8) as u8;
-    let constraints = r.bits(8) as u8;
-    r.bits(8);
+    r.bits(16);
     r.ue();
     let mut chroma = 1;
     if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128) {
@@ -231,8 +227,6 @@ fn parse_sps(nal: &[u8]) -> Sps {
         }
     }
     Sps {
-        profile,
-        constraints,
         display: (w - cw, h - ch),
         color,
     }
@@ -245,20 +239,97 @@ fn sps_of(au: &AccessUnit) -> Sps {
     parse_sps(sps)
 }
 
-fn decode_all(aus: &[AccessUnit]) -> Vec<(usize, usize)> {
-    use ::openh264::formats::YUVSource;
-    let mut dec = ::openh264::decoder::Decoder::new().unwrap();
-    let mut sizes = Vec::new();
-    for au in aus {
-        if let Some(pic) = dec.decode(&au.data).unwrap() {
-            sizes.push(pic.dimensions());
+/// True when there is no ffmpeg to decode with: the test then says why and passes, unless
+/// `STARFOLD_REQUIRE_FFMPEG=1`, which makes it fail.
+fn without_ffmpeg(test: &str) -> bool {
+    static FOUND: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let found = FOUND.get_or_init(|| {
+        match std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("`ffmpeg -version` exited with {}", o.status)),
+            Err(e) => Err(format!("no ffmpeg to run: {e}")),
         }
+    });
+    let Err(why) = found else {
+        return false;
+    };
+    assert!(
+        std::env::var_os("STARFOLD_REQUIRE_FFMPEG").is_none_or(|v| v != "1"),
+        "{test}: {why}, and STARFOLD_REQUIRE_FFMPEG=1"
+    );
+    eprintln!("skipping {test}: {why}");
+    true
+}
+
+/// What ffmpeg decodes from an Annex-B H.264 stream: the picture size, how many pictures came
+/// out, and the last one's luma.
+fn decode(stream: &[u8]) -> ((usize, usize), usize, Vec<u8>) {
+    use std::io::{BufRead, Read, Write};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-f", "h264", "-i", "-"])
+        .args(["-autoscale", "0", "-fps_mode", "passthrough"])
+        .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting ffmpeg");
+    let mut input = child.stdin.take().unwrap();
+    let data = stream.to_vec();
+    let writer = std::thread::spawn(move || input.write_all(&data));
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = Vec::new();
+    out.read_until(b'\n', &mut line).unwrap();
+    let header = String::from_utf8_lossy(&line).into_owned();
+    let dim = |tag: char| {
+        header
+            .split_ascii_whitespace()
+            .find_map(|f| f.strip_prefix(tag)?.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    let (w, h) = (dim('W'), dim('H'));
+    let (mut luma, mut chroma) = (vec![0; w * h], vec![0; 2 * w.div_ceil(2) * h.div_ceil(2)]);
+    let mut frames = 0;
+    loop {
+        line.clear();
+        if out.read_until(b'\n', &mut line).unwrap() == 0 {
+            break;
+        }
+        assert!(
+            line.starts_with(b"FRAME"),
+            "{header}: {}",
+            String::from_utf8_lossy(&line)
+        );
+        out.read_exact(&mut luma).unwrap();
+        out.read_exact(&mut chroma).unwrap();
+        frames += 1;
     }
-    sizes
+    let wrote = writer.join().unwrap();
+    let done = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&done.stderr);
+    assert!(
+        done.status.success() && err.is_empty() && wrote.is_ok(),
+        "ffmpeg {} ({wrote:?}): {err}",
+        done.status
+    );
+    ((w, h), frames, luma)
+}
+
+fn decode_all(aus: &[AccessUnit]) -> Vec<(usize, usize)> {
+    let stream: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
+    let (size, frames, _) = decode(&stream);
+    vec![size; frames]
 }
 
 #[test]
 fn idr_on_request_with_parameter_sets() {
+    if without_ffmpeg("idr_on_request_with_parameter_sets") {
+        return;
+    }
     for b in backends() {
         let mut enc = open(&config(b, 320, 240, 4000)).unwrap();
         let mut p = Picture::new(320, 240);
@@ -287,14 +358,12 @@ fn idr_on_request_with_parameter_sets() {
     }
 }
 
-#[cfg(feature = "openh264")]
+#[cfg(feature = "x264")]
 #[test]
-fn openh264_signals_constrained_baseline_and_srgb() {
-    let mut enc = open(&config(Backend::OpenH264, 640, 480, 4000)).unwrap();
+fn x264_signals_srgb_and_its_codec_string() {
+    let mut enc = open(&config(Backend::X264, 640, 480, 4000)).unwrap();
     let au = encode_one(&mut *enc, &Picture::new(640, 480), 0, false).remove(0);
     let sps = sps_of(&au);
-    assert_eq!(sps.profile, 66);
-    assert_eq!(sps.constraints & 0xc0, 0xc0, "constraint_set0 and 1");
     assert_eq!(sps.color, Some((false, 1, 13, 6)));
     let c = au.config.expect("stream config");
     let sps_nal = nal_units(&au.data)
@@ -307,12 +376,14 @@ fn openh264_signals_constrained_baseline_and_srgb() {
             sps_nal[1], sps_nal[2], sps_nal[3]
         )
     );
-    assert!(c.codec_string.starts_with("avc1.42"), "{}", c.codec_string);
     assert_eq!((c.coded, c.display), ((640, 480), (640, 480)));
 }
 
 #[test]
 fn odd_and_tiny_sizes_pad() {
+    if without_ffmpeg("odd_and_tiny_sizes_pad") {
+        return;
+    }
     for b in backends() {
         for (w, h) in [
             (641, 361),
@@ -370,41 +441,6 @@ fn rate_change_without_reopen() {
         let (high, low) = (mean(10..30), mean(45..60));
         assert!(low * 3 < high, "{b:?}: {high} -> {low} bytes per frame");
     }
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn oversized_picture_fails_cleanly() {
-    let e = open(&config(Backend::OpenH264, 8192, 4608, 20_000))
-        .err()
-        .expect("too large");
-    assert!(e.0.contains("--stripes"), "{e}");
-    assert!(Backend::OpenH264.fits(3840, 2160));
-    assert!(Backend::OpenH264.fits(4096, 2304));
-    assert!(!Backend::OpenH264.fits(4096, 2320));
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn largest_picture_encodes() {
-    for (w, h) in [(3840, 2160), (4096, 2304)] {
-        let mut enc = open(&config(Backend::OpenH264, w, h, 20_000)).unwrap();
-        let aus = encode_one(&mut *enc, &Picture::new(w as usize, h as usize), 0, false);
-        assert!(aus[0].keyframe, "{w}x{h}");
-        assert_eq!(decode_all(&aus), vec![(w as usize, h as usize)]);
-    }
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn threads_slice_the_picture() {
-    let mut cfg = config(Backend::OpenH264, 1280, 720, 8000);
-    cfg.threads = 4;
-    let mut enc = open(&cfg).unwrap();
-    let au = encode_one(&mut *enc, &Picture::new(1280, 720), 0, false).remove(0);
-    let slices = types(&au).iter().filter(|&&t| t == NAL_IDR).count();
-    assert_eq!(slices, 4);
-    assert_eq!(decode_all(&[au]), vec![(1280, 720)]);
 }
 
 #[test]
@@ -508,8 +544,8 @@ fn a_plane_past_a_c_int_is_refused() {
 }
 
 /// A plane with a stride wider than the picture that ends right after the last row's
-/// pixels is refused before any encoder sees it: OpenH264 and x264's C copy step their
-/// pointer a stride past every row, the last one too, which would point beyond its end.
+/// pixels is refused before any encoder sees it: x264's C copy steps its pointer a stride
+/// past every row, the last one too, which would point beyond its end.
 /// With every row's stride there, it encodes.
 #[test]
 fn a_padded_plane_must_hold_its_last_rows_stride() {
@@ -589,12 +625,9 @@ fn idr_missing_parameter_sets_gets_cached_ones() {
 
 #[test]
 fn unknown_encoder_names() {
-    #[cfg(feature = "openh264")]
-    assert_eq!(Backend::parse("openh264"), Ok(Backend::OpenH264));
-    #[cfg(not(feature = "openh264"))]
     assert!(Backend::parse("openh264")
         .unwrap_err()
-        .contains("--features openh264"));
+        .contains("no longer has OpenH264"));
     assert!(Backend::parse("x265").is_err());
     #[cfg(not(feature = "x264"))]
     assert!(Backend::parse("x264")
@@ -629,7 +662,7 @@ fn unknown_encoder_names() {
 
 #[test]
 fn backends_without_the_codec_refuse_to_open() {
-    let mut cfg = config(SOFTWARE_H264, 64, 64, 1000);
+    let mut cfg = config(SOFTWARE, 64, 64, 1000);
     cfg.codec = Codec::Hevc;
     assert!(open(&cfg).is_err());
     #[cfg(not(windows))]
@@ -876,13 +909,14 @@ fn videotoolbox_pads_small_and_odd_sizes() {
 /// Writes the default encoder's typing, scrolling and video streams to `$STREAM_DIR`
 /// for bench/webcodecs-decode.mjs: per access unit a big-endian u32 length, a keyframe
 /// byte and the Annex-B bytes.
+#[cfg(feature = "x264")]
 #[test]
 #[ignore]
 fn dump_streams() {
     let dir = std::path::PathBuf::from(std::env::var("STREAM_DIR").expect("STREAM_DIR"));
     let (w, h) = (1280usize, 720usize);
     for workload in ["typing", "scrolling", "video"] {
-        let mut cfg = config(SOFTWARE_H264, w as u32, h as u32, 30_000);
+        let mut cfg = config(SOFTWARE, w as u32, h as u32, 30_000);
         cfg.best_quality = cfg.rate.quality;
         let mut enc = open(&cfg).unwrap();
         let mut p = Picture::new(w, h);
@@ -907,14 +941,14 @@ fn dump_streams() {
 }
 
 /// CPU per stream at 1080p30 for typing, scrolling and video-like content:
-/// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND=openh264 with the
-/// openh264 feature; FRAMES, THREADS). One line per workload, `bench` first.
+/// `cargo test --release cpu_per_stream -- --ignored --nocapture` (BACKEND, CODEC, FRAMES,
+/// THREADS). One line per workload, `bench` first.
 #[cfg(unix)]
 #[test]
 #[ignore]
 fn cpu_per_stream() {
     let backend =
-        Backend::parse(&std::env::var("BACKEND").unwrap_or(SOFTWARE_H264.name().into())).unwrap();
+        Backend::parse(&std::env::var("BACKEND").unwrap_or(SOFTWARE.name().into())).unwrap();
     let env = |k: &str, d: usize| {
         std::env::var(k)
             .ok()
@@ -924,6 +958,9 @@ fn cpu_per_stream() {
     let (frames, threads) = (env("FRAMES", 300), env("THREADS", 1));
     let codec = match std::env::var("CODEC").as_deref() {
         Ok("hevc") => Codec::Hevc,
+        Ok("av1") => Codec::Av1,
+        Ok("h264") => Codec::H264,
+        _ if backend == SOFTWARE => SOFTWARE_CODEC,
         _ => Codec::H264,
     };
     let (w, h, fps) = (1920usize, 1080usize, 30u32);
@@ -1011,20 +1048,26 @@ fn luma_psnr(a: &[u8], stride: usize, p: &Picture) -> f64 {
     }
 }
 
-/// A stream decoded as it goes: scrolled text, then whatever the test does.
+/// A stream of scrolled text, then whatever the test does, decoded when a test asks how sharp
+/// it is.
+#[cfg(feature = "x264")]
 struct Refining {
     enc: Box<dyn VideoEncoder>,
-    dec: ::openh264::decoder::Decoder,
     pic: Picture,
     pts: i64,
     scrolled: usize,
-    last_psnr: f64,
     /// What each frame tells the encoder didn't change (x264 marks up its copy).
     map: Option<Vec<u8>>,
     /// Every byte the encoder sent, in order.
     stream: Vec<u8>,
+    /// How many pictures the stream holds, and the last one sent.
+    frames: usize,
+    shown: Picture,
+    /// The PSNR [`Refining::psnr`] found, and at how many pictures.
+    decoded: Option<(usize, f64)>,
 }
 
+#[cfg(feature = "x264")]
 impl Refining {
     fn config(backend: Backend, threads: u32, fps: u32) -> EncoderConfig {
         let mut cfg = config(backend, 640, 480, 8000);
@@ -1032,11 +1075,6 @@ impl Refining {
         cfg.fps = fps;
         cfg.best_quality = 24.0;
         cfg
-    }
-
-    #[cfg(feature = "openh264")]
-    fn new(threads: u32, fps: u32) -> Self {
-        Self::on(Backend::OpenH264, threads, fps)
     }
 
     fn on(backend: Backend, threads: u32, fps: u32) -> Self {
@@ -1050,13 +1088,14 @@ impl Refining {
     fn sized(enc: Box<dyn VideoEncoder>, w: usize, h: usize) -> Self {
         let mut me = Refining {
             enc,
-            dec: ::openh264::decoder::Decoder::new().unwrap(),
             pic: Picture::new(w, h),
             pts: 0,
             scrolled: 0,
-            last_psnr: 0.0,
             map: None,
             stream: Vec::new(),
+            frames: 0,
+            shown: Picture::new(w, h),
+            decoded: None,
         };
         me.step(true, None);
         me
@@ -1064,7 +1103,6 @@ impl Refining {
 
     /// Bytes and whether it was a keyframe; a frame that doesn't come out is 0 bytes.
     fn step(&mut self, force_keyframe: bool, refine: Option<Refine>) -> (usize, bool) {
-        use ::openh264::formats::YUVSource;
         self.pts += 33;
         let mut map = self.map.clone();
         let aus = self
@@ -1084,11 +1122,25 @@ impl Refining {
             n += au.data.len();
             key |= au.keyframe;
             self.stream.extend_from_slice(&au.data);
-            if let Some(d) = self.dec.decode(&au.data).unwrap() {
-                self.last_psnr = luma_psnr(d.y(), d.strides().0, &self.pic);
-            }
+            self.frames += 1;
+            self.shown.clone_from(&self.pic);
         }
         (n, key)
+    }
+
+    /// The luma PSNR of the last picture the stream holds, decoded from the whole stream.
+    fn psnr(&mut self) -> f64 {
+        if let Some((frames, psnr)) = self.decoded {
+            if frames == self.frames {
+                return psnr;
+            }
+        }
+        let (size, frames, luma) = decode(&self.stream);
+        assert_eq!(frames, self.frames, "pictures decoded");
+        assert_eq!(size, (self.pic.w, self.pic.h));
+        let psnr = luma_psnr(&luma, size.0, &self.shown);
+        self.decoded = Some((self.frames, psnr));
+        psnr
     }
 
     fn scroll(&mut self, frames: usize) -> usize {
@@ -1109,189 +1161,6 @@ impl Refining {
     }
 }
 
-/// An odd size opens OpenH264 padded; the refinement worker must still hear when a pass
-/// would sharpen, down to the finest rung.
-#[cfg(feature = "openh264")]
-#[test]
-fn a_padded_encoder_refines_to_the_last_rung() {
-    for (w, h) in [(1920u32, 1080u32), (1921, 1080)] {
-        let mut enc = open(&EncoderConfig {
-            best_quality: 24.0,
-            ..config(Backend::OpenH264, w, h, 8000)
-        })
-        .unwrap();
-        let mut p = Picture::new(w as usize, h as usize);
-        encode_one(&mut *enc, &p, 0, true);
-        for f in 1..30i64 {
-            p.texture(0, 0, 0, w as usize, h as usize, f as usize * 12);
-            encode_one(&mut *enc, &p, f * 33, false);
-        }
-        let mut pts = 30 * 33;
-        let rungs: Vec<u8> = [20u8, 16, 12]
-            .into_iter()
-            .take_while(|&qp| {
-                let r = Refine {
-                    qp,
-                    max_bytes: None,
-                };
-                if !enc.refinable(r) {
-                    return false;
-                }
-                pts += 33;
-                let opts = EncodeOptions {
-                    pts_ms: pts,
-                    force_keyframe: false,
-                    static_mbs: None,
-                    refine: Some(r),
-                };
-                !enc.encode(&p.view(), opts).unwrap().is_empty()
-            })
-            .collect();
-        assert_eq!(rungs, [20, 16, 12], "{w}x{h}");
-    }
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn refining_sharpens_without_an_idr_at_any_thread_count_or_rate() {
-    for (threads, fps) in [(1, 30), (4, 30), (1, 120), (4, 120)] {
-        let mut s = Refining::new(threads, fps);
-        s.scroll(30);
-        let motion = s.last_psnr;
-        s.enc.set_rate(RateConfig::new(24.0, 3000, fps)).unwrap();
-        let mut prev = motion;
-        for qp in [20, 16, 12] {
-            let (n, key) = s.pass(qp, None);
-            assert!(
-                n > 0 && !key,
-                "t{threads} f{fps} qp {qp}: {n} bytes, key {key}"
-            );
-            assert!(
-                s.last_psnr > prev,
-                "t{threads} f{fps} qp {qp}: {} after {prev}",
-                s.last_psnr
-            );
-            prev = s.last_psnr;
-        }
-        assert!(prev > motion + 3.0, "t{threads} f{fps}: {motion} -> {prev}");
-        s.scroll(5);
-    }
-}
-
-/// The keyframe budget and a stripe's share both go past what the encoder opened with.
-#[cfg(feature = "openh264")]
-#[test]
-fn refining_works_above_the_rate_the_encoder_opened_with() {
-    let mut s = Refining::new(1, 30);
-    s.enc.set_rate(RateConfig::new(24.0, 64_000, 30)).unwrap();
-    assert!(s.step(true, None).1);
-    let (n, key) = s.pass(20, None);
-    assert!(
-        n > 0 && !key,
-        "right after the boosted keyframe: {n} bytes, key {key}"
-    );
-    s.enc.set_rate(RateConfig::new(24.0, 40_000, 30)).unwrap();
-    s.scroll(5);
-    let (n, key) = s.pass(16, None);
-    assert!(n > 0 && !key, "at a raised cap: {n} bytes, key {key}");
-    s.enc.set_rate(RateConfig::new(24.0, 2_000, 30)).unwrap();
-    s.scroll(5);
-    let (n, key) = s.pass(12, None);
-    assert!(n > 0 && !key, "at a lowered cap: {n} bytes, key {key}");
-}
-
-/// The library really refuses the switch: nothing goes out, nothing fails, motion carries
-/// on under rate control exactly as if no pass had been asked for, and no later pass tries.
-#[cfg(feature = "openh264")]
-#[test]
-fn a_refused_switch_costs_nothing() {
-    let mut enc = openh264::OpenH264::new(&Refining::config(Backend::OpenH264, 1, 30)).unwrap();
-    enc.break_switch = true;
-    let mut broken = Refining::with(Box::new(enc));
-    let mut plain = Refining::new(1, 30);
-    assert_eq!(broken.scroll(10), plain.scroll(10));
-    let before = broken.last_psnr;
-    for qp in [20, 16, 12, 20, 16, 12] {
-        assert_eq!(broken.pass(qp, None), (0, false));
-    }
-    assert_eq!(broken.last_psnr, before);
-    assert_eq!(
-        broken.scroll(10),
-        plain.scroll(10),
-        "rate control untouched"
-    );
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn refining_leaves_rate_control_where_it_was() {
-    let mut plain = Refining::new(1, 30);
-    let mut refined = Refining::new(1, 30);
-    plain.scroll(30);
-    refined.scroll(30);
-    for _ in 0..3 {
-        plain.step(false, None);
-    }
-    for qp in [20, 16, 12] {
-        refined.pass(qp, None);
-    }
-    // The sharper reference costs a little for a moment; what matters is where it settles.
-    plain.scroll(10);
-    refined.scroll(10);
-    let (a, b) = (plain.scroll(110) as f64, refined.scroll(110) as f64);
-    assert!((b / a - 1.0).abs() < 0.03, "motion after: {a} vs {b} bytes");
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn a_refining_pass_with_nothing_to_gain_sends_nothing() {
-    let mut s = Refining::new(1, 30);
-    s.scroll(5);
-    assert!(s.pass(12, None).0 > 0);
-    let before = s.last_psnr;
-    assert_eq!(s.pass(16, None).0, 0);
-    assert_eq!(s.pass(12, None).0, 0);
-    assert_eq!(s.last_psnr, before);
-}
-
-#[cfg(feature = "openh264")]
-#[test]
-fn a_keyframe_stays_under_rate_control() {
-    let mut s = Refining::new(1, 30);
-    s.scroll(5);
-    let refine = Refine {
-        qp: 12,
-        max_bytes: None,
-    };
-    let (plain, key) = s.step(true, None);
-    assert!(key);
-    let (with, key) = s.step(true, Some(refine));
-    assert!(key);
-    assert!(with < plain * 2, "IDR at the pass's QP: {with} vs {plain}");
-}
-
-/// A reopened encoder's next picture is an IDR even though nobody asked for one.
-#[cfg(feature = "openh264")]
-#[test]
-fn a_new_encoders_first_frame_stays_under_rate_control() {
-    let p = Picture::new(640, 480);
-    let first = |refine| {
-        let mut enc = open(&Refining::config(Backend::OpenH264, 1, 30)).unwrap();
-        let opts = EncodeOptions {
-            refine,
-            ..Default::default()
-        };
-        let aus = enc.encode(&p.view(), opts).unwrap();
-        assert!(aus[0].keyframe);
-        aus[0].data.len()
-    };
-    let refine = Refine {
-        qp: 12,
-        max_bytes: None,
-    };
-    assert_eq!(first(Some(refine)), first(None));
-}
-
 /// x264 under VBV, as it streams, at one thread and sliced, each with and without a byte
 /// budget: every pass sends bytes and no IDR. At one thread no pass leaves the picture worse,
 /// a budget holds within twice itself, and the ladder ends far sharper than motion left it and
@@ -1304,11 +1173,14 @@ fn a_new_encoders_first_frame_stays_under_rate_control() {
 #[cfg(feature = "x264")]
 #[test]
 fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
+    if without_ffmpeg("x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget") {
+        return;
+    }
     for (threads, max_bytes) in [(1, None), (1, Some(60_000)), (4, None), (4, Some(60_000))] {
         let mut s = Refining::on(Backend::X264, threads, 30);
         s.enc.set_rate(RateConfig::new(24.0, 3000, 30)).unwrap();
         s.scroll(30);
-        let motion = s.last_psnr;
+        let motion = s.psnr();
         let mut prev = motion;
         for qp in [20, 16, 12] {
             let (n, key) = s.pass(qp, max_bytes);
@@ -1316,9 +1188,9 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
             assert!(n > 0 && !key, "{at}: {n} bytes, key {key}");
             if threads == 1 {
                 assert!(max_bytes.is_none_or(|m| n <= m * 2), "{at}: {n} bytes");
-                assert!(s.last_psnr >= prev, "{at}: {} after {prev}", s.last_psnr);
+                assert!(s.psnr() >= prev, "{at}: {} after {prev}", s.psnr());
             }
-            prev = s.last_psnr;
+            prev = s.psnr();
         }
         if threads == 1 {
             assert!(prev > motion + 3.0, "t1 {max_bytes:?}: {motion} -> {prev}");
@@ -1339,18 +1211,21 @@ fn x264_refining_sharpens_without_an_idr_at_any_thread_count_or_budget() {
 #[cfg(feature = "x264")]
 #[test]
 fn x264_sliced_refining_without_vbv_sharpens_every_rung_the_same_every_run() {
+    if without_ffmpeg("x264_sliced_refining_without_vbv_sharpens_every_rung_the_same_every_run") {
+        return;
+    }
     let run = || {
         let mut cfg = Refining::config(Backend::X264, 4, 30);
         cfg.rate = RateConfig::new(24.0, 0, 30);
         let mut s = Refining::with(open(&cfg).unwrap());
         s.scroll(30);
-        let motion = s.last_psnr;
+        let motion = s.psnr();
         let mut prev = motion;
         for qp in [20, 16, 12] {
             let (n, key) = s.pass(qp, None);
             assert!(n > 0 && !key, "qp {qp}: {n} bytes, key {key}");
-            assert!(s.last_psnr > prev, "qp {qp}: {} after {prev}", s.last_psnr);
-            prev = s.last_psnr;
+            assert!(s.psnr() > prev, "qp {qp}: {} after {prev}", s.psnr());
+            prev = s.psnr();
         }
         assert!(prev > motion + 3.0, "{motion} -> {prev}");
         assert!(!s.enc.refinable(Refine {
@@ -1380,6 +1255,9 @@ fn x264_sliced_refining_without_vbv_sharpens_every_rung_the_same_every_run() {
 #[cfg(feature = "x264")]
 #[test]
 fn x264_converges_under_a_tight_vbv() {
+    if without_ffmpeg("x264_converges_under_a_tight_vbv") {
+        return;
+    }
     let (w, h): (usize, usize) = (1920, 1080);
     let cols = w / 16;
     let band = 20..48;
@@ -1408,7 +1286,7 @@ fn x264_converges_under_a_tight_vbv() {
                 s.step(false, Some(tail));
                 tails += 1;
             }
-            (s.last_psnr, tails)
+            (s.psnr(), tails)
         };
         s.scroll(30);
         let whole = settle(&mut s);
@@ -1549,9 +1427,12 @@ fn x264_with_adaptive_quantisation_takes_no_tails() {
 #[cfg(feature = "x264")]
 #[test]
 fn x264_a_cavlc_pass_below_12_runs_but_never_settles() {
+    if without_ffmpeg("x264_a_cavlc_pass_below_12_runs_but_never_settles") {
+        return;
+    }
     let mut s = Refining::on(Backend::X264, 1, 30);
     s.scroll(5);
-    let motion = s.last_psnr;
+    let motion = s.psnr();
     let below = Refine {
         qp: 8,
         max_bytes: None,
@@ -1561,7 +1442,7 @@ fn x264_a_cavlc_pass_below_12_runs_but_never_settles() {
         assert!(n > 0 && !key, "pass {i}: {n} bytes");
         assert!(s.enc.refinable(below), "pass {i} counted as settled");
     }
-    assert!(s.last_psnr > motion + 3.0, "{motion} -> {}", s.last_psnr);
+    assert!(s.psnr() > motion + 3.0, "{motion} -> {}", s.psnr());
     assert!(s.pass(12, None).0 > 0);
     assert!(!s.enc.refinable(Refine {
         qp: 12,
@@ -1590,28 +1471,34 @@ fn x264_motion_still_gets_a_pass_at_51() {
 #[cfg(feature = "x264")]
 #[test]
 fn x264_a_pass_that_cannot_fit_sends_nothing() {
+    if without_ffmpeg("x264_a_pass_that_cannot_fit_sends_nothing") {
+        return;
+    }
     let mut s = Refining::on(Backend::X264, 1, 30);
     s.scroll(5);
-    let before = s.last_psnr;
+    let before = s.psnr();
     assert!(!s.enc.refinable(Refine {
         qp: 20,
         max_bytes: Some(100)
     }));
     assert_eq!(s.pass(20, Some(100)), (0, false));
-    assert_eq!(s.last_psnr, before);
+    assert_eq!(s.psnr(), before);
     assert!(s.pass(20, None).0 > 0);
 }
 
 #[cfg(feature = "x264")]
 #[test]
 fn x264_a_refining_pass_with_nothing_to_gain_sends_nothing() {
+    if without_ffmpeg("x264_a_refining_pass_with_nothing_to_gain_sends_nothing") {
+        return;
+    }
     let mut s = Refining::on(Backend::X264, 1, 30);
     s.scroll(5);
     assert!(s.pass(12, None).0 > 0);
-    let before = s.last_psnr;
+    let before = s.psnr();
     assert_eq!(s.pass(16, None).0, 0);
     assert_eq!(s.pass(12, None).0, 0);
-    assert_eq!(s.last_psnr, before);
+    assert_eq!(s.psnr(), before);
     s.scroll(1);
     assert!(s.pass(12, None).0 > 0, "motion makes room again");
 }
@@ -1757,144 +1644,4 @@ fn the_estimate_counts_every_block_still_coarse() {
     assert_eq!(s.qp.iter().filter(|&&q| q == 24).count(), 1000);
     s.refined(12, 0);
     assert_eq!(s.pick(budget(1_000_000)), None, "nothing left to sharpen");
-}
-
-/// Thousands of rate-control switches against the same motion without them, in a long mix
-/// of scrolling, typing and video: `SOAK_FRAMES` frames at each cap, decoded throughout.
-#[cfg(feature = "openh264")]
-#[test]
-#[ignore]
-fn refine_soak() {
-    let frames: usize = std::env::var("SOAK_FRAMES").map_or(60_000, |v| v.parse().unwrap());
-    const SEGMENT: usize = 24;
-    let window = frames / 4 / SEGMENT * SEGMENT;
-    for kbps in [8000, 2000] {
-        let run = |ladder: bool| {
-            let mut s = Refining::new(1, 30);
-            s.enc.set_rate(RateConfig::new(24.0, kbps, 30)).unwrap();
-            let (w, h) = (s.pic.w, s.pic.h);
-            let (mut bytes, mut passes, mut pass_bytes) = (vec![0usize; 4], 0usize, 0usize);
-            for f in 0..window * 4 {
-                match (f / SEGMENT) % 4 {
-                    0 | 3 => {
-                        s.scrolled += 12;
-                        s.pic.texture(0, 0, 0, w, h, s.scrolled);
-                    }
-                    1 => s.pic.texture(f as u32, 40, 40, 200, 56, 0),
-                    _ => s.pic.video(f),
-                }
-                let (n, key) = s.step(false, None);
-                assert!(!key, "motion got an IDR at {f}");
-                bytes[f / window] += n;
-                if ladder && f % SEGMENT == SEGMENT - 1 {
-                    for qp in [20, 16, 12] {
-                        let max = Some(kbps as usize * 200 / 8);
-                        let (n, key) = s.pass(qp, max);
-                        assert!(!key, "a pass got an IDR at {f}");
-                        passes += (n > 0) as usize;
-                        pass_bytes += n;
-                    }
-                }
-            }
-            (bytes, passes, pass_bytes)
-        };
-        let (base, _, _) = run(false);
-        let (with, passes, pass_bytes) = run(true);
-        let per_s = |b: usize| b as f64 * 8.0 / 1000.0 / (window as f64 / 30.0);
-        for q in 0..4 {
-            let ratio = with[q] as f64 / base[q] as f64;
-            println!(
-                "soak {kbps} kbps quarter {q}: motion {:.0} kbps, with switches {:.0} kbps, ratio {ratio:.3}",
-                per_s(base[q]),
-                per_s(with[q])
-            );
-            assert!(per_s(with[q]) < kbps as f64 * 1.1, "over the cap");
-        }
-        println!(
-            "soak {kbps} kbps: {passes} fixed-QP frames, {} KB",
-            pass_bytes / 1024
-        );
-        let r: Vec<f64> = (0..4).map(|q| with[q] as f64 / base[q] as f64).collect();
-        assert!(passes >= 1000);
-        assert!(
-            r.iter().all(|x| (x - 1.0).abs() < 0.06),
-            "motion bytes off baseline: {r:?}"
-        );
-    }
-}
-
-/// A stream opened for more frames a second than OpenH264 budgets over, once told frames come
-/// at 30, gives each the bytes a stream opened at 30 does.
-#[cfg(feature = "openh264")]
-#[test]
-fn a_stream_opened_past_the_frame_cap_budgets_like_one_opened_at_its_new_rate() {
-    let (w, h) = (640usize, 480usize);
-    let mut fast = config(Backend::OpenH264, w as u32, h as u32, 2000);
-    fast.fps = 120;
-    fast.rate = RateConfig::new(24.0, 2000, 120);
-    let mut fast = open(&fast).unwrap();
-    fast.set_rate(RateConfig::new(24.0, 2000, 30)).unwrap();
-    let mut at30 = open(&config(Backend::OpenH264, w as u32, h as u32, 2000)).unwrap();
-    let mut p = Picture::new(w, h);
-    let mut per_frame = |enc: &mut Box<dyn VideoEncoder>| {
-        let bytes: Vec<usize> = (0..45)
-            .map(|f| {
-                p.video(f);
-                let opts = EncodeOptions {
-                    pts_ms: (f * 1000 / 30) as i64,
-                    force_keyframe: false,
-                    static_mbs: None,
-                    refine: None,
-                };
-                let aus = enc.encode(&p.view(), opts).unwrap();
-                aus.iter().map(|a| a.data.len()).sum::<usize>()
-            })
-            .collect();
-        bytes[15..].iter().sum::<usize>() / 30
-    };
-    let (slowed, opened) = (per_frame(&mut fast), per_frame(&mut at30));
-    assert!(
-        slowed * 10 >= opened * 8,
-        "{slowed} bytes a frame slowed to 30 fps, {opened} opened at 30"
-    );
-}
-
-/// Told frames now come at a third of the rate, rate control gives each about three times the
-/// bytes, and the stream carries on without an IDR.
-#[cfg(feature = "openh264")]
-#[test]
-fn a_lower_frame_rate_budgets_more_per_frame_without_an_idr() {
-    let (w, h) = (640usize, 480usize);
-    let mut enc = open(&config(Backend::OpenH264, w as u32, h as u32, 2000)).unwrap();
-    let mut p = Picture::new(w, h);
-    let mut run = |enc: &mut Box<dyn VideoEncoder>, from: usize, frames: usize, step: usize| {
-        let (mut bytes, mut keys) = (Vec::new(), 0);
-        for i in 0..frames {
-            let f = from + i * step;
-            p.video(f);
-            let aus = enc
-                .encode(
-                    &p.view(),
-                    EncodeOptions {
-                        pts_ms: (f * 1000 / 30) as i64,
-                        force_keyframe: false,
-                        static_mbs: None,
-                        refine: None,
-                    },
-                )
-                .unwrap();
-            keys += aus.iter().filter(|a| a.keyframe).count();
-            bytes.push(aus.iter().map(|a| a.data.len()).sum::<usize>());
-        }
-        let tail = &bytes[frames / 3..];
-        (tail.iter().sum::<usize>() / tail.len(), keys)
-    };
-    let (at30, _) = run(&mut enc, 0, 45, 1);
-    enc.set_rate(RateConfig::new(24.0, 2000, 10)).unwrap();
-    let (at10, keys) = run(&mut enc, 45, 45, 3);
-    assert_eq!(keys, 0, "no IDR for a rate change");
-    assert!(
-        at10 >= at30 * 2,
-        "{at30} bytes a frame at 30 fps, {at10} at 10"
-    );
 }
