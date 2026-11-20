@@ -35,8 +35,9 @@
 
 ## What each release binary carries
 
-Each release has exactly two flavours of the binary for each platform. The archive's `licenses/`
-holds every text named here.
+Each release has exactly two flavours of the binary for each platform. The archive's root holds
+the binary, `LICENSE` (starfold's MIT licence), this file and `README.md`, and in an x264 archive
+`COPYING` and `X264-SOURCE.txt`; `licenses/` holds every other text named here.
 
 - **Default** (`starfold-<version>-<platform>`), distributed under MIT: starfold (MIT); libaom
   (BSD-2-Clause and the Alliance for Open Media Patent License 1.0) with fastfeat (BSD-3-Clause),
@@ -46,8 +47,10 @@ holds every text named here.
   it offers) and the Rust standard library (`licenses/rust-std/`). By platform: on Linux, glibc's
   startup files (LGPL-2.1-or-later, with permission to link them into any program) and GCC's
   (GPL-3.0-or-later with the GCC Runtime Library Exception); on macOS, Opus (BSD-3-Clause); on
-  Windows, Opus and libyuv (both BSD-3-Clause), the MinGW-w64 runtime and GCC's runtime
-  libraries (GPL-3.0-or-later with the GCC Runtime Library Exception), and what is transcribed from
+  Windows, Opus and libyuv (both BSD-3-Clause), the MinGW-w64 runtime (ZPL-2.1, with parts under
+  MIT-style licences and in the public domain; `licenses/MinGW-w64-copyright.txt`), GCC's runtime
+  libraries (GPL-3.0-or-later with the GCC Runtime Library Exception;
+  `licenses/GCC-runtime-copyright.txt`), and what is transcribed from
   the Intel libvpl API headers (MIT). On Linux, libyuv, Opus and
   PulseAudio's client library are the system's shared libraries and are not part of the binary.
 - **x264** (`starfold-x264-<version>-<platform>`), distributed under GPL-2.0-or-later as a combined

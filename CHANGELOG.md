@@ -68,7 +68,6 @@ distributed under MIT and a GPL-2.0-or-later build with x264; see [Install](READ
 - An encoder that holds its bitrate cap gets exactly its share of the area (#65)
 - A viewer that connects during a resize ends on the newest hello (#67)
 - Hellos no longer offer a backend that is off (#66)
-- OpenH264's forced intra frame gets the layer id it expects (#73)
 - A paint-over doubles the bitrate cap only on an encoder that doesn't hold it (#70)
 - The embeddable client signals when there is no common codec, ends the session on a worker error and keeps the host page's focus (#81)
 - A paste in the embeddable client that a blur drops sends nothing; unmounting after a worker error still reports a close (#83)
