@@ -172,7 +172,9 @@ jobs:
         env:
           STARFOLD_REQUIRE_FFMPEG: '1'
           STARFOLD_TEST_SYSTEM_FUSE: '1'
-        run: cargo test --features x264 --locked
+        run: |
+          cargo test --features x264 --locked
+          cargo test -p starfold-server --locked --no-default-features --features x264
 
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)

@@ -4,8 +4,8 @@
 # Usage: mac-encoders.sh <rounds>. Also says whether this host can capture its screen for a browser run.
 set -euo pipefail
 rounds=${1:-5}
-bin=$(cargo test --release --locked --lib --no-run --color never 2>&1 | tee /dev/stderr | grep -oE 'target/release/deps/starfold-[0-9a-f]+' | head -1)
-arms=("videotoolbox h264" "videotoolbox hevc" "x264 h264")
+bin=$(cargo test --release --locked --lib --features x264 --no-run --color never 2>&1 | tee /dev/stderr | grep -oE 'target/release/deps/starfold-[0-9a-f]+' | head -1)
+arms=("videotoolbox h264" "videotoolbox hevc" "x264 h264" "libaom av1")
 for ((i = 0; i < rounds; i++)); do
 	for ((k = 0; k < ${#arms[@]}; k++)); do
 		read -r backend codec <<< "${arms[$(((k + i) % ${#arms[@]}))]}"
@@ -13,7 +13,7 @@ for ((i = 0; i < rounds; i++)); do
 	done
 done
 sysctl -n machdep.cpu.brand_string hw.ncpu
-cargo build --release --locked --color never 2>&1 | tail -1
+cargo build --release --locked --features x264 --color never 2>&1 | tail -1
 log=$(mktemp)
 RUST_LOG=info target/release/starfold --addr=127.0.0.1 --port=6961 --enable-basic-auth=false --audio-enabled=false --encoder=auto > "$log" 2>&1 &
 pid=$!

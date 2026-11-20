@@ -41,9 +41,10 @@ Each [release](https://github.com/kyora-sh/starfold/releases) attaches two build
   `licenses/` of the archives they apply to: GCC's in the Linux and Windows ones, glibc's in the
   Linux ones.
 - **x264** (`starfold-x264-<version>-<platform>`): adds x264, so where the host has no hardware
-  H.264 encoder the stream is H.264 from x264, which protocol 1 viewers and browsers without AV1
-  decode too. GPL-2.0-or-later as a combined work with x264, whose source the release attaches
-  beside it.
+  H.264 encoder the base stream (recordings, protocol 1 viewers, browsers without AV1) is H.264
+  from x264, while browsers that decode AV1 still get AV1 from libaom; with `--encoder x264` every
+  viewer gets x264. GPL-2.0-or-later as a combined work with x264, whose source the release
+  attaches beside it.
 
 | Platform              | Default (MIT)                             | x264 (GPL-2.0-or-later)                        |
 | --------------------- | ----------------------------------------- | ---------------------------------------------- |
@@ -220,7 +221,7 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 | `--encoder-probe`                                              | `true`                                                                | probe the hardware encoders at startup (`/stats` lists what was found)                                                                                                                                    |
 | `--experimental-hw-probes`                                     | `false`                                                               | also probe VA-API, NVENC, Media Foundation and Quick Sync, each in a child process; needed to name one with `--encoder`, which `auto` never picks                                                         |
 | `--preset`                                                     | `ultrafast`                                                           | the preset or speed of the encoder `--encoder` names (under `auto`, of the software base one); others keep their default; `--help` lists what each built-in encoder takes                                 |
-| `--encoder-threads`                                            | `ncpu/4`, from 1 to 4; libaom: 4 or 8                                 | sliced encoder threads; libaom takes 4 up to 1080p and 8 above, never more than the CPUs or fewer than 2 (see [Encoder threads](#encoder-threads))                                                        |
+| `--encoder-threads`                                            | `ncpu/4`, from 1 to 4; libaom: 4 or 8                                 | sliced encoder threads; libaom takes 4 up to 1080p and 8 above, at most the CPUs but never under 2 (see [Encoder threads](#encoder-threads))                                                              |
 | `--crf`                                                        | `24`                                                                  | x264's base quality; libaom's and most bench arms' lowest quantizer or QP; a hardware encoder's constant QP when it runs one (`--max-kbps 0`, or as VA-API's driver allows)                               |
 | `--max-kbps` / `--video-bitrate`                               | `30000`                                                               | adaptive bitrate ceiling                                                                                                                                                                                  |
 | `--min-kbps`                                                   | `2000`                                                                | adaptive bitrate floor                                                                                                                                                                                    |
@@ -250,8 +251,9 @@ starfold reads it or not. On a host with several users, don't start Xvfb with `-
 ### Encoder threads
 
 Unless `--encoder-threads` is given, libaom picks its own thread count from the picture size and
-the host's CPUs: 4 for a picture up to 1080p, 8 above it (1440p, 4K), never more than the CPUs and
-never fewer than 2; two libaom encoders running at once share the CPUs, each with at least 2.
+the host's CPUs: 4 for a picture up to 1080p, 8 above it (1440p, 4K), at most the CPUs, but never
+under 2 per encoder (so 2 on a 1-CPU host); two libaom encoders running at once share the CPUs,
+each with at least 2, so together they can take more threads than there are CPUs.
 4K at 30 fps with libaom needs 8 or more CPUs. On fewer, the server sends fewer frames: it never
 queues captures behind a slow encode (one running, at most one waiting), skips the rest and
 carries what changed in them into the next frame. Other software encoders take `ncpu/4` threads,
@@ -681,16 +683,20 @@ localhost:
 | Firefox for Android                                                    | No    |
 
 Where the stream is AV1 (the default build on a host without hardware H.264), the viewer needs a
-protocol 2 client, such as starfold's own web page, in a browser whose WebCodecs decodes AV1:
-current Chrome, Edge and Firefox do; Safari, and any browser on iPhone or iPad, only on a device
-whose hardware decodes AV1. For the others, use the x264 build or a host with hardware H.264.
+protocol 2 client, such as starfold's own web page. Its WebCodecs decodes AV1 in current Chrome,
+Edge and Firefox, and in Safari, or any browser on iPhone or iPad, on a device whose hardware
+decodes AV1. Where WebCodecs can't, the page decodes AV1 with dav1d compiled to WebAssembly, on
+the CPU: on 4 vCPUs it holds 30 fps up to 1600x900 in Chromium and about 26 fps at 1080p (29 in
+Firefox, 30 in WebKit). For less load on the viewer, use the x264 build or a host with hardware
+H.264.
 
 Phones and tablets get touch input and an on-screen keyboard.
 
 **Wayland?** Not yet; on Linux starfold streams X11 displays, Xvfb included.
 
 **Does it use the GPU?** On Linux, not by default: the stream is encoded on the CPU, AV1 with
-libaom (H.264 with x264 in a build with x264).
+libaom (in a build with x264, the base stream is H.264 with x264 and browsers that decode AV1 get
+AV1 with libaom).
 `--encoder auto` uses a hardware encoder that isn't experimental where it finds one (VideoToolbox on
 macOS). The VA-API, NVENC, Media Foundation and Intel Quick Sync (oneVPL, 64-bit Windows) encoders are
 experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`,

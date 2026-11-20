@@ -7,8 +7,8 @@
 // decoders from the server's `codec` message of each epoch. An older server gets
 // protocol 1: H.264, configured from each keyframe's SPS.
 //
-// Decoders are WebCodecs, or dav1d-wasm for AV1 on browsers without any hardware
-// WebCodecs decoder; dav1d.js and dav1d.wasm are fetched only when that is needed.
+// Decoders are WebCodecs, or dav1d-wasm for AV1 when WebCodecs decodes no offer (Safari
+// and iOS without AV1 hardware, for one); dav1d.js and dav1d.wasm are fetched only then.
 import { FrameQueue, Percentiles } from './assembly';
 import type { Part } from './assembly';
 import { avcCodec, familyOf, keyframeCodec } from './codecs';

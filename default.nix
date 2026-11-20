@@ -26,6 +26,11 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ./Cargo.lock;
 
+  # The x264 flavour: libaom's build checks its source against the pinned submodule's
+  # git metadata, which a Nix source does not carry.
+  buildNoDefaultFeatures = true;
+  buildFeatures = ["x264"];
+
   nativeBuildInputs = [
     pkg-config
     rustPlatform.bindgenHook
@@ -49,9 +54,9 @@ rustPlatform.buildRustPackage {
   ];
 
   meta = {
-    description = "Low-latency X11 desktop streaming server (H.264 over WebSocket) for the Computer preview";
+    description = "Low-latency X11 desktop streaming server (H.264 from x264 over WebSocket) for the Computer preview";
     # MIT source; the binary links x264, so it is GPL-2.0-or-later as a combined work.
-    license = with lib.licenses; [mit gpl2Plus];
+    license = lib.licenses.gpl2Plus;
     mainProgram = "starfold";
     platforms = ["x86_64-linux"];
   };

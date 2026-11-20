@@ -107,6 +107,62 @@ describe('probe', () => {
 		]);
 	});
 
+	test('an AV1 offer WebCodecs decodes at one stripe size only goes whole to dav1d-wasm', async () => {
+		const mixed: VideoOffer = {
+			...AV1,
+			stripes: [
+				AV1.stripes[0],
+				{
+					i: 1,
+					y: 1080,
+					h: 360,
+					config: { codec: 'av01.0.04M.08', codedWidth: 640, codedHeight: 360 },
+				},
+			],
+		};
+		const e: ProbeEnv = {
+			supported: async (c) =>
+				c.hardwareAcceleration === 'prefer-hardware' && c.codedWidth === 640,
+			dav1d: async () => true,
+			dav1dDecodes,
+		};
+		const r = await probe([mixed], e);
+		expect(r.decode.map((d) => [d.codec, d.implementation])).toEqual([
+			['av01.0.04M.08', 'webcodecs'],
+			['av01.0.08M.08', 'dav1d-wasm'],
+			['av01.0.04M.08', 'dav1d-wasm'],
+		]);
+		expect(r.accepted.get('av01.0.04M.08/640x360')?.implementation).toBe(
+			'dav1d-wasm'
+		);
+		expect(r.accepted.get('av01.0.08M.08/1920x1080')?.implementation).toBe(
+			'dav1d-wasm'
+		);
+	});
+
+	test('an AV1 offer with a stripe dav1d-wasm cannot decode is not advertised to it', async () => {
+		const ten: VideoOffer = {
+			...AV1,
+			stripes: [
+				AV1.stripes[0],
+				{
+					i: 1,
+					y: 1080,
+					h: 1080,
+					config: {
+						codec: 'av01.0.08M.10',
+						codedWidth: 1920,
+						codedHeight: 1080,
+					},
+				},
+			],
+		};
+		const { e, loads } = env([], []);
+		const r = await probe([ten], e);
+		expect(r.decode).toEqual([]);
+		expect(loads()).toBe(0);
+	});
+
 	test('WebCodecs AV1 at one size rules dav1d-wasm out at another', async () => {
 		const small = offer('av1', 'av01.0.04M.08', 640, 360);
 		const e: ProbeEnv = {
