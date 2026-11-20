@@ -61,9 +61,9 @@ pub enum Phase {
 pub struct Route {
     pub proto: Proto,
     /// Protocol 2: the decoder configurations of the client's last capability hello,
-    /// and the offer generation they answer.
+    /// and the offer generation they answer (none before its first answer is taken).
     pub caps: Vec<DecodeCap>,
-    pub caps_gen: u64,
+    pub caps_gen: Option<u64>,
     pub cohort: Option<u64>,
     pub choice: Option<Choice>,
     /// Protocol 2: the configuration generation, one per `codec` message.
@@ -198,11 +198,22 @@ impl Client {
         let mut r = self.route.lock();
         r.proto = Proto::V2;
         r.caps = caps;
-        r.caps_gen = gen;
+        r.caps_gen = Some(gen);
         r.rejected.clear();
         r.detach();
         self.started.store(false, Ordering::Relaxed);
         self.needs_keyframe.store(false, Ordering::Relaxed);
+    }
+
+    /// A protocol 2 message the server did not act on (an answer to offers that have
+    /// since changed, or one it could not read): the client speaks protocol 2 all the
+    /// same, so a later `v,1` does not make it protocol 1. It is negotiated once it
+    /// answers the offers in force.
+    pub fn speaks_v2(&self) {
+        let mut r = self.route.lock();
+        if r.proto == Proto::Unknown {
+            r.proto = Proto::V2;
+        }
     }
 
     /// The rate this viewer can show: None when it didn't say or can't keep up.

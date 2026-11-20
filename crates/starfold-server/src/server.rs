@@ -1624,6 +1624,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
             if !Hub::answers(offer, gen) {
+                if offer.is_some_and(|o| o < gen) {
+                    c.speaks_v2();
+                }
                 return;
             }
             c.caps_hello(crate::negotiate::decode_caps(&decode), gen);
@@ -1673,8 +1676,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     if t.starts_with('{') {
-        if let Some(m) = ClientMsg::parse(t) {
-            handle_json(s, c, m);
+        match ClientMsg::parse(t) {
+            Some(m) => handle_json(s, c, m),
+            None => c.speaks_v2(),
         }
         return;
     }
@@ -2041,6 +2045,32 @@ mod tests {
         assert_eq!(c.display_hz(), None);
     }
 
+    /// A protocol 2 message the server drops, an answer to offers that have since changed
+    /// or JSON it cannot read, still tells protocol 2: a `v,1` after it does not make the
+    /// viewer protocol 1, and it is not negotiated before it answers the offers in force.
+    #[test]
+    fn a_dropped_protocol_2_message_then_v1_is_not_protocol_1() {
+        let hub = Hub::new();
+        let s = app(&hub, false, None);
+        let mut rtts = Default::default();
+        hub.next_offer_gen();
+        for first in [
+            r#"{"t":"hello","v":2,"offer":0,"decode":[]}"#,
+            r#"{"t":"hello","v":2,"offer":"0","decode":[]}"#,
+            r#"{"t":"later"}"#,
+            "{",
+        ] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let c = hub.add_client(tx);
+            handle_text(&s, &c, first, &mut rtts);
+            handle_text(&s, &c, "v,1", &mut rtts);
+            let r = c.route.lock();
+            assert_eq!((r.proto, r.caps_gen), (Proto::V2, None), "{first}");
+            drop(r);
+            assert!(c.video.load(Ordering::Relaxed));
+        }
+    }
+
     #[test]
     fn protocol_is_told_by_the_first_message() {
         let hub = Hub::new();
@@ -2206,10 +2236,24 @@ mod tests {
         }
 
         /// Everything queued to `c` so far reaches the viewer: a marker is queued behind
-        /// it and read back, failing the test on a close before it.
-        async fn flushed(c: &Client, ws: &mut WebSocketStream<tokio::net::TcpStream>) {
+        /// it and read back, failing the test on a close before it. The `t` of each JSON
+        /// message before the marker, in order.
+        async fn flushed(c: &Client, ws: &mut WebSocketStream<tokio::net::TcpStream>) -> Vec<String> {
             c.send(Out::Text(r#"{"t":"marker"}"#.into()));
-            json_of(ws, "marker").await;
+            let mut seen = Vec::new();
+            loop {
+                match raw(ws).await {
+                    Ws::Text(m) => {
+                        let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
+                        if j["t"] == "marker" {
+                            return seen;
+                        }
+                        seen.push(j["t"].as_str().unwrap_or_default().to_string());
+                    }
+                    Ws::Close(c) => panic!("closed before the marker: {c:?}"),
+                    _ => {}
+                }
+            }
         }
 
         /// Waits, without sleeping, until the server has handled what the viewer sent:
@@ -2280,6 +2324,40 @@ mod tests {
             assert_eq!(offered["videoOffers"][0]["codec"], "av1");
             ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
             handled(|| !c.route.lock().caps.is_empty()).await;
+            eng.replan();
+            let codec = json_of(&mut ws, "codec").await;
+            assert_eq!(codec["codec"], "av1", "{codec}");
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            server.abort();
+        }
+
+        /// The same viewer that never answers the hello at the new generation: no encoder
+        /// is planned for it and nothing closes it, and each new generation offers again;
+        /// its answer to the one in force gets it the AV1 stream.
+        #[tokio::test]
+        async fn a_viewer_that_never_answers_the_offers_in_force_is_offered_each_new_generation() {
+            let (hub, mut eng, c, mut ws, server, first) = viewer_at_startup().await;
+            ws.send(Ws::Text(answer(&first).into())).await.unwrap();
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
+            handled(|| c.video.load(Ordering::Relaxed)).await;
+            for _ in 0..3 {
+                eng.replan();
+            }
+            let seen = flushed(&c, &mut ws).await;
+            assert!(seen.contains(&"hello".to_string()), "{seen:?}");
+            assert!(!seen.contains(&"codec".to_string()), "{seen:?}");
+            {
+                let r = c.route.lock();
+                assert_eq!((r.proto, r.caps_gen, r.cohort), (Proto::V2, None, None));
+            }
+            hub.next_offer_gen();
+            hub.restart_clients();
+            let gen = hub.offer_gen.load(Ordering::SeqCst);
+            let again = json_of(&mut ws, "hello").await;
+            assert_eq!(again["offer"], gen);
+            ws.send(Ws::Text(answer(&again).into())).await.unwrap();
+            handled(|| c.route.lock().caps_gen == Some(gen)).await;
             eng.replan();
             let codec = json_of(&mut ws, "codec").await;
             assert_eq!(codec["codec"], "av1", "{codec}");
