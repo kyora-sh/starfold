@@ -3961,7 +3961,10 @@ fn preset_goes_only_to_the_encoder_it_was_given_for() {
         preset: "veryfast".into(),
         ..config()
     };
-    assert_eq!(encoder_config(&auto, SOFTWARE, W, H, H, 1).preset, "veryfast");
+    assert_eq!(
+        encoder_config(&auto, SOFTWARE, W, H, H, 1).preset,
+        "veryfast"
+    );
     assert_eq!(
         encoder_config(&auto, H264_HW, W, H, H, 1).preset,
         encoder::DEFAULT_PRESET
@@ -4030,7 +4033,10 @@ fn libaom_picks_its_own_threads_unless_they_were_given() {
         adaptive_threads: true,
         ..config()
     };
-    assert_eq!(encoder_config(&adaptive, aom, 1920, 1080, 1080, 1).threads, 1);
+    assert_eq!(
+        encoder_config(&adaptive, aom, 1920, 1080, 1080, 1).threads,
+        1
+    );
     assert_eq!(
         adaptive_max_threads(&adaptive, aom, 1920, 1080, 1),
         4,
