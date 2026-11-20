@@ -2391,6 +2391,86 @@ mod tests {
             }
         }
 
+        fn restart_close(close: &tokio_tungstenite::tungstenite::protocol::CloseFrame) -> bool {
+            (u16::from(close.code), close.reason.as_str())
+                == (crate::hub::RESTART_CLOSE, crate::hub::RESTART_REASON)
+        }
+
+        #[tokio::test]
+        async fn a_viewer_connected_at_shutdown_reads_1012() {
+            let (hub, _input) = wired();
+            let (mut ws, server) = viewer(&hub).await;
+            let Ws::Text(_) = raw(&mut ws).await else {
+                panic!("the hello is a text message");
+            };
+            let shutdown = tokio::spawn({
+                let hub = hub.clone();
+                async move {
+                    let t = Instant::now();
+                    hub.close_for_restart(Duration::from_secs(5)).await;
+                    t.elapsed()
+                }
+            });
+            let close = close_frame(&mut ws).await;
+            assert!(restart_close(&close), "{close:?}");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await
+            .expect("the socket never closed");
+            let took = shutdown.await.unwrap();
+            assert!(
+                took < Duration::from_secs(2),
+                "waited {took:?} for a viewer that answered the close"
+            );
+            assert!(hub.clients.lock().is_empty());
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_viewer_that_joins_during_shutdown_is_closed_with_1012() {
+            let (hub, _input) = wired();
+            hub.close_for_restart(Duration::ZERO).await;
+            let (mut ws, server) = viewer(&hub).await;
+            let close = close_frame(&mut ws).await;
+            assert!(restart_close(&close), "{close:?}");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_never_reads_holds_up_shutdown_for_the_bound_at_most() {
+            let (hub, _input) = wired();
+            let (ws, server) = viewer(&hub).await;
+            let mut joined = None;
+            for _ in 0..500 {
+                joined = hub.clients.lock().first().cloned();
+                if joined.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let c = joined.expect("the viewer never joined");
+            let mb = Bytes::from(vec![0u8; 1 << 20]);
+            for _ in 0..64 {
+                c.send(Out::Bin(mb.clone()));
+            }
+            let bound = Duration::from_millis(300);
+            let t = Instant::now();
+            hub.close_for_restart(bound).await;
+            let took = t.elapsed();
+            assert!(
+                took >= bound && took < bound + Duration::from_millis(500),
+                "returned after {took:?}"
+            );
+            assert_eq!(
+                hub.clients.lock().len(),
+                1,
+                "the bound, not the peer, ended the wait"
+            );
+            drop(ws);
+            server.abort();
+        }
+
         #[tokio::test]
         async fn a_protocol_1_viewer_of_an_av1_server_is_closed_with_4406() {
             let (hub, _input, mut ws, stop, engine, server) = legacy_viewer().await;

@@ -357,6 +357,10 @@ fn recorder_from_args(
     Ok(record::Recorder::new(hub.clone(), s.max, s.on, s.dir))
 }
 
+/// How long a shutdown waits for the viewers' sockets to close after sending them 1012;
+/// it exits no sooner than 200 ms after the signal either way.
+const SHUTDOWN_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn serve(
     a: HashMap<String, String>,
     listen: Listen,
@@ -388,6 +392,7 @@ async fn serve(
         #[cfg(windows)]
         let _ = tokio::signal::ctrl_c().await;
         log::info!("shutting down");
+        let at_least = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
         if let Some(tx) = shutdown_hub.input.lock().as_ref() {
             let _ = tx.send(input::InputEvent::Shutdown);
         }
@@ -395,7 +400,8 @@ async fn serve(
         if let Some(file) = socket_file {
             server::remove_unix(file);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown_hub.close_for_restart(SHUTDOWN_CLOSE_WAIT).await;
+        tokio::time::sleep_until(at_least).await;
         std::process::exit(0);
     });
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.

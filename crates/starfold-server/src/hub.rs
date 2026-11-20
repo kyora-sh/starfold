@@ -6,8 +6,12 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// The close code and reason of a server that is shutting down (1012, service restart).
+pub const RESTART_CLOSE: u16 = 1012;
+pub const RESTART_REASON: &str = "server restarting";
 
 pub enum Out {
     Bin(Bytes),
@@ -431,6 +435,9 @@ pub struct Stats {
 
 pub struct Hub {
     pub clients: Mutex<Vec<Arc<Client>>>,
+    /// Set with `clients` locked once the server shuts down: a viewer that joins later is
+    /// closed at once.
+    closing: AtomicBool,
     pub next_id: AtomicU64,
     pub stats: Stats,
     pub width: AtomicU32,
@@ -492,6 +499,7 @@ impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Hub {
             clients: Mutex::new(Vec::new()),
+            closing: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stats: Stats::default(),
             width: AtomicU32::new(0),
@@ -578,13 +586,36 @@ impl Hub {
             hz: AtomicU32::new(0),
             slow: AtomicBool::new(false),
         });
-        self.clients.lock().push(c.clone());
+        let mut clients = self.clients.lock();
+        if self.closing.load(Ordering::Relaxed) {
+            c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
+        }
+        clients.push(c.clone());
+        drop(clients);
         c
     }
 
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().retain(|c| c.id != id);
         self.replan();
+    }
+
+    /// Closes every viewer, and each one that joins from now on, with 1012 (service
+    /// restart), after what is already queued for it. Returns once all of them are gone or
+    /// `within` has passed, whichever is first: a peer that reads nothing holds it up for
+    /// `within` at most.
+    pub async fn close_for_restart(&self, within: Duration) {
+        let end = tokio::time::Instant::now() + within;
+        {
+            let clients = self.clients.lock();
+            self.closing.store(true, Ordering::Relaxed);
+            for c in clients.iter() {
+                c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
+            }
+        }
+        while !self.clients.lock().is_empty() && tokio::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub fn video_clients(&self) -> Vec<Arc<Client>> {
