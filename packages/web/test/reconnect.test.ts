@@ -229,11 +229,12 @@ describe('the limits of a run', () => {
 	});
 });
 
-describe('waiting for the attempt', () => {
-	const never = () => {
-		throw new Error('expired');
-	};
+/** An expire callback for a wait that must not expire. */
+function never(): never {
+	throw new Error('expired');
+}
 
+describe('waiting for the attempt', () => {
 	test('connects when the delay is up, once', () => {
 		const { r, advance, wakes } = reconnector();
 		let connects = 0;
