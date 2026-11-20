@@ -149,7 +149,11 @@ describe('probe', () => {
 					i: 1,
 					y: 1080,
 					h: 1080,
-					config: { codec: 'av01.0.08M.10', codedWidth: 1920, codedHeight: 1080 },
+					config: {
+						codec: 'av01.0.08M.10',
+						codedWidth: 1920,
+						codedHeight: 1080,
+					},
 				},
 			],
 		};
