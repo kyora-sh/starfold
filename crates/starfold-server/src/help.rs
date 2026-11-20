@@ -83,7 +83,7 @@ THREADS_ENTRY
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
   --stored-screens              libaom keeps up to six settled screens and codes
-                                a return to one from it (default false)
+                                a return to one from it (default true)
 PAINTOVER_ENTRY
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
