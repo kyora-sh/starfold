@@ -209,7 +209,9 @@ export class Reconnector {
 	}
 
 	private left(): number {
-		return this.run ? this.o.maxMs - (this.env.now() - this.run.start) : Infinity;
+		return this.run
+			? this.o.maxMs - (this.env.now() - this.run.start)
+			: Infinity;
 	}
 
 	private awake(): boolean {
@@ -246,7 +248,11 @@ export class Reconnector {
 
 	/** Calls `expire` once the run is past maxMs, unless something else is waited for first. */
 	guard(expire: () => void) {
-		this.start(expire, () => false, () => {});
+		this.start(
+			expire,
+			() => false,
+			() => {}
+		);
 		this.check();
 	}
 

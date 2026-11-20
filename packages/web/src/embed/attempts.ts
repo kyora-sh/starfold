@@ -248,8 +248,8 @@ export class PageLife {
 			() => {
 				if (!this.live || this.phase !== 'idle') return;
 				this.attempt();
-				const id = this.id;
-				r.guard(() => this.expireAsking(id));
+				const next = this.id;
+				r.guard(() => this.expireAsking(next));
 			},
 			() => {
 				if (this.live && this.phase === 'idle') this.giveUp('time');

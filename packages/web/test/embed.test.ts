@@ -693,9 +693,7 @@ describe('reconnect, opt-in', () => {
 		s.conns[0].ws!.close(1000, 'done');
 		await until(() => statuses(seen).at(-1) === 'closed');
 		expect(statuses(seen)).toEqual(['connecting', 'open', 'gave-up', 'closed']);
-		expect(events).toEqual([
-			{ kind: 'gave-up', why: 'code', code: 1000 },
-		]);
+		expect(events).toEqual([{ kind: 'gave-up', why: 'code', code: 1000 }]);
 		await sleep(300);
 		expect(s.conns.length).toBe(1);
 	});
@@ -819,7 +817,9 @@ describe('reconnect, opt-in', () => {
 	test('a reconnect attempt whose preamble is still pending at the deadline gives up', async () => {
 		let calls = 0;
 		const { s, page, seen, events } = reconnecting(
-			{ preamble: () => (++calls === 1 ? 't1' : new Promise<string>(() => {})) },
+			{
+				preamble: () => (++calls === 1 ? 't1' : new Promise<string>(() => {})),
+			},
 			{ maxMs: 400 }
 		);
 		page.connect();
