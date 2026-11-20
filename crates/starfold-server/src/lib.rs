@@ -357,6 +357,13 @@ fn recorder_from_args(
     Ok(record::Recorder::new(hub.clone(), s.max, s.on, s.dir))
 }
 
+/// How long a shutdown waits for the viewers' sockets to close once 1012 is queued for them,
+/// and then how long it leaves the desktop's input to be released ([`server::shut_down`]).
+/// Once the signal is taken, a thread of its own queues the input release 1 s later and
+/// exits 200 ms after that, however the runtime is held up.
+const SHUTDOWN_SOCKETS: std::time::Duration = std::time::Duration::from_millis(800);
+const SHUTDOWN_RELEASE: std::time::Duration = std::time::Duration::from_millis(200);
+
 async fn serve(
     a: HashMap<String, String>,
     listen: Listen,
@@ -387,15 +394,22 @@ async fn serve(
         tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         #[cfg(windows)]
         let _ = tokio::signal::ctrl_c().await;
+        shutdown_hub.begin_close();
+        let release = shutdown_hub.input.lock().clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SHUTDOWN_SOCKETS + SHUTDOWN_RELEASE);
+            if let Some(tx) = release {
+                let _ = tx.send(input::InputEvent::Shutdown);
+            }
+            std::thread::sleep(SHUTDOWN_RELEASE);
+            std::process::exit(0);
+        });
         log::info!("shutting down");
-        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(input::InputEvent::Shutdown);
-        }
         #[cfg(target_os = "linux")]
         if let Some(file) = socket_file {
             server::remove_unix(file);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        server::shut_down(&shutdown_hub, SHUTDOWN_SOCKETS, SHUTDOWN_RELEASE).await;
         std::process::exit(0);
     });
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.

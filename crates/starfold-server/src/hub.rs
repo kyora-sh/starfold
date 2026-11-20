@@ -6,8 +6,12 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// The close code and reason of a server that is shutting down (1012, service restart).
+pub const RESTART_CLOSE: u16 = 1012;
+pub const RESTART_REASON: &str = "server restarting";
 
 pub enum Out {
     Bin(Bytes),
@@ -431,6 +435,11 @@ pub struct Stats {
 
 pub struct Hub {
     pub clients: Mutex<Vec<Arc<Client>>>,
+    /// Set with `clients` locked once the server shuts down: a viewer that joins later is
+    /// closed at once.
+    closing: AtomicBool,
+    /// Set when the shutdown stops waiting for viewers: no more upgrades.
+    sealed: AtomicBool,
     pub next_id: AtomicU64,
     pub stats: Stats,
     pub width: AtomicU32,
@@ -492,6 +501,8 @@ impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Hub {
             clients: Mutex::new(Vec::new()),
+            closing: AtomicBool::new(false),
+            sealed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stats: Stats::default(),
             width: AtomicU32::new(0),
@@ -578,13 +589,51 @@ impl Hub {
             hz: AtomicU32::new(0),
             slow: AtomicBool::new(false),
         });
-        self.clients.lock().push(c.clone());
+        let mut clients = self.clients.lock();
+        if self.closing.load(Ordering::Relaxed) {
+            c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
+        }
+        clients.push(c.clone());
+        drop(clients);
         c
     }
 
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().retain(|c| c.id != id);
         self.replan();
+    }
+
+    /// Queues 1012 (service restart) for every viewer, after what is already queued for
+    /// it, and for each one that joins from now on; their input is ignored from now on.
+    /// Called again, it does nothing.
+    pub fn begin_close(&self) {
+        let clients = self.clients.lock();
+        if self.closing.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        for c in clients.iter() {
+            c.send(Out::Close(RESTART_CLOSE, RESTART_REASON));
+        }
+    }
+
+    pub fn closing(&self) -> bool {
+        self.closing.load(Ordering::Relaxed)
+    }
+
+    /// Waits until every viewer is gone or `until`, whichever is first.
+    pub async fn wait_closed(&self, until: tokio::time::Instant) {
+        while tokio::time::Instant::now() < until && !self.clients.lock().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// No more upgrades: the WebSocket route answers 503 from now on.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn sealed(&self) -> bool {
+        self.sealed.load(Ordering::Relaxed)
     }
 
     pub fn video_clients(&self) -> Vec<Arc<Client>> {
