@@ -325,7 +325,10 @@ fn a_keyframe_clears_the_stored_screens() {
     s.enc.stored_screens(true);
     s.page(1);
     s.page(2);
-    assert_eq!(s.enc.screens().unwrap().iter().filter(|&&h| h != 0).count(), 2);
+    assert_eq!(
+        s.enc.screens().unwrap().iter().filter(|&&h| h != 0).count(),
+        2
+    );
     s.pic.texture(1 << 29, 0, 0, W, H, 0);
     s.frame(None);
     let (_, key) = s.encode(None, true, None);
@@ -350,7 +353,10 @@ fn after_a_requested_keyframe_no_frame_references_a_screen_from_before_it() {
     let again = s.frame(None);
     let psnr = s.psnr();
     eprintln!("page 2 again after the keyframe: {again} bytes, {psnr:.2} dB");
-    assert!(again > back * 4, "{again} bytes, as if page 2 were still stored");
+    assert!(
+        again > back * 4,
+        "{again} bytes, as if page 2 were still stored"
+    );
     assert!(psnr > 30.0, "{psnr:.2} dB");
 }
 

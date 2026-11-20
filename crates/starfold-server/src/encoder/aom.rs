@@ -660,7 +660,11 @@ impl VideoEncoder for Aom {
         };
         let (screen, h) = match key {
             true => (Screen::None, 0),
-            false => self.screen(p, opts.static_mbs.as_deref().map(|m| &m[..mbs]), fixed.is_some()),
+            false => self.screen(
+                p,
+                opts.static_mbs.as_deref().map(|m| &m[..mbs]),
+                fixed.is_some(),
+            ),
         };
         if !key {
             self.set_references(fixed.is_some(), screen)?;
