@@ -2453,12 +2453,32 @@ mod tests {
                 .expect("the shutdown never returned")
                 .unwrap();
             assert!(
-                took < Duration::from_secs(3),
+                took < Duration::from_secs(1),
                 "waited {took:?} for a viewer that answered the close"
             );
             assert!(input.try_iter().any(|e| matches!(e, InputEvent::Shutdown)));
             assert!(hub.sealed());
             server.abort();
+        }
+
+        #[tokio::test]
+        async fn with_no_viewer_a_shutdown_takes_only_the_release() {
+            let (hub, input) = wired();
+            let release = Duration::from_millis(200);
+            let t = Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                shut_down(&hub, Duration::from_secs(5), release),
+            )
+            .await
+            .expect("the shutdown never returned");
+            let took = t.elapsed();
+            assert!(
+                took >= release && took < release + Duration::from_millis(300),
+                "took {took:?} with nobody to close"
+            );
+            assert!(input.try_iter().any(|e| matches!(e, InputEvent::Shutdown)));
+            assert!(hub.sealed());
         }
 
         #[tokio::test]
