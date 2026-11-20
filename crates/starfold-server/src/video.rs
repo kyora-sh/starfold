@@ -1240,7 +1240,7 @@ impl Engine {
                     let r = c.route.lock();
                     let (legacy, caps, rejected) = match r.proto {
                         Proto::Legacy => (true, Vec::new(), Vec::new()),
-                        Proto::V2 if r.caps_gen == gen => {
+                        Proto::V2 if r.caps_gen == Some(gen) => {
                             (false, r.caps.clone(), r.rejected.clone())
                         }
                         _ => return None,

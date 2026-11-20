@@ -1613,6 +1613,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
     if s.read_only && crate::readonly::json(&m) != crate::readonly::Kind::Watch {
         return;
     }
+    if !matches!(m, ClientMsg::Hello { .. }) {
+        c.speaks_v2();
+    }
     match m {
         ClientMsg::Hello {
             v,
@@ -1624,6 +1627,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
             let gen = s.hub.offer_gen.load(Ordering::Relaxed);
             // It answers offers that have since changed; its answer to the new ones follows.
             if !Hub::answers(offer, gen) {
+                if offer.is_some_and(|o| o < gen) {
+                    c.speaks_v2();
+                }
                 return;
             }
             c.caps_hello(crate::negotiate::decode_caps(&decode), gen);
@@ -1673,8 +1679,9 @@ fn handle_json(s: &AppState, c: &Arc<Client>, m: ClientMsg) {
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     if t.starts_with('{') {
-        if let Some(m) = ClientMsg::parse(t) {
-            handle_json(s, c, m);
+        match ClientMsg::parse(t) {
+            Some(m) => handle_json(s, c, m),
+            None => c.speaks_v2(),
         }
         return;
     }
@@ -2041,6 +2048,39 @@ mod tests {
         assert_eq!(c.display_hz(), None);
     }
 
+    /// A protocol 2 message the server drops (an answer to offers that have since changed,
+    /// JSON it cannot read, or a message for an epoch it has not announced) still tells
+    /// protocol 2: a `v,1` after it does not make the
+    /// viewer protocol 1, and it is not negotiated before it answers the offers in force.
+    #[test]
+    fn a_dropped_protocol_2_message_then_v1_is_not_protocol_1() {
+        let hub = Hub::new();
+        let s = app(&hub, false, None);
+        let mut rtts = Default::default();
+        hub.next_offer_gen();
+        for first in [
+            r#"{"t":"hello","v":2,"offer":0,"decode":[]}"#,
+            r#"{"t":"hello","v":2,"offer":"0","decode":[]}"#,
+            r#"{"t":"later"}"#,
+            "{",
+            r#"{"t":"codec-ready","epoch":1}"#,
+            r#"{"t":"codec-error","epoch":1,"reason":"x"}"#,
+            r#"{"t":"ack","epoch":1,"frame":1}"#,
+            r#"{"t":"keyframe","epoch":1}"#,
+            r#"{"t":"hz","hz":60}"#,
+            r#"{"t":"slow"}"#,
+        ] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let c = hub.add_client(tx);
+            handle_text(&s, &c, first, &mut rtts);
+            handle_text(&s, &c, "v,1", &mut rtts);
+            let r = c.route.lock();
+            assert_eq!((r.proto, r.caps_gen), (Proto::V2, None), "{first}");
+            drop(r);
+            assert!(c.video.load(Ordering::Relaxed));
+        }
+    }
+
     #[test]
     fn protocol_is_told_by_the_first_message() {
         let hub = Hub::new();
@@ -2061,16 +2101,16 @@ mod tests {
         assert_eq!(r.caps.len(), 1);
         drop(r);
         assert!(new.video.load(Ordering::Relaxed));
-        // An answer to an older offer generation is ignored.
+        // An answer to an offer generation not yet made is ignored.
         let (tx, _rx) = mpsc::unbounded_channel();
-        let late = hub.add_client(tx);
+        let ahead = hub.add_client(tx);
         handle_text(
             &s,
-            &late,
+            &ahead,
             &caps.replace("\"offer\":0", "\"offer\":9"),
             &mut rtts,
         );
-        assert_eq!(late.route.lock().proto, Proto::Unknown);
+        assert_eq!(ahead.route.lock().proto, Proto::Unknown);
         // A v2 ack is ignored from a protocol 1 viewer, and `a,` from a protocol 2 one.
         old.inflight.lock().push_back(crate::hub::Inflight {
             id: 1,
@@ -2157,22 +2197,186 @@ mod tests {
             let (hub, input) = wired();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let engine = crate::video::tests::av1_only_engine(hub.clone(), stop.clone());
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = l.local_addr().unwrap().port();
-            let server = tokio::spawn(axum::serve(l, router(app(&hub, false, None))).into_future());
-            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let (mut ws, _) =
-                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
-                    .await
-                    .unwrap();
+            let (mut ws, server) = viewer(&hub).await;
             let Ws::Text(hello) = raw(&mut ws).await else {
                 panic!("the hello is a text message");
             };
             assert_eq!(hello.as_str(), hub.hello());
             ws.send(Ws::Text("v,1".into())).await.unwrap();
             (hub, input, ws, stop, engine, server)
+        }
+
+        async fn viewer(
+            hub: &Arc<Hub>,
+        ) -> (
+            WebSocketStream<tokio::net::TcpStream>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let server = tokio::spawn(axum::serve(l, router(app(hub, false, None))).into_future());
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (ws, _) =
+                tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), sock)
+                    .await
+                    .unwrap();
+            (ws, server)
+        }
+
+        /// The next JSON message whose `t` is `t`, skipping everything else; a close
+        /// before it fails the test with its code and reason.
+        async fn json_of(
+            ws: &mut WebSocketStream<tokio::net::TcpStream>,
+            t: &str,
+        ) -> serde_json::Value {
+            loop {
+                match raw(ws).await {
+                    Ws::Text(m) => {
+                        let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
+                        if j["t"] == t {
+                            return j;
+                        }
+                    }
+                    Ws::Close(c) => panic!("closed before a {t:?} message: {c:?}"),
+                    _ => {}
+                }
+            }
+        }
+
+        /// Everything queued to `c` so far reaches the viewer: a marker is queued behind
+        /// it and read back, failing the test on a close before it. The `t` of each JSON
+        /// message before the marker, in order.
+        async fn flushed(
+            c: &Client,
+            ws: &mut WebSocketStream<tokio::net::TcpStream>,
+        ) -> Vec<String> {
+            c.send(Out::Text(r#"{"t":"marker"}"#.into()));
+            let mut seen = Vec::new();
+            loop {
+                match raw(ws).await {
+                    Ws::Text(m) => {
+                        let j: serde_json::Value = serde_json::from_str(m.as_str()).unwrap();
+                        if j["t"] == "marker" {
+                            return seen;
+                        }
+                        seen.push(j["t"].as_str().unwrap_or_default().to_string());
+                    }
+                    Ws::Close(c) => panic!("closed before the marker: {c:?}"),
+                    _ => {}
+                }
+            }
+        }
+
+        /// Waits, without sleeping, until the server has handled what the viewer sent:
+        /// `done` reads the state that the last message sets.
+        async fn handled(done: impl Fn() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !done() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the server never handled the message");
+        }
+
+        /// A protocol 2 viewer's answer to a hello: every stripe of every offer decodes.
+        fn answer(hello: &serde_json::Value) -> String {
+            let decode: Vec<serde_json::Value> = hello["videoOffers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|o| o["stripes"].as_array().unwrap().iter())
+                .map(|s| {
+                    let mut c = s["config"].clone();
+                    c["implementation"] = "webcodecs".into();
+                    c
+                })
+                .collect();
+            serde_json::json!({"t": "hello", "v": 2, "offer": hello["offer"], "decode": decode})
+                .to_string()
+        }
+
+        /// A protocol 2 viewer connected to a server whose stream has not started, with
+        /// the stream started after its empty hello at generation 0 was read: the hello at
+        /// the new generation is queued to it, unanswered.
+        async fn viewer_at_startup() -> (
+            Arc<Hub>,
+            crate::video::tests::Av1Engine,
+            Arc<Client>,
+            WebSocketStream<tokio::net::TcpStream>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+            serde_json::Value,
+        ) {
+            let (hub, _input) = wired();
+            let (mut ws, server) = viewer(&hub).await;
+            let first = json_of(&mut ws, "hello").await;
+            assert_eq!(first["offer"], 0);
+            assert_eq!(first["videoOffers"], serde_json::json!([]));
+            let c = hub.clients.lock()[0].clone();
+            let eng = crate::video::tests::Av1Engine::new(&hub);
+            assert!(hub.offer_gen.load(Ordering::SeqCst) > 0);
+            (hub, eng, c, ws, server, first)
+        }
+
+        /// A viewer that connects as the stream starts answers the empty hello of
+        /// generation 0 and turns its video on, both reaching the server after the first
+        /// offers moved the generation on. It is still a protocol 2 viewer: not closed with
+        /// 4406, and its answer to the hello at the new generation gets it the AV1 stream.
+        #[tokio::test]
+        async fn a_viewer_whose_first_answer_crosses_the_first_offer_still_gets_av1() {
+            let (hub, mut eng, c, mut ws, server, first) = viewer_at_startup().await;
+            ws.send(Ws::Text(answer(&first).into())).await.unwrap();
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
+            handled(|| c.video.load(Ordering::Relaxed)).await;
+            eng.replan();
+            let offered = json_of(&mut ws, "hello").await;
+            flushed(&c, &mut ws).await;
+            assert_eq!(offered["offer"], hub.offer_gen.load(Ordering::SeqCst));
+            assert_eq!(offered["videoOffers"][0]["codec"], "av1");
+            ws.send(Ws::Text(answer(&offered).into())).await.unwrap();
+            handled(|| !c.route.lock().caps.is_empty()).await;
+            eng.replan();
+            let codec = json_of(&mut ws, "codec").await;
+            assert_eq!(codec["codec"], "av1", "{codec}");
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            server.abort();
+        }
+
+        /// The same viewer that never answers the hello at the new generation: no encoder
+        /// is planned for it and nothing closes it, and each new generation offers again;
+        /// its answer to the one in force gets it the AV1 stream.
+        #[tokio::test]
+        async fn a_viewer_that_never_answers_the_offers_in_force_is_offered_each_new_generation() {
+            let (hub, mut eng, c, mut ws, server, first) = viewer_at_startup().await;
+            ws.send(Ws::Text(answer(&first).into())).await.unwrap();
+            ws.send(Ws::Text("v,1".into())).await.unwrap();
+            handled(|| c.video.load(Ordering::Relaxed)).await;
+            for _ in 0..3 {
+                eng.replan();
+            }
+            let seen = flushed(&c, &mut ws).await;
+            assert!(seen.contains(&"hello".to_string()), "{seen:?}");
+            assert!(!seen.contains(&"codec".to_string()), "{seen:?}");
+            {
+                let r = c.route.lock();
+                assert_eq!((r.proto, r.caps_gen, r.cohort), (Proto::V2, None, None));
+            }
+            hub.next_offer_gen();
+            hub.restart_clients();
+            let gen = hub.offer_gen.load(Ordering::SeqCst);
+            let again = json_of(&mut ws, "hello").await;
+            assert_eq!(again["offer"], gen);
+            ws.send(Ws::Text(answer(&again).into())).await.unwrap();
+            handled(|| c.route.lock().caps_gen == Some(gen)).await;
+            eng.replan();
+            let codec = json_of(&mut ws, "codec").await;
+            assert_eq!(codec["codec"], "av1", "{codec}");
+            ws.close(None).await.unwrap();
+            gone(&hub).await;
+            server.abort();
         }
 
         async fn close_frame(

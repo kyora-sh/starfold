@@ -385,15 +385,36 @@ fn engine(hub: &Arc<Hub>, cands: &[Candidate], o: Opts) -> Engine {
 }
 
 /// An engine whose only encoder is a software AV1 one, as on a server without H.264,
-/// replanning on its own thread until `stop` is set.
+/// replanning on its own thread until `stop` is set. Returns once the engine has published
+/// its first offers, as the stream's start does.
 pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    let (started, ready) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
         let mut eng = engine(&hub, &[FAKE_AV1_SW], Opts::default());
+        started.send(()).unwrap();
         while !stop.load(Ordering::Acquire) {
             eng.replan();
             std::thread::sleep(Duration::from_millis(5));
         }
-    })
+    });
+    ready.recv().expect("the engine failed to start");
+    t
+}
+
+/// An engine whose only encoder is a software AV1 one, replanned only when the caller
+/// says, for tests that order its steps against a viewer's messages.
+pub(crate) struct Av1Engine(Engine);
+
+impl Av1Engine {
+    /// Starts the stream: its first offers, at the next offer generation.
+    pub(crate) fn new(hub: &Arc<Hub>) -> Self {
+        Self(engine(hub, &[FAKE_AV1_SW], Opts::default()))
+    }
+
+    pub(crate) fn replan(&mut self) {
+        self.0.hub.replan();
+        self.0.replan();
+    }
 }
 
 const FAKE_AV1_SW: Candidate = Candidate {
