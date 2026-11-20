@@ -2503,7 +2503,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             ws.send(Ws::Text("k,65,1".into())).await.unwrap();
-            let took = shutdown.await.unwrap();
+            let took = tokio::time::timeout(bound + Duration::from_secs(2), shutdown)
+                .await
+                .expect("a peer that never reads held the shutdown up past the bound")
+                .unwrap();
             assert!(
                 took >= bound && took < bound + Duration::from_secs(2),
                 "returned after {took:?}"
