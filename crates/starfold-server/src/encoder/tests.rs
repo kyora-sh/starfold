@@ -955,10 +955,7 @@ fn videotoolbox_encodes_h264_and_hevc() {
                 assert_eq!(sps.display, (w as u32, h as u32));
                 assert_eq!(sps.color, Some((false, 1, 13, 6)));
                 assert_eq!(decode_all_as(&aus, Codec::H264).len(), aus.len());
-                assert_eq!(
-                    decode_all_as(&aus[30..], Codec::H264).len(),
-                    aus.len() - 30
-                );
+                assert_eq!(decode_all_as(&aus[30..], Codec::H264).len(), aus.len() - 30);
             }
             _ => assert!(c.codec_string.starts_with("hvc1.1."), "{}", c.codec_string),
         }
