@@ -2238,7 +2238,10 @@ mod tests {
         /// Everything queued to `c` so far reaches the viewer: a marker is queued behind
         /// it and read back, failing the test on a close before it. The `t` of each JSON
         /// message before the marker, in order.
-        async fn flushed(c: &Client, ws: &mut WebSocketStream<tokio::net::TcpStream>) -> Vec<String> {
+        async fn flushed(
+            c: &Client,
+            ws: &mut WebSocketStream<tokio::net::TcpStream>,
+        ) -> Vec<String> {
             c.send(Out::Text(r#"{"t":"marker"}"#.into()));
             let mut seen = Vec::new();
             loop {
