@@ -96,7 +96,12 @@ export function limits(options: true | ReconnectOptions): Limits {
 	};
 	for (const [k, v] of Object.entries(out)) {
 		const min = k === 'factor' ? 1 : 0;
-		if (typeof v !== 'number' || !Number.isFinite(v) || v < min || (min === 0 && v === 0))
+		if (
+			typeof v !== 'number' ||
+			!Number.isFinite(v) ||
+			v < min ||
+			(min === 0 && v === 0)
+		)
 			throw new TypeError(`starfold: reconnect.${k} must be a positive number`);
 	}
 	return out;
@@ -176,7 +181,8 @@ export class Reconnector {
 		const short = openFor !== null && openFor < STABLE_MS;
 		const repeat = short && is44xx(code) && run.last44xx === code;
 		run.last44xx = short && is44xx(code) ? code : null;
-		run.neverOpened = code === 1006 && openFor === null ? run.neverOpened + 1 : 0;
+		run.neverOpened =
+			code === 1006 && openFor === null ? run.neverOpened + 1 : 0;
 		const wanted = this.should ? this.should(code, reason) : retryable(code);
 		if (!wanted) return { t: 'give-up', why: 'code' };
 		if (repeat) return { t: 'give-up', why: 'repeated-close' };
@@ -198,9 +204,7 @@ export class Reconnector {
 		if (!this.run) return this.o.maxMs;
 		const now = this.env.now();
 		const offline = this.offlineSince === null ? 0 : now - this.offlineSince;
-		return (
-			this.o.maxMs - (now - this.run.start - this.run.pausedMs - offline)
-		);
+		return this.o.maxMs - (now - this.run.start - this.run.pausedMs - offline);
 	}
 
 	/** Starts or ends a stretch offline as `navigator.onLine` says; the stretch is not counted. */

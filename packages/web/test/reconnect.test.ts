@@ -255,7 +255,11 @@ describe('waiting for the attempt', () => {
 		let expired = 0;
 		expect(r.closed(1006, '').t).toBe('retry');
 		advance(600);
-		r.schedule(5000, () => connects++, () => expired++);
+		r.schedule(
+			5000,
+			() => connects++,
+			() => expired++
+		);
 		advance(399);
 		expect(expired).toBe(0);
 		advance(1);
@@ -273,7 +277,11 @@ describe('waiting for the attempt', () => {
 		let expired = 0;
 		expect(r.closed(1006, '').t).toBe('retry');
 		page.hidden = true;
-		r.schedule(10, () => connects++, () => expired++);
+		r.schedule(
+			10,
+			() => connects++,
+			() => expired++
+		);
 		advance(5000);
 		expect(expired).toBe(0);
 		page.hidden = false;
