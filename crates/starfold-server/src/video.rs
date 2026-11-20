@@ -31,6 +31,9 @@ pub struct VideoConfig {
     pub fps: u32,
     pub preset: String,
     pub threads: u32,
+    /// The host's CPUs, from which libaom picks its own thread count; None when `threads`
+    /// was given, which libaom then takes as every encoder does.
+    pub cpus: Option<u32>,
     pub convert_threads: usize,
     pub crf: f32,
     pub max_kbps: u32,
@@ -613,10 +616,13 @@ fn encoder_config(
         width,
         height,
         fps,
-        threads: if cfg.adaptive_threads {
-            1
-        } else {
-            (cfg.threads / stripes as u32).max(1)
+        threads: match (cfg.adaptive_threads, cfg.cpus) {
+            (true, _) => 1,
+            #[cfg(feature = "libaom")]
+            (false, Some(cpus)) if cand.backend == encoder::Backend::Libaom => {
+                encoder::aom_threads(width as u64 * height as u64, cpus, stripes as u32)
+            }
+            _ => (cfg.threads / stripes as u32).max(1),
         },
         rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,

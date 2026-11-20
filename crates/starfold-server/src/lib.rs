@@ -459,6 +459,7 @@ async fn serve(
             }
         }
     }
+    let threads: Option<u32> = a.get("encoder-threads").and_then(|v| v.parse().ok());
     let vcfg = video::VideoConfig {
         display: display.clone(),
         selection,
@@ -469,10 +470,8 @@ async fn serve(
             .unwrap_or_else(|| encoder::DEFAULT_PRESET.into()),
         // Four sliced threads: lower latency than one, and the encoders' slicing overhead
         // grows with thread count, so more threads only add CPU (x264, 2560x1600).
-        threads: a
-            .get("encoder-threads")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or((ncpu / 4).clamp(1, 4)),
+        threads: threads.unwrap_or((ncpu / 4).clamp(1, 4)),
+        cpus: threads.is_none().then_some(ncpu),
         convert_threads: a
             .get("convert-threads")
             .and_then(|v| v.parse().ok())

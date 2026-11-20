@@ -121,6 +121,15 @@ fn level(w: u32, h: u32) -> c_int {
     }
 }
 
+/// Threads for each of `live` libaom encoders sharing `cpus`, at `pixels` a picture: four up
+/// to level 4.0's picture size (1080p), eight above it, no more than the CPUs, and never
+/// fewer than two. At speed 9 one thread doesn't hold 1080p30, four don't hold 4K30 where
+/// eight do, and eight at 1080p save a millisecond a frame for 1.7% more bytes.
+pub fn threads(pixels: u64, cpus: u32, live: u32) -> u32 {
+    let budget = if pixels <= 2_228_224 { 4 } else { 8 };
+    (budget.min(cpus) / live.max(1)).max(2)
+}
+
 impl Aom {
     pub fn new(c: &EncoderConfig) -> Result<Self, EncodeError> {
         if c.codec != Codec::Av1 {

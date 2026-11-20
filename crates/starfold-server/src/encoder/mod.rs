@@ -3,6 +3,8 @@
 
 #[cfg(feature = "libaom")]
 mod aom;
+#[cfg(feature = "libaom")]
+pub use aom::threads as aom_threads;
 #[cfg_attr(
     not(any(feature = "libaom", feature = "svt-av1", target_os = "linux", windows)),
     allow(dead_code)

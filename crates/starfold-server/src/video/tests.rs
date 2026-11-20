@@ -363,6 +363,7 @@ fn config() -> VideoConfig {
         fps: 30,
         preset: "ultrafast".into(),
         threads: 1,
+        cpus: None,
         convert_threads: 1,
         crf: 24.0,
         max_kbps: 30000,
@@ -3923,6 +3924,104 @@ fn preset_goes_only_to_the_encoder_it_was_given_for() {
     assert_eq!(
         encoder_config(&auto, H264_HW, W, H, 1).preset,
         encoder::DEFAULT_PRESET
+    );
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn libaom_threads_follow_the_picture_size_the_cpus_and_the_encoders_sharing_them() {
+    const P1080: u64 = 1920 * 1080;
+    const P1440: u64 = 2560 * 1440;
+    const P4K: u64 = 3840 * 2160;
+    for (pixels, cpus, live, want) in [
+        (P1080, 8, 1, 4),
+        (P4K, 8, 1, 8),
+        (P4K, 6, 1, 6),
+        (P4K, 4, 1, 4),
+        (P1080, 2, 1, 2),
+        (P1080, 1, 1, 2),
+        (P1440, 8, 1, 8),
+        (P4K, 8, 2, 4),
+        (P1080, 2, 2, 2),
+    ] {
+        assert_eq!(
+            encoder::aom_threads(pixels, cpus, live),
+            want,
+            "{pixels} px, {cpus} CPUs, {live} encoders"
+        );
+    }
+}
+
+#[cfg(feature = "libaom")]
+#[test]
+fn libaom_picks_its_own_threads_unless_they_were_given() {
+    let aom = Candidate {
+        codec: Codec::Av1,
+        backend: Backend::Libaom,
+        hardware: false,
+    };
+    let auto = VideoConfig {
+        threads: 2,
+        cpus: Some(8),
+        ..config()
+    };
+    assert_eq!(encoder_config(&auto, aom, 1920, 1080, 1).threads, 4);
+    assert_eq!(encoder_config(&auto, aom, 3840, 2160, 1).threads, 8);
+    assert_eq!(
+        encoder_config(&auto, aom, 3840, 1080, 2).threads,
+        4,
+        "two stripes share the budget"
+    );
+    assert_eq!(encoder_config(&auto, H264, 3840, 2160, 1).threads, 2);
+    let given = VideoConfig {
+        threads: 3,
+        ..config()
+    };
+    assert_eq!(encoder_config(&given, aom, 3840, 2160, 1).threads, 3);
+}
+
+#[test]
+fn an_encoder_slower_than_the_capture_drops_captures_instead_of_queueing_them() {
+    let encodes = Encodes::default();
+    let hub = Hub::new();
+    let o = Opts {
+        h264_hw_delay: Some(Duration::from_millis(100)),
+        h264_hw_encodes: Some(encodes.clone()),
+        ..Default::default()
+    };
+    let mut eng = Engine::new(config(), hub.clone(), W, H, &[H264_HW], fakes(o)).unwrap();
+    let (c, mut rx) = client(&hub);
+    join_legacy(&hub, &c);
+    settle(&eng);
+    let before = encodes.lock().unwrap().len();
+    let captures = 30;
+    let mut most = 0;
+    for _ in 0..captures {
+        acked(&c, &mut rx);
+        let now = Instant::now();
+        eng.replan();
+        let views = eng.views();
+        eng.update_rates(&views);
+        let turn = eng.turn(&views, 33.0, now);
+        let mut f = whole(W, H);
+        f.band = Some(Band { y0: 0, y1: H });
+        eng.mark(&views, None);
+        eng.dispatch(&f, &views, &turn, now);
+        most = most.max(eng.cohorts[0].shared.busy.load(Ordering::Acquire));
+        std::thread::sleep(Duration::from_millis(33));
+    }
+    let t = Instant::now();
+    settle(&eng);
+    let drained = t.elapsed();
+    let encoded = encodes.lock().unwrap().len() - before;
+    assert!(most <= 2, "one encoding and one waiting at most: {most}");
+    assert!(
+        drained < Duration::from_millis(400),
+        "a backlog after the last capture: {drained:?}"
+    );
+    assert!(
+        (5..=captures / 2).contains(&encoded),
+        "{encoded} of {captures} captures encoded"
     );
 }
 
