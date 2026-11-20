@@ -287,7 +287,8 @@ fn encoder_entries(usage: &str) -> String {
     let threads = match cfg!(feature = "libaom") {
         true => {
             "sliced threads (default cores/4, from 1 to 4; libaom picks its own: 4 up to \
-                 1080p, 8 above, never more than the cores or fewer than 2)"
+                 1080p, 8 above, at most the cores but never under 2 per encoder, so 2 on \
+                 a 1-core host)"
         }
         false => "sliced threads (default cores/4, from 1 to 4)",
     };

@@ -1919,7 +1919,7 @@ fn a_failed_session_is_closed_when_no_replacement_opens() {
 fn a_reopen_closes_the_old_encoder_before_opening_the_new_one() {
     let live = Arc::new(AtomicUsize::new(0));
     let open = slotted(fakes(Opts::default()), 1, 2, live.clone());
-    let cfg = encoder_config(&config(), H264, W, H, 1);
+    let cfg = encoder_config(&config(), H264, W, H, H, 1);
     let enc = open(&cfg).unwrap();
     let mut s = Stripe {
         y: 0,
@@ -3934,9 +3934,9 @@ fn high_fps_caps_hardware_videotoolbox_only() {
         ..high_fps()
     };
     assert_eq!((fps_cap(&forced, H264), base_fps(&forced)), (120, 120));
-    assert_eq!(encoder_config(&on, HEVC, W, H, 1).fps, 120);
-    assert_eq!(encoder_config(&on, HEVC, W, H, 1).rate.fps, 120);
-    assert_eq!(encoder_config(&on, H264, W, H, 1).fps, 60);
+    assert_eq!(encoder_config(&on, HEVC, W, H, H, 1).fps, 120);
+    assert_eq!(encoder_config(&on, HEVC, W, H, H, 1).rate.fps, 120);
+    assert_eq!(encoder_config(&on, H264, W, H, H, 1).fps, 60);
 }
 
 const SOFTWARE: Candidate = Candidate {
@@ -3952,18 +3952,18 @@ fn preset_goes_only_to_the_encoder_it_was_given_for() {
         preset: "12".into(),
         ..config()
     };
-    assert_eq!(encoder_config(&pinned, H264_HW, W, H, 1).preset, "12");
+    assert_eq!(encoder_config(&pinned, H264_HW, W, H, H, 1).preset, "12");
     assert_eq!(
-        encoder_config(&pinned, SOFTWARE, W, H, 1).preset,
+        encoder_config(&pinned, SOFTWARE, W, H, H, 1).preset,
         encoder::DEFAULT_PRESET
     );
     let auto = VideoConfig {
         preset: "veryfast".into(),
         ..config()
     };
-    assert_eq!(encoder_config(&auto, SOFTWARE, W, H, 1).preset, "veryfast");
+    assert_eq!(encoder_config(&auto, SOFTWARE, W, H, H, 1).preset, "veryfast");
     assert_eq!(
-        encoder_config(&auto, H264_HW, W, H, 1).preset,
+        encoder_config(&auto, H264_HW, W, H, H, 1).preset,
         encoder::DEFAULT_PRESET
     );
 }
@@ -4006,19 +4006,37 @@ fn libaom_picks_its_own_threads_unless_they_were_given() {
         cpus: Some(8),
         ..config()
     };
-    assert_eq!(encoder_config(&auto, aom, 1920, 1080, 1).threads, 4);
-    assert_eq!(encoder_config(&auto, aom, 3840, 2160, 1).threads, 8);
+    assert_eq!(encoder_config(&auto, aom, 1920, 1080, 1080, 1).threads, 4);
+    assert_eq!(encoder_config(&auto, aom, 3840, 2160, 2160, 1).threads, 8);
     assert_eq!(
-        encoder_config(&auto, aom, 3840, 1080, 2).threads,
+        encoder_config(&auto, aom, 3840, 1080, 2160, 2).threads,
         4,
         "two stripes share the budget"
     );
-    assert_eq!(encoder_config(&auto, H264, 3840, 2160, 1).threads, 2);
+    assert_eq!(
+        encoder_config(&auto, aom, 2560, 720, 1440, 2).threads,
+        4,
+        "the budget is the whole picture's"
+    );
+    assert_eq!(encoder_config(&auto, H264, 3840, 2160, 2160, 1).threads, 2);
     let given = VideoConfig {
         threads: 3,
         ..config()
     };
-    assert_eq!(encoder_config(&given, aom, 3840, 2160, 1).threads, 3);
+    assert_eq!(encoder_config(&given, aom, 3840, 2160, 2160, 1).threads, 3);
+    let adaptive = VideoConfig {
+        threads: 1,
+        cpus: Some(4),
+        adaptive_threads: true,
+        ..config()
+    };
+    assert_eq!(encoder_config(&adaptive, aom, 1920, 1080, 1080, 1).threads, 1);
+    assert_eq!(
+        adaptive_max_threads(&adaptive, aom, 1920, 1080, 1),
+        4,
+        "--adaptive-threads grows libaom up to its own budget"
+    );
+    assert_eq!(adaptive_max_threads(&adaptive, H264, 1920, 1080, 1), 1);
 }
 
 #[test]
@@ -4080,9 +4098,9 @@ fn a_bench_arms_preset_stays_off_its_h264_cohort() {
             backend,
             hardware: false,
         };
-        assert_eq!(encoder_config(&cfg, arm, W, H, 1).preset, "12", "{name}");
+        assert_eq!(encoder_config(&cfg, arm, W, H, H, 1).preset, "12", "{name}");
         assert_eq!(
-            encoder_config(&cfg, SOFTWARE, W, H, 1).preset,
+            encoder_config(&cfg, SOFTWARE, W, H, H, 1).preset,
             encoder::DEFAULT_PRESET,
             "{name}"
         );

@@ -2331,7 +2331,6 @@ mod tests {
             .unwrap()
         }
 
-
         #[tokio::test]
         async fn a_framed_session_over_a_unix_socket() {
             let (hub, input) = wired();

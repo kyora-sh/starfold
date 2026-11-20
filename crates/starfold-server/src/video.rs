@@ -602,11 +602,46 @@ impl View {
     }
 }
 
+/// The threads each of `stripes` encoders of `cand` may use for a `width`x`picture_h`
+/// picture: libaom's own budget where the CPUs are known, else `--threads` shared out.
+fn stripe_threads(
+    cfg: &VideoConfig,
+    cand: Candidate,
+    width: u32,
+    picture_h: u32,
+    stripes: usize,
+) -> u32 {
+    #[cfg(feature = "libaom")]
+    if let (encoder::Backend::Libaom, Some(cpus)) = (cand.backend, cfg.cpus) {
+        return encoder::aom_threads(width as u64 * picture_h as u64, cpus, stripes as u32);
+    }
+    let _ = (cand, width, picture_h);
+    (cfg.threads / stripes.max(1) as u32).max(1)
+}
+
+/// The most threads `--adaptive-threads` gives each of `stripes` encoders of `cand`; 1
+/// where it doesn't adapt them.
+fn adaptive_max_threads(
+    cfg: &VideoConfig,
+    cand: Candidate,
+    width: u32,
+    picture_h: u32,
+    stripes: usize,
+) -> u32 {
+    match cfg.adaptive_threads && cand.backend.takes_threads() {
+        true => stripe_threads(cfg, cand, width, picture_h, stripes),
+        false => 1,
+    }
+}
+
+/// The encoder for one of `stripes` stripes, `width`x`height`, of a picture `picture_h`
+/// high.
 fn encoder_config(
     cfg: &VideoConfig,
     cand: Candidate,
     width: u32,
     height: u32,
+    picture_h: u32,
     stripes: usize,
 ) -> EncoderConfig {
     let fps = fps_cap(cfg, cand);
@@ -616,13 +651,9 @@ fn encoder_config(
         width,
         height,
         fps,
-        threads: match (cfg.adaptive_threads, cfg.cpus) {
-            (true, _) => 1,
-            #[cfg(feature = "libaom")]
-            (false, Some(cpus)) if cand.backend == encoder::Backend::Libaom => {
-                encoder::aom_threads(width as u64 * height as u64, cpus, stripes as u32)
-            }
-            _ => (cfg.threads / stripes as u32).max(1),
+        threads: match cfg.adaptive_threads {
+            true => 1,
+            false => stripe_threads(cfg, cand, width, picture_h, stripes),
         },
         rate: RateConfig::new(cfg.crf, cfg.max_kbps, fps),
         best_quality: cfg.crf,
@@ -743,7 +774,7 @@ fn make_offer(
             None => {
                 let c = sample(
                     open,
-                    &encoder_config(cfg, cand, w, sh, layout.len()),
+                    &encoder_config(cfg, cand, w, sh, h, layout.len()),
                     cfg,
                     layout.len(),
                 )?;
@@ -1074,16 +1105,12 @@ impl Engine {
         let n = offer.stripes.len();
         let mut stripes = Vec::new();
         for s in &offer.stripes {
-            let ecfg = encoder_config(&self.cfg, cand, self.w, s.h, n);
+            let ecfg = encoder_config(&self.cfg, cand, self.w, s.h, self.h, n);
             stripes.push(Stripe {
                 y: s.y as usize,
                 h: s.h as usize,
                 enc: (self.open)(&ecfg)?,
-                max_threads: if self.cfg.adaptive_threads && ecfg.backend.takes_threads() {
-                    (self.cfg.threads / n as u32).max(1)
-                } else {
-                    1
-                },
+                max_threads: adaptive_max_threads(&self.cfg, cand, self.w, self.h, n),
                 cfg: ecfg,
                 applied_kbps: None,
                 applied_crf: -1.0,
@@ -1810,14 +1837,15 @@ fn build(
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
     hub.activity.reset(w, h);
+    let engine = Engine::new(cfg.clone(), hub.clone(), w, h, cands, open.clone())?;
+    let n = hub.stripes.lock().len().max(1);
     log::info!(
         "capturing {}x{} @ {} fps, {} encoder threads",
         w,
         h,
         cfg.fps,
-        cfg.threads
+        stripe_threads(cfg, engine.base, w, h, n) * n as u32
     );
-    let engine = Engine::new(cfg.clone(), hub.clone(), w, h, cands, open.clone())?;
     Ok(Pipeline { cap, engine })
 }
 

@@ -286,7 +286,11 @@ const HARDWARE_FIRST: bool = true;
 /// A candidate's place in [`candidates`], lowest first, in the order [`HARDWARE_FIRST`]
 /// names.
 fn rank(c: Candidate, hardware_first: bool) -> (bool, u8, bool) {
-    (hardware_first && !c.hardware, codec_rank(c.codec), !c.hardware)
+    (
+        hardware_first && !c.hardware,
+        codec_rank(c.codec),
+        !c.hardware,
+    )
 }
 
 /// The base cohort's encoders in the order it falls back through them: the H.264 ones in

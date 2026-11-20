@@ -65,7 +65,6 @@ fn pairs(c: &[Candidate]) -> Vec<(Codec, Backend)> {
     c.iter().map(|c| (c.codec, c.backend)).collect()
 }
 
-
 fn offer(cand: Candidate, codec: &str, stripes: &[(u32, u32)], w: u32) -> Offer {
     Offer {
         codec: cand.codec,
@@ -919,7 +918,10 @@ fn libaom_alone_is_the_base_chain() {
     }
     let base = base_backend(&r, Selection::Pinned(Backend::Libaom)).unwrap();
     assert_eq!(base, LIBAOM);
-    assert_eq!(candidates_for(&r, Selection::Pinned(Backend::Libaom), base), vec![LIBAOM]);
+    assert_eq!(
+        candidates_for(&r, Selection::Pinned(Backend::Libaom), base),
+        vec![LIBAOM]
+    );
     assert_eq!(base_chain(&candidates(&r, base)), vec![LIBAOM]);
 }
 
