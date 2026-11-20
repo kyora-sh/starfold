@@ -164,6 +164,8 @@ pub struct Aom {
     hashed: u64,
     #[cfg(test)]
     wrong_match: bool,
+    #[cfg(test)]
+    last_screen: Screen,
 }
 
 unsafe impl Send for Aom {}
@@ -311,6 +313,8 @@ impl Aom {
                 hashed: 0,
                 #[cfg(test)]
                 wrong_match: false,
+                #[cfg(test)]
+                last_screen: Screen::None,
             };
             enc.controls(speed)?;
             Ok(enc)
@@ -389,6 +393,12 @@ impl Aom {
     #[cfg(test)]
     pub(crate) fn force_wrong_match(&mut self) {
         self.wrong_match = true;
+    }
+
+    /// What the last frame handed to libaom did with the stored screens.
+    #[cfg(test)]
+    pub(crate) fn last_screen(&self) -> Screen {
+        self.last_screen
     }
 
     fn set_references(&mut self, refine: bool, screen: Screen) -> Result<(), EncodeError> {
@@ -666,6 +676,10 @@ impl VideoEncoder for Aom {
                 fixed.is_some(),
             ),
         };
+        #[cfg(test)]
+        {
+            self.last_screen = screen;
+        }
         if !key {
             self.set_references(fixed.is_some(), screen)?;
         }
@@ -681,14 +695,8 @@ impl VideoEncoder for Aom {
         };
         let out = if r == ffi::aom_codec_err_t_AOM_CODEC_OK {
             self.fresh = false;
-            let out = self.collect();
-            let whole = out.as_ref().is_ok_and(|o| o.iter().any(|a| a.keyframe));
-            self.screen_coded(key || whole || out.is_err(), screen, h);
-            out
+            self.collect()
         } else {
-            if let Some(s) = self.screens.as_mut() {
-                s.clear();
-            }
             Err(self.error("encode"))
         };
         let q = match out {
@@ -699,6 +707,13 @@ impl VideoEncoder for Aom {
             Some(_) => self.restore(),
             None => Ok(()),
         };
+        match (&out, &q, &restored) {
+            (Ok(o), Ok(_), Ok(())) if !o.is_empty() => {
+                let whole = o.iter().any(|a| a.keyframe);
+                self.screen_coded(key || whole, screen, h);
+            }
+            _ => self.screen_coded(true, Screen::None, 0),
+        }
         let (out, q) = (out?, q?);
         restored?;
         let bytes: usize = out.iter().map(|a| a.data.len()).sum();

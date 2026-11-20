@@ -347,10 +347,13 @@ fn after_a_requested_keyframe_no_frame_references_a_screen_from_before_it() {
     let first = s.page(2);
     s.pic.texture(1 << 29, 0, 0, W, H, 0);
     let back = s.frame(None);
+    assert!(matches!(s.enc.last_screen(), Screen::Back(_)));
     assert!(back * 4 < first, "back {back}, page {first}");
     assert!(s.encode(None, true, None).1);
+    assert_eq!(s.enc.screens().unwrap(), [0; SCREENS]);
     s.pic.texture(2 << 29, 0, 0, W, H, 0);
     let again = s.frame(None);
+    assert_eq!(s.enc.last_screen(), Screen::None);
     let psnr = s.psnr();
     eprintln!("page 2 again after the keyframe: {again} bytes, {psnr:.2} dB");
     assert!(
@@ -373,6 +376,10 @@ fn a_wrong_match_decodes_to_the_right_picture() {
     s.enc.force_wrong_match();
     s.pic.texture(1 << 29, 0, 0, W, H, 0);
     let n = s.frame(None);
+    let Screen::Back(k) = s.enc.last_screen() else {
+        panic!("{:?}: the frame did not predict from a stored screen", s.enc.last_screen());
+    };
+    assert_eq!(s.enc.screens().unwrap()[k - 1], screen_hash(&page2.view()));
     let recon = s.enc.reconstruction().unwrap();
     let right = luma_psnr(&recon, W, &s.pic);
     let wrong = luma_psnr(&recon, W, &page2);
