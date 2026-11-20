@@ -2717,6 +2717,7 @@ fn videotoolbox_hevc_negotiated() {
                         assert!(c.codec_ready(epoch));
                     }
                 }
+                Out::Close(code, reason) => panic!("closed: {code} {reason}"),
             }
         }
     }
