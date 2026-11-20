@@ -950,8 +950,11 @@ fn videotoolbox_encodes_h264_and_hevc() {
         match codec {
             Codec::H264 => {
                 assert!(c.codec_string.starts_with("avc1.64"), "{}", c.codec_string);
+                let sps_nal = nal_units(&aus[0].data)
+                    .find(|n| nal_type(n) == NAL_SPS)
+                    .unwrap();
+                assert_eq!(sps_nal[1], 100);
                 let sps = sps_of(&aus[0]);
-                assert_eq!(sps.profile, 100);
                 assert_eq!(sps.display, (w as u32, h as u32));
                 assert_eq!(sps.color, Some((false, 1, 13, 6)));
                 assert_eq!(decode_all_as(&aus, Codec::H264).len(), aus.len());
