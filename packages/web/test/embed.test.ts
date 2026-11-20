@@ -630,7 +630,9 @@ describe('reconnect, opt-in', () => {
 		page.connect();
 		for (const i of [0, 1]) {
 			await until(() => !!s.conns[i]?.ws && (s.conns[i]?.got.length ?? 0) >= 1);
-			await until(() => statuses(seen).filter((x) => x === 'open').length === i + 1);
+			await until(
+				() => statuses(seen).filter((x) => x === 'open').length === i + 1
+			);
 			s.conns[i].ws!.close(4401, 'ticket rejected');
 		}
 		await until(() => statuses(seen).at(-1) === 'closed');

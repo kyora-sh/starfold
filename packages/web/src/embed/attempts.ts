@@ -163,7 +163,10 @@ export class PageLife {
 	}
 
 	/** An attempt that ended before a socket; one made to reconnect ends the run. */
-	private failed(s: 'preamble-failed' | 'connect-failed', detail: ConnectFailure) {
+	private failed(
+		s: 'preamble-failed' | 'connect-failed',
+		detail: ConnectFailure
+	) {
 		const r = this.o.reconnect;
 		const run = r?.reconnecting ?? false;
 		this.status(s, detail);

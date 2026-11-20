@@ -70,7 +70,8 @@ describe('which closes reconnect', () => {
 		for (const code of [1006, 1001, 1012, 1013, 4401, 4400, 4499, 4429])
 			expect([code, retryable(code)]).toEqual([code, true]);
 		for (const code of [
-			1000, 1005, 1003, 1007, 1009, 1011, 4000, 4001, 4002, 4406, 4500, 4399, 3000,
+			1000, 1005, 1003, 1007, 1009, 1011, 4000, 4001, 4002, 4406, 4500, 4399,
+			3000,
 		])
 			expect([code, retryable(code)]).toEqual([code, false]);
 	});
