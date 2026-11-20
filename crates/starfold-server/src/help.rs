@@ -82,6 +82,7 @@ PRESET_ENTRY
 THREADS_ENTRY
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
+STORED_ENTRY
 PAINTOVER_ENTRY
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
@@ -292,8 +293,16 @@ fn encoder_entries(usage: &str) -> String {
         }
         false => "sliced threads (default cores/4, from 1 to 4)",
     };
+    let stored = match cfg!(feature = "libaom") {
+        true => {
+            "libaom keeps up to six settled screens and codes a return to one from it \
+             (default true)"
+        }
+        false => "accepted and ignored: this build's encoders keep no stored screens",
+    };
     usage
         .replace("THREADS_ENTRY\n", &entry("--encoder-threads", threads))
+        .replace("STORED_ENTRY\n", &entry("--stored-screens", stored))
         .replace("CRF_ENTRY\n", &entry("--crf", &crf))
         .replace("ENCODER_ENTRY\n", &entry("--encoder", &encoder))
         .replace("PRESET_ENTRY\n", &entry("--preset", &preset))
@@ -412,6 +421,12 @@ mod tests {
         assert_eq!(
             words.contains("libaom picks its own: 4 up to 1080p, 8 above"),
             cfg!(feature = "libaom"),
+            "{text}"
+        );
+        assert!(words.contains("--stored-screens"), "{text}");
+        assert_eq!(
+            words.contains("accepted and ignored: this build's encoders keep no stored screens"),
+            !cfg!(feature = "libaom"),
             "{text}"
         );
         assert!(!text.contains("_ENTRY"), "{text}");
