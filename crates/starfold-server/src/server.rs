@@ -2412,7 +2412,12 @@ mod tests {
             }
         }
 
-        fn restart_close(close: &tokio_tungstenite::tungstenite::protocol::CloseFrame) -> bool {
+        /// Whether the next close is 1012 "server restarting"; a viewer that gets none within
+        /// 5 s (pings keep coming) fails the test.
+        async fn restart_close(ws: &mut WebSocketStream<tokio::net::TcpStream>) -> bool {
+            let close = tokio::time::timeout(Duration::from_secs(5), close_frame(ws))
+                .await
+                .expect("no close within 5 s");
             (u16::from(close.code), close.reason.as_str()) == (1012, "server restarting")
         }
 
@@ -2433,8 +2438,7 @@ mod tests {
                 panic!("the hello is a text message");
             };
             let shutdown = shut_down_task(&hub, Duration::from_secs(5));
-            let close = close_frame(&mut ws).await;
-            assert!(restart_close(&close), "{close:?}");
+            assert!(restart_close(&mut ws).await, "not 1012");
             assert!(
                 !input.try_iter().any(|e| matches!(e, InputEvent::Shutdown)),
                 "input released while a viewer was still on"
@@ -2444,7 +2448,10 @@ mod tests {
             })
             .await
             .expect("the socket never closed");
-            let took = shutdown.await.unwrap();
+            let took = tokio::time::timeout(Duration::from_secs(10), shutdown)
+                .await
+                .expect("the shutdown never returned")
+                .unwrap();
             assert!(
                 took < Duration::from_secs(3),
                 "waited {took:?} for a viewer that answered the close"
@@ -2459,8 +2466,7 @@ mod tests {
             let (hub, _input) = wired();
             hub.begin_close();
             let (mut ws, server) = viewer(&hub).await;
-            let close = close_frame(&mut ws).await;
-            assert!(restart_close(&close), "{close:?}");
+            assert!(restart_close(&mut ws).await, "not 1012");
             hub.seal();
             let port = {
                 let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
