@@ -2045,8 +2045,9 @@ mod tests {
         assert_eq!(c.display_hz(), None);
     }
 
-    /// A protocol 2 message the server drops, an answer to offers that have since changed
-    /// or JSON it cannot read, still tells protocol 2: a `v,1` after it does not make the
+    /// A protocol 2 message the server drops (an answer to offers that have since changed,
+    /// JSON it cannot read, or a message for an epoch it has not announced) still tells
+    /// protocol 2: a `v,1` after it does not make the
     /// viewer protocol 1, and it is not negotiated before it answers the offers in force.
     #[test]
     fn a_dropped_protocol_2_message_then_v1_is_not_protocol_1() {
@@ -2059,6 +2060,12 @@ mod tests {
             r#"{"t":"hello","v":2,"offer":"0","decode":[]}"#,
             r#"{"t":"later"}"#,
             "{",
+            r#"{"t":"codec-ready","epoch":1}"#,
+            r#"{"t":"codec-error","epoch":1,"reason":"x"}"#,
+            r#"{"t":"ack","epoch":1,"frame":1}"#,
+            r#"{"t":"keyframe","epoch":1}"#,
+            r#"{"t":"hz","hz":60}"#,
+            r#"{"t":"slow"}"#,
         ] {
             let (tx, _rx) = mpsc::unbounded_channel();
             let c = hub.add_client(tx);
@@ -2091,16 +2098,16 @@ mod tests {
         assert_eq!(r.caps.len(), 1);
         drop(r);
         assert!(new.video.load(Ordering::Relaxed));
-        // An answer to an older offer generation is ignored.
+        // An answer to an offer generation not yet made is ignored.
         let (tx, _rx) = mpsc::unbounded_channel();
-        let late = hub.add_client(tx);
+        let ahead = hub.add_client(tx);
         handle_text(
             &s,
-            &late,
+            &ahead,
             &caps.replace("\"offer\":0", "\"offer\":9"),
             &mut rtts,
         );
-        assert_eq!(late.route.lock().proto, Proto::Unknown);
+        assert_eq!(ahead.route.lock().proto, Proto::Unknown);
         // A v2 ack is ignored from a protocol 1 viewer, and `a,` from a protocol 2 one.
         old.inflight.lock().push_back(crate::hub::Inflight {
             id: 1,

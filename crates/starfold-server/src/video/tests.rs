@@ -390,7 +390,7 @@ fn engine(hub: &Arc<Hub>, cands: &[Candidate], o: Opts) -> Engine {
 pub(crate) fn av1_only_engine(hub: Arc<Hub>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     let (started, ready) = std::sync::mpsc::channel();
     let t = std::thread::spawn(move || {
-        let mut eng = Av1Engine::new(&hub);
+        let mut eng = engine(&hub, &[FAKE_AV1_SW], Opts::default());
         started.send(()).unwrap();
         while !stop.load(Ordering::Acquire) {
             eng.replan();
