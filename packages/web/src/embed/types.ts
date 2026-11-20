@@ -28,9 +28,9 @@ export type Status =
 /**
  * The `reconnect` option's limits. The delay before attempt n is a random time below
  * min(capMs, initialMs * factor^(n-1)); a run gives up after maxAttempts attempts or maxMs
- * since its first close (time offline not counted), whichever comes first. A connection that
- * stays open for 10 s ends the run. Each limit is a positive number (factor at least 1), or
- * mount() throws.
+ * since its first close on the wall clock (offline, hidden or suspended time included),
+ * whichever comes first. A connection that stays open for 10 s ends the run. Each limit is a
+ * positive number, maxAttempts a whole one and factor at least 1, or mount() throws.
  */
 export interface ReconnectOptions {
 	/** Default 500. */
@@ -67,19 +67,13 @@ export type ReconnectWhy =
 	| 'connect-failed';
 
 /**
- * What `onReconnect` gets; `code` and `reason` are the last close's, as the server or gateway
- * sent them (as for onClose: a gateway that echoes a ticket in its reason leaks it itself).
+ * What `onReconnect` gets; `code` is the last close's. The close's reason is not in it: it is
+ * the server's or a gateway's text, and only onClose and shouldReconnect get it.
  */
 export type ReconnectEvent =
-	| {
-			kind: 'reconnecting';
-			attempt: number;
-			delayMs: number;
-			code: number;
-			reason: string;
-	  }
-	| { kind: 'reconnected'; attempt: number; code: number; reason: string }
-	| { kind: 'gave-up'; why: ReconnectWhy; code: number; reason: string };
+	| { kind: 'reconnecting'; attempt: number; delayMs: number; code: number }
+	| { kind: 'reconnected'; attempt: number; code: number }
+	| { kind: 'gave-up'; why: ReconnectWhy; code: number };
 
 /**
  * What onClose gets when unmount() ends a connection whose socket was asked for: 1001, "going

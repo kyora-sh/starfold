@@ -46,6 +46,7 @@ export function backoff(
 }
 
 export interface Env {
+	/** Wall-clock milliseconds: they go on while the tab or the machine is suspended. */
 	now(): number;
 	setTimeout(f: () => void, ms: number): unknown;
 	clearTimeout(h: unknown): void;
@@ -56,10 +57,10 @@ export interface Env {
 	onWake(f: () => void): () => void;
 }
 
-/** The page's own: `document.visibilityState`, `navigator.onLine` and their events. */
+/** The page's own: `Date.now()`, `document.visibilityState`, `navigator.onLine` and their events. */
 export function pageEnv(): Env {
 	return {
-		now: () => performance.now(),
+		now: () => Date.now(),
 		setTimeout: (f, ms) => setTimeout(f, ms),
 		clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
 		random: Math.random,
@@ -84,7 +85,10 @@ export type Decision =
 
 type Limits = Required<Omit<ReconnectOptions, 'shouldReconnect'>>;
 
-/** The limits with their defaults; a limit that is not a positive number (factor: >= 1) throws. */
+/**
+ * The limits with their defaults. Each must be a positive finite number, maxAttempts a whole
+ * one and factor at least 1, or this throws.
+ */
 export function limits(options: true | ReconnectOptions): Limits {
 	const o = options === true ? {} : options;
 	const out: Limits = {
@@ -95,13 +99,12 @@ export function limits(options: true | ReconnectOptions): Limits {
 		maxMs: o.maxMs ?? RECONNECT_DEFAULTS.maxMs,
 	};
 	for (const [k, v] of Object.entries(out)) {
-		const min = k === 'factor' ? 1 : 0;
-		if (
-			typeof v !== 'number' ||
-			!Number.isFinite(v) ||
-			v < min ||
-			(min === 0 && v === 0)
-		)
+		const ok =
+			typeof v === 'number' &&
+			Number.isFinite(v) &&
+			(k === 'factor' ? v >= 1 : v > 0) &&
+			(k !== 'maxAttempts' || Number.isInteger(v));
+		if (!ok)
 			throw new TypeError(`starfold: reconnect.${k} must be a positive number`);
 	}
 	return out;
@@ -110,19 +113,16 @@ export function limits(options: true | ReconnectOptions): Limits {
 interface Run {
 	start: number;
 	attempts: number;
-	/** Time spent offline while waiting, which does not count toward maxMs. */
-	pausedMs: number;
 	neverOpened: number;
 	/** The 44xx code of the last close if it came right after an open. */
 	last44xx: number | null;
 }
 
-/** An attempt waiting for its delay and for the page to be visible and online. */
+/** What waits: the delay, the deadline, and the page's visibility and network. */
 interface Wait {
-	timer: unknown;
-	due: boolean;
+	delay: unknown;
+	deadline: unknown;
 	stop: () => void;
-	go: () => void;
 }
 
 export class Reconnector {
@@ -131,7 +131,6 @@ export class Reconnector {
 	private run: Run | null = null;
 	private openedAt: number | null = null;
 	private wait: Wait | null = null;
-	private offlineSince: number | null = null;
 
 	constructor(
 		options: true | ReconnectOptions,
@@ -151,9 +150,14 @@ export class Reconnector {
 		return this.run?.attempts ?? 0;
 	}
 
-	/** Whether an attempt is waiting: its delay, or the page to wake. */
+	/** Whether something waits: a delay, or a held reply. */
 	get pending(): boolean {
 		return this.wait !== null;
+	}
+
+	/** Whether the run is past maxMs since its first close, on the wall clock. */
+	get expired(): boolean {
+		return this.run !== null && this.left() <= 0;
 	}
 
 	opened() {
@@ -162,19 +166,24 @@ export class Reconnector {
 	}
 
 	/**
-	 * What to do after a socket closed with `code`; with `retry`, the attempt is counted. Calls
-	 * the embedder's `shouldReconnect`, which may throw or call back into the client: the caller
-	 * handles both.
+	 * What to do after a socket closed with `code`, open for `openMs` (null: it never opened;
+	 * undefined: measured here, from opened() to now); with `retry`, the attempt is counted.
+	 * Calls the embedder's `shouldReconnect`, which may throw or call back into the client: the
+	 * caller handles both.
 	 */
-	closed(code: number, reason: string): Decision {
+	closed(code: number, reason: string, openMs?: number | null): Decision {
 		const now = this.env.now();
-		const openFor = this.openedAt === null ? null : now - this.openedAt;
+		const openFor =
+			openMs !== undefined
+				? openMs
+				: this.openedAt === null
+					? null
+					: now - this.openedAt;
 		this.openedAt = null;
 		if (openFor !== null && openFor >= STABLE_MS) this.run = null;
 		const run = (this.run ??= {
 			start: now,
 			attempts: 0,
-			pausedMs: 0,
 			neverOpened: 0,
 			last44xx: null,
 		});
@@ -199,22 +208,8 @@ export class Reconnector {
 		};
 	}
 
-	/** What is left of the run's maxMs, time offline not counted. */
 	private left(): number {
-		if (!this.run) return this.o.maxMs;
-		const now = this.env.now();
-		const offline = this.offlineSince === null ? 0 : now - this.offlineSince;
-		return this.o.maxMs - (now - this.run.start - this.run.pausedMs - offline);
-	}
-
-	/** Starts or ends a stretch offline as `navigator.onLine` says; the stretch is not counted. */
-	private network() {
-		const now = this.env.now();
-		if (!this.env.online()) this.offlineSince ??= now;
-		else if (this.offlineSince !== null) {
-			if (this.run) this.run.pausedMs += now - this.offlineSince;
-			this.offlineSince = null;
-		}
+		return this.run ? this.o.maxMs - (this.env.now() - this.run.start) : Infinity;
 	}
 
 	private awake(): boolean {
@@ -222,77 +217,90 @@ export class Reconnector {
 	}
 
 	/**
-	 * Calls `connect` once `delayMs` is up and the page is visible and online; coming back online
-	 * connects at once, delay or not. If maxMs runs out first, calls `expire` instead (at the
-	 * deadline, or on waking past it).
+	 * Calls `connect` once `delayMs` is up (or at once if the page is or goes offline during
+	 * it) and the page is visible and online; calls `expire` instead once the run is past
+	 * maxMs, at the deadline or on waking past it.
 	 */
 	schedule(delayMs: number, connect: () => void, expire: () => void) {
-		this.cancel();
-		this.network();
-		const w: Wait = {
-			timer: null,
-			due: false,
-			stop: () => {},
-			go: () => {
-				this.cancel();
-				if (this.left() <= 0) expire();
-				else connect();
-			},
+		let due = !this.env.online();
+		this.start(expire, () => due && this.awake(), connect);
+		const w = this.wait!;
+		w.delay = this.env.setTimeout(() => {
+			w.delay = null;
+			due = true;
+			this.check();
+		}, delayMs);
+		this.wake = () => {
+			if (!this.env.online()) due = true;
 		};
-		const left = this.left();
-		w.timer = this.env.setTimeout(
-			() => {
-				w.timer = null;
-				w.due = true;
-				if (this.left() <= 0 && this.env.online()) w.go();
-				else if (this.awake()) w.go();
-			},
-			Math.max(0, Math.min(delayMs, left))
-		);
-		w.stop = this.env.onWake(() => {
-			const wasOffline = this.offlineSince !== null;
-			this.network();
-			const back = wasOffline && this.offlineSince === null;
-			if ((w.due || back) && this.awake()) w.go();
-		});
-		this.wait = w;
 	}
 
-	/** Calls `f` now if the page is visible and online, else once it is (dropped by cancel/reset). */
-	hold(f: () => void) {
-		if (this.awake()) {
-			f();
-			return;
+	/**
+	 * Calls `f` now if the page is visible and online, else once it is; calls `expire` instead
+	 * if the run is past maxMs, now or by then.
+	 */
+	hold(f: () => void, expire: () => void) {
+		this.start(expire, () => this.awake(), f);
+		this.check();
+	}
+
+	/** Calls `expire` once the run is past maxMs, unless something else is waited for first. */
+	guard(expire: () => void) {
+		this.start(expire, () => false, () => {});
+		this.check();
+	}
+
+	private ready: () => boolean = () => false;
+	private onReady: () => void = () => {};
+	private onExpire: () => void = () => {};
+	private wake: () => void = () => {};
+
+	private start(expire: () => void, ready: () => boolean, go: () => void) {
+		this.cancel();
+		this.ready = ready;
+		this.onReady = go;
+		this.onExpire = expire;
+		this.wake = () => {};
+		const w: Wait = { delay: null, deadline: null, stop: () => {} };
+		this.wait = w;
+		const arm = () => {
+			w.deadline = this.env.setTimeout(
+				() => {
+					w.deadline = null;
+					if (this.expired) this.check();
+					else arm();
+				},
+				Math.max(0, this.left())
+			);
+		};
+		if (Number.isFinite(this.left())) arm();
+		w.stop = this.env.onWake(() => {
+			this.wake();
+			this.check();
+		});
+	}
+
+	private check() {
+		if (!this.wait) return;
+		if (this.expired) {
+			const expire = this.onExpire;
+			this.cancel();
+			expire();
+		} else if (this.ready()) {
+			const go = this.onReady;
+			this.cancel();
+			go();
 		}
-		this.cancel();
-		this.network();
-		const w: Wait = {
-			timer: null,
-			due: true,
-			stop: () => {},
-			go: () => {
-				this.cancel();
-				f();
-			},
-		};
-		w.stop = this.env.onWake(() => {
-			this.network();
-			if (this.awake()) w.go();
-		});
-		this.wait = w;
 	}
 
-	/** Drops a waiting attempt. */
+	/** Drops what waits. */
 	cancel() {
 		const w = this.wait;
 		this.wait = null;
-		if (w) {
-			if (w.timer !== null) this.env.clearTimeout(w.timer);
-			w.stop();
-		}
-		if (this.offlineSince !== null && this.run)
-			this.run.pausedMs += this.env.now() - this.offlineSince;
-		this.offlineSince = null;
+		if (!w) return;
+		if (w.delay !== null) this.env.clearTimeout(w.delay);
+		if (w.deadline !== null) this.env.clearTimeout(w.deadline);
+		w.stop();
 	}
 
 	/** The host's own connect(), or the end of a run: counting starts over. */

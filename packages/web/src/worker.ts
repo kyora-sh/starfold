@@ -98,6 +98,8 @@ function get2dContext(
 }
 /** One per socket: async work started on an earlier connection is dropped. */
 let conn = 0;
+/** When the current socket opened (null until it does): the page's reconnect times it so. */
+let openedAt: number | null = null;
 /** Protocol 2: the epoch announced last, and whether the decoders are set up for it. */
 let epoch = 0;
 let ready = false;
@@ -202,14 +204,18 @@ function makeLink(mode: LinkMode) {
 			rate = new StreamRate();
 			behind = new FellBehind();
 			hzOwed = false;
+			openedAt = null;
 		},
 		open(id) {
+			openedAt = performance.now();
 			if (life) up({ t: 'open', id });
 			else post({ t: 'status', s: 'open' });
 			send(cmd.audio(wantAudio));
 		},
 		closed(id, code, reason) {
-			if (life) up({ t: 'closed', id, code, reason });
+			const openMs = openedAt === null ? null : performance.now() - openedAt;
+			openedAt = null;
+			if (life) up({ t: 'closed', id, code, reason, openMs });
 			else post({ t: 'status', s: 'closed' });
 			proto = 0;
 			videoSent = false;

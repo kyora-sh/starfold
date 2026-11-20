@@ -60,7 +60,7 @@ export class PageLife {
 	}
 
 	/** The last close, for a gave-up that follows a later attempt's failure. */
-	private lastClose = { code: 0, reason: '' };
+	private lastCode = 0;
 
 	/**
 	 * A new attempt, unless a socket is open or being made; it replaces one waiting for its
@@ -136,7 +136,7 @@ export class PageLife {
 						this.event({
 							kind: 'reconnected',
 							attempt: r.attempt,
-							...this.lastClose,
+							code: this.lastCode,
 						});
 					r.opened();
 				}
@@ -144,7 +144,7 @@ export class PageLife {
 			case 'closed':
 				if (this.phase !== 'socket') return;
 				this.phase = 'idle';
-				this.closed(m.code, m.reason);
+				this.closed(m.code, m.reason, m.openMs);
 				break;
 			case 'connectFailed':
 				if (this.phase !== 'socket') return;
@@ -168,11 +168,19 @@ export class PageLife {
 			this.phase = 'socket';
 			this.down({ t: 'preamble', id, msgs: r.msgs });
 		};
-		// A reconnect attempt opens no socket while the page is hidden or offline, even if the
-		// page went so while its preamble was pending.
+		// A reconnect attempt sends no reply while the page is hidden or offline, even if the
+		// page went so while its preamble was pending, nor past the run's deadline.
 		const re = this.o.reconnect;
-		if (re?.reconnecting) re.hold(send);
+		if (re?.reconnecting) re.hold(send, () => this.expireAsking(id));
 		else send();
+	}
+
+	/** A reconnect attempt still before its socket when the run's deadline passes. */
+	private expireAsking(id: number) {
+		if (!this.live || id !== this.id || this.phase !== 'asking') return;
+		this.phase = 'idle';
+		this.down({ t: 'preambleFailed', id });
+		this.giveUp('time');
 	}
 
 	/** An attempt that ended before a socket; one made to reconnect ends the run. */
@@ -192,7 +200,7 @@ export class PageLife {
 	 * attempt later, or 'gave-up' and 'closed'. Each is queued on its own: one throwing can't skip
 	 * another.
 	 */
-	private closed(code: number, reason: string) {
+	private closed(code: number, reason: string, openMs?: number | null) {
 		const onClose = this.o.onClose;
 		if (onClose) {
 			this.closeQueued = true;
@@ -201,7 +209,7 @@ export class PageLife {
 				onClose(code, reason);
 			});
 		}
-		this.lastClose = { code, reason };
+		this.lastCode = code;
 		const r = this.o.reconnect;
 		if (!r) {
 			this.status('closed');
@@ -215,7 +223,7 @@ export class PageLife {
 		const id = this.id;
 		let d: Decision;
 		try {
-			d = r.closed(code, reason);
+			d = r.closed(code, reason, openMs);
 		} catch (err) {
 			this.dispatch.call(() => {
 				throw err;
@@ -234,12 +242,14 @@ export class PageLife {
 			attempt: d.attempt,
 			delayMs: d.delayMs,
 			code,
-			reason,
 		});
 		r.schedule(
 			d.delayMs,
 			() => {
-				if (this.live && this.phase === 'idle') this.attempt();
+				if (!this.live || this.phase !== 'idle') return;
+				this.attempt();
+				const id = this.id;
+				r.guard(() => this.expireAsking(id));
 			},
 			() => {
 				if (this.live && this.phase === 'idle') this.giveUp('time');
@@ -247,11 +257,11 @@ export class PageLife {
 		);
 	}
 
-	/** 'gave-up' with the last close's code and reason, then 'closed': the run is over. */
+	/** 'gave-up' with the last close's code, then 'closed': the run is over. */
 	private giveUp(why: ReconnectWhy) {
 		this.o.reconnect?.reset();
 		this.status('gave-up');
-		this.event({ kind: 'gave-up', why, ...this.lastClose });
+		this.event({ kind: 'gave-up', why, code: this.lastCode });
 		this.status('closed');
 	}
 

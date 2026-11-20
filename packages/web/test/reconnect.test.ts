@@ -272,8 +272,8 @@ describe('waiting for the attempt', () => {
 		]);
 	});
 
-	test('a hidden page past the deadline gives up instead of connecting', () => {
-		const { r, advance, page, wake } = reconnector({ maxMs: 1000 });
+	test('a hidden page gives up at the deadline, not on waking', () => {
+		const { r, advance, page, wake, wakes } = reconnector({ maxMs: 1000 });
 		let connects = 0;
 		let expired = 0;
 		expect(r.closed(1006, '').t).toBe('retry');
@@ -283,8 +283,52 @@ describe('waiting for the attempt', () => {
 			() => connects++,
 			() => expired++
 		);
-		advance(5000);
+		advance(999);
 		expect(expired).toBe(0);
+		advance(1);
+		expect([connects, expired, wakes.size]).toEqual([0, 1, 0]);
+		page.hidden = false;
+		wake();
+		expect([connects, expired]).toEqual([0, 1]);
+	});
+
+	test('a deadline timer that fires early is set again, and the delay is not cut short', () => {
+		const { r, advance, env } = reconnector({ maxMs: 1000 });
+		let connects = 0;
+		let expired = 0;
+		expect(r.closed(1006, '').t).toBe('retry');
+		const set = env.setTimeout;
+		const early: number[] = [];
+		env.setTimeout = (f, ms) => {
+			early.push(ms);
+			return set(f, early.length === 1 ? ms - 1 : ms);
+		};
+		r.schedule(
+			5000,
+			() => connects++,
+			() => expired++
+		);
+		advance(999);
+		expect([connects, expired, r.pending]).toEqual([0, 0, true]);
+		advance(1);
+		expect([connects, expired, r.pending]).toEqual([0, 1, false]);
+	});
+
+	test('a page that wakes past the deadline before its timers ran gives up', () => {
+		const { r, page, wake, env } = reconnector({ maxMs: 1000 });
+		let connects = 0;
+		let expired = 0;
+		expect(r.closed(1006, '').t).toBe('retry');
+		const t0 = env.now();
+		env.setTimeout = () => 0;
+		env.clearTimeout = () => {};
+		page.hidden = true;
+		r.schedule(
+			10,
+			() => connects++,
+			() => expired++
+		);
+		env.now = () => t0 + 60_000;
 		page.hidden = false;
 		wake();
 		expect([connects, expired]).toEqual([0, 1]);
@@ -308,31 +352,33 @@ describe('waiting for the attempt', () => {
 		expect(r.pending).toBe(false);
 	});
 
-	test('offline waits for online, and time offline does not count toward maxMs', () => {
-		const { r, advance, page, wake } = reconnector({
-			maxMs: 10_000,
-			maxAttempts: 100,
-		});
+	test('offline waits for online; time offline counts toward maxMs', () => {
+		const { r, advance, page, wake } = reconnector({ maxMs: 10_000 });
 		let connects = 0;
+		let expired = 0;
 		r.opened();
 		expect(r.closed(1012, '').t).toBe('retry');
 		page.online = false;
 		r.schedule(100, () => connects++, never);
-		advance(60_000);
+		advance(5000);
 		expect(connects).toBe(0);
 		page.online = true;
 		wake();
 		expect(connects).toBe(1);
 		r.opened();
-		advance(1000);
 		expect(r.closed(1012, '').t).toBe('retry');
+		page.online = false;
+		r.schedule(
+			100,
+			() => connects++,
+			() => expired++
+		);
+		advance(5000);
+		expect([connects, expired]).toEqual([1, 1]);
 	});
 
-	test('offline from the start of the delay: back online connects at once, the time not counted', () => {
-		const { r, advance, page, wake, timers } = reconnector({
-			maxMs: 10_000,
-			maxAttempts: 100,
-		});
+	test('offline from the start of the delay: back online connects at once', () => {
+		const { r, advance, page, wake, timers, wakes } = reconnector();
 		let connects = 0;
 		r.opened();
 		expect(r.closed(1012, '').t).toBe('retry');
@@ -343,17 +389,29 @@ describe('waiting for the attempt', () => {
 		expect(connects).toBe(0);
 		page.online = true;
 		wake();
-		expect([connects, timers.size]).toEqual([1, 0]);
-		r.opened();
-		advance(9500);
-		expect(r.closed(1012, '').t).toBe('retry');
+		expect([connects, timers.size, wakes.size]).toEqual([1, 0, 0]);
 	});
 
-	test('going offline during the delay is noticed then, not when it ends', () => {
-		const { r, advance, page, wake } = reconnector({
-			maxMs: 10_000,
-			maxAttempts: 100,
-		});
+	test('online while hidden, then visible before the delay ends: connects at once', () => {
+		const { r, advance, page, wake } = reconnector();
+		let connects = 0;
+		r.opened();
+		expect(r.closed(1012, '').t).toBe('retry');
+		page.online = false;
+		page.hidden = true;
+		r.schedule(4000, () => connects++, never);
+		advance(500);
+		page.online = true;
+		wake();
+		expect(connects).toBe(0);
+		advance(500);
+		page.hidden = false;
+		wake();
+		expect(connects).toBe(1);
+	});
+
+	test('going offline during the delay: back online connects at once, delay or not', () => {
+		const { r, advance, page, wake } = reconnector();
 		let connects = 0;
 		r.opened();
 		expect(r.closed(1012, '').t).toBe('retry');
@@ -361,23 +419,19 @@ describe('waiting for the attempt', () => {
 		advance(500);
 		page.online = false;
 		wake();
-		advance(60_000);
-		expect(connects).toBe(0);
+		advance(100);
 		page.online = true;
 		wake();
 		expect(connects).toBe(1);
-		r.opened();
-		advance(9000);
-		expect(r.closed(1012, '').t).toBe('retry');
 	});
 
 	test('hold runs at once on a visible page, else once it is visible and online', () => {
 		const { r, page, wake, wakes } = reconnector();
 		let sent = 0;
-		r.hold(() => sent++);
+		r.hold(() => sent++, never);
 		expect(sent).toBe(1);
 		page.hidden = true;
-		r.hold(() => sent++);
+		r.hold(() => sent++, never);
 		expect([sent, r.pending]).toEqual([1, true]);
 		page.hidden = false;
 		page.online = false;
@@ -386,6 +440,23 @@ describe('waiting for the attempt', () => {
 		page.online = true;
 		wake();
 		expect([sent, r.pending, wakes.size]).toEqual([2, false, 0]);
+	});
+
+	test('hold and guard past the deadline expire instead', () => {
+		const { r, advance } = reconnector({ maxMs: 1000 });
+		let sent = 0;
+		let expired = 0;
+		expect(r.closed(1006, '').t).toBe('retry');
+		r.guard(() => expired++);
+		advance(999);
+		expect(expired).toBe(0);
+		advance(1);
+		expect([expired, r.pending]).toEqual([1, false]);
+		r.hold(
+			() => sent++,
+			() => expired++
+		);
+		expect([sent, expired]).toEqual([0, 2]);
 	});
 
 	test('cancel and reset drop the waiting attempt and its listener', () => {
@@ -419,6 +490,7 @@ describe('the limits themselves', () => {
 			{ capMs: -1 },
 			{ initialMs: 0 },
 			{ factor: 0.5 },
+			{ maxAttempts: 1.5 },
 			{ maxAttempts: '3' as unknown as number },
 		])
 			expect(() => new Reconnector(o, env)).toThrow(TypeError);

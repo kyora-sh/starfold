@@ -98,8 +98,10 @@ export interface MountOptions {
 	 * after `unmount()`; with `reconnect`, `reconnecting` follows instead while another attempt
 	 * is coming (it then reports `connecting` and `open` as any connect), and `gave-up` then
 	 * `closed` when none is. A reconnect attempt that ends in `preamble-failed` or
-	 * `connect-failed` is followed by `gave-up` and `closed`, and so is a worker that fails
-	 * while reconnect is on.
+	 * `connect-failed` is followed by `gave-up` and `closed`. With `reconnect`, a worker that
+	 * fails after a socket was asked for, or while waiting to reconnect, also ends in `gave-up`
+	 * and `closed`; one that fails while the host's own connect() waits for its preamble ends in
+	 * `connect-failed` alone, as without it.
 	 */
 	onStatus?(status: Status, detail?: ConnectFailure): void;
 	/**
@@ -111,10 +113,10 @@ export interface MountOptions {
 	 */
 	reconnect?: true | ReconnectOptions;
 	/**
-	 * With `reconnect`: `reconnecting` (the attempt number, its delay and the close that caused
-	 * it), `reconnected` (an attempt reached open, with the close it followed) and `gave-up` (why,
-	 * and the last close's code and reason). Each comes after the `onStatus` of the same name
-	 * (`open` for `reconnected`).
+	 * With `reconnect`: `reconnecting` (the attempt number, its delay and the code of the close
+	 * that caused it), `reconnected` (an attempt reached open, with the code of the close it
+	 * followed) and `gave-up` (why, and the last close's code). Each comes after the `onStatus` of
+	 * the same name (`open` for `reconnected`). No close reason is in them: onClose has it.
 	 */
 	onReconnect?(e: ReconnectEvent): void;
 }

@@ -338,12 +338,11 @@ The embeddable client (`mount()` in `packages/web/src/embed`) reconnects only wh
 (`{ initialMs, factor, capMs, maxAttempts, maxMs, shouldReconnect }`). It does what a careful
 host would: the same `connect()`, with the preamble called again for every attempt, so a
 ticket is minted for each. Each close still reaches `onClose`; then `onStatus('reconnecting')`
-and `onReconnect({ kind: 'reconnecting', attempt, delayMs, code, reason })`, an attempt
-(`connecting`, `open`, then `onReconnect({ kind: 'reconnected', attempt, code, reason })`), or,
-once it stops, `onStatus('gave-up')`, `onReconnect({ kind: 'gave-up', why, code, reason })`
-with the last close's code and reason, and `onStatus('closed')`. The close's reason is the
-server's or gateway's text, given to `onReconnect` and `shouldReconnect` as to `onClose`: a
-gateway that echoes a ticket there leaks it itself.
+and `onReconnect({ kind: 'reconnecting', attempt, delayMs, code })`, an attempt (`connecting`,
+`open`, then `onReconnect({ kind: 'reconnected', attempt, code })`), or, once it stops,
+`onStatus('gave-up')`, `onReconnect({ kind: 'gave-up', why, code })` with the last close's code,
+and `onStatus('closed')`. The close's reason, the server's or a gateway's own text, goes only to
+`onClose` and `shouldReconnect`.
 
 | Close code            | Sent by                                                                                                        | Reconnects                                                                                   |
 | --------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -359,15 +358,19 @@ gateway that echoes a ticket there leaks it itself.
 `shouldReconnect(code, reason)` replaces the table; the limits still apply. It is called at
 once, not queued; one that throws counts as no. The delay before attempt n is a random time
 below min(`capMs`, `initialMs` x `factor`^(n-1)) (defaults 500 ms, 2, 30 s), and a run gives up
-after `maxAttempts` attempts (10) or `maxMs` since its first close (5 min, time offline not
-counted), whichever comes first; a limit that is not a positive number makes `mount()` throw.
-A connection that stays open for 10 s ends the run (measured from when the page hears of the
-open to when it hears of the close). A hidden tab waits to be visible again and an offline page
-for the network, then connects at once; coming back online connects at once, delay or not. A
-reconnect attempt opens no socket while the page is hidden or offline, even if it became so
-while the preamble was pending. A reconnect attempt whose preamble fails, or whose socket can't
-be made, gives up (`preamble-failed`, `connect-failed`); a preamble that never settles leaves
-the attempt waiting, as it does the host's own `connect()`. The host's own `connect()` while
+after `maxAttempts` attempts (10) or `maxMs` since its first close (5 min, on the wall clock:
+time hidden, offline or asleep counts), whichever comes first; it gives up at that deadline even
+while it waits, and a reply that would go out past it is not sent. A limit that is not a
+positive number (`maxAttempts` a whole one, `factor` at least 1) makes `mount()` throw. A
+connection that stays open for 10 s, timed by the worker that holds the socket, ends the run.
+A hidden tab waits to be visible again and an offline page for the network, then connects at
+once; a page that is or goes offline during the delay connects as soon as it is back, delay or
+not. A reconnect attempt sends its preamble's messages only while the page is visible and
+online, even if it went hidden or offline while the preamble was pending (the check is made as
+the page hands them to the worker, so a tab hidden in that same instant can still connect). A
+reconnect attempt whose preamble fails, or whose socket can't be made, gives up
+(`preamble-failed`, `connect-failed`); a preamble that never settles leaves the attempt waiting
+until the deadline, as the host's own `connect()` would wait. The host's own `connect()` while
 waiting connects at once and starts the count over; `unmount()` cancels it.
 
 ### For agents and scripts
