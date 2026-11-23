@@ -14,10 +14,11 @@ hosts() {
 		grep -o -E 'https?://[^/ ]+' | sed -E 's#https?://##' | sort -u
 }
 
-# The log is public and a proxy URL can carry a user and password: printed apt output has them removed.
+# The log is public and a proxy URL can carry a user and password: printed apt output has them
+# removed, up to the last @ of a URL's authority or of any other word.
 redacted() {
-	sed -E -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1#g' \
-		-e "s#[^[:space:]/@'\"(]+:[^[:space:]/@'\"]*@##g" "$@"
+	sed -E -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/[:space:]]*@#\1#g' \
+		-e 's#(^|[[:space:]])[^/[:space:]]*@#\1#g' "$@"
 }
 
 # run <path> <phase> <limit> <apt-get args...>
@@ -30,16 +31,20 @@ run() {
 	redacted "$log"
 	echo "::endgroup::"
 	[ $rc = 0 ] && return 0
-	waiting=
-	for h in $(hosts); do
-		grep -q -E "^(Hit|Get):[0-9]+ https?://$h/" "$log" || waiting="$waiting $h"
-	done
 	if [ $rc = 124 ] || [ $rc = 137 ]; then
 		echo "apt-get $phase via $path: no result after ${limit}s (stopped)."
 	else
 		echo "apt-get $phase via $path: exit $rc after $((SECONDS - start))s."
 	fi
-	echo "  nothing received from:${waiting:- (none; every host sent something)}"
+	if [ "$phase" = update ]; then
+		waiting=
+		for h in $(hosts); do
+			grep -q -E "^(Hit|Get):[0-9]+ https?://$h/" "$log" || waiting="$waiting $h"
+		done
+		echo "  no index received from:${waiting:- (none; every host sent one)}"
+	elif [ "$phase" = download ]; then
+		echo "  last package started: $(grep -E '^Get:[0-9]+ ' "$log" | tail -n 1 | redacted)"
+	fi
 	echo "  last line: $(grep -v '^ *$' "$log" | tail -n 1 | redacted)"
 	return $rc
 }
@@ -54,7 +59,7 @@ fetch() {
 
 packages=("$@")
 served=
-if [ -s "$proxy" ]; then
+if grep -q -i -E '"[a-z][a-z0-9+.-]*://' "$proxy" 2>/dev/null; then
 	fetch "the runner's package cache" 60 120 -c "$proxy" -o Acquire::Retries=0 \
 		-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 && served="the runner's package cache"
 fi
