@@ -188,10 +188,12 @@ jobs:
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
       # The archive on a clean Ubuntu 24.04 with only the runtime packages the README names. The
       # container shares the runner's network: on docker's bridge, large package downloads stall.
+      # It gets the runner's apt proxy settings, if any, for apt-install.sh's first attempt.
       - name: Clean Ubuntu 24.04
         timeout-minutes: 25
         run: |
-          docker run --rm --network host -v "$PWD:/src:ro" -w /src ubuntu:24.04 \
+          apt-config dump 2>/dev/null | grep -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$RUNNER_TEMP/apt-proxy.conf" || true
+          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$RUNNER_TEMP/apt-proxy.conf:/run/runner-apt-proxy.conf:ro" ubuntu:24.04 \
             .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.flavour.licence }}' \
             libyuv0 libopus0 libpulse0 ${{ matrix.flavour.x264 && 'libx264-164' || '' }}
       - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
@@ -538,15 +540,14 @@ jobs:
             exit 1
           fi
       # Wine aborts on the runner itself, so it runs in a clean Ubuntu 24.04 container (on the
-      # runner's network, as above).
+      # runner's network and with its apt proxy settings, as above).
       - name: Version and licence (Wine)
         timeout-minutes: 25
         run: |
-          docker run --rm --network host -v "$PWD:/src:ro" -w /src -e WINEDEBUG=-all -e 'WINEDLLOVERRIDES=mscoree,mshtml=' ubuntu:24.04 bash -c '
+          apt-config dump 2>/dev/null | grep -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$RUNNER_TEMP/apt-proxy.conf" || true
+          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$RUNNER_TEMP/apt-proxy.conf:/run/runner-apt-proxy.conf:ro" -e WINEDEBUG=-all -e 'WINEDLLOVERRIDES=mscoree,mshtml=' ubuntu:24.04 bash -c '
             set -e
-            apt() { local limit=$1; shift; timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@" >/dev/null; }
-            deps() { apt 180 update && apt 600 install -y --no-install-recommends wine64; }
-            deps || deps
+            .github/release/apt-install.sh wine64
             .github/release/check-version.sh "$1" "$2" /usr/lib/wine/wine64 target/x86_64-pc-windows-gnu/release/starfold.exe
           ' _ "$VERSION" '${{ matrix.flavour.licence }}'
       - name: Licences
