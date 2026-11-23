@@ -3,11 +3,11 @@
 A pushed `v<version>` tag runs `.github/workflows/release.yml`: it builds everything, creates the
 GitHub release and then publishes the default (MIT) build's packages:
 
-| Registry  | Package                                          | Jobs                                |
-| --------- | ------------------------------------------------ | ----------------------------------- |
-| crates.io | `starfold-aom-sys`, then `starfold` (the server) | `crates`, `crates-publish`          |
-| npm       | `@starfold/web-embed` (the embeddable client)    | `embed`, `npm`, `npm-publish`       |
-| PyPI      | `starfold` (the Python SDK)                      | `python`, `pypi`, `pypi-publish`    |
+| Registry  | Package                                          | Jobs                             |
+| --------- | ------------------------------------------------ | -------------------------------- |
+| crates.io | `starfold-aom-sys`, then `starfold` (the server) | `crates`, `crates-publish`       |
+| npm       | `@starfold/web-embed` (the embeddable client)    | `embed`, `npm`, `npm-publish`    |
+| PyPI      | `starfold` (the Python SDK)                      | `python`, `pypi`, `pypi-publish` |
 
 The x264 (GPL-2.0-or-later) flavour is a GitHub release download only. Each registry job uses
 trusted publishing: the registry trusts this repository's `release.yml` and swaps the job's GitHub
