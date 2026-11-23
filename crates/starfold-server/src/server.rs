@@ -1127,7 +1127,9 @@ pub fn index_html(title: &str) -> Bytes {
             c => escaped.push(c),
         }
     }
-    Bytes::from(include_str!(concat!(env!("OUT_DIR"), "/web/index.html")).replace("{{title}}", &escaped))
+    Bytes::from(
+        include_str!(concat!(env!("OUT_DIR"), "/web/index.html")).replace("{{title}}", &escaped),
+    )
 }
 
 /// The page's icon (--favicon): that file's bytes and content type, or starfold's own icon.

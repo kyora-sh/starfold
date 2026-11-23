@@ -43,6 +43,7 @@ In this order, at the commit the first tag will name:
 
    This stages the web client into `crates/starfold-server/web`, packages both crates, builds each
    from its package alone, and uploads `starfold-aom-sys` before `starfold`.
+
 2. **crates.io, trusted publishing.** For each of the two crates: crates.io → the crate → Settings
    → Trusted Publishing → Add → GitHub, enter the values above, save. Then revoke the API token.
 3. **npm, the scope.** On npmjs.com, create the organisation `starfold` on the free plan (Unlimited

@@ -216,7 +216,12 @@ fn windows_libs() -> X264 {
 /// (.github/release/stage-crate-web.sh), so building it needs no esbuild.
 const WEB: &str = "../../packages/web";
 const STAGED: &str = "web";
-const STATIC: [&str; 4] = ["index.html", "favicon.ico", "inter.woff2", "dav1d/dav1d.wasm"];
+const STATIC: [&str; 4] = [
+    "index.html",
+    "favicon.ico",
+    "inter.woff2",
+    "dav1d/dav1d.wasm",
+];
 const BUNDLED: [&str; 5] = ["client.js", "worker.js", "dav1d.js", "audio.js", "mic.js"];
 
 fn web(out: &std::path::Path) {

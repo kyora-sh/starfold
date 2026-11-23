@@ -164,7 +164,7 @@ jobs:
         if: matrix.flavour.x264
         run: .github/release/x264-source.sh linux amd64
       - name: Build
-        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml${{ matrix.flavour.features }}
+        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml ${{ matrix.flavour.features }}
       # build.rs embeds the library dirs pkg-config reports as an rpath; a released binary may only
       # carry /lib, /usr/lib and their multiarch directories, and no empty entry.
       - name: Library paths
@@ -278,7 +278,7 @@ jobs:
         if: matrix.flavour.x264
         run: .github/release/x264-source.sh linux arm64
       - name: Build
-        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml--target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
+        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml --target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
       - name: Library paths
         run: .github/release/check-rpath.sh aarch64-linux-gnu-readelf target/aarch64-unknown-linux-gnu/release/starfold aarch64-linux-gnu
       - name: Version and licence (qemu)
@@ -389,7 +389,7 @@ jobs:
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: |
-          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml${{ matrix.flavour.features }} \
+          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml ${{ matrix.flavour.features }} \
             --message-format=json-render-diagnostics > "$RUNNER_TEMP/build.json"
           if [ '${{ matrix.flavour.x264 }}' = true ]; then
             .github/release/x264-linked.sh "$RUNNER_TEMP/build.json" "$STARFOLD_X264_LIB"
@@ -524,7 +524,7 @@ jobs:
           mkdir -p "$static"
           ln -sf "$(x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a)" "$static/libstdc++.a"
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static -L native=$static"
-          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml--target x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
+          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml --target x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
       # Windows' own DLLs only: no MinGW runtime beside the .exe.
       - name: DLLs
         run: |
