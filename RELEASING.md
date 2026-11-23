@@ -28,10 +28,19 @@ same values:
 - owner: `kyora-sh`
 - repository: `starfold`
 - workflow: `release.yml`
-- environment: leave empty (see [Optional: an environment](#optional-an-environment))
+- environment: `release`
 
 In this order, at the commit the first tag will name:
 
+0. **The `release` environment.** The registries check the repository, the workflow file and the
+   environment, not the tag: without a protected environment, anyone who can push a branch here
+   could change `release.yml` on that branch so that it publishes. The three publish jobs declare
+   the environment `release`; protect it before the first tag. Repository Settings → Environments
+   → New environment, name `release`; under Deployment branches and tags choose "Selected branches
+   and tags" and add the tag rule `v*` (and no branch); optionally add yourself under Required
+   reviewers, to approve every publish. If you skip this step, GitHub creates `release` the first
+   time a tag runs a publish job, with no rules: publishing works, but the protection doesn't
+   exist until you add the rules above, and the registries' publishers must still name `release`.
 1. **crates.io, first upload.** Sign in at crates.io, create an API token under Account Settings
    → API Tokens (scopes `publish-new` and `publish-update`), and run `cargo login` with it. From a
    clean checkout with its submodule (`git submodule update --init --force`), Rust 1.90 or newer
@@ -78,17 +87,6 @@ is added only when the second release is ready:
    `npm stage publish` until you do; the workflow runs `npm publish`), and save.
 4. Push the release tag within two days. If the two days pass first, delete the configuration and
    repeat steps 2 and 3.
-
-### Optional: an environment
-
-The registries check the repository, the workflow file and the environment, not the tag: anyone
-who can push a branch here could change `release.yml` on that branch so that it publishes. A
-GitHub environment closes that. Create one (Settings → Environments, for example `release`),
-limit its deployment branches and tags to the tag pattern `v*`, and optionally require a
-reviewer, who then approves every publish. Then add `environment: <name>` to the
-`crates-publish`, `npm-publish` and `pypi-publish` jobs in `release.yml`, and enter the same name
-in each registry's trusted publisher (a trusted publisher can't be edited: delete it and add it
-again).
 
 ## Each release
 

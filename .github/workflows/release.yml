@@ -770,8 +770,12 @@ jobs:
   # The publish jobs run only after the release job and their dry run succeeded, and are the only
   # jobs with `id-token: write`: trusted publishing, where the registry trusts this repository's
   # release.yml and exchanges the job's OIDC token for a short-lived one, so no secret exists. They
-  # build nothing, so no build script or dependency runs where a token can be had. GitHub-hosted
-  # runners: npm's trusted publishing takes no self-hosted runner, and the six run alike.
+  # build nothing, so no build script or dependency runs where a token can be had. They declare
+  # the environment `release`, which the registries' trusted publishers name and the repository
+  # limits to v* tags (RELEASING.md), so a branch that edits this file can't publish. They need
+  # the release job to have succeeded, and it runs only on a pushed v* tag, so a dry run skips
+  # them and never creates the environment. GitHub-hosted runners: npm's trusted publishing takes
+  # no self-hosted runner, and the six run alike.
   crates:
     name: crates.io dry run (starfold-aom-sys, starfold)
     needs: [version, release]
@@ -810,6 +814,7 @@ jobs:
     name: crates.io publish
     needs: [version, release, crates]
     if: needs.release.result == 'success'
+    environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -879,6 +884,7 @@ jobs:
     name: npm publish
     needs: [version, release, npm]
     if: needs.release.result == 'success'
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -935,6 +941,7 @@ jobs:
     name: PyPI publish
     needs: [version, release, pypi]
     if: needs.release.result == 'success'
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
