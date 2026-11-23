@@ -3,11 +3,11 @@
 A pushed `v<version>` tag runs `.github/workflows/release.yml`: it builds everything, creates the
 GitHub release and then publishes the default (MIT) build's packages:
 
-| Registry  | Package                                          | Jobs             |
-| --------- | ------------------------------------------------ | ---------------- |
-| crates.io | `starfold-aom-sys`, then `starfold` (the server) | `crates`         |
-| npm       | `@starfold/web-embed` (the embeddable client)    | `embed`, `npm`   |
-| PyPI      | `starfold` (the Python SDK)                      | `python`, `pypi` |
+| Registry  | Package                                          | Jobs                                |
+| --------- | ------------------------------------------------ | ----------------------------------- |
+| crates.io | `starfold-aom-sys`, then `starfold` (the server) | `crates`, `crates-publish`          |
+| npm       | `@starfold/web-embed` (the embeddable client)    | `embed`, `npm`, `npm-publish`       |
+| PyPI      | `starfold` (the Python SDK)                      | `python`, `pypi`, `pypi-publish`    |
 
 The x264 (GPL-2.0-or-later) flavour is a GitHub release download only. Each registry job uses
 trusted publishing: the registry trusts this repository's `release.yml` and swaps the job's GitHub
@@ -38,9 +38,12 @@ In this order, at the commit the first tag will name:
    the environment `release`; protect it before the first tag. Repository Settings → Environments
    → New environment, name `release`; under Deployment branches and tags choose "Selected branches
    and tags" and add the tag rule `v*` (and no branch); optionally add yourself under Required
-   reviewers, to approve every publish. If you skip this step, GitHub creates `release` the first
-   time a tag runs a publish job, with no rules: publishing works, but the protection doesn't
-   exist until you add the rules above, and the registries' publishers must still name `release`.
+   reviewers, to approve every publish. The tag rule only helps while pushing a `v*` tag is
+   reserved to you: if others can push to this repository, also add a tag ruleset (Settings →
+   Rules → Rulesets, target tags `v*`, restrict creations) or a required reviewer. If you skip this
+   step, GitHub creates `release` the first time a tag runs a publish job, with no rules:
+   publishing works, but the protection doesn't exist until you add the rules above, and the
+   registries' publishers must still name `release`.
 1. **crates.io, first upload.** Sign in at crates.io, create an API token under Account Settings
    → API Tokens (scopes `publish-new` and `publish-update`), and run `cargo login` with it. From a
    clean checkout with its submodule (`git submodule update --init --force`), Rust 1.90 or newer

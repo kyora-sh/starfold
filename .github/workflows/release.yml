@@ -180,6 +180,7 @@ jobs:
           doc=$(rustc --print sysroot)/share/doc/rust
           cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           .github/release/linux-runtime-notices.sh cc "$RUNNER_TEMP/licenses"
+          .github/release/about-private.sh --filter-platform x86_64-unknown-linux-gnu ${{ matrix.flavour.features }}
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           ls -l "$RUNNER_TEMP/licenses"
@@ -292,6 +293,7 @@ jobs:
           doc=$(rustc --print sysroot)/share/doc/rust
           cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
           .github/release/linux-runtime-notices.sh aarch64-linux-gnu-gcc "$RUNNER_TEMP/licenses"
+          .github/release/about-private.sh --filter-platform aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-unknown-linux-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           ls -l "$RUNNER_TEMP/licenses"
@@ -421,6 +423,7 @@ jobs:
           # Rust's standard library, linked into every binary: its notices from the toolchain built with.
           doc=$(rustc --print sysroot)/share/doc/rust
           cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
+          .github/release/about-private.sh --filter-platform aarch64-apple-darwin ${{ matrix.flavour.features }}
           cargo about generate --locked --fail -c .github/release/about.toml --target aarch64-apple-darwin \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           cp "$(brew --prefix opus)/COPYING" "$RUNNER_TEMP/licenses/Opus-COPYING.txt"
@@ -552,6 +555,7 @@ jobs:
           # Rust's standard library, linked into every binary: its notices from the toolchain built with.
           doc=$(rustc --print sysroot)/share/doc/rust
           cp "$doc/COPYRIGHT-library.html" "$doc"/licenses/* "$RUNNER_TEMP/licenses/rust-std/"
+          .github/release/about-private.sh --filter-platform x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
           cargo about generate --locked --fail -c .github/release/about.toml --target x86_64-pc-windows-gnu \
             ${{ matrix.flavour.features }} -o "$RUNNER_TEMP/licenses/rust-crates.txt" .github/release/about.hbs
           share=$VCPKG_ROOT/installed/$VCPKGRS_TRIPLET/share
@@ -807,7 +811,7 @@ jobs:
         with:
           name: crate-web-${{ needs.version.outputs.version }}
           path: crates/starfold-server/web/
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: error
 
   crates-publish:
