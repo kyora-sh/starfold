@@ -103,6 +103,14 @@ for f in "$pkgdir"/*.crate; do
 			grep -qxF "$want" <<<"$files" || { echo "::error::$f lacks $want"; exit 1; }
 		done
 		;;
+	starfold-aom-sys-*)
+		# MIT; libaom's BSD-2-Clause and patent licence; its third_party/ BSD-3-Clause and ISC.
+		for want in LICENSE aom/LICENSE aom/PATENTS aom/third_party/fastfeat/LICENSE \
+			aom/third_party/highway/LICENSE-BSD3 aom/third_party/libwebm/LICENSE.TXT \
+			aom/third_party/libyuv/LICENSE aom/third_party/vector/LICENSE aom/third_party/x86inc/LICENSE; do
+			grep -qxF "$want" <<<"$files" || { echo "::error::$f lacks $want"; exit 1; }
+		done
+		;;
 	esac
 done
 # A dry run's `cargo package` above built each one from its .crate; an upload is that same tree.
