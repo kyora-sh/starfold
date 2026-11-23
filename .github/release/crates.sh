@@ -86,15 +86,17 @@ for f in target/package/*.crate; do
 	size=$(wc -c <"$f" | tr -d ' ')
 	echo "$(basename "$f"): $size bytes"
 	[ "$size" -lt 10485760 ] || { echo "::error::$f is over crates.io's 10 MB limit"; exit 1; }
-	tar -tzf "$f" | grep -q '^[^/]*/\.cargo_vcs_info\.json$' || { echo "::error::$f has no .cargo_vcs_info.json"; exit 1; }
-done
-for f in target/package/starfold-[0-9]*.crate; do
-	[ -e "$f" ] || continue
-	tar -tzf "$f" | grep '^[^/]*/web/'
-	# The texts of the three licences its `license` names: MIT, BSD-2-Clause (dav1d), OFL-1.1 (Inter).
-	for want in web/client.js LICENSE web/COPYING-dav1d web/COPYING-wasi-libc web/inter-LICENSE.txt; do
-		tar -tzf "$f" | grep -qx "[^/]*/$want" || { echo "::error::$f lacks $want"; exit 1; }
-	done
+	files=$(tar -tzf "$f" | sed 's|^[^/]*/||')
+	grep -qx '\.cargo_vcs_info\.json' <<<"$files" || { echo "::error::$f has no .cargo_vcs_info.json"; exit 1; }
+	case $(basename "$f") in
+	starfold-[0-9]*)
+		grep '^web/' <<<"$files"
+		# The texts of the three licences its `license` names: MIT, BSD-2-Clause (dav1d), OFL-1.1 (Inter).
+		for want in web/client.js LICENSE web/COPYING-dav1d web/COPYING-wasi-libc web/inter-LICENSE.txt; do
+			grep -qxF "$want" <<<"$files" || { echo "::error::$f lacks $want"; exit 1; }
+		done
+		;;
+	esac
 done
 # `cargo package` above built each one from its .crate; the upload is that same tree.
 ESBUILD=false cargo publish ${dry[@]+"${dry[@]}"} --no-verify --allow-dirty --locked "${selected[@]}"
