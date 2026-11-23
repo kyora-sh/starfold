@@ -31,6 +31,11 @@ case $status in
 esac
 [ -z "$(git -C "$aom" status --porcelain --untracked-files=no)" ] || { echo "::error::$aom has local changes"; exit 1; }
 
+# cargo counts the staged web/ (ignored by git, listed in `include`) as uncommitted, so packaging
+# passes --allow-dirty; this check stands in for cargo's: no tracked file changed, and nothing
+# untracked under crates/ that a package could take in.
+dirty=$(git status --porcelain --untracked-files=no; git status --porcelain -- crates)
+[ -z "$dirty" ] || { echo "::error::uncommitted changes:"; echo "$dirty"; exit 1; }
 "$here/stage-crate-web.sh"
 
 # name<TAB>version of every package the workspace may publish.
@@ -76,7 +81,7 @@ if [ ${#selected[@]} = 0 ]; then
 fi
 
 rm -rf target/package
-ESBUILD=false cargo package ${verify[@]+"${verify[@]}"} --locked "${selected[@]}"
+ESBUILD=false cargo package ${verify[@]+"${verify[@]}"} --allow-dirty --locked "${selected[@]}"
 for f in target/package/*.crate; do
 	size=$(wc -c <"$f" | tr -d ' ')
 	echo "$(basename "$f"): $size bytes"
@@ -86,7 +91,10 @@ done
 for f in target/package/starfold-[0-9]*.crate; do
 	[ -e "$f" ] || continue
 	tar -tzf "$f" | grep '^[^/]*/web/'
-	tar -tzf "$f" | grep -q '^[^/]*/web/client\.js$' || { echo "::error::$f carries no staged web client"; exit 1; }
+	# The texts of the three licences its `license` names: MIT, BSD-2-Clause (dav1d), OFL-1.1 (Inter).
+	for want in web/client.js LICENSE web/COPYING-dav1d web/COPYING-wasi-libc web/inter-LICENSE.txt; do
+		tar -tzf "$f" | grep -qx "[^/]*/$want" || { echo "::error::$f lacks $want"; exit 1; }
+	done
 done
 # `cargo package` above built each one from its .crate; the upload is that same tree.
-ESBUILD=false cargo publish ${dry[@]+"${dry[@]}"} --no-verify --locked "${selected[@]}"
+ESBUILD=false cargo publish ${dry[@]+"${dry[@]}"} --no-verify --allow-dirty --locked "${selected[@]}"
