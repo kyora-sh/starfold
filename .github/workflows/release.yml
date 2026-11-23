@@ -188,12 +188,15 @@ jobs:
         run: .github/release/package.sh "$VERSION" "$ARCHIVE" target/release/starfold tar.gz dist "$RUNNER_TEMP"/licenses/*
       # The archive on a clean Ubuntu 24.04 with only the runtime packages the README names. The
       # container shares the runner's network: on docker's bridge, large package downloads stall.
-      # It gets the runner's apt proxy settings, if any, for apt-install.sh's first attempt.
+      # It gets the runner's apt proxy settings, if any, for apt-install.sh's first attempt: a
+      # file only this user can read, removed when the step ends.
       - name: Clean Ubuntu 24.04
         timeout-minutes: 25
         run: |
-          apt-config dump 2>/dev/null | grep -i -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$RUNNER_TEMP/apt-proxy.conf" || true
-          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$RUNNER_TEMP/apt-proxy.conf:/run/runner-apt-proxy.conf:ro" ubuntu:24.04 \
+          proxy=$(mktemp -p "$RUNNER_TEMP" apt-proxy.XXXXXX)
+          trap 'rm -f "$proxy"' EXIT
+          apt-config dump 2>/dev/null | grep -i -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$proxy" || true
+          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$proxy:/run/runner-apt-proxy.conf:ro" ubuntu:24.04 \
             .github/release/smoke-linux.sh "dist/$ARCHIVE.tar.gz" "$VERSION" '${{ matrix.flavour.licence }}' \
             libyuv0 libopus0 libpulse0 ${{ matrix.flavour.x264 && 'libx264-164' || '' }}
       - run: tar -tzvf "dist/$ARCHIVE.tar.gz"
@@ -544,8 +547,10 @@ jobs:
       - name: Version and licence (Wine)
         timeout-minutes: 25
         run: |
-          apt-config dump 2>/dev/null | grep -i -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$RUNNER_TEMP/apt-proxy.conf" || true
-          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$RUNNER_TEMP/apt-proxy.conf:/run/runner-apt-proxy.conf:ro" -e WINEDEBUG=-all -e 'WINEDLLOVERRIDES=mscoree,mshtml=' ubuntu:24.04 bash -c '
+          proxy=$(mktemp -p "$RUNNER_TEMP" apt-proxy.XXXXXX)
+          trap 'rm -f "$proxy"' EXIT
+          apt-config dump 2>/dev/null | grep -i -E '^Acquire::https?::Proxy(::[^ ]+)? "[^"]+";$' >"$proxy" || true
+          docker run --rm --network host -v "$PWD:/src:ro" -w /src -v "$proxy:/run/runner-apt-proxy.conf:ro" -e WINEDEBUG=-all -e 'WINEDLLOVERRIDES=mscoree,mshtml=' ubuntu:24.04 bash -c '
             set -e
             .github/release/apt-install.sh wine64
             .github/release/check-version.sh "$1" "$2" /usr/lib/wine/wine64 target/x86_64-pc-windows-gnu/release/starfold.exe
