@@ -8,6 +8,9 @@ license = "MIT AND BSD-2-Clause AND OFL-1.1"
 description = "Low-latency desktop streaming for the browser: an X11 display, a Mac's screen or a Windows desktop as AV1 or H.264 over a WebSocket"
 repository = "https://github.com/kyora-sh/starfold"
 readme = "../../README.md"
+# crates.io only; .github/release/about.toml relies on it to leave starfold's own crates out of the
+# release archives' list of Rust dependencies.
+publish = ["crates-io"]
 # web/ is the web client, staged from a repository build before packaging
 # (.github/release/stage-crate-web.sh); the repository's own builds read packages/web.
 include = ["/src/**", "/build.rs", "/web/**", "/LICENSE"]

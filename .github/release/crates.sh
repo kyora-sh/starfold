@@ -4,16 +4,16 @@
 # A crate whose version crates.io already has is left out (starfold-aom-sys keeps its version
 # across most releases); when none is left there is nothing to do. Before packaging: libaom's
 # submodule is at the commit the repository records, unchanged (the packaged crate can't check
-# it), and the web client is staged (stage-crate-web.sh). cargo verifies every package by
+# it). `dry-run` stages the web client (stage-crate-web.sh) and has cargo verify every package by
 # building it from its .crate alone, with ESBUILD=false so a build that reached for esbuild fails;
-# each .crate stays under crates.io's 10 MB limit.
+# each .crate stays under crates.io's 10 MB limit. `publish` builds nothing: it packages the web
+# client a dry run of the same commit staged (in the workflow, its artifact) without verifying,
+# and uploads.
 set -euo pipefail
 mode=${1:?usage: crates.sh dry-run|publish}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 cd "$root"
-# `publish` runs after `dry-run` in the same job: its packages were built from their .crate files
-# there, so they aren't built again.
 case $mode in
 	dry-run) dry=(--dry-run) verify=() ;;
 	publish) dry=() verify=(--no-verify) ;;
@@ -36,15 +36,22 @@ esac
 # untracked under crates/ that a package could take in.
 dirty=$(git status --porcelain --untracked-files=no; git status --porcelain -- crates)
 [ -z "$dirty" ] || { echo "::error::uncommitted changes:"; echo "$dirty"; exit 1; }
-"$here/stage-crate-web.sh"
+if [ "$mode" = dry-run ]; then
+	"$here/stage-crate-web.sh"
+elif [ ! -f crates/starfold-server/web/client.js ]; then
+	echo "::error::crates/starfold-server/web holds no staged web client: run crates.sh dry-run first"
+	exit 1
+fi
 
+meta=$(cargo metadata --locked --no-deps --format-version 1)
+pkgdir=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' <<<"$meta")/package
 # name<TAB>version of every package the workspace may publish.
-packages=$(cargo metadata --locked --no-deps --format-version 1 | python3 -I -c '
+packages=$(python3 -I -c '
 import json, sys
 for p in json.load(sys.stdin)["packages"]:
     if p["publish"] is None or "crates-io" in p["publish"]:
         print(p["name"], p["version"], sep="\t")
-')
+' <<<"$meta")
 # Whether crates.io's index lists name at version (build metadata aside, as crates.io compares).
 published() {
 	local name=$1 version=${2%%+*} index
@@ -80,9 +87,9 @@ if [ ${#selected[@]} = 0 ]; then
 	exit 0
 fi
 
-rm -rf target/package
+rm -rf "$pkgdir"
 ESBUILD=false cargo package ${verify[@]+"${verify[@]}"} --allow-dirty --locked "${selected[@]}"
-for f in target/package/*.crate; do
+for f in "$pkgdir"/*.crate; do
 	size=$(wc -c <"$f" | tr -d ' ')
 	echo "$(basename "$f"): $size bytes"
 	[ "$size" -lt 10485760 ] || { echo "::error::$f is over crates.io's 10 MB limit"; exit 1; }
@@ -98,5 +105,5 @@ for f in target/package/*.crate; do
 		;;
 	esac
 done
-# `cargo package` above built each one from its .crate; the upload is that same tree.
+# A dry run's `cargo package` above built each one from its .crate; an upload is that same tree.
 ESBUILD=false cargo publish ${dry[@]+"${dry[@]}"} --no-verify --allow-dirty --locked "${selected[@]}"

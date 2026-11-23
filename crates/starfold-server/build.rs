@@ -213,7 +213,8 @@ fn windows_libs() -> X264 {
 /// page, icon, font and dav1d.wasm, and its TypeScript bundled with esbuild (on PATH, or
 /// ESBUILD; shell.nix and default.nix provide it). A published crate has no packages/web: it
 /// carries the same files in web/, taken from a repository build when it was packaged
-/// (.github/release/stage-crate-web.sh), so building it needs no esbuild.
+/// (.github/release/stage-crate-web.sh), so building it needs no esbuild. A repository build
+/// never reads web/, staged or not.
 const WEB: &str = "../../packages/web";
 const STAGED: &str = "web";
 const STATIC: [&str; 4] = [
@@ -233,7 +234,10 @@ fn web(out: &std::path::Path) {
             .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
     };
     let web = std::path::Path::new(WEB);
-    if web.join("src").is_dir() {
+    // A crate cargo packaged (it writes .cargo_vcs_info.json) always reads its own web/, even
+    // when vendored somewhere that has a packages/web two levels up.
+    let packaged = std::path::Path::new(".cargo_vcs_info.json").is_file();
+    if !packaged && web.join("src").is_dir() {
         for f in STATIC {
             copy(web.join(f));
             println!("cargo:rerun-if-changed={WEB}/{f}");

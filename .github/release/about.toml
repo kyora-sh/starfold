@@ -13,5 +13,8 @@ accepted = [
 	"0BSD",
 	"Unlicense",
 ]
-# starfold itself: its LICENSE is in the archive beside the binary.
-private = { ignore = true }
+# starfold's own crates (starfold, starfold-aom-sys): their licences are in the archive beside the
+# binary and in THIRD_PARTY.md. cargo-about leaves out a workspace crate whose `publish` lists only
+# these registries, and both declare `publish = ["crates-io"]`; a dependency from crates.io
+# declares no `publish`, so it is listed as before.
+private = { ignore = true, registries = ["crates-io"] }

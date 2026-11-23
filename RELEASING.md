@@ -34,8 +34,9 @@ In this order, at the commit the first tag will name:
 
 1. **crates.io, first upload.** Sign in at crates.io, create an API token under Account Settings
    → API Tokens (scopes `publish-new` and `publish-update`), and run `cargo login` with it. From a
-   clean checkout with its submodule (`git submodule update --init --force`) and the build tools
-   from the README's Build section, on Linux:
+   clean checkout with its submodule (`git submodule update --init --force`), Rust 1.90 or newer
+   (it packages both crates in one command) and the build tools from the README's Build section,
+   on Linux:
 
    ```sh
    .github/release/crates.sh dry-run && .github/release/crates.sh publish
@@ -49,11 +50,13 @@ In this order, at the commit the first tag will name:
 3. **npm, the scope.** On npmjs.com, create the organisation `starfold` on the free plan (Unlimited
    public packages); its name is the `@starfold` scope.
 4. **npm, first upload.** Run the Release workflow by hand at that commit (Actions → Release → Run
-   workflow), download its `starfold-web-embed-<version>` artifact, then:
+   workflow), download its `starfold-web-embed-<version>` artifact (a `.zip`: unzip it for the
+   `.tgz`), then:
 
    ```sh
    npm login
    npm publish ./starfold-web-embed-<version>.tgz --access public
+   npm logout
    ```
 
 5. **PyPI.** pypi.org → Your account → Publishing → Add a new pending publisher → GitHub, enter the
@@ -78,16 +81,22 @@ is added only when the second release is ready:
 
 ### Optional: an environment
 
-A GitHub environment (Settings → Environments, for example `release` with required reviewers)
-lets a person approve every publish. To use one, create it, add `environment: <name>` to the
-`crates`, `npm` and `pypi` jobs in `release.yml`, and enter the same name in each registry's
-trusted publisher.
+The registries check the repository, the workflow file and the environment, not the tag: anyone
+who can push a branch here could change `release.yml` on that branch so that it publishes. A
+GitHub environment closes that. Create one (Settings → Environments, for example `release`),
+limit its deployment branches and tags to the tag pattern `v*`, and optionally require a
+reviewer, who then approves every publish. Then add `environment: <name>` to the
+`crates-publish`, `npm-publish` and `pypi-publish` jobs in `release.yml`, and enter the same name
+in each registry's trusted publisher (a trusted publisher can't be edited: delete it and add it
+again).
 
 ## Each release
 
 1. On main, set the same `version` in `crates/starfold-server/Cargo.toml` and
    `python/starfold/pyproject.toml`. Bump `crates/starfold-aom-sys/Cargo.toml` (and the `=`
-   version `crates/starfold-server/Cargo.toml` asks of it) only when it changed. Merge.
+   version `crates/starfold-server/Cargo.toml` asks of it) only when it changed. Refresh the
+   lock files the builds read with `--locked`: `cargo update --workspace` and, in
+   `python/starfold`, `uv lock`. Merge.
 2. Optional: run the Release workflow by hand for a dry run of everything, the registry jobs'
    dry runs included.
 3. Tag main's head and push the tag:
@@ -97,5 +106,7 @@ trusted publisher.
    ```
 
 The workflow checks that the tag names the version, builds, creates the GitHub release, then
-publishes to crates.io, npm and PyPI. If a registry job fails after the release exists, re-run it
-from the run's page.
+publishes to crates.io, npm and PyPI. Each registry has a dry-run job (`crates`, `npm`, `pypi`)
+and a publish job after it (`crates-publish`, `npm-publish`, `pypi-publish`), the only jobs that
+can obtain a registry token. If a publish job fails after the release exists, re-run it from the
+run's page.

@@ -764,21 +764,20 @@ jobs:
           NOTES
           .github/release/publish.sh "$GITHUB_REF_NAME" '${{ needs.version.outputs.commit }}' x264-notes.md dist ${{ needs.version.outputs.flavour_names }}
 
-  # The registries. On a pushed v* tag they publish once the release job succeeded (a tag whose
-  # release failed publishes nothing); on any other run, where the release job is skipped, each
-  # runs its dry run only. Trusted publishing: the registry trusts this repository's release.yml
-  # and exchanges the job's OIDC token for a short-lived one, so `id-token: write` is granted to
-  # these jobs only and no secret exists. GitHub-hosted runners: npm's trusted publishing takes no
-  # self-hosted runner, and the three run alike.
+  # The registries, in two jobs each. The dry-run jobs (crates, npm, pypi) run after the release
+  # job on every run: after it succeeded on a pushed v* tag, and on any other run, where it is
+  # skipped (a manual run on a tag included); a pushed tag whose release didn't succeed runs none.
+  # The publish jobs run only after the release job and their dry run succeeded, and are the only
+  # jobs with `id-token: write`: trusted publishing, where the registry trusts this repository's
+  # release.yml and exchanges the job's OIDC token for a short-lived one, so no secret exists. They
+  # build nothing, so no build script or dependency runs where a token can be had. GitHub-hosted
+  # runners: npm's trusted publishing takes no self-hosted runner, and the six run alike.
   crates:
-    name: crates.io (starfold-aom-sys, starfold)
+    name: crates.io dry run (starfold-aom-sys, starfold)
     needs: [version, release]
-    if: ${{ !cancelled() && needs.version.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -797,25 +796,53 @@ jobs:
         run: |
           echo "building ${{ needs.version.outputs.commit }}"
           .github/release/crates.sh dry-run
+      # The staged web client, for the publish job to package without building. Only after the
+      # release job, so its download of every artifact never sees this one.
+      - uses: actions/upload-artifact@v4
+        if: needs.release.result == 'success'
+        with:
+          name: crate-web-${{ needs.version.outputs.version }}
+          path: crates/starfold-server/web/
+          retention-days: 7
+          if-no-files-found: error
+
+  crates-publish:
+    name: crates.io publish
+    needs: [version, release, crates]
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+          submodules: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate-web-${{ needs.version.outputs.version }}
+          path: crates/starfold-server/web
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Token
         id: auth
-        if: needs.release.result == 'success'
         uses: rust-lang/crates-io-auth-action@v1
       - name: Publish
-        if: needs.release.result == 'success'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: .github/release/crates.sh publish
 
   npm:
-    name: npm (embeddable web client)
+    name: npm dry run (embeddable web client)
     needs: [version, embed, release]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
+    outputs:
+      package: ${{ steps.check.outputs.package }}
     env:
       TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
     steps:
@@ -831,6 +858,7 @@ jobs:
       # The tarball the release attached; its package.json must name this repository, which npm
       # compares with the workflow's before it accepts the token.
       - name: Dry run
+        id: check
         working-directory: dist
         run: |
           sha256sum -c "$TARBALL.sha256"
@@ -838,18 +866,41 @@ jobs:
           import json, sys
           p, want = json.load(sys.stdin), f"git+https://github.com/{sys.argv[1]}.git"
           got = p.get("repository", {}).get("url")
-          print(p["name"], p["version"], got)
+          name, version = p["name"], p["version"]
+          print(name, version, got)
           if got != want:
               sys.exit(f"repository.url is {got!r}, not {want!r}")
-          with open(sys.argv[2], "a") as env:
-              env.write(f"PACKAGE={p['name']}@{p['version']}\n")
-          ' "$GITHUB_REPOSITORY" "$GITHUB_ENV"
+          with open(sys.argv[2], "a") as out:
+              out.write(f"package={name}@{version}\n")
+          ' "$GITHUB_REPOSITORY" "$GITHUB_OUTPUT"
           npm publish "./$TARBALL" --access public --dry-run
+
+  npm-publish:
+    name: npm publish
+    needs: [version, release, npm]
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
+      PACKAGE: ${{ needs.npm.outputs.package }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-web-embed-${{ needs.version.outputs.version }}
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+      - run: npm install -g npm@11.6.2 && npm --version
       # A version npm has already (the first one, published by hand, or a re-run) is skipped.
       - name: Publish
-        if: needs.release.result == 'success'
         working-directory: dist
         run: |
+          sha256sum -c "$TARBALL.sha256"
           if [ "$(npm view "$PACKAGE" version 2>/dev/null || true)" = "${PACKAGE##*@}" ]; then
             echo "$PACKAGE is on npm already"
           else
@@ -857,14 +908,11 @@ jobs:
           fi
 
   pypi:
-    name: PyPI (Python SDK)
+    name: PyPI dry run (Python SDK)
     needs: [version, python, release]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -882,9 +930,29 @@ jobs:
           mkdir pypi
           cp "dist/starfold-$VERSION-py3-none-any.whl" "dist/starfold-$VERSION.tar.gz" pypi/
           uvx twine@6.2.0 check --strict pypi/*
-      - name: Publish
-        if: needs.release.result == 'success'
-        uses: pypa/gh-action-pypi-publish@release/v1
+
+  pypi-publish:
+    name: PyPI publish
+    needs: [version, release, pypi]
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-python-${{ needs.version.outputs.version }}
+          path: dist
+      - name: The sdist and the wheel
+        run: |
+          (cd dist && sha256sum -c -- *.sha256)
+          mkdir pypi
+          cp "dist/starfold-$VERSION-py3-none-any.whl" "dist/starfold-$VERSION.tar.gz" pypi/
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pypi/
           skip-existing: true

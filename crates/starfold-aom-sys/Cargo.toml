@@ -2,10 +2,14 @@
 name = "starfold-aom-sys"
 version = "0.1.0+libaom.3.15.3"
 edition = "2021"
-# These bindings and build script are MIT; libaom, built from aom/ and linked statically, is BSD-2-Clause.
-license = "MIT AND BSD-2-Clause"
+# These bindings and build script are MIT; libaom, built from aom/ and linked statically, is
+# BSD-2-Clause; the libaom source this crate ships also has third_party/ code under BSD-3-Clause
+# (fastfeat, highway, libwebm, libyuv) and ISC (x86inc).
+license = "MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC"
 description = "libaom's AV1 encoder, real-time only, built from source and linked statically, for starfold"
 repository = "https://github.com/kyora-sh/starfold"
+# crates.io only; see crates/starfold-server/Cargo.toml.
+publish = ["crates-io"]
 links = "aom"
 categories = ["external-ffi-bindings", "multimedia::video"]
 # libaom's test sources, docs and examples are not needed to build the library (its cmake

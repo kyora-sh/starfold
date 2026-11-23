@@ -33,4 +33,8 @@ for f in index.html favicon.ico inter.woff2; do
 	cmp "$root/packages/web/$f" "$crate/web/$f"
 done
 cmp "$root/packages/web/dav1d/dav1d.wasm" "$crate/web/dav1d.wasm"
-(cd "$crate/web" && shasum -a 256 -- *)
+if command -v sha256sum >/dev/null; then
+	(cd "$crate/web" && sha256sum -- *)
+else
+	(cd "$crate/web" && shasum -a 256 -- *)
+fi

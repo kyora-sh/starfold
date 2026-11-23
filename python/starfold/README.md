@@ -1,11 +1,13 @@
 # starfold (Python)
 
 A client for agents and scripts driving a starfold desktop: screenshots, waiting for the
-screen, mouse and keyboard, recordings and files. Private: not published to PyPI.
+screen, mouse and keyboard, recordings and files.
 
 ```sh
-uv add --editable path/to/starfold/python/starfold   # or: pip install -e python/starfold
+uv add starfold   # or: pip install starfold
 ```
+
+From a checkout: `uv add --editable path/to/starfold/python/starfold` (or `pip install -e python/starfold`).
 
 ```python
 from starfold import Starfold, act
