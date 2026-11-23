@@ -763,4 +763,7 @@ GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distribut
 under MIT; a Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with
 permission to link them into any program. The Linux and Windows release archives carry these
 texts; the macOS ones have neither (Apple's toolchain links no GCC or glibc code).
-[THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences.
+The `starfold` crate on crates.io is `MIT AND BSD-2-Clause AND OFL-1.1`: besides starfold's code it
+ships the web client's dav1d.wasm (dav1d, BSD-2-Clause) and the Inter font (OFL-1.1), with their
+licence texts. [THIRD_PARTY.md](THIRD_PARTY.md) lists the bundled components and their licences,
+and what each published package carries.

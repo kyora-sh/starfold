@@ -9,7 +9,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 crate=$root/crates/starfold-server
 messages=$(mktemp)
 trap 'rm -f "$messages"' EXIT
-cargo check --locked --manifest-path "$crate/Cargo.toml" --no-default-features --message-format=json >"$messages"
+cargo check --locked --manifest-path "$crate/Cargo.toml" --message-format=json >"$messages"
 out_dir=$(python3 -I -c '
 import json, sys
 dirs = set()

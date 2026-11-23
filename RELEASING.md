@@ -62,12 +62,18 @@ In this order, at the commit the first tag will name:
 6. Push the first tag (see [Each release](#each-release)). crates.io and npm have that version
    already and are skipped; PyPI's project is created.
 
-**npm's trusted publisher, before the second release.** npm expires a trusted publisher that
-hasn't published within two days of its creation, so add it when the next release is ready:
-npmjs.com → `@starfold/web-embed` → Settings → Trusted Publisher → GitHub Actions, enter the values
-above, tick **npm publish** under the allowed actions (a new configuration allows only
-`npm stage publish` until you do; the workflow runs `npm publish`), save, and push that release's
-tag within two days. An expired configuration is deleted and created again.
+### npm's trusted publisher, before the second release
+
+npm expires a trusted publisher that hasn't published within **two days** of its creation, so it
+is added only when the second release is ready:
+
+1. Merge the second release's version bump (see [Each release](#each-release)).
+2. npmjs.com → `@starfold/web-embed` → Settings → Trusted Publisher → GitHub Actions; enter the
+   values above.
+3. Under the allowed actions, tick **npm publish** (a new configuration allows only
+   `npm stage publish` until you do; the workflow runs `npm publish`), and save.
+4. Push the release tag within two days. If the two days pass first, delete the configuration and
+   repeat steps 2 and 3.
 
 ### Optional: an environment
 
