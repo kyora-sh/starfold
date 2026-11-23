@@ -811,7 +811,7 @@ jobs:
     name: npm (embeddable web client)
     needs: [version, embed, release]
     if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -860,7 +860,7 @@ jobs:
     name: PyPI (Python SDK)
     needs: [version, python, release]
     if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

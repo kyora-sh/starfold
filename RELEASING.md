@@ -12,7 +12,8 @@ GitHub release and then publishes the default (MIT) build's packages:
 The x264 (GPL-2.0-or-later) flavour is a GitHub release download only. Each registry job uses
 trusted publishing: the registry trusts this repository's `release.yml` and swaps the job's GitHub
 OIDC token for a short-lived one, so no registry token is stored in the repository. The publishing
-jobs run on GitHub-hosted runners (`ubuntu-24.04`), which npm requires for trusted publishing; this
+jobs run on GitHub-hosted runners (`ubuntu-latest`; `ubuntu-24.04` for crates.io, whose packages
+the job installs by name), which npm requires for trusted publishing; this
 repository is public, so those minutes cost nothing.
 
 A version a registry has already is skipped rather than published again, so a job can be re-run,
