@@ -33,6 +33,23 @@
 
 `starfold --version` lists the encoders a binary includes and its licence.
 
+## What the published packages carry
+
+- **`starfold` on crates.io** (the server's source), `MIT AND BSD-2-Clause AND OFL-1.1`: starfold's
+  code (MIT, `LICENSE`) and, in `web/`, the web client it embeds, with dav1d.wasm (dav1d,
+  BSD-2-Clause, `COPYING-dav1d`; wasi-libc, MIT with parts under BSD-2-Clause and CC0,
+  `COPYING-wasi-libc`) and the Inter font (OFL-1.1, `inter-LICENSE.txt`). Built with its default
+  features it links libaom from `starfold-aom-sys`; `--features x264` makes the binary
+  GPL-2.0-or-later as below.
+- **`starfold-aom-sys` on crates.io**, `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC`: its
+  bindings and build script (MIT, `LICENSE`) and libaom's source (BSD-2-Clause and the Alliance for
+  Open Media Patent License 1.0, `aom/LICENSE`, `aom/PATENTS`) with its `third_party/` code:
+  fastfeat, highway, libwebm and libyuv (BSD-3-Clause), vector (MIT) and x86inc (ISC), each with
+  its licence beside it.
+- **`@starfold/web-embed` on npm**, `MIT AND BSD-2-Clause`: the embeddable client (MIT) with
+  dav1d.wasm (as above).
+- **`starfold` on PyPI**, MIT: the Python SDK.
+
 ## What each release binary carries
 
 Each release has exactly two flavours of the binary for each platform. The archive's root holds

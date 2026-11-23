@@ -1127,14 +1127,16 @@ pub fn index_html(title: &str) -> Bytes {
             c => escaped.push(c),
         }
     }
-    Bytes::from(include_str!("../../../packages/web/index.html").replace("{{title}}", &escaped))
+    Bytes::from(
+        include_str!(concat!(env!("OUT_DIR"), "/web/index.html")).replace("{{title}}", &escaped),
+    )
 }
 
 /// The page's icon (--favicon): that file's bytes and content type, or starfold's own icon.
 pub fn favicon(path: Option<&str>) -> Result<(Bytes, &'static str), String> {
     let Some(path) = path else {
         return Ok((
-            Bytes::from_static(include_bytes!("../../../packages/web/favicon.ico")),
+            Bytes::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/web/favicon.ico"))),
             "image/x-icon",
         ));
     };
@@ -1189,13 +1191,13 @@ macro_rules! asset {
                     (header::CONTENT_TYPE, $ctype),
                     (header::CACHE_CONTROL, "no-cache"),
                 ],
-                include_bytes!(concat!("../../../packages/web/", $name)).as_slice(),
+                include_bytes!(concat!(env!("OUT_DIR"), "/web/", $name)).as_slice(),
             )
         })
     };
 }
 
-/// Scripts bundled from web/src by build.rs.
+/// Scripts bundled from packages/web/src by build.rs.
 macro_rules! bundled {
     ($name:literal) => {
         get(|| async {
@@ -1217,7 +1219,7 @@ async fn dav1d_wasm() -> Response {
             (header::CONTENT_TYPE, "application/wasm"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        include_bytes!("../../../packages/web/dav1d/dav1d.wasm").as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/web/dav1d.wasm")).as_slice(),
     )
         .into_response()
 }

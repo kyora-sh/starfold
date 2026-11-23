@@ -12,7 +12,7 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if not line.startswith("{"):
         continue
     m = json.loads(line)
-    # A path package id: path+file:///.../crates/starfold-server#0.3.2
+    # A path package id: path+file:///.../crates/starfold-server#starfold@0.3.2
     if m.get("reason") == "build-script-executed" and m["package_id"].split("#")[0].endswith("/starfold-server"):
         dirs.add(m["out_dir"])
 if len(dirs) != 1:

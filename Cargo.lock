@@ -1337,16 +1337,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "starfold-aom-sys"
-version = "0.1.0+libaom.3.15.3"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
-]
-
-[[package]]
-name = "starfold-server"
+name = "starfold"
 version = "0.3.2"
 dependencies = [
  "axum",
@@ -1383,6 +1374,15 @@ dependencies = [
  "windows-core",
  "x11rb",
  "zip",
+]
+
+[[package]]
+name = "starfold-aom-sys"
+version = "0.1.0+libaom.3.15.3"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
 ]
 
 [[package]]

@@ -51,6 +51,11 @@ cat >"$pkg/package.json" <<EOF
 	"main": "index.js",
 	"types": "index.d.ts",
 	"license": "MIT AND BSD-2-Clause",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kyora-sh/starfold.git",
+		"directory": "packages/web"
+	},
 	"sideEffects": false
 }
 EOF

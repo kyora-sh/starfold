@@ -1,12 +1,19 @@
 [package]
-name = "starfold-server"
+name = "starfold"
 version = "0.3.2"
 edition = "2021"
-license = "MIT"
+# starfold's own code is MIT; the web client it embeds carries dav1d.wasm (dav1d, BSD-2-Clause;
+# wasi-libc, MIT) and the Inter font (OFL-1.1), with their licences in web/.
+license = "MIT AND BSD-2-Clause AND OFL-1.1"
 description = "Low-latency desktop streaming for the browser: an X11 display, a Mac's screen or a Windows desktop as AV1 or H.264 over a WebSocket"
 repository = "https://github.com/kyora-sh/starfold"
 readme = "../../README.md"
-publish = false
+# crates.io only; .github/release/about.toml relies on it to leave starfold's own crates out of the
+# release archives' list of Rust dependencies.
+publish = ["crates-io"]
+# web/ is the web client, staged from a repository build before packaging
+# (.github/release/stage-crate-web.sh); the repository's own builds read packages/web.
+include = ["/src/**", "/build.rs", "/web/**", "/LICENSE"]
 # Lets programs that embed starfold read DEP_STARFOLD_RPATH (see build.rs).
 links = "starfold"
 keywords = ["remote-desktop", "streaming", "x11", "h264", "websocket"]
@@ -69,7 +76,7 @@ getrandom = "0.3"
 zip = { version = "7", default-features = false, features = [
 	"deflate-flate2-zlib-rs",
 ] }
-starfold-aom-sys = { path = "../starfold-aom-sys", optional = true }
+starfold-aom-sys = { path = "../starfold-aom-sys", version = "=0.1.0", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["dir", "fs", "poll", "time"] }
@@ -139,3 +146,6 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
 bindgen = { version = "0.72", optional = true }
 pkg-config = "0.3"
 vcpkg = "0.2"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
