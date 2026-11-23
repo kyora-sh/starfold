@@ -165,7 +165,7 @@ jobs:
       - name: Clippy
         run: |
           cargo clippy --features x264 --all-targets --locked -- -D warnings
-          cargo clippy -p starfold-server --all-targets --locked --no-default-features --features x264 -- -D warnings
+          cargo clippy --manifest-path crates/starfold-server/Cargo.toml--all-targets --locked --no-default-features --features x264 -- -D warnings
       # The x264 tests fail rather than skip without ffmpeg. Lets the FUSE test change
       # /etc/fuse.conf and /dev/fuse for its run (tests/unix_socket.rs).
       - name: Test
@@ -174,7 +174,7 @@ jobs:
           STARFOLD_TEST_SYSTEM_FUSE: '1'
         run: |
           cargo test --features x264 --locked
-          cargo test -p starfold-server --locked --no-default-features --features x264
+          cargo test --manifest-path crates/starfold-server/Cargo.toml--locked --no-default-features --features x264
 
   bench-arms:
     name: Rust with the svt-av1 and x265 bench arms (clippy, test, startup)
@@ -357,7 +357,7 @@ jobs:
           PKG_CONFIG_ALLOW_CROSS: '1'
           CC_x86_64_unknown_linux_musl: musl-gcc
           CXX_x86_64_unknown_linux_musl: g++
-        run: cargo clippy --target x86_64-unknown-linux-musl -p starfold-server --all-targets --locked -- -D warnings
+        run: cargo clippy --target x86_64-unknown-linux-musl --manifest-path crates/starfold-server/Cargo.toml--all-targets --locked -- -D warnings
 
   windows:
     name: Windows (clippy, cross-compiled on Linux)

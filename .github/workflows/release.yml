@@ -2,7 +2,12 @@ name: Release
 
 # Builds the release binaries, the Python SDK and the embeddable web client, and on a version tag
 # (v0.4.0, ...) attaches them to a GitHub release with GitHub's generated notes (the pull requests
-# merged since the previous tag). Nothing is published to a registry.
+# merged since the previous tag). After the release exists, the same tag publishes the default
+# (MIT) build's packages to the registries: the crates to crates.io, the embeddable web client to
+# npm and the Python SDK to PyPI, each through trusted publishing (a short-lived token from GitHub's
+# OIDC identity; no secret is stored or referenced). Those jobs run on GitHub-hosted runners, which
+# npm requires for trusted publishing; RELEASING.md has the one-time registry setup. The x264
+# flavour is never published to a registry.
 #
 # Each binary comes in exactly two flavours: starfold-<version>-<platform> links libaom
 # (BSD-2-Clause, with the Alliance for Open Media Patent License 1.0) and is distributed under MIT;
@@ -11,11 +16,14 @@ name: Release
 # release also attaches the exact x264 source of every platform's build, from third_party/x264
 # (hash-checked, nothing fetched).
 #
-# A dry run builds and checks everything and uploads the files as workflow artifacts only: a push
-# to a branch other than main that changes this workflow or the scripts it runs, or a manual run.
+# A dry run builds and checks everything and uploads the files as workflow artifacts only, and
+# runs each registry job's dry run (cargo package and publish --dry-run, npm publish --dry-run,
+# twine check): a push to a branch other than main that changes this workflow or the scripts it
+# runs, or a manual run.
 # There is no pull_request trigger: forks can't reach these self-hosted runners, because only
 # writers can push branches here and a fork's push runs in the fork. Only a pushed v* tag creates
-# the release; the release job's condition can't be met by a branch push or a manual run.
+# the release and publishes; the release job's condition can't be met by a branch push or a manual
+# run, and the registry jobs publish only after it succeeded on a tag.
 # Bump `version` in crates/starfold-server/Cargo.toml and python/starfold/pyproject.toml on main
 # first; the tag has to match both.
 on:
@@ -27,6 +35,8 @@ on:
       - .github/workflows/release.yml
       - .github/release/**
       - packages/web/embed/pack.sh
+      - crates/*/Cargo.toml
+      - python/starfold/pyproject.toml
   workflow_dispatch:
     inputs:
       dry_run:
@@ -154,7 +164,7 @@ jobs:
         if: matrix.flavour.x264
         run: .github/release/x264-source.sh linux amd64
       - name: Build
-        run: cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }}
+        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml${{ matrix.flavour.features }}
       # build.rs embeds the library dirs pkg-config reports as an rpath; a released binary may only
       # carry /lib, /usr/lib and their multiarch directories, and no empty entry.
       - name: Library paths
@@ -268,7 +278,7 @@ jobs:
         if: matrix.flavour.x264
         run: .github/release/x264-source.sh linux arm64
       - name: Build
-        run: cargo build --release --locked -p starfold-server --target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
+        run: cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml--target aarch64-unknown-linux-gnu ${{ matrix.flavour.features }}
       - name: Library paths
         run: .github/release/check-rpath.sh aarch64-linux-gnu-readelf target/aarch64-unknown-linux-gnu/release/starfold aarch64-linux-gnu
       - name: Version and licence (qemu)
@@ -379,7 +389,7 @@ jobs:
           echo "$HOME/cargo-about/bin" >> "$GITHUB_PATH"
       - name: Build
         run: |
-          cargo build --release --locked -p starfold-server ${{ matrix.flavour.features }} \
+          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml${{ matrix.flavour.features }} \
             --message-format=json-render-diagnostics > "$RUNNER_TEMP/build.json"
           if [ '${{ matrix.flavour.x264 }}' = true ]; then
             .github/release/x264-linked.sh "$RUNNER_TEMP/build.json" "$STARFOLD_X264_LIB"
@@ -514,7 +524,7 @@ jobs:
           mkdir -p "$static"
           ln -sf "$(x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a)" "$static/libstdc++.a"
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static -L native=$static"
-          cargo build --release --locked -p starfold-server --target x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
+          cargo build --release --locked --manifest-path crates/starfold-server/Cargo.toml--target x86_64-pc-windows-gnu ${{ matrix.flavour.features }}
       # Windows' own DLLs only: no MinGW runtime beside the .exe.
       - name: DLLs
         run: |
@@ -753,3 +763,128 @@ jobs:
             `vcpkg-2026.10.16-ports-x264.tar.gz`; Homebrew builds it unpatched.
           NOTES
           .github/release/publish.sh "$GITHUB_REF_NAME" '${{ needs.version.outputs.commit }}' x264-notes.md dist ${{ needs.version.outputs.flavour_names }}
+
+  # The registries. On a pushed v* tag they publish once the release job succeeded (a tag whose
+  # release failed publishes nothing); on any other run, where the release job is skipped, each
+  # runs its dry run only. Trusted publishing: the registry trusts this repository's release.yml
+  # and exchanges the job's OIDC token for a short-lived one, so `id-token: write` is granted to
+  # these jobs only and no secret exists. GitHub-hosted runners: npm's trusted publishing takes no
+  # self-hosted runner, and the three run alike.
+  crates:
+    name: crates.io (starfold-aom-sys, starfold)
+    needs: [version, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+          submodules: true
+      - name: Native libraries
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          aptq 180 update
+          aptq 720 install -y libclang-dev libyuv-dev libopus-dev libpulse-dev libxcb1-dev cmake nasm perl esbuild
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # Stages the web client, packages both crates and builds each from its .crate alone.
+      - name: Dry run
+        run: |
+          echo "building ${{ needs.version.outputs.commit }}"
+          .github/release/crates.sh dry-run
+      - name: Token
+        id: auth
+        if: needs.release.result == 'success'
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish
+        if: needs.release.result == 'success'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: .github/release/crates.sh publish
+
+  npm:
+    name: npm (embeddable web client)
+    needs: [version, embed, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-web-embed-${{ needs.version.outputs.version }}
+          path: dist
+      # Trusted publishing needs npm 11.5.1 or newer and Node 22.14.0 or newer.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+      - run: npm install -g npm@11.6.2 && npm --version
+      # The tarball the release attached; its package.json must name this repository, which npm
+      # compares with the workflow's before it accepts the token.
+      - name: Dry run
+        working-directory: dist
+        run: |
+          sha256sum -c "$TARBALL.sha256"
+          tar -xzOf "$TARBALL" package/package.json | python3 -I -c '
+          import json, sys
+          p, want = json.load(sys.stdin), f"git+https://github.com/{sys.argv[1]}.git"
+          got = p.get("repository", {}).get("url")
+          print(p["name"], p["version"], got)
+          if got != want:
+              sys.exit(f"repository.url is {got!r}, not {want!r}")
+          with open(sys.argv[2], "a") as env:
+              env.write(f"PACKAGE={p['name']}@{p['version']}\n")
+          ' "$GITHUB_REPOSITORY" "$GITHUB_ENV"
+          npm publish "./$TARBALL" --access public --dry-run
+      # A version npm has already (the first one, published by hand, or a re-run) is skipped.
+      - name: Publish
+        if: needs.release.result == 'success'
+        working-directory: dist
+        run: |
+          if [ "$(npm view "$PACKAGE" version 2>/dev/null || true)" = "${PACKAGE##*@}" ]; then
+            echo "$PACKAGE is on npm already"
+          else
+            npm publish "./$TARBALL" --access public
+          fi
+
+  pypi:
+    name: PyPI (Python SDK)
+    needs: [version, python, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.ref_type != 'tag')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-python-${{ needs.version.outputs.version }}
+          path: dist
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.11.8
+      # The sdist and the wheel the release attached, without their .sha256 files.
+      - name: Dry run
+        run: |
+          (cd dist && sha256sum -c -- *.sha256)
+          mkdir pypi
+          cp "dist/starfold-$VERSION-py3-none-any.whl" "dist/starfold-$VERSION.tar.gz" pypi/
+          uvx twine@6.2.0 check --strict pypi/*
+      - name: Publish
+        if: needs.release.result == 'success'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi/
+          skip-existing: true

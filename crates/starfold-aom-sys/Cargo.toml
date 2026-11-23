@@ -6,7 +6,6 @@ edition = "2021"
 license = "MIT AND BSD-2-Clause"
 description = "libaom's AV1 encoder, real-time only, built from source and linked statically, for starfold"
 repository = "https://github.com/kyora-sh/starfold"
-publish = false
 links = "aom"
 categories = ["external-ffi-bindings", "multimedia::video"]
 # libaom's test sources, docs and examples are not needed to build the library (its cmake
@@ -23,3 +22,6 @@ exclude = [
 bindgen = "0.72"
 cc = "1"
 cmake = "0.1.58"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]

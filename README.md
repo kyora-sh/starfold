@@ -88,7 +88,7 @@ Ubuntu 24.04:
 ```sh
 sudo apt install build-essential clang libclang-dev pkg-config esbuild cmake perl nasm \
   libyuv-dev libopus-dev libpulse-dev libxcb1-dev
-cargo install --locked --git https://github.com/kyora-sh/starfold starfold-server
+cargo install --locked --git https://github.com/kyora-sh/starfold starfold
 ```
 
 That is the default build, with libaom and under MIT; `--tag v<version>` installs a release
@@ -148,8 +148,8 @@ nix-shell --arg withRust true
 cargo build --release
 ```
 
-Or install it with the same libraries on your system (the crate is `starfold-server`, the binary is
-`starfold`):
+Or install it with the same libraries on your system (the package in `crates/starfold-server` is
+`starfold`, and so is the binary):
 
 ```sh
 cargo install --locked --path crates/starfold-server

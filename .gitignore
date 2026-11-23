@@ -8,3 +8,4 @@ __pycache__
 .vcpkg
 .vcpkg-cache
 .vcpkg-downloads
+/crates/starfold-server/web

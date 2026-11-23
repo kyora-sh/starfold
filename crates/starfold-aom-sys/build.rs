@@ -22,7 +22,16 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
-    check_source(&src);
+    // docs.rs has no cmake or nasm and links nothing: the bindings are all its build reads.
+    if std::env::var_os("DOCS_RS").is_some() {
+        bindings(&src, &out);
+        return;
+    }
+    // A crate cargo packaged (it writes .cargo_vcs_info.json) carries aom/ without its git
+    // metadata; packaging checked the submodule, and the registry's checksum covers the rest.
+    if src.join(".git").exists() || !manifest.join(".cargo_vcs_info.json").is_file() {
+        check_source(&src);
+    }
     check_tools();
     bindings(&src, &out);
     layout_probe(&src);

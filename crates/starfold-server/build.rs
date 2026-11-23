@@ -1,6 +1,12 @@
 fn main() {
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if docs_rs() {
+        web(&out);
+        return;
+    }
     let x264 = if target == "windows" {
         windows_libs()
     } else {
@@ -10,8 +16,7 @@ fn main() {
     x264_bindings(&x264.expect("x264"), &out);
     #[cfg(not(feature = "x264"))]
     let _ = x264;
-    bundle_web(&out);
-    println!("cargo:rerun-if-changed=build.rs");
+    web(&out);
 }
 
 /// x264's include paths, with the `x264` feature.
@@ -204,11 +209,60 @@ fn windows_libs() -> X264 {
     x264
 }
 
-/// Bundles the TypeScript web client (packages/web/src) into OUT_DIR/web, which the server
-/// embeds. Needs esbuild on PATH (or ESBUILD); shell.nix and default.nix provide it.
+/// The web client the server embeds, gathered in OUT_DIR/web. In the repository: packages/web's
+/// page, icon, font and dav1d.wasm, and its TypeScript bundled with esbuild (on PATH, or
+/// ESBUILD; shell.nix and default.nix provide it). A published crate has no packages/web: it
+/// carries the same files in web/, taken from a repository build when it was packaged
+/// (.github/release/stage-crate-web.sh), so building it needs no esbuild.
 const WEB: &str = "../../packages/web";
+const STAGED: &str = "web";
+const STATIC: [&str; 4] = ["index.html", "favicon.ico", "inter.woff2", "dav1d/dav1d.wasm"];
+const BUNDLED: [&str; 5] = ["client.js", "worker.js", "dav1d.js", "audio.js", "mic.js"];
 
-fn bundle_web(out: &std::path::Path) {
+fn web(out: &std::path::Path) {
+    let dir = out.join("web");
+    std::fs::create_dir_all(&dir).expect("create OUT_DIR/web");
+    let copy = |from: std::path::PathBuf| {
+        let to = dir.join(from.file_name().expect("a file name"));
+        std::fs::copy(&from, &to)
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
+    };
+    let web = std::path::Path::new(WEB);
+    if web.join("src").is_dir() {
+        for f in STATIC {
+            copy(web.join(f));
+            println!("cargo:rerun-if-changed={WEB}/{f}");
+        }
+        if docs_rs() {
+            for f in BUNDLED {
+                std::fs::write(dir.join(f), "").expect("write an empty bundle");
+            }
+        } else {
+            bundle_web(&dir);
+        }
+    } else {
+        let staged = std::path::Path::new(STAGED);
+        let names = STATIC.iter().map(|f| f.rsplit('/').next().unwrap());
+        for f in names.chain(BUNDLED) {
+            if !staged.join(f).is_file() {
+                panic!(
+                    "{STAGED}/{f} is missing: a build outside the repository needs the web client \
+                     staged into {STAGED}/ (.github/release/stage-crate-web.sh)"
+                );
+            }
+            copy(staged.join(f));
+        }
+        println!("cargo:rerun-if-changed={STAGED}");
+    }
+}
+
+/// docs.rs builds without network, esbuild, cmake or the native libraries; it reads only the API.
+fn docs_rs() -> bool {
+    std::env::var_os("DOCS_RS").is_some()
+}
+
+/// Bundles packages/web/src into `dir`.
+fn bundle_web(dir: &std::path::Path) {
     // npm installs esbuild on Windows as a .cmd shim.
     let default = if cfg!(windows) {
         "esbuild.cmd"
@@ -229,7 +283,7 @@ fn bundle_web(out: &std::path::Path) {
             "--minify",
             "--log-level=warning",
         ])
-        .arg(format!("--outdir={}", out.join("web").display()))
+        .arg(format!("--outdir={}", dir.display()))
         .current_dir(WEB)
         .status()
         .unwrap_or_else(|e| {
