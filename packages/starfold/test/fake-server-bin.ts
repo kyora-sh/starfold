@@ -3,7 +3,8 @@
 // under --base-path, needs $STARFOLD_PASSWORD (an empty one counts as none: a random one, as
 // the server makes up) for anything but /healthz, and writes its pid, flags and password to
 // $FAKE_RECORD. FAKE_EXIT=<code> makes it print to stderr and exit before listening; with
-// FAKE_TAKEN=<file>, while that file exists, it removes it and exits as on a taken port.
+// FAKE_TAKEN=<file>, while that file exists, it removes it and exits as on a taken port; with
+// FAKE_STALL=1 /healthz sends its headers and then nothing more.
 import { existsSync, rmSync, writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
@@ -41,7 +42,14 @@ const server = Bun.serve({
 	port: Number(flags.port),
 	fetch(req) {
 		const path = new URL(req.url).pathname;
-		if (path === `${base}/healthz`) return new Response('ok');
+		if (path === `${base}/healthz`) {
+			if (process.env.FAKE_STALL) {
+				return new Response(new ReadableStream({ start() {} }), {
+					headers: { 'content-type': 'text/plain' },
+				});
+			}
+			return new Response('ok');
+		}
 		if (!path.startsWith(`${base}/`)) {
 			return new Response('not found', { status: 404 });
 		}

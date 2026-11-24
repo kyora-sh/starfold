@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as starfold from '../src/index.ts';
@@ -52,6 +59,54 @@ describe.if(posix)('startServer', () => {
 			expect(await server.client().key('a')).toEqual({ seq: 1, events: 1 });
 		});
 	}
+
+	test(
+		'a server that sends its headers and then stalls fails within the timeout',
+		async () => {
+			const dir = scratch();
+			const started = Date.now();
+			const e = await caught(
+				starfold.startServer({
+					binary: fakeBinary(dir),
+					timeoutMs: 1500,
+					env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_STALL: '1' },
+				})
+			);
+			expect(e.name).toBe('ServerStartError');
+			expect(Date.now() - started).toBeLessThan(5000);
+		},
+		10_000
+	);
+
+	test('a --base-path that makes no URL is a ServerStartError, the server closed', async () => {
+		const dir = scratch();
+		const rec = join(dir, 'rec.json');
+		const e = await caught(
+			starfold.startServer({
+				binary: fakeBinary(dir),
+				args: ['--base-path=desktop'],
+				timeoutMs: 3000,
+				env: { FAKE_RECORD: rec },
+			})
+		);
+		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		expect(e.name).toBe('ServerStartError');
+		expect(e.message).toContain('--base-path');
+		if (existsSync(rec)) {
+			const { pid } = JSON.parse(readFileSync(rec, 'utf8')) as { pid: number };
+			let alive = true;
+			for (let i = 0; i < 50 && alive; i++) {
+				try {
+					process.kill(pid, 0);
+					// oxlint-disable-next-line no-await-in-loop
+					await Bun.sleep(100);
+				} catch {
+					alive = false;
+				}
+			}
+			expect(alive).toBe(false);
+		}
+	});
 
 	test('an empty password counts as none: one is generated', async () => {
 		const dir = scratch();

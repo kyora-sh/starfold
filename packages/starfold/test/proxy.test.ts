@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
@@ -9,11 +9,25 @@ import { join, resolve } from 'node:path';
 const here = import.meta.dir;
 const node = Bun.which('node');
 
-// Node takes HTTP_PROXY from the environment with NODE_USE_ENV_PROXY=1; startServer's poll of
-// the server it started must go straight to it all the same.
-test.if(process.platform !== 'win32' && node !== null)(
+// Node 22.21 and later take HTTP_PROXY from the environment with NODE_USE_ENV_PROXY=1;
+// startServer's poll of the server it started must go straight to it all the same. Without such
+// a Node on PATH the test fails rather than skips (CI's web job installs one).
+function nodeVersion(): number[] | null {
+	if (node === null) return null;
+	const v = spawnSync(node, ['--version'], { encoding: 'utf8' }).stdout ?? '';
+	const m = /^v(\d+)\.(\d+)\./.exec(v.trim());
+	return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+test.if(process.platform !== 'win32')(
 	'under Node with NODE_USE_ENV_PROXY=1 the readiness poll goes straight to the server',
 	async () => {
+		const v = nodeVersion();
+		if (v === null || v[0]! < 22 || (v[0] === 22 && v[1]! < 21)) {
+			throw new Error(
+				`this test needs Node 22.21 or newer on PATH (found ${node === null ? 'none' : v?.join('.')})`
+			);
+		}
 		const seen: string[] = [];
 		const proxy = createServer((sock) => {
 			sock.once('data', (d) => {
@@ -55,7 +69,7 @@ try {
 		let out = '';
 		child.stdout!.on('data', (d) => (out += String(d)));
 		const code = await new Promise<number | null>((ok) =>
-			child.once('exit', (c) => ok(c))
+			child.once('close', (c) => ok(c))
 		);
 		proxy.close();
 		expect({ out: out.trim(), seen }).toEqual({
