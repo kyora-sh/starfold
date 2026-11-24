@@ -1,5 +1,18 @@
 # Changelog
 
+### PyPI
+
+- `starfold` is the Python client alone: `Starfold`, `AsyncStarfold`, `act` and the errors, an
+  sdist and a pure wheel, no binary and no `starfold` command.
+- `starfold-server` (new, import `starfold_server`) is the server: the `starfold` command,
+  `start_server()`, `LocalServer`, `binary_path()`, `check_libraries()`, `BinaryNotFoundError`,
+  `MissingLibrariesError` and `ServerStartError` (still `starfold.StarfoldError`s), unchanged in
+  behaviour; `LocalServer.client()` returns a `starfold.Starfold`. It requires exactly
+  `starfold==0.4.0` and comes as four platform wheels (Linux x86_64 and aarch64, macOS arm64,
+  Windows x86_64), each with that platform's binary; `STARFOLD_BIN` still names another one.
+- `from starfold import start_server` (or any other moved name) raises an `ImportError` that
+  names `starfold-server` and the new import.
+
 ## Unreleased
 
 The first release of kyora starfold. Prebuilt binaries for Linux (x86_64, aarch64), macOS (Apple

@@ -50,9 +50,9 @@
   dav1d.wasm (as above).
 - **`starfold` on npm**, MIT: the TypeScript SDK. It carries no binary; it depends on the server
   package for its platform.
-- **`starfold` on PyPI**: the sdist and the pure wheel (`py3-none-any`) are the Python SDK alone,
-  MIT.
-- **The npm server packages and PyPI's platform wheels**: each holds the default binary of one
+- **`starfold` on PyPI**: the sdist and the pure wheel (`py3-none-any`) are the Python client
+  alone, MIT.
+- **The npm server packages and `starfold-server`'s platform wheels on PyPI**: each holds the default binary of one
   platform's release archive with the archive's `LICENSE`, this file and `licenses/`, so it
   carries what [What each release binary carries](#what-each-release-binary-carries) lists for its
   platform. Each declares that list as one SPDX expression (`license` in the npm package's

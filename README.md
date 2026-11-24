@@ -82,21 +82,25 @@ What each platform needs at run time:
 
 ### With npm or pip
 
-The SDKs install the default build's binary with them on Linux x86_64 and aarch64, macOS (Apple
-silicon) and Windows x86_64: npm through a server package for the platform
-(`@starfold/server-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin-arm64`, `-win32-x64`), pip
-through a platform wheel. Each binary is the release archive's, with its `LICENSE`,
-`THIRD_PARTY.md` and `licenses/`.
+The server packages install the default build's binary with them on Linux x86_64 and aarch64,
+macOS (Apple silicon) and Windows x86_64: npm's `@starfold/server` through a binary package for
+the platform (`@starfold/server-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin-arm64`,
+`-win32-x64`), PyPI's `starfold-server` through a platform wheel. Each binary is the release
+archive's, with its `LICENSE`, `THIRD_PARTY.md` and `licenses/`.
 
 ```sh
-npm install starfold && npx starfold --version
-pip install starfold && starfold --version
+npm install @starfold/server && npx starfold --version
+pip install starfold-server && starfold --version
 ```
 
-Both can start a server from code (`startServer()` in TypeScript, `start_server()` in Python) on
-loopback with a generated password, and give a client already signed in to it; see
-[packages/starfold](packages/starfold/README.md) and [python/starfold](python/starfold/README.md).
-On other platforms they install the client alone, which works against a server running elsewhere.
+Both can start a server from code (`startServer()` from `@starfold/server` in TypeScript,
+`start_server()` from `starfold_server` in Python) on loopback with a generated password, and give
+a client already signed in to it; see [packages/server](packages/server/README.md) and
+[python/starfold-server](python/starfold-server/README.md). On other platforms `@starfold/server`
+installs without a binary and PyPI has no `starfold-server` wheel; set `STARFOLD_BIN` to a
+starfold binary built for it, or use a client against a server running elsewhere. The client alone is npm's `starfold`
+([packages/starfold](packages/starfold/README.md)), with no dependencies and no binary, and PyPI's
+`starfold` ([python/starfold](python/starfold/README.md)), with no binary and no `starfold` command.
 
 On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc 2.39
 or newer (Ubuntu 24.04 or newer):

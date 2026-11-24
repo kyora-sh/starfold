@@ -1,7 +1,9 @@
 # starfold (Python)
 
 A client for agents and scripts driving a starfold desktop: screenshots, waiting for the
-screen, mouse and keyboard, recordings and files.
+screen, mouse and keyboard, recordings and files. It is the client alone: no server binary and
+no `starfold` command. To run a server on this machine, or start one from Python, install
+[`starfold-server`](../starfold-server/README.md), which brings this package with it.
 
 ```sh
 uv add starfold   # or: pip install starfold
@@ -37,56 +39,32 @@ image if Pillow is installed (`starfold[pillow]`).
 
 Errors: `AuthError` (wrong or missing password), `ReadOnlyError` (the server runs with
 `--read-only`), `RecordingOffError` (it runs without `--enable-recording`), `ForbiddenError`,
-`NotFoundError`, `StarfoldTimeoutError`, `StarfoldConnectionError`, and for the server on this
-machine (below) `BinaryNotFoundError`, `MissingLibrariesError` and `ServerStartError`, all
-`StarfoldError`. `wait()` reports a timeout in its result
-(`timed_out`) rather than raising.
+`NotFoundError`, `StarfoldTimeoutError` and `StarfoldConnectionError`, all `StarfoldError`.
+`wait()` reports a timeout in its result (`timed_out`) rather than raising.
 
 Keys for `key()` are a single character or a name (Enter, Tab, Escape, BackSpace, Delete,
 Home, End, PageUp, PageDown, Up, Down, Left, Right, F1-F24, ...), joined with `+` after
 modifiers (ctrl, shift, alt, altgr, super). With shift, a letter or a US-layout digit or
 punctuation key means the shifted key: `ctrl+shift+t`, `cmd+shift+4`.
 
-## The server, from the same install
+## From 0.3.2
 
-On Linux x86_64 and aarch64, macOS arm64 and Windows x86_64, `pip install starfold` gets a
-wheel with the starfold server binary in it. On other platforms it installs the client alone,
-which works against a server running elsewhere.
+Up to 0.3.2 this package also carried the server: the `starfold` command, `start_server()`,
+`LocalServer`, `binary_path()`, `check_libraries()` and their errors. From 0.4.0 they are in
+`starfold-server`:
 
-```python
-import starfold
+| 0.3.2                                              | 0.4.0                                      |
+| -------------------------------------------------- | ------------------------------------------ |
+| `pip install starfold` (for the command or server) | `pip install starfold-server`              |
+| `starfold.start_server(...)`                       | `starfold_server.start_server(...)`        |
+| `from starfold import start_server`                | `from starfold_server import start_server` |
+| `Starfold`, `AsyncStarfold`, `act`, the errors     | unchanged                                  |
 
-with starfold.start_server() as server:  # loopback, a free port, a generated password
-    sf = server.client()  # signed in already
-    sf.screenshot().save("desktop.png")
-```
-
-`start_server()` listens on 127.0.0.1 unless you pass `addr=`; `port=`, `password=` (an
-empty one counts as none), `args=` (more server flags, `starfold --help`), `env=` (merged onto
-this process's environment), `cwd=`, `binary=` (default `binary_path()`) and `timeout=`
-(seconds until it answers, default 30) are optional. If the server exits, doesn't answer in
-time or can't have its port, it raises `ServerStartError` with the server's last output in
-`output`. It returns a `LocalServer` with `url`, `password`, `process`, `stderr_tail` (the
-server's last lines of output), `client()`, `async_client()` and `close()`; the server stops on
-`close()`, at the end of the `with` block, at exit, and when your process ends, however it
-ends. On Linux and macOS `process` is a small `sh` guard whose child is the server. On Linux it
-needs a display (`DISPLAY`, e.g. from Xvfb); it doesn't start one.
-
-`starfold.binary_path()` is the binary: `$STARFOLD_BIN` if set, else the wheel's. The
-`starfold` command runs it (`starfold --help`).
-
-On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc
-2.39 or newer (Ubuntu 24.04 or newer):
-
-```sh
-sudo apt install libyuv0 libopus0 libpulse0
-```
-
-Without them, `start_server()` and `starfold` say which libraries are missing.
+`from starfold import start_server` (or any other moved name) raises an `ImportError` that says
+so. Staying on `starfold==0.3.2` changes nothing: it still carries the server.
 
 ## Tests
 
 ```sh
-uv run pytest                                      # unit tests, no server
-STARFOLD_BIN=../../target/release/starfold uv run pytest -m integration   # Linux, Xvfb + xterm
+uv run pytest
 ```

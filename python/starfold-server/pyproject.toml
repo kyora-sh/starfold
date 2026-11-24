@@ -1,0 +1,36 @@
+[project]
+name = "starfold-server"
+version = "0.4.0"
+description = "The starfold server binary, its starfold command and start_server() for Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["starfold==0.4.0"]
+
+[project.scripts]
+starfold = "starfold_server._native:main"
+
+[project.urls]
+Repository = "https://github.com/kyora-sh/starfold"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+starfold = { path = "../starfold", editable = true }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: starts the server on Xvfb (set STARFOLD_BIN to run)"]
