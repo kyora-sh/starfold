@@ -350,7 +350,10 @@ export class LocalServer {
 		});
 		const forced = await Promise.race([this.#exited.then(() => false), late]);
 		clearTimeout(timer);
-		if (forced) {
+		// The group only while its leader, the guard, is unreaped: Node reaps it when it sets
+		// exitCode or signalCode, after which the group's id could name another group.
+		const unreaped = child.exitCode === null && child.signalCode === null;
+		if (forced && unreaped) {
 			try {
 				if (process.platform === 'win32' || child.pid === undefined) {
 					child.kill('SIGKILL');
