@@ -13,11 +13,16 @@ list=$(npm view "$name" versions --json --cache "$cache" --prefer-online) || {
 	exit 1
 }
 python3 -I -c '
-import json, sys
-versions = json.loads(sys.argv[1])
+import json, re, sys
+semver = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
+try:
+    versions = json.loads(sys.argv[1])
+except ValueError:
+    versions = None
 if isinstance(versions, str):
     versions = [versions]
-if not isinstance(versions, list) or not versions or not all(isinstance(v, str) for v in versions):
+if (not isinstance(versions, list) or not versions
+        or not all(isinstance(v, str) and semver.fullmatch(v) for v in versions)):
     sys.exit(f"npm-has.sh: not a version list: {sys.argv[1]!r}")
 print("present" if sys.argv[2] in versions else "absent")
 ' "$list" "$version"

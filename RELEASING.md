@@ -34,7 +34,7 @@ its registry:
 - workflow: `release.yml`
 - environment: `crates` (crates.io), `npm` (npm) or `pypi` (PyPI)
 
-In this order, at the commit the first tag will name:
+In this order:
 
 0. **The environments `crates`, `npm` and `pypi`** (they exist, each limited to tags matching
    `v*`). The registries check the repository, the workflow file and the environment, not the tag:
@@ -81,7 +81,8 @@ In this order, at the commit the first tag will name:
    Settings → Trusted Publishing → Add → GitHub, enter the values above with environment `crates`,
    save. Then delete the `crates` environment's secret `CRATES_IO_BOOTSTRAP_TOKEN` and revoke the token on crates.io; from the
    next release on, `crates-publish` uses trusted publishing.
-7. **npm, after the first release.** Deprecate the placeholder so that it points at the release:
+7. **npm, after the first release.** Deprecate the placeholder so that it points at the release,
+   from a shell signed in with `npm login`:
 
    ```sh
    npm deprecate @starfold/web@0.0.1 "a placeholder; install @starfold/web@latest"
