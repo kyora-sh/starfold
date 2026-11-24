@@ -4,7 +4,6 @@ import {
 	accessSync,
 	chmodSync,
 	constants,
-	existsSync,
 	readdirSync,
 	statSync,
 } from 'node:fs';
@@ -122,7 +121,9 @@ export function binaryPath(): string {
 	const env = process.env.STARFOLD_BIN;
 	if (env) {
 		if (!isFile(env)) {
-			throw new BinaryNotFoundError(`STARFOLD_BIN is ${env}, which isn't a file`);
+			throw new BinaryNotFoundError(
+				`STARFOLD_BIN is ${env}, which isn't a file`
+			);
 		}
 		return executable(env);
 	}

@@ -205,9 +205,7 @@ describe.if(posix)('the starfold command', () => {
 				detached: true,
 			}
 		);
-		await new Promise<void>((ok) =>
-			wrapper.stdout!.once('data', () => ok())
-		);
+		await new Promise<void>((ok) => wrapper.stdout!.once('data', () => ok()));
 		process.kill(wrapper.pid!, 'SIGINT');
 		const ended = await Promise.race([
 			new Promise<boolean>((ok) => wrapper.once('exit', () => ok(true))),
