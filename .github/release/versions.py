@@ -8,6 +8,7 @@ Kinds:
   cargo <Cargo.toml>          [package] version
   pyproject <pyproject.toml>  [project] version
   package-json <tarball>      package/package.json's top-level "version"
+  package-json-file <file>    a package.json's top-level "version"
   wheel <.whl>                the first Version header of the .dist-info/METADATA
   sdist <.tar.gz>             the first Version header of <name>-<version>/PKG-INFO
   dsc <.dsc>                  the Version field of the source package's paragraph
@@ -59,9 +60,13 @@ def read(kind, path):
     if kind == "pyproject":
         with open(path, "rb") as f:
             return tomllib.load(f)["project"]["version"]
-    if kind == "package-json":
-        with tarfile.open(path) as t:
-            data = json.load(t.extractfile("package/package.json"))
+    if kind in ("package-json", "package-json-file"):
+        if kind == "package-json":
+            with tarfile.open(path) as t:
+                data = json.load(t.extractfile("package/package.json"))
+        else:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
         if not isinstance(data.get("version"), str):
             fail(f"{path}: package.json has no top-level version")
         return data["version"]
