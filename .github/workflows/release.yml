@@ -5,7 +5,7 @@ name: Release
 # merged since the previous tag). After the release exists, the same tag publishes the default
 # (MIT) build's packages to the registries: the crates to crates.io, the embeddable web client to
 # npm and the Python SDK to PyPI, each through trusted publishing (a short-lived token from GitHub's
-# OIDC identity). The one exception is crates.io's first release, which the `release` environment's
+# OIDC identity). The one exception is crates.io's first release, which the `crates` environment's
 # secret CRATES_IO_BOOTSTRAP_TOKEN publishes until it is deleted (RELEASING.md). Those jobs run on GitHub-hosted runners, which
 # npm requires for trusted publishing; RELEASING.md has the one-time registry setup. The x264
 # flavour is never published to a registry.
@@ -782,11 +782,12 @@ jobs:
   # jobs with `id-token: write`: trusted publishing, where the registry trusts this repository's
   # release.yml and exchanges the job's OIDC token for a short-lived one, so once crates.io's
   # bootstrap token is deleted, no registry secret exists. They
-  # build nothing, so no build script or dependency runs where a token can be had. They declare
-  # the environment `release`, which the registries' trusted publishers name and the repository
-  # limits to v* tags (RELEASING.md), so a branch that edits this file can't publish. They need
-  # the release job to have succeeded, and it runs only on a pushed v* tag, so a dry run skips
-  # them and never creates the environment. GitHub-hosted runners: npm's trusted publishing takes
+  # build nothing, so no build script or dependency runs where a token can be had. Each declares
+  # its registry's environment (`crates`, `npm`, `pypi`), which that registry's trusted publishers
+  # name and the repository limits to v* tags (RELEASING.md), so a branch that edits this file
+  # can't publish, and a job in one environment can't read another's secrets. They need the
+  # release job to have succeeded, and it runs only on a pushed v* tag, so a dry run skips them
+  # and never deploys to an environment. GitHub-hosted runners: npm's trusted publishing takes
   # no self-hosted runner, and the six run alike.
   crates:
     name: crates.io dry run (starfold-aom-sys, starfold)
@@ -826,7 +827,7 @@ jobs:
     name: crates.io publish
     needs: [version, release, crates]
     if: needs.release.result == 'success'
-    environment: release
+    environment: crates
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -846,7 +847,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # Until both crates exist and trust this workflow, the environment secret
       # CRATES_IO_BOOTSTRAP_TOKEN (RELEASING.md) publishes them; once it is deleted, trusted
-      # publishing does. Only this job names the secret, and only a job declaring the `release`
+      # publishing does. Only this job names the secret, and only a job declaring the `crates`
       # environment, on a v* tag, can read it.
       - name: Credentials
         id: which
@@ -913,7 +914,7 @@ jobs:
     name: npm publish
     needs: [version, release, npm]
     if: needs.release.result == 'success'
-    environment: release
+    environment: npm
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -975,7 +976,7 @@ jobs:
     name: PyPI publish
     needs: [version, release, pypi]
     if: needs.release.result == 'success'
-    environment: release
+    environment: pypi
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
