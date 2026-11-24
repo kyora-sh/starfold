@@ -6,90 +6,87 @@ GitHub release and then publishes the default (MIT) build's packages:
 | Registry  | Package                                          | Jobs                             |
 | --------- | ------------------------------------------------ | -------------------------------- |
 | crates.io | `starfold-aom-sys`, then `starfold` (the server) | `crates`, `crates-publish`       |
-| npm       | `@starfold/web-embed` (the embeddable client)    | `embed`, `npm`, `npm-publish`    |
+| npm       | `@starfold/web` (the embeddable client)          | `embed`, `npm`, `npm-publish`    |
 | PyPI      | `starfold` (the Python SDK)                      | `python`, `pypi`, `pypi-publish` |
 
 The x264 (GPL-2.0-or-later) flavour is a GitHub release download only. Each registry job uses
 trusted publishing: the registry trusts this repository's `release.yml` and swaps the job's GitHub
-OIDC token for a short-lived one, so no registry token is stored in the repository. The publishing
+OIDC token for a short-lived one. The one stored token is crates.io's bootstrap token for the first
+release (below), an environment secret that is deleted once that release is out. The publishing
 jobs run on GitHub-hosted runners (`ubuntu-latest`; `ubuntu-24.04` for crates.io, whose packages
 the job installs by name), which npm requires for trusted publishing; this
 repository is public, so those minutes cost nothing.
 
 A version a registry has already is skipped rather than published again, so a job can be re-run,
-and `starfold-aom-sys` keeps its version until libaom or its bindings change.
+and `starfold-aom-sys` keeps its version until libaom or its bindings change. npm's job reads the
+package's version list from the registry first and fails if the registry doesn't give one.
 
 ## Before the first release (once)
 
-crates.io and npm only let a package that exists trust a workflow, so a maintainer publishes the
-first version of those by hand; PyPI creates its project from the workflow. Every form takes the
-same values:
+crates.io and npm only let a package that exists trust a workflow. On crates.io the first tag
+publishes with a bootstrap token, and trusted publishing is set up afterwards; on npm a `0.0.1`
+placeholder of `@starfold/web` exists for this, and the first tag publishes the real version. PyPI
+creates its project from the workflow. Every form takes the same values, with the environment of
+its registry:
 
 - owner: `kyora-sh`
 - repository: `starfold`
 - workflow: `release.yml`
-- environment: `release`
+- environment: `crates` (crates.io), `npm` (npm) or `pypi` (PyPI)
 
-In this order, at the commit the first tag will name:
+In this order:
 
-0. **The `release` environment.** The registries check the repository, the workflow file and the
-   environment, not the tag: without a protected environment, anyone who can push a branch here
-   could change `release.yml` on that branch so that it publishes. The three publish jobs declare
-   the environment `release`; protect it before the first tag. Repository Settings → Environments
-   → New environment, name `release`; under Deployment branches and tags choose "Selected branches
-   and tags" and add the tag rule `v*` (and no branch); optionally add yourself under Required
-   reviewers, to approve every publish. The tag rule only helps while pushing a `v*` tag is
-   reserved to you: if others can push to this repository, also add a tag ruleset (Settings →
-   Rules → Rulesets, target tags `v*`, restrict creations) or a required reviewer. If you skip this
-   step, GitHub creates `release` the first time a tag runs a publish job, with no rules:
-   publishing works, but the protection doesn't exist until you add the rules above, and the
-   registries' publishers must still name `release`.
-1. **crates.io, first upload.** Sign in at crates.io, create an API token under Account Settings
-   → API Tokens (scopes `publish-new` and `publish-update`), and run `cargo login` with it. From a
-   clean checkout with its submodule (`git submodule update --init --force`), Rust 1.90 or newer
-   (it packages both crates in one command) and the build tools from the README's Build section,
-   on Linux:
-
-   ```sh
-   .github/release/crates.sh dry-run && .github/release/crates.sh publish
-   ```
-
-   This stages the web client into `crates/starfold-server/web`, packages both crates, builds each
-   from its package alone, and uploads `starfold-aom-sys` before `starfold`.
-
-2. **crates.io, trusted publishing.** For each of the two crates: crates.io → the crate → Settings
-   → Trusted Publishing → Add → GitHub, enter the values above, save. Then revoke the API token.
-3. **npm, the scope.** On npmjs.com, create the organisation `starfold` on the free plan (Unlimited
-   public packages); its name is the `@starfold` scope.
-4. **npm, first upload.** Run the Release workflow by hand at that commit (Actions → Release → Run
-   workflow), download its `starfold-web-embed-<version>` artifact (a `.zip`: unzip it for the
-   `.tgz`), then:
-
-   ```sh
-   npm login
-   npm publish ./starfold-web-embed-<version>.tgz --access public
-   npm logout
-   ```
-
-5. **PyPI.** pypi.org → Your account → Publishing → Add a new pending publisher → GitHub, enter the
-   values above and the project name `starfold`, then Add. Nothing is uploaded by hand: the first
+0. **The environments `crates`, `npm` and `pypi`** (they exist, each limited to tags matching
+   `v*`). The registries check the repository, the workflow file and the environment, not the tag:
+   without a protected environment, anyone who can push a branch here could change `release.yml`
+   on that branch so that it publishes. Each publish job declares its registry's environment
+   (`crates-publish` → `crates`, `npm-publish` → `npm`, `pypi-publish` → `pypi`), and a job reads
+   only its own environment's secrets. Under Repository Settings → Environments, each of the three
+   has "Selected branches and tags" with the tag rule `v*` (and no branch); optionally add
+   yourself under Required reviewers on each, to approve every publish. The tag rule only helps
+   while pushing a `v*` tag is reserved to you: if others can push to this repository, also add a
+   tag ruleset (Settings → Rules → Rulesets, target tags `v*`, restrict creations) or a required
+   reviewer.
+1. **crates.io, the bootstrap token.** Sign in at crates.io and create an API token under Account
+   Settings → API Tokens with the scopes `publish-new` and `publish-update`, limited to the crates
+   `starfold` and `starfold-aom-sys`. Add it as a secret of the `crates` environment (Settings →
+   Environments → `crates` → Environment secrets) named `CRATES_IO_BOOTSTRAP_TOKEN`, not as a
+   repository secret. Only the `crates-publish` job names it, and as a secret of `crates` only a
+   job that declares `crates`, on a `v*` tag, can read it. While it is set, `crates-publish`
+   uses it (its log says "crates.io: bootstrap token"); without it, trusted publishing ("crates.io:
+   trusted publishing").
+2. **npm, the scope and the placeholder.** The organisation `starfold` (its name is the
+   `@starfold` scope) and a `0.0.1` placeholder of `@starfold/web` exist already; the release
+   versions come from the workflow, and the real tarball is never uploaded by hand.
+3. **PyPI.** pypi.org → Your account → Publishing → Add a new pending publisher → GitHub, enter the
+   values above with environment `pypi` and the project name `starfold`, then Add. Nothing is uploaded by hand: the first
    tag creates the project. A pending publisher reserves nothing: if someone registers `starfold`
    first, it is no longer valid.
-6. Push the first tag (see [Each release](#each-release)). crates.io and npm have that version
-   already and are skipped; PyPI's project is created.
+4. **npm, trusted publishing**, when the first tag is ready, since npm expires a trusted publisher
+   that hasn't published within **two days** of its creation:
+   1. Merge the first release's version (see [Each release](#each-release)).
+   2. npmjs.com → `@starfold/web` → Settings → Trusted Publisher → GitHub Actions; enter the
+      values above, environment `npm`.
+   3. Under the allowed actions, tick **npm publish** (a new configuration allows only
+      `npm stage publish` until you do; the workflow runs `npm publish`), and save. Instead of 2
+      and 3, npm 11.15.0 or newer can do both from a shell signed in to npm with two-factor
+      authentication:
+      `npm trust github @starfold/web --file release.yml --repo kyora-sh/starfold --env npm --allow-publish --yes`.
+   4. Push the tag (step 5) within two days. If the two days pass first, delete the configuration
+      and repeat 2 and 3.
+5. Push the first tag (see [Each release](#each-release)). crates.io gets both crates through the
+   bootstrap token, `starfold-aom-sys` first; npm publishes the release beside the placeholder;
+   PyPI's project is created.
+6. **crates.io, after the first release.** For each of the two crates: crates.io → the crate →
+   Settings → Trusted Publishing → Add → GitHub, enter the values above with environment `crates`,
+   save. Then delete the `crates` environment's secret `CRATES_IO_BOOTSTRAP_TOKEN` and revoke the token on crates.io; from the
+   next release on, `crates-publish` uses trusted publishing.
+7. **npm, after the first release.** Deprecate the placeholder so that it points at the release,
+   from a shell signed in with `npm login`:
 
-### npm's trusted publisher, before the second release
-
-npm expires a trusted publisher that hasn't published within **two days** of its creation, so it
-is added only when the second release is ready:
-
-1. Merge the second release's version bump (see [Each release](#each-release)).
-2. npmjs.com → `@starfold/web-embed` → Settings → Trusted Publisher → GitHub Actions; enter the
-   values above.
-3. Under the allowed actions, tick **npm publish** (a new configuration allows only
-   `npm stage publish` until you do; the workflow runs `npm publish`), and save.
-4. Push the release tag within two days. If the two days pass first, delete the configuration and
-   repeat steps 2 and 3.
+   ```sh
+   npm deprecate @starfold/web@0.0.1 "a placeholder; install @starfold/web@latest"
+   ```
 
 ## Each release
 

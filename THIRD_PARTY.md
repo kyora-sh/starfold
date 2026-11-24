@@ -46,7 +46,7 @@
   Open Media Patent License 1.0, `aom/LICENSE`, `aom/PATENTS`) with its `third_party/` code:
   fastfeat, highway, libwebm and libyuv (BSD-3-Clause), vector (MIT) and x86inc (ISC), each with
   its licence beside it.
-- **`@starfold/web-embed` on npm**, `MIT AND BSD-2-Clause`: the embeddable client (MIT) with
+- **`@starfold/web` on npm**, `MIT AND BSD-2-Clause`: the embeddable client (MIT) with
   dav1d.wasm (as above).
 - **`starfold` on PyPI**, MIT: the Python SDK.
 
