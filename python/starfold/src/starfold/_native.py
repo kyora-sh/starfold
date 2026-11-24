@@ -129,23 +129,26 @@ GUARD = """exec 3<&0 0</dev/null
 "$0" "$@" 3<&- &
 p=$!
 trap '' TERM
-{ trap - TERM; while read -r _ <&3; do :; done; kill -TERM 0; } >/dev/null 2>&1 &
+{ while read -r _ <&3; do :; done; kill -TERM 0; } >/dev/null 2>&1 &
 exec 3<&-
 wait "$p"
 rc=$?
-kill -TERM 0 2>/dev/null
+trap '' USR1
+kill -USR1 0 2>/dev/null
 exit "$rc"
 """
 """Runs the server with the guard's stdin, a pipe from this process, held by a watcher.
 
 The guard leads its own process group (a new session), and nothing in it signals a pid: when
 the pipe closes (this process ended, however it ended, or close() closed it) the watcher sends
-TERM to its group, which reaches the server and the watcher; the guard ignores TERM (set after
-the server started, so the server keeps the default), so its wait is never cut short and its
-exit status is the server's. After the server has exited the guard sends TERM to its group once
-more, which ends the watcher. A process group can't be reused while a member is alive, and the
-sender is always a member. The TypeScript SDK starts its server through the same script (a test
-compares the two)."""
+TERM to its group, which stops the server, and then ends. The guard and the watcher ignore TERM
+(set after the server started, so the server keeps the default), so the guard's wait is never
+cut short and its exit status is the server's. Once the server has exited and been reaped, the
+guard ignores USR1 itself and sends it to its group, which ends the watcher: its USR1 was never
+trapped or ignored, so this holds however soon the server exits (unless this process itself
+ignores USR1: then the watcher lingers, holding no output, until the pipe closes). A process
+group can't be reused while a member is alive, and the sender is always a member. The
+TypeScript SDK starts its server through the same script (a test compares the two)."""
 
 _live: weakref.WeakSet[LocalServer] = weakref.WeakSet()
 _jobs: list[int] = []

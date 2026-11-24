@@ -3,8 +3,11 @@
 # as packages/starfold/src/native.ts) under this system's /bin/sh, with stand-in servers (no binary):
 #   1. its stdin pipe closes: the server is stopped, the guard exits with the server's status;
 #   2. the process holding that pipe is SIGKILLed: no server and no watcher are left;
-#   3. the server exits by itself: the guard exits with its status at once and leaves no watcher.
-# Each time nothing may be left in the guard's process group. Needs perl (setsid; macOS has no command).
+#   3. the server exits by itself: the guard exits with its status at once and leaves no watcher;
+#   4. the same for a server that exits at once (and 5., with STARFOLD_BIN set, the real binary given
+#      a flag it refuses).
+# Each time nothing may be left in the guard's process group; in 3 to 5 that is checked while its stdin
+# is still open, so only the guard can have ended the watcher. Needs perl (setsid; macOS has no command).
 # Run as `sh .github/release/guard-test.sh` from anywhere; GUARD_SH names another shell to run the guard
 # with (default /bin/sh, the one the SDKs use).
 set -u
@@ -35,7 +38,7 @@ group_empty_within() {
 	i=0
 	while [ -n "$(left_in "$1")" ]; do
 		i=$((i + 1))
-		[ $i -gt 100 ] && return 1
+		[ $i -gt 30 ] && return 1
 		sleep 0.1
 	done
 }
@@ -43,23 +46,35 @@ group_empty_within() {
 # A server that writes its pid, leaves on TERM with status 7, or by itself after $2 seconds with status 5.
 cat >"$work/server" <<'EOF'
 #!/bin/sh
-echo $$ >"$1"
 trap 'exit 7' TERM
+echo $$ >"$1"
 n=0
 while [ "$n" -lt "$2" ]; do sleep 1; n=$((n + 1)); done
 exit 5
 EOF
 chmod +x "$work/server"
 
-start() {
+start() { run "$work/server" "$work/pid" "$1"; }
+run() {
 	rm -f "$work/pid" "$work/in"
 	mkfifo "$work/in"
 	# In its own session, as the SDKs start it: the guard signals its process group. GUARD_SH may hold
 	# a shell and its options (bash --posix), so it is split on purpose.
 	# shellcheck disable=SC2086
 	perl -e 'use POSIX; POSIX::setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!"' \
-		${GUARD_SH:-/bin/sh} -c "$guard" "$work/server" "$work/pid" "$1" <"$work/in" >/dev/null 2>&1 &
+		${GUARD_SH:-/bin/sh} -c "$guard" "$@" <"$work/in" >/dev/null 2>&1 &
 	g=$!
+}
+# The guard ends by itself while its stdin stays open; then nothing may be left in its group.
+exits_with() {
+	n=$1 want=$2
+	exec 8>"$work/in"
+	gone_within "$g" || bad "$n: the guard didn't exit after its server did"
+	wait "$g"
+	rc=$?
+	[ -z "$want" ] || [ "$rc" = "$want" ] || bad "$n: the guard exited with $rc, not the server's $want"
+	group_empty_within "$g" || bad "$n: left in the guard's group with its stdin open: $(left_in "$g" | tr '\n' ' ')"
+	exec 8>&-
 }
 server_pid() {
 	i=0
@@ -98,15 +113,21 @@ echo "2. holder SIGKILLed: server and guard gone, nothing left in its group"
 
 # 3. the server exits by itself
 start 1
-exec 8>"$work/in"
-s=$(server_pid) || bad "3: the server never started"
-gone_within "$g" || bad "3: the guard didn't exit after its server did"
-wait "$g"
-rc=$?
-exec 8>&-
-[ "$rc" = 5 ] || bad "3: the guard exited with $rc, not the server's 5"
-group_empty_within "$g" || bad "3: left in the guard's group: $(left_in "$g" | tr '\n' ' ')"
+exits_with 3 5
 echo "3. server exited by itself: guard exited $rc, nothing left in its group"
+
+# 4. the server exits at once
+start 0
+exits_with 4 5
+echo "4. server exited at once: guard exited $rc, nothing left in its group"
+
+# 5. the real server refuses a flag
+if [ -n "${STARFOLD_BIN:-}" ]; then
+	run "$STARFOLD_BIN" --no-such-flag
+	exits_with 5 ""
+	[ "$rc" != 0 ] || bad "5: the guard exited 0 for a refused flag"
+	echo "5. starfold refused a flag: guard exited $rc, nothing left in its group"
+fi
 
 [ $fail = 0 ] && echo "guard-test: all passed with ${GUARD_SH:-/bin/sh}"
 exit $fail
