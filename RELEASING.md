@@ -111,11 +111,13 @@ In this order:
 
 ## Each release
 
-1. On main, set the same `version` in `crates/starfold-server/Cargo.toml` and
-   `python/starfold/pyproject.toml`. Bump `crates/starfold-aom-sys/Cargo.toml` (and the `=`
+1. On main, set the same `version` in `crates/starfold-server/Cargo.toml`,
+   `python/starfold/pyproject.toml` and `packages/starfold/package.json` (the release's
+   `version` job fails if one differs). Bump `crates/starfold-aom-sys/Cargo.toml` (and the `=`
    version `crates/starfold-server/Cargo.toml` asks of it) only when it changed. Refresh the
-   lock files the builds read with `--locked`: `cargo update --workspace` and, in
-   `python/starfold`, `uv lock`. Merge.
+   lock files the builds read with `--locked` or `--frozen-lockfile`: `cargo update --workspace`;
+   in `python/starfold`, `uv lock`; and `bun.lock`, which records `packages/starfold`'s version,
+   with `bun install` at the repository root, using bun 1.4.4 (CI's). Merge.
 2. Optional: run the Release workflow by hand for a dry run of everything, the registry jobs'
    dry runs included.
 3. Tag main's head and push the tag:

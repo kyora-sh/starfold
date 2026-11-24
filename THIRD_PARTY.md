@@ -50,24 +50,22 @@
   dav1d.wasm (as above).
 - **`starfold` on npm**, MIT: the TypeScript SDK. It carries no binary; it depends on the server
   package for its platform.
-- **`@starfold/server-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin-arm64` and `-win32-x64` on
-  npm**, MIT (`license` in package.json, the licence the binary is distributed under): each holds
-  the default binary of one platform's release archive and the archive's `LICENSE`, this file and
-  `licenses/`, so it carries what [What each release binary carries](#what-each-release-binary-carries)
-  lists for its platform.
 - **`starfold` on PyPI**: the sdist and the pure wheel (`py3-none-any`) are the Python SDK alone,
-  MIT. The four platform wheels (`manylinux_2_39_x86_64`, `manylinux_2_39_aarch64`,
-  `macosx_11_0_arm64`, `win_amd64`) add the same binary as the npm server package of their
-  platform, with the archive's `LICENSE`, this file and `licenses/` as their licence files. Their
-  `License-Expression` names every licence in
-  [What each release binary carries](#what-each-release-binary-carries) for the platform, joined
-  with `AND`:
-  - everywhere: MIT, BSD-2-Clause, BSD-3-Clause, ISC, Apache-2.0, Unicode-3.0, Zlib, OFL-1.1,
-    CC0-1.0 and `LicenseRef-AOM-Patent-License-1.0`;
-  - on Linux also LGPL-2.1-or-later (glibc's startup files) and
-    `GPL-3.0-or-later WITH GCC-exception-3.1` (GCC's);
-  - on Windows also ZPL-2.1 (the MinGW-w64 runtime) and
-    `GPL-3.0-or-later WITH GCC-exception-3.1` (GCC's runtime libraries).
+  MIT.
+- **The npm server packages and PyPI's platform wheels**: each holds the default binary of one
+  platform's release archive with the archive's `LICENSE`, this file and `licenses/`, so it
+  carries what [What each release binary carries](#what-each-release-binary-carries) lists for its
+  platform. Each declares that list as one SPDX expression (`license` in the npm package's
+  package.json, `License-Expression` in the wheel's metadata); per platform (archive target, npm
+  package, wheel tag):
+  - `x86_64-linux` (`@starfold/server-linux-x64-gnu`, `manylinux_2_39_x86_64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND LGPL-2.1-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1`
+  - `aarch64-linux` (`@starfold/server-linux-arm64-gnu`, `manylinux_2_39_aarch64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND LGPL-2.1-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1`
+  - `aarch64-macos` (`@starfold/server-darwin-arm64`, `macosx_11_0_arm64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0`
+  - `x86_64-windows` (`@starfold/server-win32-x64`, `win_amd64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND ZPL-2.1 AND GPL-3.0-or-later WITH GCC-exception-3.1`
+
+  LGPL-2.1-or-later is glibc's startup files, `GPL-3.0-or-later WITH GCC-exception-3.1` GCC's
+  startup files (Linux) and runtime libraries (Windows), ZPL-2.1 the MinGW-w64 runtime; the
+  binary itself stays distributed under MIT (`starfold --version`).
 
 ## What each release binary carries
 
