@@ -2,6 +2,14 @@
 
 from . import act
 from ._client import AsyncStarfold, Starfold
+from ._native import (
+    BinaryNotFoundError,
+    LocalServer,
+    MissingLibrariesError,
+    binary_path,
+    check_libraries,
+    start_server,
+)
 from ._types import (
     AuthError,
     FileEntry,
@@ -24,10 +32,13 @@ from ._types import (
 __all__ = [
     "AsyncStarfold",
     "AuthError",
+    "BinaryNotFoundError",
     "FileEntry",
     "FileList",
     "ForbiddenError",
     "InputResult",
+    "LocalServer",
+    "MissingLibrariesError",
     "NotFoundError",
     "ReadOnlyError",
     "Recording",
@@ -41,4 +52,7 @@ __all__ = [
     "Upload",
     "WaitResult",
     "act",
+    "binary_path",
+    "check_libraries",
+    "start_server",
 ]

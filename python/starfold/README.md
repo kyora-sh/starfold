@@ -45,6 +45,39 @@ Home, End, PageUp, PageDown, Up, Down, Left, Right, F1-F24, ...), joined with `+
 modifiers (ctrl, shift, alt, altgr, super). With shift, a letter or a US-layout digit or
 punctuation key means the shifted key: `ctrl+shift+t`, `cmd+shift+4`.
 
+## The server, from the same install
+
+On Linux x86_64 and aarch64, macOS arm64 and Windows x86_64, `pip install starfold` gets a
+wheel with the starfold server binary in it. On other platforms it installs the client alone,
+which works against a server running elsewhere.
+
+```python
+import starfold
+
+with starfold.start_server() as server:  # loopback, a free port, a generated password
+    sf = server.client()  # signed in already
+    sf.screenshot().save("desktop.png")
+```
+
+`start_server()` listens on 127.0.0.1 unless you pass `addr=`; `port=`, `password=`,
+`args=` (more server flags, `starfold --help`), `env=`, `cwd=` and `timeout=` (seconds until
+it answers, default 30) are optional. It returns a `LocalServer` with `url`, `password`,
+`process`, `client()`, `async_client()` and `close()`; the server stops on `close()`, at the
+end of the `with` block, at exit, and when your process is killed. On Linux it needs a display
+(`DISPLAY`, e.g. from Xvfb); it doesn't start one.
+
+`starfold.binary_path()` is the binary: `$STARFOLD_BIN` if set, else the wheel's. The
+`starfold` command runs it (`starfold --help`).
+
+On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc
+2.39 or newer (Ubuntu 24.04 or newer):
+
+```sh
+sudo apt install libyuv0 libopus0 libpulse0
+```
+
+Without them, `start_server()` and `starfold` say which libraries are missing.
+
 ## Tests
 
 ```sh
