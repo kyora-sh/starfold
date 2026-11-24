@@ -5,7 +5,8 @@ name: Release
 # merged since the previous tag). After the release exists, the same tag publishes the default
 # (MIT) build's packages to the registries: the crates to crates.io, the embeddable web client to
 # npm and the Python SDK to PyPI, each through trusted publishing (a short-lived token from GitHub's
-# OIDC identity; no secret is stored or referenced). Those jobs run on GitHub-hosted runners, which
+# OIDC identity). The one exception is crates.io's first release, which the `release` environment's
+# secret CRATES_IO_BOOTSTRAP_TOKEN publishes until it is deleted (RELEASING.md). Those jobs run on GitHub-hosted runners, which
 # npm requires for trusted publishing; RELEASING.md has the one-time registry setup. The x264
 # flavour is never published to a registry.
 #
@@ -779,7 +780,8 @@ jobs:
   # skipped (a manual run on a tag included); a pushed tag whose release didn't succeed runs none.
   # The publish jobs run only after the release job and their dry run succeeded, and are the only
   # jobs with `id-token: write`: trusted publishing, where the registry trusts this repository's
-  # release.yml and exchanges the job's OIDC token for a short-lived one, so no secret exists. They
+  # release.yml and exchanges the job's OIDC token for a short-lived one, so once crates.io's
+  # bootstrap token is deleted, no registry secret exists. They
   # build nothing, so no build script or dependency runs where a token can be had. They declare
   # the environment `release`, which the registries' trusted publishers name and the repository
   # limits to v* tags (RELEASING.md), so a branch that edits this file can't publish. They need
@@ -842,12 +844,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # Until both crates exist and trust this workflow, the environment secret
+      # CRATES_IO_BOOTSTRAP_TOKEN (RELEASING.md) publishes them; once it is deleted, trusted
+      # publishing does. Only this job names the secret, and only a job declaring the `release`
+      # environment, on a v* tag, can read it.
+      - name: Credentials
+        id: which
+        env:
+          HAS_BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN != '' }}
+        run: |
+          if [ "$HAS_BOOTSTRAP_TOKEN" = true ]; then
+            echo "crates.io: bootstrap token"
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+          else
+            echo "crates.io: trusted publishing"
+            echo "mode=trusted" >> "$GITHUB_OUTPUT"
+          fi
       - name: Token
         id: auth
+        if: steps.which.outputs.mode == 'trusted'
         uses: rust-lang/crates-io-auth-action@v1
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.which.outputs.mode == 'bootstrap' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.auth.outputs.token }}
         run: .github/release/crates.sh publish
 
   npm:

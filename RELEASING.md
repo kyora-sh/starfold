@@ -11,7 +11,8 @@ GitHub release and then publishes the default (MIT) build's packages:
 
 The x264 (GPL-2.0-or-later) flavour is a GitHub release download only. Each registry job uses
 trusted publishing: the registry trusts this repository's `release.yml` and swaps the job's GitHub
-OIDC token for a short-lived one, so no registry token is stored in the repository. The publishing
+OIDC token for a short-lived one. The one stored token is crates.io's bootstrap token for the first
+release (below), an environment secret that is deleted once that release is out. The publishing
 jobs run on GitHub-hosted runners (`ubuntu-latest`; `ubuntu-24.04` for crates.io, whose packages
 the job installs by name), which npm requires for trusted publishing; this
 repository is public, so those minutes cost nothing.
@@ -22,10 +23,10 @@ package's version list from the registry first and fails if the registry doesn't
 
 ## Before the first release (once)
 
-crates.io and npm only let a package that exists trust a workflow. On crates.io a maintainer
-publishes the first version by hand; on npm a `0.0.1` placeholder of `@starfold/web` exists for
-this, and the first tag publishes the real version. PyPI creates its project from the workflow.
-Every form takes the same values:
+crates.io and npm only let a package that exists trust a workflow. On crates.io the first tag
+publishes with a bootstrap token, and trusted publishing is set up afterwards; on npm a `0.0.1`
+placeholder of `@starfold/web` exists for this, and the first tag publishes the real version. PyPI
+creates its project from the workflow. Every form takes the same values:
 
 - owner: `kyora-sh`
 - repository: `starfold`
@@ -42,43 +43,39 @@ In this order, at the commit the first tag will name:
    and tags" and add the tag rule `v*` (and no branch); optionally add yourself under Required
    reviewers, to approve every publish. The tag rule only helps while pushing a `v*` tag is
    reserved to you: if others can push to this repository, also add a tag ruleset (Settings →
-   Rules → Rulesets, target tags `v*`, restrict creations) or a required reviewer. If you skip this
-   step, GitHub creates `release` the first time a tag runs a publish job, with no rules:
-   publishing works, but the protection doesn't exist until you add the rules above, and the
-   registries' publishers must still name `release`.
-1. **crates.io, first upload.** Sign in at crates.io, create an API token under Account Settings
-   → API Tokens (scopes `publish-new` and `publish-update`), and run `cargo login` with it. From a
-   clean checkout with its submodule (`git submodule update --init --force`), Rust 1.90 or newer
-   (it packages both crates in one command) and the build tools from the README's Build section,
-   on Linux:
-
-   ```sh
-   .github/release/crates.sh dry-run && .github/release/crates.sh publish
-   ```
-
-   This stages the web client into `crates/starfold-server/web`, packages both crates, builds each
-   from its package alone, and uploads `starfold-aom-sys` before `starfold`.
-
-2. **crates.io, trusted publishing.** For each of the two crates: crates.io → the crate → Settings
-   → Trusted Publishing → Add → GitHub, enter the values above, save. Then revoke the API token.
-3. **npm, the scope and the placeholder.** The organisation `starfold` (its name is the
+   Rules → Rulesets, target tags `v*`, restrict creations) or a required reviewer. The environment
+   also holds crates.io's bootstrap token (step 1), which its tag rule keeps from any branch run.
+1. **crates.io, the bootstrap token.** Sign in at crates.io and create an API token under Account
+   Settings → API Tokens with the scopes `publish-new` and `publish-update`, limited to the crates
+   `starfold` and `starfold-aom-sys`. Add it as a secret of the `release` environment (Settings →
+   Environments → `release` → Environment secrets) named `CRATES_IO_BOOTSTRAP_TOKEN`, not as a
+   repository secret. Only the `crates-publish` job names it, and as an environment secret only a
+   job that declares `release`, on a `v*` tag, can read it. While it is set, `crates-publish`
+   uses it (its log says "crates.io: bootstrap token"); without it, trusted publishing ("crates.io:
+   trusted publishing").
+2. **npm, the scope and the placeholder.** The organisation `starfold` (its name is the
    `@starfold` scope) and a `0.0.1` placeholder of `@starfold/web` exist already; the release
    versions come from the workflow, and the real tarball is never uploaded by hand.
-4. **PyPI.** pypi.org → Your account → Publishing → Add a new pending publisher → GitHub, enter the
+3. **PyPI.** pypi.org → Your account → Publishing → Add a new pending publisher → GitHub, enter the
    values above and the project name `starfold`, then Add. Nothing is uploaded by hand: the first
    tag creates the project. A pending publisher reserves nothing: if someone registers `starfold`
    first, it is no longer valid.
-5. **npm, trusted publishing**, when the first tag is ready, since npm expires a trusted publisher
+4. **npm, trusted publishing**, when the first tag is ready, since npm expires a trusted publisher
    that hasn't published within **two days** of its creation:
    1. Merge the first release's version (see [Each release](#each-release)).
    2. npmjs.com → `@starfold/web` → Settings → Trusted Publisher → GitHub Actions; enter the
       values above.
    3. Under the allowed actions, tick **npm publish** (a new configuration allows only
       `npm stage publish` until you do; the workflow runs `npm publish`), and save.
-   4. Push the tag (step 6) within two days. If the two days pass first, delete the configuration
+   4. Push the tag (step 5) within two days. If the two days pass first, delete the configuration
       and repeat 2 and 3.
-6. Push the first tag (see [Each release](#each-release)). crates.io has that version already and
-   is skipped; npm publishes it beside the placeholder; PyPI's project is created.
+5. Push the first tag (see [Each release](#each-release)). crates.io gets both crates through the
+   bootstrap token, `starfold-aom-sys` first; npm publishes the release beside the placeholder;
+   PyPI's project is created.
+6. **crates.io, after the first release.** For each of the two crates: crates.io → the crate →
+   Settings → Trusted Publishing → Add → GitHub, enter the values above, save. Then delete the
+   environment secret `CRATES_IO_BOOTSTRAP_TOKEN` and revoke the token on crates.io; from the
+   next release on, `crates-publish` uses trusted publishing.
 7. **npm, after the first release.** Deprecate the placeholder so that it points at the release:
 
    ```sh
