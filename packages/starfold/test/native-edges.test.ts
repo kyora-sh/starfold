@@ -205,14 +205,27 @@ describe.if(posix)('the starfold command', () => {
 				detached: true,
 			}
 		);
-		await new Promise<void>((ok) => wrapper.stdout!.once('data', () => ok()));
+		const exited = new Promise<string>((ok) =>
+			wrapper.once('exit', (code, signal) => ok(`${code ?? signal}`))
+		);
+		let out = '';
+		await new Promise<void>((ok) =>
+			wrapper.stdout!.on('data', (d) => {
+				out += String(d);
+				if (out.includes('ready')) ok();
+			})
+		);
+		// The server's trap is in place once it printed; the wrapper's handlers since it spawned.
+		await Bun.sleep(200);
 		process.kill(wrapper.pid!, 'SIGINT');
 		const ended = await Promise.race([
-			new Promise<boolean>((ok) => wrapper.once('exit', () => ok(true))),
-			Bun.sleep(3000).then(() => false),
+			exited,
+			Bun.sleep(3000).then(() => 'running'),
 		]);
-		if (!ended) process.kill(-wrapper.pid!, 'SIGKILL');
-		expect(ended).toBe(true);
-		expect(await Bun.file(marker).exists()).toBe(true);
+		if (ended === 'running') process.kill(-wrapper.pid!, 'SIGKILL');
+		expect({ ended, interrupted: await Bun.file(marker).exists() }).toEqual({
+			ended: '0',
+			interrupted: true,
+		});
 	});
 });

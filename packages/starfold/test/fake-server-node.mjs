@@ -3,9 +3,7 @@
 import { createServer } from 'node:http';
 
 const flag = (name) =>
-	process.argv
-		.find((a) => a.startsWith(`--${name}=`))
-		?.slice(name.length + 3);
+	process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 const server = createServer((req, res) => {
 	res.writeHead(req.url === '/healthz' ? 200 : 404).end('ok');
 });
