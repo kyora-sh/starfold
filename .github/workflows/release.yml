@@ -889,7 +889,7 @@ jobs:
           npm pkg set type=module
           npm install --offline --no-audit --no-fund "../npm/starfold-$VERSION.tgz"
           npm ls --all
-          [ ! -e node_modules/.bin/starfold ] && [ ! -e node_modules/.bin/starfold.cmd ] || { echo "::error::the client alone installed a starfold command"; exit 1; }
+          if [ -e node_modules/.bin/starfold ] || [ -e node_modules/.bin/starfold.cmd ]; then echo "::error::the client alone installed a starfold command"; exit 1; fi
           [ ! -e node_modules/@starfold ] || { echo "::error::the client alone installed $(ls node_modules/@starfold)"; exit 1; }
           if npx --no-install starfold --version; then echo "::error::npx starfold ran with the client alone"; exit 1; fi
           node --input-type=module -e "
