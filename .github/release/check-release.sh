@@ -4,7 +4,8 @@
 # versions and the downloaded set: run that before staging x264's source. <dist dir> holds the downloaded workflow artifacts, one directory each
 # (never merged); x264's source is staged elsewhere (stage-x264-source.sh) and joins only after
 # the downloaded set has passed. Fails unless:
-#   - Cargo.toml's version (tomllib) names the tag, v<version>, and pyproject.toml declares it;
+#   - Cargo.toml's version (tomllib) names the tag, v<version>, and pyproject.toml and
+#     packages/starfold/package.json declare it;
 #   - the downloaded set is exactly what expected-files.sh lists outside x264-source/, by directory
 #     and name, no more and no fewer (an artifact named x264-source fails), no symbolic link;
 #   - the staged source is exactly expected-files.sh's x264-source files, and once joined as
@@ -129,8 +130,12 @@ while read -r sum name; do
 		fail "x264-source/$name doesn't match third_party/x264/SHA256SUMS"
 done <"$root/third_party/x264/SHA256SUMS"
 
-if [ "${RELEASE_LOOKUP:-1}" = 1 ] && "${GH:-gh}" release view "$tag" >/dev/null 2>&1; then
-	[ "${RELEASE_RESUME:-0}" = 1 ] || fail "$tag already has a release"
-	echo "::notice::$tag has a release already; publish.sh uploads what it lacks and verifies the rest"
+if [ "${RELEASE_LOOKUP:-1}" = 1 ]; then
+	if lookup=$("${GH:-gh}" release view "$tag" --json tagName 2>&1); then
+		[ "${RELEASE_RESUME:-0}" = 1 ] || fail "$tag already has a release"
+		echo "::notice::$tag has a release already; publish.sh uploads what it lacks and verifies the rest"
+	elif [ "$lookup" != "release not found" ]; then
+		fail "couldn't look up the release of $tag: $lookup"
+	fi
 fi
 echo "release $tag: $(wc -l <<<"$expected" | tr -d ' ') files checked"

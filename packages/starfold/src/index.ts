@@ -25,9 +25,11 @@ export type {
 	WaitResult,
 } from './types.js';
 export {
+	BinaryNotFoundError,
 	LINUX_LIBRARIES_HINT,
 	LocalServer,
 	MissingLibrariesError,
+	ServerStartError,
 	binaryPath,
 	checkLibraries,
 	missingLibraries,

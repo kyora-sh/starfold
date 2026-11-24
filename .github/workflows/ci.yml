@@ -86,8 +86,9 @@ jobs:
       - name: Test
         run: uv run --locked pytest
 
-  # publish.sh against a stand-in gh: a fresh release, a re-run that completes a partial one, and
-  # the mismatches that must fail.
+  # The release scripts against stand-ins: publish.sh with gh (a fresh release, a re-run that
+  # completes a partial one, the mismatches that must fail), the install job's pip step with uv
+  # (LINUX_WHEELS on and off), crates.sh's index check with curl (damaged answers stop it).
   release-scripts:
     name: Release scripts
     runs-on: kyora-2x4
@@ -95,6 +96,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: .github/release/publish-test.sh
+      - run: .github/release/install-step-test.sh
+      - run: .github/release/crates-index-test.sh
 
   upstream-sync:
     name: Upstream sync script

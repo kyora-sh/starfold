@@ -6,12 +6,15 @@ import {
 	constants,
 	existsSync,
 	readdirSync,
+	statSync,
 } from 'node:fs';
+import { request } from 'node:http';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { Starfold } from './client.js';
 import type { StarfoldOptions } from './client.js';
+import { StarfoldError } from './types.js';
 
 /** The apt line for the shared libraries the Linux binary links. */
 export const LINUX_LIBRARIES_HINT =
@@ -25,6 +28,33 @@ const PACKAGES: Record<string, string> = {
 };
 
 const SUPPORTED = 'Linux x64 and arm64 with glibc, macOS arm64, Windows x64';
+
+/** No server binary: $STARFOLD_BIN isn't set (or isn't a file) and no platform package has one. */
+export class BinaryNotFoundError extends StarfoldError {}
+
+/** The shared libraries the server binary needs don't all resolve on this Linux system. */
+export class MissingLibrariesError extends StarfoldError {
+	readonly missing: string[];
+
+	constructor(missing: string[]) {
+		super(
+			`the starfold server can't start: these shared libraries are missing: ${missing.join(', ')}. ` +
+				`It needs glibc 2.39+ (Ubuntu 24.04 or newer) and: ${LINUX_LIBRARIES_HINT}`
+		);
+		this.missing = missing;
+	}
+}
+
+/** startServer failed: the server exited, didn't answer in time, or its port was taken. */
+export class ServerStartError extends StarfoldError {
+	/** The last of what the server printed. */
+	readonly output: string;
+
+	constructor(message: string, output: string) {
+		super(`${message}:\n${output}`);
+		this.output = output;
+	}
+}
 
 function glibc(): boolean {
 	const report = (
@@ -62,6 +92,14 @@ export function serverPackage(key: string = platformKey()): string | null {
 	return PACKAGES[key] ?? null;
 }
 
+function isFile(path: string): boolean {
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
+}
+
 function executable(path: string): string {
 	if (process.platform === 'win32') {
 		return path;
@@ -77,14 +115,14 @@ function executable(path: string): string {
 
 /**
  * The server binary: $STARFOLD_BIN if set, else the one in this platform's
- * @starfold/server-* package. Throws if neither is there; the client still works
- * against a remote server without it.
+ * @starfold/server-* package. Throws a BinaryNotFoundError if neither is there; the client
+ * still works against a remote server without it.
  */
 export function binaryPath(): string {
 	const env = process.env.STARFOLD_BIN;
 	if (env) {
-		if (!existsSync(env)) {
-			throw new Error(`STARFOLD_BIN is ${env}, which does not exist`);
+		if (!isFile(env)) {
+			throw new BinaryNotFoundError(`STARFOLD_BIN is ${env}, which isn't a file`);
 		}
 		return executable(env);
 	}
@@ -93,7 +131,7 @@ export function binaryPath(): string {
 	const remote =
 		'The client still works against a remote server: new Starfold(url).';
 	if (pkg === null) {
-		throw new Error(
+		throw new BinaryNotFoundError(
 			`starfold has no server binary for ${key} (there are packages for ${SUPPORTED}); ` +
 				`set STARFOLD_BIN to a starfold binary built for it. ${remote}`
 		);
@@ -104,7 +142,7 @@ export function binaryPath(): string {
 			createRequire(import.meta.url).resolve(`${pkg}/package.json`)
 		);
 	} catch {
-		throw new Error(
+		throw new BinaryNotFoundError(
 			`the server binary for ${key} comes in ${pkg}, which is not installed ` +
 				`(were optional dependencies left out?); install it, or set STARFOLD_BIN. ${remote}`
 		);
@@ -114,43 +152,36 @@ export function binaryPath(): string {
 		'bin',
 		process.platform === 'win32' ? 'starfold.exe' : 'starfold'
 	);
-	if (!existsSync(bin)) {
-		throw new Error(`${pkg} has no ${bin}; reinstall it, or set STARFOLD_BIN`);
+	if (!isFile(bin)) {
+		throw new BinaryNotFoundError(
+			`${pkg} has no ${bin}; reinstall it, or set STARFOLD_BIN`
+		);
 	}
 	return executable(bin);
 }
 
-/** On Linux, the shared libraries `binary` needs that do not resolve (by ldd); elsewhere none. */
+/**
+ * On Linux, what `binary` needs and the system lacks, by ldd: the shared libraries that don't
+ * resolve and the glibc versions that are too new (GLIBC_2.39, say); elsewhere nothing.
+ */
 export function missingLibraries(binary: string): string[] {
 	if (process.platform !== 'linux') {
 		return [];
 	}
-	const r = spawnSync('ldd', [binary], { encoding: 'utf8' });
-	if (r.error || typeof r.stdout !== 'string') {
+	const r = spawnSync('ldd', ['--', binary], { encoding: 'utf8' });
+	if (r.error) {
 		return [];
 	}
 	const missing: string[] = [];
-	for (const line of r.stdout.split('\n')) {
-		const m = /^\s*(\S+)\s+=>\s+not found/.exec(line);
-		if (m) {
-			missing.push(m[1]!);
+	for (const line of `${r.stdout ?? ''}\n${r.stderr ?? ''}`.split('\n')) {
+		const lib = /^\s*(\S+)\s+=>\s+not found/.exec(line);
+		const version = /version `([^']+)' not found/.exec(line);
+		const name = lib?.[1] ?? version?.[1];
+		if (name && !missing.includes(name)) {
+			missing.push(name);
 		}
 	}
 	return missing;
-}
-
-/** The shared libraries the server binary needs are not installed. */
-export class MissingLibrariesError extends Error {
-	readonly missing: string[];
-
-	constructor(missing: string[]) {
-		super(
-			`the starfold server needs shared libraries this system lacks (${missing.join(', ')}); ` +
-				`install them with: ${LINUX_LIBRARIES_HINT}`
-		);
-		this.name = 'MissingLibrariesError';
-		this.missing = missing;
-	}
 }
 
 /** Throws a MissingLibrariesError naming what `binary` lacks (Linux only). */
@@ -164,13 +195,13 @@ export function checkLibraries(binary: string): void {
 export interface StartServerOptions {
 	/** The address to bind (default 127.0.0.1, loopback only). */
 	addr?: string;
-	/** The port (default: a free one). */
+	/** The port (default: a free one, tried again if another process takes it first). */
 	port?: number;
-	/** The password (default: a generated one, which `client()` holds). */
+	/** The password (default, and when empty: a generated one, which `client()` holds). */
 	password?: string;
-	/** More server flags, such as --enable-recording or --read-only. */
+	/** More server flags, such as --enable-recording or --base-path. */
 	args?: string[];
-	/** Extra environment for the server (DISPLAY, for one). */
+	/** Environment for the server, on top of this process's (DISPLAY, for one). */
 	env?: Record<string, string>;
 	/** The binary (default: binaryPath()). */
 	binary?: string;
@@ -192,6 +223,7 @@ kill "$w" 2>/dev/null
 exit "$rc"`;
 
 const TAIL_BYTES = 16 * 1024;
+const PORT_TRIES = 3;
 
 function freePort(addr: string): Promise<number> {
 	return new Promise((resolve, reject) => {
@@ -220,14 +252,34 @@ function urlHost(addr: string): string {
 	return addr.includes(':') ? `[${addr}]` : addr;
 }
 
-async function answers(url: string): Promise<boolean> {
-	try {
-		const r = await fetch(url, { signal: AbortSignal.timeout(1000) });
-		await r.arrayBuffer();
-		return r.ok;
-	} catch {
-		return false;
+/** The --base-path among the server flags, read as the server reads it, without a trailing /. */
+function basePath(args: string[]): string {
+	let found = '';
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i]!;
+		const m = /^--base[-_]path(=(.*))?$/.exec(a);
+		if (!m) continue;
+		if (m[1] !== undefined) {
+			found = m[2]!;
+		} else if (i + 1 < args.length && !args[i + 1]!.startsWith('--')) {
+			found = args[++i]!;
+		}
 	}
+	return found.replace(/\/$/, '');
+}
+
+// Straight to the server with node:http, which takes no proxy from the environment.
+function answers(url: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		const req = request(url, { timeout: 1000 }, (res) => {
+			res.resume();
+			res.once('end', () => resolve(res.statusCode === 200));
+			res.once('error', () => resolve(false));
+		});
+		req.once('timeout', () => req.destroy());
+		req.once('error', () => resolve(false));
+		req.end();
+	});
 }
 
 function unref(x: unknown): void {
@@ -272,6 +324,7 @@ export class LocalServer {
 	async close(): Promise<void> {
 		const child = this.process;
 		if (child.exitCode !== null || child.signalCode !== null) {
+			await this.#exited;
 			return;
 		}
 		if (process.platform === 'win32') {
@@ -304,10 +357,13 @@ export class LocalServer {
 	}
 }
 
+class PortTaken extends Error {}
+
 /**
  * Starts the server and resolves once it answers. It binds to loopback with a generated
  * password unless told otherwise, and stops when this process exits. On Linux it needs an
- * X display ($DISPLAY, Xvfb for one); it does not start one.
+ * X display ($DISPLAY, Xvfb for one); it does not start one. Every failure to start is a
+ * ServerStartError carrying what the server printed.
  */
 export async function startServer(
 	options: StartServerOptions = {}
@@ -315,9 +371,31 @@ export async function startServer(
 	const binary = options.binary ?? binaryPath();
 	checkLibraries(binary);
 	const addr = options.addr ?? '127.0.0.1';
-	const port = options.port ?? (await freePort(addr));
-	const password = options.password ?? generatedPassword();
-	const timeoutMs = options.timeoutMs ?? 30_000;
+	const password = options.password || generatedPassword();
+	const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+	for (let attempt = 1; ; attempt++) {
+		// oxlint-disable-next-line no-await-in-loop
+		const port = options.port ?? (await freePort(addr));
+		try {
+			// oxlint-disable-next-line no-await-in-loop
+			return await launch(binary, addr, port, password, options, deadline);
+		} catch (e) {
+			if (!(e instanceof PortTaken)) throw e;
+			if (options.port !== undefined || attempt >= PORT_TRIES) {
+				throw new ServerStartError(`port ${port} is taken`, e.message);
+			}
+		}
+	}
+}
+
+async function launch(
+	binary: string,
+	addr: string,
+	port: number,
+	password: string,
+	options: StartServerOptions,
+	deadline: number
+): Promise<LocalServer> {
 	const env: Record<string, string | undefined> = {
 		...process.env,
 		...options.env,
@@ -345,8 +423,9 @@ export async function startServer(
 	child.stdout?.on('data', keep);
 	child.stderr?.on('data', keep);
 	let exitedWith: string | null = null;
+	// 'close', after the output pipes have drained, so the tail holds the server's last words.
 	const exited = new Promise<void>((resolve) => {
-		child.once('exit', (code, signal) => {
+		child.once('close', (code, signal) => {
 			exitedWith = signal ? `signal ${signal}` : `code ${code}`;
 			resolve();
 		});
@@ -361,30 +440,38 @@ export async function startServer(
 		void exited.then(() => process.off('exit', stop));
 	}
 
-	const url = `http://${urlHost(addr)}:${port}`;
+	const url = `http://${urlHost(addr)}:${port}${basePath(options.args ?? [])}`;
 	const server = new LocalServer(url, password, child, exited, () => tail);
-	const deadline = Date.now() + timeoutMs;
+	const failed = (): Error => {
+		if (/address (already )?in use/i.test(tail)) return new PortTaken(tail);
+		return new ServerStartError(
+			`the starfold server exited (${exitedWith}) before it answered`,
+			tail
+		);
+	};
 	// oxlint-disable-next-line no-await-in-loop
 	while (!(await answers(`${url}/healthz`))) {
 		if (exitedWith !== null) {
-			throw new Error(
-				`the starfold server exited (${exitedWith}) before it answered:\n${tail}`
-			);
+			throw failed();
+		}
+		if (child.exitCode !== null || child.signalCode !== null) {
+			// oxlint-disable-next-line no-await-in-loop
+			await exited;
+			throw failed();
 		}
 		if (Date.now() > deadline) {
 			// oxlint-disable-next-line no-await-in-loop
 			await server.close();
-			throw new Error(
-				`the starfold server did not answer within ${timeoutMs} ms:\n${tail}`
+			throw new ServerStartError(
+				`the starfold server did not answer within ${options.timeoutMs ?? 30_000} ms`,
+				tail
 			);
 		}
 		// oxlint-disable-next-line no-await-in-loop
 		await new Promise((r) => setTimeout(r, 100));
 	}
 	if (exitedWith !== null) {
-		throw new Error(
-			`the starfold server exited (${exitedWith}) before it answered:\n${tail}`
-		);
+		throw failed();
 	}
 	unref(child);
 	unref(child.stdin);

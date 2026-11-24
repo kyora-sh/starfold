@@ -118,6 +118,7 @@ done 3< <("$here/expected-files.sh" native "$version")
 
 # The SDK, built and staged with what its package.json "files" names, plus the pins.
 sdk=$root/packages/starfold
+cmp "$sdk/LICENSE" "$root/LICENSE" || fail "packages/starfold/LICENSE isn't the repository's LICENSE"
 [ -x "$sdk/node_modules/.bin/tsc" ] || [ -x "$root/node_modules/.bin/tsc" ] || fail "no tsc: run bun install --frozen-lockfile first"
 (cd "$sdk" && bun run build)
 stage=$work/sdk

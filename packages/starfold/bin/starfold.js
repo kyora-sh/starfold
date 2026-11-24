@@ -14,9 +14,10 @@ try {
 
 const child = spawn(bin, process.argv.slice(2), { stdio: 'inherit' });
 const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-// A terminal's Ctrl-C already reaches the server (same process group); other signals are passed on.
+// Each is passed on. A terminal's Ctrl-C reaches the server twice (the process group, and this);
+// the server shuts down on the first and ignores the second.
 const forward = (signal) => {
-	if (signal !== 'SIGINT') child.kill(signal);
+	child.kill(signal);
 };
 if (process.platform !== 'win32') {
 	for (const s of signals) process.on(s, forward);

@@ -26,8 +26,9 @@ name: Release
 # writers can push branches here and a fork's push runs in the fork. Only a pushed v* tag creates
 # the release and publishes; the release job's condition can't be met by a branch push or a manual
 # run, and the registry jobs publish only after it succeeded on a tag.
-# Bump `version` in crates/starfold-server/Cargo.toml and python/starfold/pyproject.toml on main
-# first; the tag has to match both.
+# Bump `version` in crates/starfold-server/Cargo.toml, python/starfold/pyproject.toml and
+# packages/starfold/package.json (and bun.lock, RELEASING.md) on main first; the tag has to match
+# all three.
 on:
   push:
     tags: ['v*']
@@ -103,7 +104,8 @@ jobs:
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "building $commit ($GITHUB_REF)"
-      # Cargo.toml's version, which pyproject.toml must declare too; on a tag, the tag has to name it.
+      # Cargo.toml's version, which pyproject.toml and packages/starfold/package.json must declare
+      # too; on a tag, the tag has to name it.
       - id: version
         run: |
           version=$(python3 -I .github/release/versions.py cargo crates/starfold-server/Cargo.toml)
@@ -764,7 +766,7 @@ jobs:
   # GitHub-hosted runners (Linux arm64, Windows) cost nothing on a public repository.
   install:
     name: Install (${{ matrix.platform }})
-    needs: [version, native]
+    needs: [version, python, native]
     strategy:
       fail-fast: false
       matrix:
@@ -794,6 +796,11 @@ jobs:
         with:
           name: starfold-wheels-${{ env.VERSION }}
           path: wheels
+      # The pure wheel, which pip on Linux takes when LINUX_WHEELS is 0.
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-python-${{ env.VERSION }}
+          path: python
       - uses: actions/setup-node@v4
         with:
           node-version: '24.11.1'
@@ -825,6 +832,15 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.12 venv
+          # Without Linux wheels (LINUX_WHEELS=0) pip on Linux takes the pure wheel: the client,
+          # no binary to check.
+          if [ "$RUNNER_OS" = Linux ] && [ "$LINUX_WHEELS" = 0 ]; then
+            pure=python/starfold-$VERSION-py3-none-any.whl
+            uv pip install --python venv --no-index --no-deps "$pure"
+            uv pip install --python venv "$pure"
+            echo "LINUX_WHEELS=0: no Linux platform wheel; the pure wheel installed, binary check skipped"
+            exit 0
+          fi
           # starfold from these wheels alone, pip's tag choice for this platform; then its
           # dependencies (httpx) from PyPI.
           uv pip install --python venv --no-index --no-deps --find-links wheels "starfold==$VERSION"
@@ -858,6 +874,10 @@ jobs:
           }
           EOF
           (cd app && node smoke.mjs)
+          if [ "$LINUX_WHEELS" = 0 ]; then
+            echo "LINUX_WHEELS=0: no Linux platform wheel; the pure wheel installed, binary check skipped"
+            exit 0
+          fi
           venv/bin/python -c '
           import starfold
           with starfold.start_server(args=["--audio-enabled=false"]) as server:
@@ -941,13 +961,14 @@ jobs:
         run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist --downloads-only ${{ needs.version.outputs.flavour_names }}
       - name: x264's source
         run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
-      # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml declares
-      # too; the downloads, then with x264's source joined, are exactly the expected files and every
+      # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml and
+      # packages/starfold/package.json declare too; the downloads, then with x264's source joined, are exactly the expected files and every
       # checksum checks; the packages carry the version and their archive's binary; and the tag has
       # no release yet, except on a re-run of this job.
       - name: Check the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_RESUME: ${{ github.run_attempt > 1 && '1' || '0' }}
         run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/x264-source" ${{ needs.version.outputs.flavour_names }}
       # Created for the commit every job built, while the tag names it; the tag is read again after.

@@ -66,17 +66,21 @@ const sf = server.client(); // signed in already
 await (await sf.screenshot()).save('desktop.png');
 ```
 
-`startServer()` listens on 127.0.0.1 unless you pass `addr`; `port`, `password`, `args`
-(more server flags, `starfold --help`), `env`, `binary` and `timeoutMs` (until it answers,
-default 30000) are optional. It resolves to a `LocalServer` with `url`, `password`, `process`,
-`client()`, `output()` (the last of what the server printed) and `close()`; the server stops on
-`close()`, at the end of an `await using` block, when your process exits, and on Linux and
-macOS also when your process is killed. If the server exits before it answers, the error
-carries what it printed. On Linux it needs a display (`DISPLAY`, e.g. from Xvfb); it doesn't
+`startServer()` listens on 127.0.0.1 unless you pass `addr`; `port` (default: a free one,
+tried again if another process takes it first), `password` (default, and when empty: a
+generated one), `args` (more server flags, `starfold --help`; with `--base-path` the `url`
+includes it), `env` (added to this process's environment), `binary` and `timeoutMs` (until it
+answers, default 30000) are optional. It resolves to a `LocalServer` with `url`, `password`,
+`process`, `client()`, `output()` (the last of what the server printed) and `close()`; the
+server stops on `close()`, at the end of an `await using` block, when your process exits, and
+on Linux and macOS also when your process is killed. If the server exits, doesn't answer in
+time or finds its port taken, `startServer()` throws a `ServerStartError` whose `output` is
+what the server printed. On Linux it needs a display (`DISPLAY`, e.g. from Xvfb); it doesn't
 start one.
 
-`binaryPath()` is the binary: `$STARFOLD_BIN` if set, else the platform package's. The
-`starfold` command runs it (`npx starfold --help`).
+`binaryPath()` is the binary: `$STARFOLD_BIN` if set, else the platform package's; without
+one it throws a `BinaryNotFoundError`. The `starfold` command runs it (`npx starfold --help`).
+These errors, and `MissingLibrariesError` below, are `StarfoldError`s too.
 
 On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc
 2.39 or newer (Ubuntu 24.04 or newer):
@@ -85,7 +89,9 @@ On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and 
 sudo apt install libyuv0 libopus0 libpulse0
 ```
 
-Without them, `startServer()` and `starfold` say which libraries are missing.
+Without them, or on an older glibc, `startServer()` (a `MissingLibrariesError`) and
+`starfold` name what is missing, the libraries or the glibc version (`GLIBC_2.39`), with
+that line.
 
 ## Tests
 
