@@ -336,6 +336,8 @@ export class LocalServer {
 	async close(): Promise<void> {
 		const child = this.process;
 		if (child.exitCode !== null || child.signalCode !== null) {
+			// The guard is gone; its stdin's end tells a watcher that may outlive it to stop.
+			child.stdin?.destroy();
 			await this.#exited;
 			return;
 		}
@@ -464,11 +466,15 @@ async function launch(
 	) {
 		await server.close();
 		throw new ServerStartError(
-			`--base-path ${base} makes no URL to reach the server at (it starts with /)`,
+			base !== ''
+				? `--base-path ${base} makes no URL to reach the server at (it starts with /)`
+				: `the address ${addr} with port ${port} makes no URL to reach the server at`,
 			tail
 		);
 	}
 	const failed = (): Error => {
+		// The guard is gone; its stdin's end tells a watcher that may outlive it to stop.
+		child.stdin?.destroy();
 		if (/address (already )?in use/i.test(tail)) return new PortTaken(tail);
 		return new ServerStartError(
 			`the starfold server exited (${exitedWith}) before it answered`,
