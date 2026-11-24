@@ -212,19 +212,20 @@ export interface StartServerOptions {
 
 // The Python SDK's guard, the same text: run as the leader of its own process group (detached),
 // it starts the server and a watcher holding the guard's stdin, a pipe from this process. When
-// that pipe closes (this process ended, however it ended) the watcher signals the group, which
-// stops the server; once the server is reaped the guard signals the group again, ending the
-// watcher, and exits with the server's status. Only the group is ever signalled, never a pid
-// that may have been reaped.
+// that pipe closes (this process ended, however it ended) the watcher sends TERM to the group,
+// which stops the server (the guard and the watcher ignore it); once the server is reaped the
+// guard sends USR1 to the group, which ends the watcher, and exits with the server's status.
+// Only the group is ever signalled, never a pid that may have been reaped.
 const GUARD = `exec 3<&0 0</dev/null
 "$0" "$@" 3<&- &
 p=$!
 trap '' TERM
-{ trap - TERM; while read -r _ <&3; do :; done; kill -TERM 0; } >/dev/null 2>&1 &
+{ while read -r _ <&3; do :; done; kill -TERM 0; } >/dev/null 2>&1 &
 exec 3<&-
 wait "$p"
 rc=$?
-kill -TERM 0 2>/dev/null
+trap '' USR1
+kill -USR1 0 2>/dev/null
 exit "$rc"`;
 
 const TAIL_BYTES = 16 * 1024;
