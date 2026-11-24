@@ -807,6 +807,20 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           version: 0.11.8
+      # The guard both SDKs run the server under, on this system's /bin/sh (dash on Linux, bash
+      # 3.2 in sh mode on macOS) with stand-in servers; Windows runs the server without one.
+      - uses: actions/checkout@v4
+        if: runner.os != 'Windows'
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+          path: src
+          sparse-checkout: |
+            .github/release/guard-test.sh
+            python/starfold/src/starfold/_native.py
+          sparse-checkout-cone-mode: false
+      - name: The server guard under /bin/sh
+        if: runner.os != 'Windows'
+        run: sh src/.github/release/guard-test.sh
       - name: Runtime libraries
         if: runner.os == 'Linux'
         run: |
