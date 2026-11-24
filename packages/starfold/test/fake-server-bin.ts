@@ -4,7 +4,8 @@
 // the server makes up) for anything but /healthz, and writes its pid, flags and password to
 // $FAKE_RECORD. FAKE_EXIT=<code> makes it print to stderr and exit before listening; with
 // FAKE_TAKEN=<file>, while that file exists, it removes it and exits as on a taken port; with
-// FAKE_STALL=1 /healthz sends its headers and then nothing more.
+// FAKE_STALL=1 /healthz sends its headers and then nothing more; FAKE_EXIT_AFTER=<ms> exits
+// with status 0 that long after it listens.
 import { existsSync, rmSync, writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
@@ -69,6 +70,9 @@ writeFileSync(
 	})
 );
 console.error(`listening on http://${flags.addr}:${server.port}${base}`);
+if (process.env.FAKE_EXIT_AFTER) {
+	setTimeout(() => process.exit(0), Number(process.env.FAKE_EXIT_AFTER));
+}
 process.on('SIGTERM', () => {
 	server.stop(true);
 	process.exit(0);

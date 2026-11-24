@@ -61,6 +61,22 @@ describe.if(posix)('startServer', () => {
 		expect(e.message).not.toContain('--base-path');
 	});
 
+	test('close() after the server exited ends the guard stdin', async () => {
+		const dir = scratch();
+		server = await starfold.startServer({
+			binary: fakeBinary(dir),
+			env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_EXIT_AFTER: '200' },
+		});
+		const guard = server.process;
+		for (let i = 0; i < 50 && guard.exitCode === null; i++) {
+			// oxlint-disable-next-line no-await-in-loop
+			await Bun.sleep(100);
+		}
+		expect(guard.exitCode).toBe(0);
+		await server.close();
+		expect(guard.stdin?.destroyed).toBe(true);
+	});
+
 	test.if(process.platform === 'linux')(
 		'a server that exits at once leaves nothing in the guard group (30 runs)',
 		async () => {
