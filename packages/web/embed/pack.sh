@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pack.sh <commit> [out dir]: the embeddable client as an npm-style tarball,
+# pack.sh <commit> [out dir]: the embeddable client as the npm package @starfold/web,
 # starfold-web-embed-<commit>.tgz at version 0.0.0-<commit>; with PACK_VERSION set (a release),
 # starfold-web-embed-<PACK_VERSION>.tgz at that version. The worker, dav1d and worklet bundles
 # are built with the same esbuild flags as the server's own (crates/starfold-server/build.rs);
@@ -44,7 +44,7 @@ cp ../../LICENSE "$pkg/LICENSE"
 cp dav1d/COPYING-dav1d dav1d/COPYING-wasi-libc "$pkg/"
 cat >"$pkg/package.json" <<EOF
 {
-	"name": "@starfold/web-embed",
+	"name": "@starfold/web",
 	"version": "${version}",
 	"description": "starfold's browser client, to mount in another page",
 	"type": "module",

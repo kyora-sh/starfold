@@ -904,6 +904,9 @@ jobs:
       TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
       PACKAGE: ${{ needs.npm.outputs.package }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.commit }}
       - uses: actions/download-artifact@v4
         with:
           name: starfold-web-embed-${{ needs.version.outputs.version }}
@@ -912,12 +915,14 @@ jobs:
         with:
           node-version: '24.11.1'
       - run: npm install -g npm@11.6.2 && npm --version
-      # A version npm has already (the first one, published by hand, or a re-run) is skipped.
+      # A version npm lists already (a re-run) is skipped; a registry that doesn't answer with the
+      # package's versions fails the job.
       - name: Publish
         working-directory: dist
         run: |
           sha256sum -c "$TARBALL.sha256"
-          if [ "$(npm view "$PACKAGE" version 2>/dev/null || true)" = "${PACKAGE##*@}" ]; then
+          has=$(../.github/release/npm-has.sh "${PACKAGE%@*}" "${PACKAGE##*@}")
+          if [ "$has" = present ]; then
             echo "$PACKAGE is on npm already"
           else
             npm publish "./$TARBALL" --access public
