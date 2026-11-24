@@ -69,6 +69,8 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  # The client (python/starfold), then the server package (python/starfold-server, with the client
+  # from the checkout), each in its own environment.
   python:
     name: Python (ruff, pytest)
     runs-on: kyora-8x16
@@ -86,8 +88,20 @@ jobs:
         run: uv run --locked ruff format --check
       - name: Lint
         run: uv run --locked ruff check
-      # Unit tests; the Xvfb integration test skips without STARFOLD_BIN.
       - name: Test
+        run: uv run --locked pytest
+      - name: starfold-server
+        working-directory: python/starfold-server
+        run: uv sync --locked
+      - name: starfold-server format
+        working-directory: python/starfold-server
+        run: uv run --locked ruff format --check
+      - name: starfold-server lint
+        working-directory: python/starfold-server
+        run: uv run --locked ruff check
+      # Unit tests; the Xvfb integration tests skip without STARFOLD_BIN.
+      - name: starfold-server test
+        working-directory: python/starfold-server
         run: uv run --locked pytest
 
   # The release scripts against stand-ins: publish.sh with gh (a fresh release, a re-run that

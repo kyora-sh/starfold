@@ -19,9 +19,10 @@ from pathlib import Path
 
 import httpx
 import pytest
+import starfold
 from _xvfb import read_display
 
-import starfold
+import starfold_server
 
 pytestmark = [
     pytest.mark.integration,
@@ -65,7 +66,7 @@ def _listening(port: int) -> list[str]:
 
 
 def test_loopback_by_default(display):
-    with starfold.start_server(args=ARGS) as server:
+    with starfold_server.start_server(args=ARGS) as server:
         port = int(server.url.rsplit(":", 1)[1])
         assert server.url == f"http://127.0.0.1:{port}"
         assert _listening(port) == ["0100007F"]
@@ -73,14 +74,14 @@ def test_loopback_by_default(display):
 
 
 def test_base_path_is_part_of_the_url(display):
-    with starfold.start_server(args=[*ARGS, "--base-path=/desktop"]) as server:
+    with starfold_server.start_server(args=[*ARGS, "--base-path=/desktop"]) as server:
         assert server.url.endswith("/desktop")
         assert server.client().screenshot().size == (1024, 768)
 
 
 def test_generated_password_held_by_the_client(display, monkeypatch):
     monkeypatch.setenv("STARFOLD_PASSWORD", "inherited-not-used")
-    with starfold.start_server(args=ARGS) as a, starfold.start_server(args=ARGS) as b:
+    with starfold_server.start_server(args=ARGS) as a, starfold_server.start_server(args=ARGS) as b:
         assert len(a.password) >= 32
         assert a.password != b.password
         assert a.password != "inherited-not-used"
@@ -113,8 +114,8 @@ def _tree(pid: int) -> list[int]:
 def test_no_orphan_after_the_parent_is_killed(display):
     script = textwrap.dedent(
         f"""
-        import sys, time, starfold
-        s = starfold.start_server(args={ARGS!r})
+        import sys, time, starfold_server
+        s = starfold_server.start_server(args={ARGS!r})
         print(s.process.pid, s.url, flush=True)
         time.sleep(600)
         """
@@ -137,8 +138,8 @@ def test_no_orphan_after_the_parent_is_killed(display):
 
 
 def test_server_outlives_the_thread_that_started_it(display):
-    started: list[starfold.LocalServer] = []
-    t = threading.Thread(target=lambda: started.append(starfold.start_server(args=ARGS)))
+    started: list[starfold_server.LocalServer] = []
+    t = threading.Thread(target=lambda: started.append(starfold_server.start_server(args=ARGS)))
     t.start()
     t.join()
     (server,) = started
@@ -189,7 +190,7 @@ def _needs_strace():
 
 def test_close_signals_no_reaped_pid(display, tmp_path):
     _needs_strace()
-    server = starfold.start_server(args=ARGS)
+    server = starfold_server.start_server(args=ARGS)
     pids = _tree(server.process.pid)
     guard_and_watcher = [p for p in pids if Path(f"/proc/{p}/comm").read_text().strip() != "starfold"]
     tracer = _strace(guard_and_watcher, tmp_path / "trace")
@@ -204,8 +205,8 @@ def test_parent_sigkill_signals_no_reaped_pid(display, tmp_path):
     _needs_strace()
     script = textwrap.dedent(
         f"""
-        import time, starfold
-        s = starfold.start_server(args={ARGS!r})
+        import time, starfold_server
+        s = starfold_server.start_server(args={ARGS!r})
         print(s.process.pid, flush=True)
         time.sleep(600)
         """
@@ -224,7 +225,7 @@ def test_parent_sigkill_signals_no_reaped_pid(display, tmp_path):
 
 
 def test_close_stops_the_server_and_its_guard(display):
-    server = starfold.start_server(args=ARGS)
+    server = starfold_server.start_server(args=ARGS)
     pids = _tree(server.process.pid)
     server.close()
     assert not [p for p in pids if _alive(p)]

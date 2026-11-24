@@ -1,16 +1,9 @@
 """Drive a starfold desktop from Python: screenshots, waiting for the screen, mouse and keyboard."""
 
+from typing import NoReturn
+
 from . import act
 from ._client import AsyncStarfold, Starfold
-from ._native import (
-    BinaryNotFoundError,
-    LocalServer,
-    MissingLibrariesError,
-    ServerStartError,
-    binary_path,
-    check_libraries,
-    start_server,
-)
 from ._types import (
     AuthError,
     FileEntry,
@@ -33,20 +26,16 @@ from ._types import (
 __all__ = [
     "AsyncStarfold",
     "AuthError",
-    "BinaryNotFoundError",
     "FileEntry",
     "FileList",
     "ForbiddenError",
     "InputResult",
-    "LocalServer",
-    "MissingLibrariesError",
     "NotFoundError",
     "ReadOnlyError",
     "Recording",
     "RecordingOffError",
     "Screenshot",
     "Segments",
-    "ServerStartError",
     "Starfold",
     "StarfoldConnectionError",
     "StarfoldError",
@@ -54,7 +43,25 @@ __all__ = [
     "Upload",
     "WaitResult",
     "act",
-    "binary_path",
-    "check_libraries",
-    "start_server",
 ]
+
+MOVED_TO_SERVER = frozenset(
+    {
+        "BinaryNotFoundError",
+        "LocalServer",
+        "MissingLibrariesError",
+        "ServerStartError",
+        "binary_path",
+        "check_libraries",
+        "start_server",
+    }
+)
+
+
+def __getattr__(name: str) -> NoReturn:
+    if name in MOVED_TO_SERVER:
+        raise ImportError(
+            f"{name} moved to the starfold-server package in 0.4.0: pip install starfold-server, "
+            f"then from starfold_server import {name}"
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

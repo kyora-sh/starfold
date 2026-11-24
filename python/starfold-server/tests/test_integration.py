@@ -18,7 +18,6 @@ from pathlib import Path
 import httpx
 import pytest
 from _xvfb import read_display
-
 from starfold import Starfold
 
 pytestmark = [

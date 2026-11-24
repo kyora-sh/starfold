@@ -1,12 +1,15 @@
-"""python-platform-wheel.py: the Python SDK's platform wheels, made from its pure wheel and a release archive.
+"""python-platform-wheel.py: a Python package's platform wheels, made from its pure wheel and a release archive.
 
-    build <version> <target> <archive> <pure wheel> <out dir>   writes the wheel, prints its path
-    verify <version> <target> <archive> <wheel>                 re-reads the wheel against the archive
-    licence <target>                                            prints the target's SPDX expression
-                                                                (npm-server-packages.sh reads it too)
+    build <distribution> <version> <target> <archive> <pure wheel> <out dir>
+                                     writes the wheel, prints its path
+    verify <distribution> <version> <target> <archive> <wheel>
+                                     re-reads the wheel against the archive
+    licence <target>                 prints the target's SPDX expression (npm-server-packages.sh reads it too)
 
-A platform wheel is the pure wheel plus starfold/_bin/starfold[.exe] (mode 0755) and its .sha256, the
-archive's LICENSE, THIRD_PARTY.md and licenses/ as licence files, a License-Expression for what the binary
+<distribution> is the wheel file name's form (starfold_server), which is also the import package the
+binary goes into. A platform wheel is the pure wheel plus <distribution>/_bin/starfold[.exe] (mode 0755)
+and its .sha256, the archive's LICENSE, THIRD_PARTY.md and licenses/ as licence files, a
+License-Expression for what the binary
 carries (THIRD_PARTY.md, "What each release binary carries"), Root-Is-Purelib: false, the platform tag and
 a new RECORD. Everything is read from the archives in memory and written with zipfile, so nothing is
 unpacked to disk and the result doesn't depend on a tool's version. Run it with python3 -I.
@@ -193,13 +196,21 @@ def wheel_file(info: zipfile.ZipInfo | str, mode: int = 0o644) -> zipfile.ZipInf
     return z
 
 
-def build(version: str, target: str, archive: str, pure_wheel: str, out_dir: str) -> None:
+def check_distribution(distribution: str) -> None:
+    if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*", distribution):
+        fail(f"{distribution!r} isn't a wheel file name's distribution (lower case, _ between words)")
+
+
+def build(distribution: str, version: str, target: str, archive: str, pure_wheel: str, out_dir: str) -> None:
+    check_distribution(distribution)
     binary, notices = read_archive(archive, version, target)
     _, binname, platform = TARGETS[target]
     tag = platform_tag(target, binary)
-    dist = f"starfold-{version}.dist-info"
+    dist = f"{distribution}-{version}.dist-info"
     with zipfile.ZipFile(pure_wheel) as z:
         pure = {i.filename: z.read(i) for i in z.infolist() if not i.is_dir()}
+    if f"{dist}/WHEEL" not in pure or f"{distribution}/__init__.py" not in pure:
+        fail(f"{pure_wheel} isn't {distribution} {version}'s wheel (no {dist}/WHEEL or {distribution}/__init__.py)")
     if pure.get(f"{dist}/licenses/LICENSE") != notices["LICENSE"]:
         fail(f"{pure_wheel}'s LICENSE isn't the archive's")
     wheel = pure.pop(f"{dist}/WHEEL").decode()
@@ -215,8 +226,8 @@ def build(version: str, target: str, archive: str, pure_wheel: str, out_dir: str
     for name, data in pure.items():
         if not name.startswith(f"{dist}/licenses/"):
             entries.append((name, data, 0o644))
-    entries.append((f"starfold/_bin/{binname}", binary, 0o755))
-    entries.append((f"starfold/_bin/{binname}.sha256", f"{sha}  {binname}\n".encode(), 0o644))
+    entries.append((f"{distribution}/_bin/{binname}", binary, 0o755))
+    entries.append((f"{distribution}/_bin/{binname}.sha256", f"{sha}  {binname}\n".encode(), 0o644))
     for name, data in notices.items():
         entries.append((f"{dist}/licenses/{name}", data, 0o644))
     entries.append((f"{dist}/METADATA", meta.encode(), 0o644))
@@ -224,7 +235,7 @@ def build(version: str, target: str, archive: str, pure_wheel: str, out_dir: str
     if len({n for n, _, _ in entries}) != len(entries):
         fail("two files with the same name in the wheel")
     record = "".join(f"{n},{record_hash(d)},{len(d)}\n" for n, d, _ in entries) + f"{dist}/RECORD,,\n"
-    path = f"{out_dir}/starfold-{version}-py3-none-{tag}.whl"
+    path = f"{out_dir}/{distribution}-{version}-py3-none-{tag}.whl"
     with zipfile.ZipFile(path, "w") as z:
         for name, data, mode in entries:
             z.writestr(wheel_file(name, mode), data)
@@ -232,20 +243,21 @@ def build(version: str, target: str, archive: str, pure_wheel: str, out_dir: str
     print(path)
 
 
-def verify(version: str, target: str, archive: str, wheel: str) -> None:
+def verify(distribution: str, version: str, target: str, archive: str, wheel: str) -> None:
+    check_distribution(distribution)
     binary, notices = read_archive(archive, version, target)
     _, binname, _ = TARGETS[target]
     want = hashlib.sha256(binary).hexdigest()
-    dist = f"starfold-{version}.dist-info"
+    dist = f"{distribution}-{version}.dist-info"
     with zipfile.ZipFile(wheel) as z:
-        info = z.getinfo(f"starfold/_bin/{binname}")
+        info = z.getinfo(f"{distribution}/_bin/{binname}")
         got = hashlib.sha256(z.read(info)).hexdigest()
         if got != want:
             fail(f"{wheel}: the binary's sha256 {got} isn't the archive's {want}")
         if (info.external_attr >> 16) & 0o777 != 0o755:
             fail(f"{wheel}: the binary's mode is {(info.external_attr >> 16) & 0o777:o}, not 755")
-        if z.read(f"starfold/_bin/{binname}.sha256").decode() != f"{want}  {binname}\n":
-            fail(f"{wheel}: starfold/_bin/{binname}.sha256 doesn't name the binary's sha256")
+        if z.read(f"{distribution}/_bin/{binname}.sha256").decode() != f"{want}  {binname}\n":
+            fail(f"{wheel}: {distribution}/_bin/{binname}.sha256 doesn't name the binary's sha256")
         for name, data in notices.items():
             if z.read(f"{dist}/licenses/{name}") != data:
                 fail(f"{wheel}: {name} isn't the archive's")
@@ -267,9 +279,9 @@ def verify(version: str, target: str, archive: str, wheel: str) -> None:
 
 if __name__ == "__main__":
     cmd, *args = sys.argv[1:] or [""]
-    if cmd == "build" and len(args) == 5:
+    if cmd == "build" and len(args) == 6:
         build(*args)
-    elif cmd == "verify" and len(args) == 4:
+    elif cmd == "verify" and len(args) == 5:
         verify(*args)
     elif cmd == "licence" and len(args) == 1 and args[0] in TARGETS:
         print(licence(TARGETS[args[0]][2]))

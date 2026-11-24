@@ -1,6 +1,6 @@
 [package]
 name = "starfold"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 # starfold's own code is MIT; the web client it embeds carries dav1d.wasm (dav1d, BSD-2-Clause;
 # wasi-libc, MIT) and the Inter font (OFL-1.1), with their licences in web/.

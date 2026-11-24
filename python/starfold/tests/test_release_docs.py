@@ -44,25 +44,24 @@ def test_third_party_states_the_declared_expression(target):
 
 
 def test_each_release_names_every_versioned_file():
-    """The release's `version` job checks each file `versions.py` reads; RELEASING.md's "Each release"
-    has to name them, and bun.lock, which records packages/starfold's version."""
+    """The release's `version` job checks each file `versions.py` reads, versions and exact pins;
+    RELEASING.md's "Each release" has to name them, bun.lock, which records the npm packages' versions,
+    and both Python projects' uv.lock."""
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-    checked = set(re.findall(r"versions\.py (?:cargo|check \S+) (\S+/\S+\.(?:toml|json))", workflow))
-    assert {"crates/starfold-server/Cargo.toml", "packages/starfold/package.json"} <= checked
+    checked = set(re.findall(r"versions\.py (?:cargo|check-pin \S+|check \S+) (\S+/\S+\.(?:toml|json))", workflow))
+    assert {
+        "crates/starfold-server/Cargo.toml",
+        "python/starfold/pyproject.toml",
+        "python/starfold-server/pyproject.toml",
+        "packages/starfold/package.json",
+        "packages/server/package.json",
+    } <= checked
+    pins = set(re.findall(r"versions\.py check-pin \S+ (\S+) starfold ", workflow))
+    assert pins == {"python/starfold-server/pyproject.toml", "packages/server/package.json"}
     releasing = (ROOT / "RELEASING.md").read_text()
     steps = releasing.split("## Each release", 1)[1]
-    for f in sorted(checked) + ["bun.lock"]:
+    for f in sorted(checked) + ["bun.lock", "python/starfold/uv.lock", "python/starfold-server/uv.lock"]:
         assert f"`{f}`" in steps, f"RELEASING.md's Each release doesn't name {f}"
-
-
-def test_both_sdks_run_the_same_guard():
-    """The TypeScript SDK starts its server through the same sh guard as this one, byte for byte."""
-    from starfold._native import GUARD
-
-    ts = (ROOT / "packages" / "starfold" / "src" / "native.ts").read_text()
-    m = re.search(r"^const GUARD = `(.*?)`;$", ts, re.S | re.M)
-    assert m, "native.ts has no GUARD"
-    assert m.group(1).strip("\n") == GUARD.strip("\n"), "native.ts's GUARD differs from _native.py's"
 
 
 def test_third_party_doesnt_call_the_server_packages_mit():

@@ -1,6 +1,7 @@
 #!/bin/sh
-# guard-test.sh: the SDKs' process guard (GUARD in python/starfold/src/starfold/_native.py, the same text
-# as packages/starfold/src/native.ts) under this system's /bin/sh, with stand-in servers (no binary):
+# guard-test.sh: the server packages' process guard (GUARD in
+# python/starfold-server/src/starfold_server/_native.py, the same text as packages/server/src/native.ts)
+# under this system's /bin/sh, with stand-in servers (no binary):
 #   1. its stdin pipe closes: the server is stopped, the guard exits with the server's status;
 #   2. the process holding that pipe is SIGKILLed: no server and no watcher are left;
 #   3. the server exits by itself: the guard exits with its status at once and leaves no watcher;
@@ -15,7 +16,7 @@ command -v perl >/dev/null || { echo "guard-test: needs perl, to start the guard
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 guard=$(awk '/^GUARD = """/ { on = 1; sub(/^GUARD = """/, ""); print; next } on && /^"""/ { exit } on' \
-	"$root/python/starfold/src/starfold/_native.py")
+	"$root/python/starfold-server/src/starfold_server/_native.py")
 [ -n "$guard" ] || { echo "guard-test: no GUARD in _native.py"; exit 1; }
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

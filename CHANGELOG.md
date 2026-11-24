@@ -22,7 +22,20 @@ version. Staying on 0.3.2 changes nothing: starfold 0.3.2 on npm and on PyPI sti
 - New `@starfold/server`: the `starfold` command and `startServer`, `LocalServer` (whose `client()` is the `starfold` package's `Starfold`), `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError` and `ServerStartError` (still `StarfoldError`s, the client's), unchanged in behaviour; `STARFOLD_BIN` still works. It depends on `starfold` at exactly its own version and installs the binary from `@starfold/server-<platform>`, now its optional dependencies
 - The four `@starfold/server-<platform>` packages are unchanged but for the version, and `@starfold/web` likewise
 
-## Unreleased
+### PyPI
+
+- `starfold` is the Python client alone: `Starfold`, `AsyncStarfold`, `act` and the errors, an
+  sdist and a pure wheel, no binary and no `starfold` command.
+- `starfold-server` (new, import `starfold_server`) is the server: the `starfold` command,
+  `start_server()`, `LocalServer`, `binary_path()`, `check_libraries()`, `BinaryNotFoundError`,
+  `MissingLibrariesError` and `ServerStartError` (still `starfold.StarfoldError`s), unchanged in
+  behaviour; `LocalServer.client()` returns a `starfold.Starfold`. It requires exactly
+  `starfold==0.4.0` and comes as four platform wheels (Linux x86_64 and aarch64, macOS arm64,
+  Windows x86_64), each with that platform's binary; `STARFOLD_BIN` still names another one.
+- `from starfold import start_server` (or any other moved name) raises an `ImportError` that
+  names `starfold-server` and the new import.
+
+## 0.3.2
 
 The first release of kyora starfold. Prebuilt binaries for Linux (x86_64, aarch64), macOS (Apple
 silicon) and Windows (x86_64) are attached to each release, each as a default build with libaom

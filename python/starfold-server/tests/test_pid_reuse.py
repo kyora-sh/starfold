@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-import starfold
-from starfold import _native
+import starfold_server
+from starfold_server import _native
 
 NS_LAST_PID = Path("/proc/sys/kernel/ns_last_pid")
 
@@ -75,13 +75,13 @@ def _victim_with_pid(pid: int) -> subprocess.Popen[str]:
     pytest.skip(f"couldn't get pid {pid} handed out again")
 
 
-def _started_then_exited(tmp_path: Path, monkeypatch) -> tuple[starfold.LocalServer, int]:
+def _started_then_exited(tmp_path: Path, monkeypatch) -> tuple[starfold_server.LocalServer, int]:
     """A server started on the macOS code path that has since exited on its own, and its pid."""
     fake = tmp_path / "starfold"
     fake.write_text(FAKE_SERVER.format(python=sys.executable))
     fake.chmod(0o755)
     monkeypatch.setattr(_native.sys, "platform", "darwin")
-    server = starfold.start_server(binary=str(fake), timeout=20)
+    server = starfold_server.start_server(binary=str(fake), timeout=20)
     pid = int((tmp_path / "pid").read_text())
     (tmp_path / "stop").touch()
     deadline = time.monotonic() + 10
