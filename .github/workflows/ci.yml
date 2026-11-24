@@ -86,6 +86,16 @@ jobs:
       - name: Test
         run: uv run --locked pytest
 
+  # publish.sh against a stand-in gh: a fresh release, a re-run that completes a partial one, and
+  # the mismatches that must fail.
+  release-scripts:
+    name: Release scripts
+    runs-on: kyora-2x4
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/release/publish-test.sh
+
   upstream-sync:
     name: Upstream sync script
     runs-on: kyora-8x16

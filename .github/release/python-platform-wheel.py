@@ -2,6 +2,8 @@
 
     build <version> <target> <archive> <pure wheel> <out dir>   writes the wheel, prints its path
     verify <version> <target> <archive> <wheel>                 re-reads the wheel against the archive
+    licence <target>                                            prints the target's SPDX expression
+                                                                (npm-server-packages.sh reads it too)
 
 A platform wheel is the pure wheel plus starfold/_bin/starfold[.exe] (mode 0755) and its .sha256, the
 archive's LICENSE, THIRD_PARTY.md and licenses/ as licence files, a License-Expression for what the binary
@@ -167,11 +169,16 @@ def record_hash(data: bytes) -> str:
     return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
+def licence(platform: str) -> str:
+    """What a platform's default binary carries, as one SPDX expression."""
+    return " AND ".join(LICENCES_ALL + LICENCES_PLATFORM[platform])
+
+
 def metadata(pure: str, platform: str, files: list[str]) -> str:
     head, sep, body = pure.partition("\n\n")
     lines = [ln for ln in head.split("\n") if not ln.startswith(("License-Expression:", "License-File:"))]
     at = next(i for i, ln in enumerate(lines) if ln.startswith("Requires-Dist:") or ln.startswith("Requires-Python:"))
-    expr = " AND ".join(LICENCES_ALL + LICENCES_PLATFORM[platform])
+    expr = licence(platform)
     lines[at:at] = [f"License-Expression: {expr}", *(f"License-File: {f}" for f in files)]
     if platform == "linux" and APT_LINE not in body:
         fail(f"the wheel's description (README.md) doesn't name the system libraries ({APT_LINE})")
@@ -264,5 +271,7 @@ if __name__ == "__main__":
         build(*args)
     elif cmd == "verify" and len(args) == 4:
         verify(*args)
+    elif cmd == "licence" and len(args) == 1 and args[0] in TARGETS:
+        print(licence(TARGETS[args[0]][2]))
     else:
         sys.exit(__doc__)

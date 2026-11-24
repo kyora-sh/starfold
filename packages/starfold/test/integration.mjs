@@ -108,25 +108,25 @@ async function healthy(url) {
 	}
 }
 
-// Xvfb on a free display number.
-let display;
-for (let n = 200 + (process.pid % 500); ; n++) {
-	if (existsSync(`/tmp/.X11-unix/X${n}`) || existsSync(`/tmp/.X${n}-lock`))
-		continue;
-	start('Xvfb', [`:${n}`, '-screen', '0', '1280x800x24', '-nolisten', 'tcp']);
-	try {
-		// oxlint-disable-next-line no-await-in-loop
-		await until('Xvfb did not start', 15_000, () =>
-			existsSync(`/tmp/.X11-unix/X${n}`)
-		);
-		display = `:${n}`;
-		break;
-	} catch (e) {
-		if (n > 1000) throw e;
-	}
-}
-baseEnv.DISPLAY = display;
 const work = mkdtempSync(join(tmpdir(), 'starfold-it-'));
+
+// Xvfb picks a free display and writes its number, once it takes connections, to -displayfd: here
+// a file, read up to the newline. (Without /tmp/.X11-unix, a user's Xvfb listens on the abstract
+// socket only, so waiting for the socket file would never end.)
+const displayFile = join(work, 'display');
+const xvfb = start('sh', [
+	'-c',
+	'exec Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$0"',
+	displayFile,
+]);
+await until('Xvfb did not name its display', 15_000, () => {
+	assert.equal(xvfb.exitCode, null, 'Xvfb exited');
+	return (
+		existsSync(displayFile) && readFileSync(displayFile, 'utf8').endsWith('\n')
+	);
+});
+const display = `:${readFileSync(displayFile, 'utf8').trim()}`;
+baseEnv.DISPLAY = display;
 
 const results = [];
 async function check(name, fn) {

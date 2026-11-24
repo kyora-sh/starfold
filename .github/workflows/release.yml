@@ -3,8 +3,9 @@ name: Release
 # Builds the release binaries, the Python SDK and the embeddable web client, and on a version tag
 # (v0.4.0, ...) attaches them to a GitHub release with GitHub's generated notes (the pull requests
 # merged since the previous tag). After the release exists, the same tag publishes the default
-# (MIT) build's packages to the registries: the crates to crates.io, the embeddable web client to
-# npm and the Python SDK to PyPI, each through trusted publishing (a short-lived token from GitHub's
+# (MIT) build's packages to the registries: the crates to crates.io; the embeddable web client,
+# the TypeScript SDK and the four server-binary packages to npm; the Python SDK's sdist, pure wheel
+# and platform wheels to PyPI; each through trusted publishing (a short-lived token from GitHub's
 # OIDC identity). The one exception is crates.io's first release, which the `crates` environment's
 # secret CRATES_IO_BOOTSTRAP_TOKEN publishes until it is deleted (RELEASING.md). Those jobs run on GitHub-hosted runners, which
 # npm requires for trusted publishing; RELEASING.md has the one-time registry setup. The x264
@@ -36,6 +37,7 @@ on:
       - .github/workflows/release.yml
       - .github/release/**
       - packages/web/embed/pack.sh
+      - packages/starfold/**
       - crates/*/Cargo.toml
       - python/starfold/pyproject.toml
   workflow_dispatch:
@@ -60,6 +62,9 @@ env:
   CARGO_ABOUT: '0.9.3'
   # Symbols stay for backtraces; the line tables of `debug = 1` don't ship.
   CARGO_PROFILE_RELEASE_STRIP: debuginfo
+  # 1 builds, checks, attaches and publishes the Linux platform wheels; 0 leaves them out everywhere
+  # (python-platform-wheels.sh and expected-files.sh read it), and pip on Linux takes the pure wheel.
+  LINUX_WHEELS: '1'
 
 jobs:
   # Resolves what every later job builds, once: on a tag, the commit the tag names on the remote
@@ -104,6 +109,8 @@ jobs:
           version=$(python3 -I .github/release/versions.py cargo crates/starfold-server/Cargo.toml)
           python3 -I .github/release/versions.py check pyproject python/starfold/pyproject.toml "$version" ||
             { echo "::error::python/starfold/pyproject.toml doesn't declare $version, crates/starfold-server/Cargo.toml's version"; exit 1; }
+          python3 -I .github/release/versions.py check package-json-file packages/starfold/package.json "$version" ||
+            { echo "::error::packages/starfold/package.json doesn't declare $version, crates/starfold-server/Cargo.toml's version"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in crates/starfold-server/Cargo.toml"
             exit 1
@@ -676,13 +683,196 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  # The SDKs with the server binary, from the default (MIT) build's four archives: the
+  # @starfold/server-* npm packages and the starfold SDK pinned to them, and the Python SDK's
+  # platform wheels (the pure wheel plus one platform's binary each). Built once, here; the install
+  # jobs, the release and the registries take exactly these files.
+  native:
+    name: SDK packages with the server (npm, wheels)
+    needs: [version, linux, linux-arm64, macos, windows, python]
+    runs-on: kyora-8x16
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.11.8
+      - run: bun install --frozen-lockfile
+      # The default flavour's archives only (starfold-<version>-<target>, never starfold-x264-*).
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: starfold-${{ env.VERSION }}-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-python-${{ env.VERSION }}
+          path: artifacts/starfold-python-${{ env.VERSION }}
+      - name: npm packages
+        run: |
+          set -o pipefail
+          echo "building ${{ needs.version.outputs.commit }}"
+          bash .github/release/npm-server-packages.sh "$VERSION" artifacts "$RUNNER_TEMP/npm" 2>&1 | tee "$RUNNER_TEMP/npm.log"
+      - name: Platform wheels
+        run: |
+          set -o pipefail
+          echo "LINUX_WHEELS=$LINUX_WHEELS"
+          bash .github/release/python-platform-wheels.sh "$VERSION" artifacts \
+            "artifacts/starfold-python-$VERSION/starfold-$VERSION-py3-none-any.whl" "$RUNNER_TEMP/wheels" 2>&1 | tee "$RUNNER_TEMP/wheels.log"
+      - name: Sizes and auditwheel
+        run: |
+          {
+            echo "### npm packages"
+            echo '```'
+            (cd "$RUNNER_TEMP/npm" && wc -c -- *.tgz)
+            echo '```'
+            echo "### Platform wheels (LINUX_WHEELS=$LINUX_WHEELS)"
+            echo '```'
+            (cd "$RUNNER_TEMP/wheels" && wc -c -- *.whl)
+            echo '```'
+            echo "### python-platform-wheels.sh, with auditwheel show for the Linux wheels"
+            echo '```'
+            cat "$RUNNER_TEMP/wheels.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starfold-npm-${{ env.VERSION }}
+          path: ${{ runner.temp }}/npm/
+          retention-days: 30
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starfold-wheels-${{ env.VERSION }}
+          path: ${{ runner.temp }}/wheels/
+          retention-days: 30
+          if-no-files-found: error
+
+  # Each platform installs exactly those files on that platform: the SDK with its server package
+  # from npm's tarballs, and the platform wheel with pip; both `starfold --version` must name the
+  # release. On Linux a server is started on Xvfb from each and takes a screenshot. The macOS and
+  # Windows runners start none (no display a server could stream without a signed-in desktop).
+  # GitHub-hosted runners (Linux arm64, Windows) cost nothing on a public repository.
+  install:
+    name: Install (${{ matrix.platform }})
+    needs: [version, native]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64-gnu
+            runner: kyora-8x16
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: kyora-macos
+          - platform: win32-x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-npm-${{ env.VERSION }}
+          path: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-wheels-${{ env.VERSION }}
+          path: wheels
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.11.8
+      - name: Runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          aptq() { local limit=$1; shift; sudo timeout -k 10 "$limit" env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
+          aptq 180 update
+          aptq 300 install -y libyuv0 libopus0 libpulse0 xvfb
+      - name: Checksums
+        run: |
+          sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          (cd npm && sum -c -- *.sha256)
+          (cd wheels && sum -c -- *.sha256)
+      - name: npm install, starfold --version
+        run: |
+          set -euo pipefail
+          mkdir app
+          cd app
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "../npm/starfold-$VERSION.tgz" "../npm/starfold-server-$PLATFORM-$VERSION.tgz"
+          out=$(npx --no-install starfold --version)
+          echo "$out"
+          case $out in "starfold $VERSION"|"starfold $VERSION "*) ;; *) echo "::error::npx starfold --version printed '$out', not starfold $VERSION"; exit 1 ;; esac
+      - name: pip install, starfold --version
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 venv
+          # starfold from these wheels alone, pip's tag choice for this platform; then its
+          # dependencies (httpx) from PyPI.
+          uv pip install --python venv --no-index --no-deps --find-links wheels "starfold==$VERSION"
+          uv pip install --python venv --find-links wheels "starfold==$VERSION"
+          case $RUNNER_OS in Windows) bin=venv/Scripts/starfold.exe ;; *) bin=venv/bin/starfold ;; esac
+          out=$("$bin" --version)
+          echo "$out"
+          case $out in "starfold $VERSION"|"starfold $VERSION "*) ;; *) echo "::error::starfold --version printed '$out', not starfold $VERSION"; exit 1 ;; esac
+          uv pip list --python venv
+      - name: Start a server and take a screenshot
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Xvfb names the display it picked once it takes connections.
+          Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$RUNNER_TEMP/display" >"$RUNNER_TEMP/xvfb.log" 2>&1 &
+          xvfb=$!
+          trap 'kill "$xvfb"' EXIT
+          for _ in $(seq 60); do grep -q . "$RUNNER_TEMP/display" 2>/dev/null && break; sleep 0.25; done
+          DISPLAY=:$(tr -d '\n' <"$RUNNER_TEMP/display")
+          export DISPLAY
+          echo "DISPLAY=$DISPLAY"
+          cat > app/smoke.mjs <<'EOF'
+          import { startServer } from 'starfold';
+          const server = await startServer({ args: ['--audio-enabled=false'] });
+          try {
+            const shot = await server.client().screenshot();
+            console.log('node', server.url, shot.size);
+            if (shot.size[0] !== 1280 || shot.size[1] !== 800) process.exitCode = 1;
+          } finally {
+            await server.close();
+          }
+          EOF
+          (cd app && node smoke.mjs)
+          venv/bin/python -c '
+          import starfold
+          with starfold.start_server(args=["--audio-enabled=false"]) as server:
+              shot = server.client().screenshot()
+              print("python", server.url, shot.size)
+              assert shot.size == (1280, 800)
+          '
+
   # The release job's checks on every run, a dry run's too, against v<version>: x264's source staged
-  # as the release would attach it, the exact file set by artifact, the checksums and the package
-  # versions (not whether that version has a release already). The release job runs them all again
-  # on what it downloads.
+  # as the release would attach it, the exact file set by artifact, the checksums, the package
+  # versions and that every package's binary is its archive's (not whether that version has a
+  # release already). The release job runs them all again on what it downloads.
   check:
     name: Release check
-    needs: [version, linux, linux-arm64, macos, windows, python, embed]
+    needs: [version, linux, linux-arm64, macos, windows, python, embed, native]
     runs-on: kyora-2x4
     timeout-minutes: 10
     steps:
@@ -716,9 +906,21 @@ jobs:
           if-no-files-found: error
 
   # Only a pushed v* tag: a branch push (whatever its name), a manual run or anything else skips it.
+  # A re-run ("Re-run failed jobs" of the tag's run, never a new build) finds the release it made
+  # and completes it: publish.sh uploads what is missing and checks the rest against the build.
   release:
     name: GitHub release
-    needs: [version, linux, linux-arm64, macos, windows, python, embed, check]
+    needs:
+      - version
+      - linux
+      - linux-arm64
+      - macos
+      - windows
+      - python
+      - embed
+      - native
+      - install
+      - check
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
     runs-on: kyora-8x16
     timeout-minutes: 15
@@ -741,10 +943,12 @@ jobs:
         run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml declares
       # too; the downloads, then with x264's source joined, are exactly the expected files and every
-      # checksum checks; the packages carry the version; and the tag has no release yet.
+      # checksum checks; the packages carry the version and their archive's binary; and the tag has
+      # no release yet, except on a re-run of this job.
       - name: Check the release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_RESUME: ${{ github.run_attempt > 1 && '1' || '0' }}
         run: .github/release/check-release.sh "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/x264-source" ${{ needs.version.outputs.flavour_names }}
       # Created for the commit every job built, while the tag names it; the tag is read again after.
       - name: Create the release
@@ -760,7 +964,9 @@ jobs:
           Library Exception) on Linux and Windows, and glibc's startup files (LGPL-2.1, with permission to link
           them) on Linux. Every file has a `.sha256` beside it, and the README's Install section lists what each
           platform needs at run time. The Python SDK (sdist and wheel) and the embeddable web client
-          (`starfold-web-embed-<version>.tgz`) are attached too.
+          (`starfold-web-embed-<version>.tgz`) are attached too, and so are the packages that carry the
+          default binary, exactly as npm and PyPI get them: the `@starfold/server-<platform>` npm tarballs
+          with the TypeScript SDK `starfold-<version>.tgz`, and the Python SDK's platform wheels.
 
           ## x264 source
 
@@ -870,45 +1076,55 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.which.outputs.mode == 'bootstrap' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.auth.outputs.token }}
         run: .github/release/crates.sh publish
 
+  # npm gets six packages, all at the release version: the four @starfold/server-* (the default
+  # binary per platform), starfold (the TypeScript SDK, which pins those four as optional
+  # dependencies) and @starfold/web (the embeddable client).
   npm:
-    name: npm dry run (embeddable web client)
-    needs: [version, embed, release]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
+    name: npm dry run (starfold, @starfold/server-*, @starfold/web)
+    needs: [version, embed, native, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && needs.native.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      package: ${{ steps.check.outputs.package }}
     env:
-      TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: starfold-web-embed-${{ needs.version.outputs.version }}
-          path: dist
-      # Trusted publishing needs npm 11.5.1 or newer and Node 22.14.0 or newer.
+          path: dist/web
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-npm-${{ needs.version.outputs.version }}
+          path: dist/npm
+      # Trusted publishing needs npm 11.5.1 or newer and Node 22.14.0 or newer
+      # (https://docs.npmjs.com/trusted-publishers).
       - uses: actions/setup-node@v4
         with:
           node-version: '24.11.1'
       - run: npm install -g npm@11.6.2 && npm --version
-      # The tarball the release attached; its package.json must name this repository, which npm
+      # The tarballs the release attached; each package.json must name this repository, which npm
       # compares with the workflow's before it accepts the token.
       - name: Dry run
-        id: check
         working-directory: dist
         run: |
-          sha256sum -c "$TARBALL.sha256"
-          tar -xzOf "$TARBALL" package/package.json | python3 -I -c '
+          set -euo pipefail
+          (cd web && sha256sum -c -- *.sha256)
+          (cd npm && sha256sum -c -- *.sha256)
+          tarballs=(npm/starfold-server-*-"$VERSION".tgz "npm/starfold-$VERSION.tgz" "web/starfold-web-embed-$VERSION.tgz")
+          [ ${#tarballs[@]} = 6 ] || { echo "::error::${#tarballs[@]} tarballs, not 6: ${tarballs[*]}"; exit 1; }
+          for t in "${tarballs[@]}"; do
+            tar -xzOf "$t" package/package.json | python3 -I -c '
           import json, sys
-          p, want = json.load(sys.stdin), f"git+https://github.com/{sys.argv[1]}.git"
-          got = p.get("repository", {}).get("url")
-          name, version = p["name"], p["version"]
-          print(name, version, got)
+          p, want, version = json.load(sys.stdin), f"git+https://github.com/{sys.argv[1]}.git", sys.argv[2]
+          got, have = p.get("repository", {}).get("url"), p["version"]
+          print(p["name"], have, got)
           if got != want:
               sys.exit(f"repository.url is {got!r}, not {want!r}")
-          with open(sys.argv[2], "a") as out:
-              out.write(f"package={name}@{version}\n")
-          ' "$GITHUB_REPOSITORY" "$GITHUB_OUTPUT"
-          npm publish "./$TARBALL" --access public --dry-run
+          if have != version:
+              sys.exit(f"version {have!r}, not {version!r}")
+          ' "$GITHUB_REPOSITORY" "$VERSION"
+            npm publish "./$t" --access public --dry-run
+          done
 
   npm-publish:
     name: npm publish
@@ -916,13 +1132,12 @@ jobs:
     if: needs.release.result == 'success'
     environment: npm
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     env:
-      TARBALL: starfold-web-embed-${{ needs.version.outputs.version }}.tgz
-      PACKAGE: ${{ needs.npm.outputs.package }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       # npm-has.sh only, so no file of the repository (an .npmrc, say) is where npm reads it.
       - uses: actions/checkout@v4
@@ -933,31 +1148,59 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: starfold-web-embed-${{ needs.version.outputs.version }}
-          path: dist
+          path: dist/web
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-npm-${{ needs.version.outputs.version }}
+          path: dist/npm
       - uses: actions/setup-node@v4
         with:
           node-version: '24.11.1'
       - run: npm install -g npm@11.6.2 && npm --version
       # A version npm lists already (a re-run) is skipped, one it doesn't is published; a registry
-      # that doesn't answer with the package's versions fails the job.
+      # that doesn't answer with the package's versions fails the job. The four server packages go
+      # first, and starfold only once npm lists all four at the version (an install of starfold
+      # resolves its platform's one then); @starfold/web last. No --tag: npm publish tags `latest`
+      # by default (`tag`, default "latest": https://docs.npmjs.com/cli/v11/commands/npm-publish),
+      # so `latest` moves from the 0.0.1 placeholders to this version.
       - name: Publish
         working-directory: dist
         run: |
-          sha256sum -c "$TARBALL.sha256"
-          has=$(../.github/release/npm-has.sh "${PACKAGE%@*}" "${PACKAGE##*@}")
-          case $has in
-          present) echo "$PACKAGE is on npm already" ;;
-          absent) npm publish "./$TARBALL" --access public ;;
-          *)
-            echo "::error::npm-has.sh answered '$has'"
-            exit 1
-            ;;
-          esac
+          set -euo pipefail
+          (cd web && sha256sum -c -- *.sha256)
+          (cd npm && sha256sum -c -- *.sha256)
+          name_of() { tar -xzOf "$1" package/package.json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["name"])'; }
+          has() { ../.github/release/npm-has.sh "$1" "$VERSION" || echo failed; }
+          publish() {
+            local name
+            name=$(name_of "$1")
+            case $(has "$name") in
+            present) echo "$name@$VERSION is on npm already" ;;
+            absent) npm publish "./$1" --access public ;;
+            *) echo "::error::npm-has.sh gave no answer for $name"; exit 1 ;;
+            esac
+          }
+          servers=(npm/starfold-server-*-"$VERSION".tgz)
+          [ ${#servers[@]} = 4 ] || { echo "::error::${#servers[@]} server packages, not 4"; exit 1; }
+          for t in "${servers[@]}"; do publish "$t"; done
+          for t in "${servers[@]}"; do
+            name=$(name_of "$t")
+            for _ in $(seq 20); do
+              [ "$(has "$name")" = present ] && break
+              sleep 15
+            done
+            [ "$(has "$name")" = present ] || { echo "::error::npm doesn't list $name@$VERSION; starfold is not published without it"; exit 1; }
+            echo "$name@$VERSION is on npm"
+          done
+          publish "npm/starfold-$VERSION.tgz"
+          publish "web/starfold-web-embed-$VERSION.tgz"
 
+  # PyPI gets the sdist, the pure wheel and the platform wheels (pip prefers a platform wheel
+  # where one fits, else the pure one, the client alone).
   pypi:
-    name: PyPI dry run (Python SDK)
-    needs: [version, python, release]
-    if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
+    name: PyPI dry run (Python SDK, platform wheels)
+    needs: [version, python, native, release]
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.python.result == 'success' && needs.native.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -967,15 +1210,24 @@ jobs:
         with:
           name: starfold-python-${{ needs.version.outputs.version }}
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-wheels-${{ needs.version.outputs.version }}
+          path: dist
       - uses: astral-sh/setup-uv@v7
         with:
           version: 0.11.8
-      # The sdist and the wheel the release attached, without their .sha256 files.
+      # The files the release attached, without their .sha256 files.
       - name: Dry run
         run: |
+          set -euo pipefail
           (cd dist && sha256sum -c -- *.sha256)
           mkdir pypi
-          cp "dist/starfold-$VERSION-py3-none-any.whl" "dist/starfold-$VERSION.tar.gz" pypi/
+          cp dist/*.whl "dist/starfold-$VERSION.tar.gz" pypi/
+          want=$((LINUX_WHEELS == 1 ? 6 : 4))
+          ls -l pypi
+          n=$(find pypi -type f | wc -l)
+          [ "$n" = "$want" ] || { echo "::error::$n files for PyPI, not $want"; exit 1; }
           uvx twine@6.2.0 check --strict pypi/*
 
   pypi-publish:
@@ -995,11 +1247,20 @@ jobs:
         with:
           name: starfold-python-${{ needs.version.outputs.version }}
           path: dist
-      - name: The sdist and the wheel
+      - uses: actions/download-artifact@v4
+        with:
+          name: starfold-wheels-${{ needs.version.outputs.version }}
+          path: dist
+      - name: The sdist and the wheels
         run: |
+          set -euo pipefail
           (cd dist && sha256sum -c -- *.sha256)
           mkdir pypi
-          cp "dist/starfold-$VERSION-py3-none-any.whl" "dist/starfold-$VERSION.tar.gz" pypi/
+          cp dist/*.whl "dist/starfold-$VERSION.tar.gz" pypi/
+          want=$((LINUX_WHEELS == 1 ? 6 : 4))
+          ls -l pypi
+          n=$(find pypi -type f | wc -l)
+          [ "$n" = "$want" ] || { echo "::error::$n files for PyPI, not $want"; exit 1; }
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pypi/
