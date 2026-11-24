@@ -131,11 +131,6 @@ while read -r sum name; do
 done <"$root/third_party/x264/SHA256SUMS"
 
 if [ "${RELEASE_LOOKUP:-1}" = 1 ]; then
-	if lookup=$("${GH:-gh}" release view "$tag" --json tagName 2>&1); then
-		[ "${RELEASE_RESUME:-0}" = 1 ] || fail "$tag already has a release"
-		echo "::notice::$tag has a release already; publish.sh uploads what it lacks and verifies the rest"
-	elif [ "$lookup" != "release not found" ]; then
-		fail "couldn't look up the release of $tag: $lookup"
-	fi
+	"$here/release-lookup.sh" "$tag"
 fi
 echo "release $tag: $(wc -l <<<"$expected" | tr -d ' ') files checked"

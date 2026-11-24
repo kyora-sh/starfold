@@ -88,7 +88,8 @@ jobs:
 
   # The release scripts against stand-ins: publish.sh with gh (a fresh release, a re-run that
   # completes a partial one, the mismatches that must fail), the install job's pip step with uv
-  # (LINUX_WHEELS on and off), crates.sh's index check with curl (damaged answers stop it).
+  # (LINUX_WHEELS on and off), crates.sh's index check with curl (damaged answers stop it), and the
+  # release lookup with gh (an error is never taken for "no release").
   release-scripts:
     name: Release scripts
     runs-on: kyora-2x4
@@ -98,6 +99,7 @@ jobs:
       - run: .github/release/publish-test.sh
       - run: .github/release/install-step-test.sh
       - run: .github/release/crates-index-test.sh
+      - run: .github/release/release-lookup-test.sh
 
   upstream-sync:
     name: Upstream sync script

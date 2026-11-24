@@ -962,9 +962,9 @@ jobs:
       - name: x264's source
         run: .github/release/stage-x264-source.sh "$RUNNER_TEMP/x264-source"
       # Before anything is created: the tag names Cargo.toml's version, which pyproject.toml and
-      # packages/starfold/package.json declare too; the downloads, then with x264's source joined, are exactly the expected files and every
-      # checksum checks; the packages carry the version and their archive's binary; and the tag has
-      # no release yet, except on a re-run of this job.
+      # packages/starfold/package.json declare too; the downloads, then with x264's source joined,
+      # are exactly the expected files and every checksum checks; the packages carry the version
+      # and their archive's binary; and the tag has no release yet, except on a re-run of this job.
       - name: Check the release
         env:
           GH_TOKEN: ${{ github.token }}
