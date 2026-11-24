@@ -273,15 +273,19 @@ function basePath(args: string[]): string {
 // environment's proxy under NODE_USE_ENV_PROXY=1.
 const direct = new Agent();
 
+// Settles on every outcome: the whole answer (true for a 200), or false once the request or
+// the answer closes, errs or stalls for a second, headers sent or not.
 function answers(url: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const req = request(url, { timeout: 1000, agent: direct }, (res) => {
 			res.resume();
 			res.once('end', () => resolve(res.statusCode === 200));
+			res.once('close', () => resolve(false));
 			res.once('error', () => resolve(false));
 		});
-		req.once('timeout', () => req.destroy());
+		req.once('timeout', () => req.destroy(new Error('no answer in time')));
 		req.once('error', () => resolve(false));
+		req.once('close', () => resolve(false));
 		req.end();
 	});
 }
@@ -444,8 +448,19 @@ async function launch(
 		void exited.then(() => process.off('exit', stop));
 	}
 
-	const url = `http://${urlHost(addr)}:${port}${basePath(options.args ?? [])}`;
+	const base = basePath(options.args ?? []);
+	const url = `http://${urlHost(addr)}:${port}${base}`;
 	const server = new LocalServer(url, password, child, exited, () => tail);
+	if (
+		(base !== '' && !base.startsWith('/')) ||
+		!URL.canParse(`${url}/healthz`)
+	) {
+		await server.close();
+		throw new ServerStartError(
+			`--base-path ${base} makes no URL to reach the server at (it starts with /)`,
+			tail
+		);
+	}
 	const failed = (): Error => {
 		if (/address (already )?in use/i.test(tail)) return new PortTaken(tail);
 		return new ServerStartError(
