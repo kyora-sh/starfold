@@ -46,6 +46,51 @@ describe.if(posix)('startServer', () => {
 		server = null;
 	});
 
+	test('an address that makes no URL is named, not --base-path', async () => {
+		const dir = scratch();
+		const e = await caught(
+			starfold.startServer({
+				binary: fakeBinary(dir),
+				addr: 'not an addr',
+				port: 4567,
+				env: { FAKE_RECORD: join(dir, 'rec.json') },
+			})
+		);
+		expect(e.name).toBe('ServerStartError');
+		expect(e.message).toContain('not an addr');
+		expect(e.message).not.toContain('--base-path');
+	});
+
+	test.if(process.platform === 'linux')(
+		'a server that exits at once leaves nothing in the guard group (30 runs)',
+		async () => {
+			const dir = scratch();
+			const bin = join(dir, 'exits-at-once');
+			const groups = join(dir, 'groups');
+			writeFileSync(
+				bin,
+				`#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' >> "${groups}"\nexit 3\n`
+			);
+			chmodSync(bin, 0o755);
+			for (let i = 0; i < 30; i++) {
+				// oxlint-disable-next-line no-await-in-loop
+				await caught(starfold.startServer({ binary: bin, timeoutMs: 3000 }));
+			}
+			const ids = readFileSync(groups, 'utf8').trim().split('\n');
+			expect(ids.length).toBe(30);
+			// Give a stopping watcher a moment, then count who is still in each guard's group.
+			await Bun.sleep(1000);
+			const left = ids.filter((g) =>
+				Bun.spawnSync(['ps', '-o', 'pid=', '-g', g]).stdout.toString().trim()
+			);
+			expect({ groupsLeft: left.length, of: ids.length }).toEqual({
+				groupsLeft: 0,
+				of: 30,
+			});
+		},
+		60_000
+	);
+
 	for (const args of [['--base-path=/desk/'], ['--base-path', '/desk']]) {
 		test(`waits for the server under ${args.join(' ')}`, async () => {
 			const dir = scratch();
