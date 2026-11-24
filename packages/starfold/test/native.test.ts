@@ -85,7 +85,7 @@ describe('binaryPath', () => {
 	test('a STARFOLD_BIN that is not there', () => {
 		process.env.STARFOLD_BIN = '/nonexistent/starfold';
 		expect(() => binaryPath()).toThrow(
-			'STARFOLD_BIN is /nonexistent/starfold, which does not exist'
+			"STARFOLD_BIN is /nonexistent/starfold, which isn't a file"
 		);
 	});
 
