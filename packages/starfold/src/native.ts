@@ -7,7 +7,7 @@ import {
 	readdirSync,
 	statSync,
 } from 'node:fs';
-import { request } from 'node:http';
+import { Agent, request } from 'node:http';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join } from 'node:path';
@@ -269,10 +269,13 @@ function basePath(args: string[]): string {
 	return found.replace(/\/$/, '');
 }
 
-// Straight to the server with node:http, which takes no proxy from the environment.
+// Straight to the server: node:http with an agent of its own, since the global one takes the
+// environment's proxy under NODE_USE_ENV_PROXY=1.
+const direct = new Agent();
+
 function answers(url: string): Promise<boolean> {
 	return new Promise((resolve) => {
-		const req = request(url, { timeout: 1000 }, (res) => {
+		const req = request(url, { timeout: 1000, agent: direct }, (res) => {
 			res.resume();
 			res.once('end', () => resolve(res.statusCode === 200));
 			res.once('error', () => resolve(false));
