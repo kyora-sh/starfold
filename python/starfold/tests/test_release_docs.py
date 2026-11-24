@@ -55,6 +55,16 @@ def test_each_release_names_every_versioned_file():
         assert f"`{f}`" in steps, f"RELEASING.md's Each release doesn't name {f}"
 
 
+def test_both_sdks_run_the_same_guard():
+    """The TypeScript SDK starts its server through the same sh guard as this one, byte for byte."""
+    from starfold._native import GUARD
+
+    ts = (ROOT / "packages" / "starfold" / "src" / "native.ts").read_text()
+    m = re.search(r"^const GUARD = `(.*?)`;$", ts, re.S | re.M)
+    assert m, "native.ts has no GUARD"
+    assert m.group(1).strip("\n") == GUARD.strip("\n"), "native.ts's GUARD differs from _native.py's"
+
+
 def test_third_party_doesnt_call_the_server_packages_mit():
     text = DOC.read_text()
     assert not re.search(r"`-win32-x64` on\s+npm\*\*, MIT", text), "THIRD_PARTY.md calls the server packages MIT"

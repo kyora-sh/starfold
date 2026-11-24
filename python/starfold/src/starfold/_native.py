@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import collections
+import contextlib
 import os
 import platform
 import re
@@ -127,17 +128,24 @@ def main() -> None:
 GUARD = """exec 3<&0 0</dev/null
 "$0" "$@" 3<&- &
 p=$!
-{ while read -r _ <&3; do :; done; kill "$p" 2>/dev/null; } &
-w=$!
+trap '' TERM
+{ trap - TERM; while read -r _ <&3; do :; done; kill -TERM 0; } >/dev/null 2>&1 &
 exec 3<&-
 wait "$p"
 rc=$?
-kill "$w" 2>/dev/null
+kill -TERM 0 2>/dev/null
 exit "$rc"
 """
-"""Runs the server with the guard's stdin, a pipe from this process, held by a watcher: when that
-pipe closes (this process ended, however it ended, or close() closed it) the watcher stops the
-server. The TypeScript SDK starts its server through the same script."""
+"""Runs the server with the guard's stdin, a pipe from this process, held by a watcher.
+
+The guard leads its own process group (a new session), and nothing in it signals a pid: when
+the pipe closes (this process ended, however it ended, or close() closed it) the watcher sends
+TERM to its group, which reaches the server and the watcher; the guard ignores TERM (set after
+the server started, so the server keeps the default), so its wait is never cut short and its
+exit status is the server's. After the server has exited the guard sends TERM to its group once
+more, which ends the watcher. A process group can't be reused while a member is alive, and the
+sender is always a member. The TypeScript SDK starts its server through the same script (a test
+compares the two)."""
 
 _live: weakref.WeakSet[LocalServer] = weakref.WeakSet()
 _jobs: list[int] = []
@@ -223,7 +231,7 @@ class LocalServer:
         p = self.process
         if p.stdin is not None and not p.stdin.closed:
             p.stdin.close()
-        elif p.poll() is None:
+        elif p.stdin is None and p.poll() is None:
             p.terminate()
         try:
             p.wait(timeout=timeout)
@@ -231,7 +239,8 @@ class LocalServer:
             if sys.platform == "win32":
                 p.kill()
             else:
-                os.killpg(p.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
             p.wait()
         _live.discard(self)
 
