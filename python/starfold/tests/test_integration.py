@@ -8,7 +8,6 @@ Needs Linux with Xvfb and xterm, and STARFOLD_BIN pointing at a built `starfold`
 import contextlib
 import os
 import secrets
-import select
 import shutil
 import signal
 import socket
@@ -18,6 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _xvfb import read_display
 
 from starfold import Starfold
 
@@ -80,11 +80,7 @@ def desktop(tmp_path, server_args):
         r, w = os.pipe()
         start(["Xvfb", "-displayfd", str(w), "-screen", "0", "1280x800x24", "-nolisten", "tcp"], pass_fds=(w,))
         os.close(w)
-        ready, _, _ = select.select([r], [], [], 15)
-        assert ready, "Xvfb did not start"
-        display = ":" + os.read(r, 32).decode().strip()
-        os.close(r)
-        env["DISPLAY"] = display
+        env["DISPLAY"] = read_display(r)
 
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))

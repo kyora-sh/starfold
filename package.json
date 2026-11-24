@@ -1,5 +1,5 @@
 {
-	"name": "starfold",
+	"name": "starfold-workspace",
 	"private": true,
 	"workspaces": [
 		"packages/*"

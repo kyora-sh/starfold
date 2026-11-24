@@ -8,6 +8,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = ["httpx>=0.27"]
 
+[project.scripts]
+starfold = "starfold._native:main"
+
 [project.urls]
 Repository = "https://github.com/kyora-sh/starfold"
 

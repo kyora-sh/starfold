@@ -80,6 +80,31 @@ What each platform needs at run time:
   so clear the download quarantine first: `xattr -d com.apple.quarantine starfold`.
 - **Windows**: nothing beyond the system; `starfold.exe` is self-contained.
 
+### With npm or pip
+
+The SDKs install the default build's binary with them on Linux x86_64 and aarch64, macOS (Apple
+silicon) and Windows x86_64: npm through a server package for the platform
+(`@starfold/server-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin-arm64`, `-win32-x64`), pip
+through a platform wheel. Each binary is the release archive's, with its `LICENSE`,
+`THIRD_PARTY.md` and `licenses/`.
+
+```sh
+npm install starfold && npx starfold --version
+pip install starfold && starfold --version
+```
+
+Both can start a server from code (`startServer()` in TypeScript, `start_server()` in Python) on
+loopback with a generated password, and give a client already signed in to it; see
+[packages/starfold](packages/starfold/README.md) and [python/starfold](python/starfold/README.md).
+On other platforms they install the client alone, which works against a server running elsewhere.
+
+On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc 2.39
+or newer (Ubuntu 24.04 or newer):
+
+```sh
+sudo apt install libyuv0 libopus0 libpulse0
+```
+
 ### From source
 
 Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries; on

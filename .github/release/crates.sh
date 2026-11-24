@@ -52,26 +52,44 @@ for p in json.load(sys.stdin)["packages"]:
     if p["publish"] is None or "crates-io" in p["publish"]:
         print(p["name"], p["version"], sep="\t")
 ' <<<"$meta")
-# Whether crates.io's index lists name at version (build metadata aside, as crates.io compares).
+# Whether crates.io's index lists name at version (build metadata aside, as crates.io compares):
+# 0 if it does, 1 if it doesn't or doesn't know the crate (404). Anything else (curl failing,
+# another status, a body that isn't the index's lines of JSON objects with a "vers") ends the
+# script with exit 2, like npm-has.sh, so nothing is published on a guess; `exit` works even
+# under `if published`, where `set -e` doesn't.
 published() {
-	local name=$1 version=${2%%+*} index
+	local name=$1 version=${2%%+*} index code rc=0
 	index=$(mktemp)
 	code=$(curl -sS -o "$index" -w '%{http_code}' -A 'starfold-release (https://github.com/kyora-sh/starfold)' \
-		"https://index.crates.io/${name:0:2}/${name:2:2}/$name")
+		"https://index.crates.io/${name:0:2}/${name:2:2}/$name") || rc=$?
+	if [ "$rc" != 0 ]; then
+		rm -f "$index"
+		echo "::error::crates.io's index couldn't be read for $name (curl exit $rc, status $code)"
+		exit 2
+	fi
 	case $code in
 		404) rm -f "$index"; return 1 ;;
 		200) ;;
-		*) echo "::error::crates.io's index answered $code for $name"; exit 1 ;;
+		*) rm -f "$index"; echo "::error::crates.io's index answered $code for $name"; exit 2 ;;
 	esac
 	python3 -I -c '
 import json, sys
 want = sys.argv[2]
-vers = [json.loads(l)["vers"].split("+")[0] for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
-sys.exit(0 if want in vers else 1)
-' "$index" "$version"
-	local rc=$?
+try:
+    lines = [l for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+    entries = [json.loads(l) for l in lines]
+    if not entries or not all(isinstance(e, dict) and isinstance(e.get("vers"), str) for e in entries):
+        raise ValueError("not lines of JSON objects with a vers")
+except Exception as e:
+    print(f"::error::crates.io index for {sys.argv[3]}: {e}")
+    sys.exit(2)
+sys.exit(0 if want in [e["vers"].split("+")[0] for e in entries] else 1)
+' "$index" "$version" "$name" || rc=$?
 	rm -f "$index"
-	return $rc
+	case $rc in
+		0 | 1) return "$rc" ;;
+		*) exit 2 ;;
+	esac
 }
 selected=()
 while IFS=$'\t' read -r name version; do

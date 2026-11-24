@@ -4,17 +4,23 @@
 # versions and the downloaded set: run that before staging x264's source. <dist dir> holds the downloaded workflow artifacts, one directory each
 # (never merged); x264's source is staged elsewhere (stage-x264-source.sh) and joins only after
 # the downloaded set has passed. Fails unless:
-#   - Cargo.toml's version (tomllib) names the tag, v<version>, and pyproject.toml declares it;
+#   - Cargo.toml's version (tomllib) names the tag, v<version>, and pyproject.toml and
+#     packages/starfold/package.json declare it;
 #   - the downloaded set is exactly what expected-files.sh lists outside x264-source/, by directory
 #     and name, no more and no fewer (an artifact named x264-source fails), no symbolic link;
 #   - the staged source is exactly expected-files.sh's x264-source files, and once joined as
 #     <dist dir>/x264-source the whole set is exactly the list;
 #   - every .sha256 names the file beside it and checks;
-#   - the wheel's and the sdist's first Version header and package.json's top-level version are the
-#     version (compared in versions.py);
+#   - the wheels' and the sdist's first Version header and every npm tarball's package.json version
+#     are the version (compared in versions.py), as is packages/starfold/package.json's;
+#   - each npm server package's and platform wheel's binary is byte for byte the default archive's
+#     (expected-files.sh native pairs them), each server package states its platform's licence
+#     expression (python-platform-wheel.py licence), and the starfold tarball pins exactly the
+#     four server packages at the version;
 #   - the x264 source files match third_party/x264's SHA256SUMS;
 #   - the tag has no GitHub release yet (GH, default gh, is asked; RELEASE_LOOKUP=0, for a dry run
-#     that builds a version already released, skips this one).
+#     that builds a version already released, skips this one). With RELEASE_RESUME=1 (a re-run of
+#     the release job) an existing release passes, and publish.sh completes and verifies it.
 set -euo pipefail
 tag=${1:?usage: check-release.sh <tag> <dist dir> <staged x264 source dir> <flavour...>}
 dist=$2 staged=$3
@@ -30,6 +36,8 @@ v=$(versions cargo "$root/crates/starfold-server/Cargo.toml")
 [ "$tag" = "v$v" ] || fail "tag $tag isn't v$v, the version in crates/starfold-server/Cargo.toml"
 versions check pyproject "$root/python/starfold/pyproject.toml" "$v" ||
 	fail "python/starfold/pyproject.toml doesn't declare $v, crates/starfold-server/Cargo.toml's version"
+versions check package-json-file "$root/packages/starfold/package.json" "$v" ||
+	fail "packages/starfold/package.json doesn't declare $v, crates/starfold-server/Cargo.toml's version"
 
 listing() { (cd "$1" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | sort); }
 links() { find "$1" -mindepth 1 -type l | wc -l | tr -d ' '; }
@@ -68,6 +76,53 @@ versions check sdist "$dist/starfold-python-$v/starfold-$v.tar.gz" "$v" || fail 
 versions check package-json "$dist/starfold-web-embed-$v/starfold-web-embed-$v.tgz" "$v" ||
 	fail "the embeddable client's package.json version isn't $v"
 
+# member <archive> <path>: one file of a .tar.gz, .tgz, .whl or .zip, to stdout.
+member() {
+	python3 -I -c '
+import sys, tarfile, zipfile
+path, name = sys.argv[1], sys.argv[2]
+if path.endswith((".zip", ".whl")):
+    with zipfile.ZipFile(path) as z:
+        data = z.read(name)
+else:
+    with tarfile.open(path) as t:
+        f = t.extractfile(name)
+        if f is None:
+            sys.exit(f"{path}: {name} is not a file")
+        data = f.read()
+sys.stdout.buffer.write(data)
+' "$1" "$2"
+}
+sum() { sha256sum | cut -d' ' -f1; }
+servers=()
+while read -r target suffix archive tgz wheel <&3; do
+	case $target in *-windows) binary=starfold.exe ;; *) binary=starfold ;; esac
+	want=$(member "$dist/$archive" "$(basename "$(dirname "$archive")")/$binary" | sum)
+	versions check package-json "$dist/$tgz" "$v" || fail "$tgz: package.json version isn't $v"
+	got=$(member "$dist/$tgz" "package/bin/$binary" | sum)
+	[ "$got" = "$want" ] || fail "$tgz: bin/$binary is $got, $archive has $want"
+	licence=$(python3 -I "$here/python-platform-wheel.py" licence "$target")
+	member "$dist/$tgz" package/package.json | python3 -I -c 'import json, sys; sys.exit(json.load(sys.stdin).get("license") != sys.argv[1])' "$licence" ||
+		fail "$tgz: package.json's license isn't $licence"
+	if [ "$wheel" != - ]; then
+		versions check wheel "$dist/$wheel" "$v" || fail "$wheel: Version isn't $v"
+		got=$(member "$dist/$wheel" "starfold/_bin/$binary" | sum)
+		[ "$got" = "$want" ] || fail "$wheel: starfold/_bin/$binary is $got, $archive has $want"
+	fi
+	echo "$target: $binary $want in $archive, $tgz, $wheel"
+	servers+=("@starfold/server-$suffix")
+done 3< <("$here/expected-files.sh" native "$v")
+sdk=starfold-npm-$v/starfold-$v.tgz
+versions check package-json "$dist/$sdk" "$v" || fail "$sdk: package.json version isn't $v"
+member "$dist/$sdk" package/package.json | python3 -I -c '
+import json, sys
+m, version, servers = json.load(sys.stdin), sys.argv[1], sys.argv[2:]
+want = {s: version for s in servers}
+name, got = m.get("name"), m.get("optionalDependencies")
+if name != "starfold" or got != want:
+    sys.exit(f"{name}: optionalDependencies {got}, expected {want}")
+' "$v" "${servers[@]}" || fail "$sdk doesn't pin the four server packages at $v"
+
 while read -r sum name; do
 	case $name in vcpkg-*) continue ;; esac
 	[ -f "$dist/x264-source/$name" ] || continue
@@ -75,7 +130,7 @@ while read -r sum name; do
 		fail "x264-source/$name doesn't match third_party/x264/SHA256SUMS"
 done <"$root/third_party/x264/SHA256SUMS"
 
-if [ "${RELEASE_LOOKUP:-1}" = 1 ] && "${GH:-gh}" release view "$tag" >/dev/null 2>&1; then
-	fail "$tag already has a release"
+if [ "${RELEASE_LOOKUP:-1}" = 1 ]; then
+	"$here/release-lookup.sh" "$tag"
 fi
 echo "release $tag: $(wc -l <<<"$expected" | tr -d ' ') files checked"

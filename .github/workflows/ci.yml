@@ -37,6 +37,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
+      # The proxy test runs startServer under Node with NODE_USE_ENV_PROXY=1 (22.21 or newer).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
       - run: bun install --frozen-lockfile
       - name: Format
         run: bun run fmt:check
@@ -85,6 +89,21 @@ jobs:
       # Unit tests; the Xvfb integration test skips without STARFOLD_BIN.
       - name: Test
         run: uv run --locked pytest
+
+  # The release scripts against stand-ins: publish.sh with gh (a fresh release, a re-run that
+  # completes a partial one, the mismatches that must fail), the install job's pip step with uv
+  # (LINUX_WHEELS on and off), crates.sh's index check with curl (damaged answers stop it), and the
+  # release lookup with gh (an error is never taken for "no release").
+  release-scripts:
+    name: Release scripts
+    runs-on: kyora-2x4
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/release/publish-test.sh
+      - run: .github/release/install-step-test.sh
+      - run: .github/release/crates-index-test.sh
+      - run: .github/release/release-lookup-test.sh
 
   upstream-sync:
     name: Upstream sync script

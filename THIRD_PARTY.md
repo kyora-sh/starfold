@@ -48,7 +48,24 @@
   its licence beside it.
 - **`@starfold/web` on npm**, `MIT AND BSD-2-Clause`: the embeddable client (MIT) with
   dav1d.wasm (as above).
-- **`starfold` on PyPI**, MIT: the Python SDK.
+- **`starfold` on npm**, MIT: the TypeScript SDK. It carries no binary; it depends on the server
+  package for its platform.
+- **`starfold` on PyPI**: the sdist and the pure wheel (`py3-none-any`) are the Python SDK alone,
+  MIT.
+- **The npm server packages and PyPI's platform wheels**: each holds the default binary of one
+  platform's release archive with the archive's `LICENSE`, this file and `licenses/`, so it
+  carries what [What each release binary carries](#what-each-release-binary-carries) lists for its
+  platform. Each declares that list as one SPDX expression (`license` in the npm package's
+  package.json, `License-Expression` in the wheel's metadata); per platform (archive target, npm
+  package, wheel tag):
+  - `x86_64-linux` (`@starfold/server-linux-x64-gnu`, `manylinux_2_39_x86_64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND LGPL-2.1-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1`
+  - `aarch64-linux` (`@starfold/server-linux-arm64-gnu`, `manylinux_2_39_aarch64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND LGPL-2.1-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1`
+  - `aarch64-macos` (`@starfold/server-darwin-arm64`, `macosx_11_0_arm64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0`
+  - `x86_64-windows` (`@starfold/server-win32-x64`, `win_amd64`): `MIT AND BSD-2-Clause AND BSD-3-Clause AND ISC AND Apache-2.0 AND Unicode-3.0 AND Zlib AND OFL-1.1 AND CC0-1.0 AND LicenseRef-AOM-Patent-License-1.0 AND ZPL-2.1 AND GPL-3.0-or-later WITH GCC-exception-3.1`
+
+  LGPL-2.1-or-later is glibc's startup files, `GPL-3.0-or-later WITH GCC-exception-3.1` GCC's
+  startup files (Linux) and runtime libraries (Windows), ZPL-2.1 the MinGW-w64 runtime; the
+  binary itself stays distributed under MIT (`starfold --version`).
 
 ## What each release binary carries
 
