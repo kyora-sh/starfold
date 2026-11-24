@@ -164,6 +164,17 @@ def _url(addr: str, port: int) -> str:
     return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
 
 
+def _base_path(args: Sequence[str]) -> str:
+    """The --base-path among the server flags, if any, without a trailing slash."""
+    found = ""
+    for i, a in enumerate(args):
+        if a.startswith("--base-path="):
+            found = a.split("=", 1)[1]
+        elif a == "--base-path" and i + 1 < len(args):
+            found = args[i + 1]
+    return found.rstrip("/")
+
+
 class LocalServer:
     """A starfold server this process started: `url`, `password`, `process`, `client()`, `close()`.
 
@@ -311,8 +322,13 @@ def _kill_on_close(p: subprocess.Popen[bytes]) -> None:
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
     k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.OpenProcess.restype = wintypes.HANDLE
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
     job = k32.CreateJobObjectW(None, None)
     info = Extended()
     info.BasicLimitInformation.LimitFlags = 0x2000
@@ -356,7 +372,7 @@ def start_server(
         chosen = port if port is not None else _free_port(addr)
         flags = [f"--addr={addr}", f"--port={chosen}", *args]
         p, out, dog = _spawn(path, flags, child_env, cwd, watchdog)
-        server = LocalServer(p, _url(addr, chosen), password, out, dog)
+        server = LocalServer(p, _url(addr, chosen) + _base_path(args), password, out, dog)
         try:
             _wait_ready(server, deadline)
             return server
@@ -375,7 +391,7 @@ class _PortTaken(Exception):
 
 
 def _wait_ready(server: LocalServer, deadline: float) -> None:
-    with httpx.Client(timeout=1.0) as http:
+    with httpx.Client(timeout=1.0, trust_env=False) as http:
         while True:
             if server.process.poll() is not None:
                 tail = server._output.tail(wait=2.0)

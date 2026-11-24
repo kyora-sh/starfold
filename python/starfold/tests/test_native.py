@@ -166,6 +166,12 @@ def test_start_server_times_out_with_the_output(tmp_path):
         starfold.start_server(binary=str(fake), timeout=1, env={"PATH": os.environ["PATH"]})
 
 
+def test_base_path_from_the_server_flags():
+    assert _native._base_path([]) == ""
+    assert _native._base_path(["--base-path=/desktop/"]) == "/desktop"
+    assert _native._base_path(["--title", "x", "--base-path", "/a/b"]) == "/a/b"
+
+
 def test_url_for_wildcard_and_ipv6_addresses():
     assert _native._url("127.0.0.1", 5) == "http://127.0.0.1:5"
     assert _native._url("0.0.0.0", 5) == "http://127.0.0.1:5"

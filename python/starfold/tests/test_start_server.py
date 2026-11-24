@@ -6,7 +6,6 @@ Needs Linux with Xvfb and STARFOLD_BIN pointing at a built `starfold` binary:
 """
 
 import os
-import select
 import shutil
 import signal
 import subprocess
@@ -17,6 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _xvfb import read_display
 
 import starfold
 
@@ -42,10 +42,7 @@ def display(monkeypatch):
         start_new_session=True,
     )
     os.close(w)
-    ready, _, _ = select.select([r], [], [], 15)
-    assert ready, "Xvfb did not start"
-    d = ":" + os.read(r, 32).decode().strip()
-    os.close(r)
+    d = read_display(r)
     monkeypatch.setenv("DISPLAY", d)
     yield d
     xvfb.terminate()
@@ -69,6 +66,12 @@ def test_loopback_by_default(display):
         port = int(server.url.rsplit(":", 1)[1])
         assert server.url == f"http://127.0.0.1:{port}"
         assert _listening(port) == ["0100007F"]
+        assert server.client().screenshot().size == (1024, 768)
+
+
+def test_base_path_is_part_of_the_url(display):
+    with starfold.start_server(args=[*ARGS, "--base-path=/desktop"]) as server:
+        assert server.url.endswith("/desktop")
         assert server.client().screenshot().size == (1024, 768)
 
 
