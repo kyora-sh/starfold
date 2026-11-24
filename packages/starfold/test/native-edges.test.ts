@@ -60,23 +60,19 @@ describe.if(posix)('startServer', () => {
 		});
 	}
 
-	test(
-		'a server that sends its headers and then stalls fails within the timeout',
-		async () => {
-			const dir = scratch();
-			const started = Date.now();
-			const e = await caught(
-				starfold.startServer({
-					binary: fakeBinary(dir),
-					timeoutMs: 1500,
-					env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_STALL: '1' },
-				})
-			);
-			expect(e.name).toBe('ServerStartError');
-			expect(Date.now() - started).toBeLessThan(5000);
-		},
-		10_000
-	);
+	test('a server that sends its headers and then stalls fails within the timeout', async () => {
+		const dir = scratch();
+		const started = Date.now();
+		const e = await caught(
+			starfold.startServer({
+				binary: fakeBinary(dir),
+				timeoutMs: 1500,
+				env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_STALL: '1' },
+			})
+		);
+		expect(e.name).toBe('ServerStartError');
+		expect(Date.now() - started).toBeLessThan(5000);
+	}, 10_000);
 
 	test('a --base-path that makes no URL is a ServerStartError, the server closed', async () => {
 		const dir = scratch();
