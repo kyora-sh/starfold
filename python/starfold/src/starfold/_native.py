@@ -198,10 +198,12 @@ class LocalServer:
         return self._output.tail()
 
     def client(self, timeout: float = 30.0) -> Starfold:
-        """A Starfold client signed in to this server, closed with it (a new one if `timeout` changed)."""
-        if self._client is None or self._client.timeout != timeout:
-            if self._client is not None:
-                self._client.close()
+        """A Starfold client signed in to this server, closed with it.
+
+        The first call's timeout holds; for another one, use
+        Starfold(server.url, password=server.password, timeout=...).
+        """
+        if self._client is None:
             self._client = Starfold(self.url, password=self.password, timeout=timeout)
         return self._client
 
