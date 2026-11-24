@@ -832,16 +832,40 @@ jobs:
           sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
           (cd npm && sum -c -- *.sha256)
           (cd wheels && sum -c -- *.sha256)
+      # @starfold/server with the client and this platform's binary package, all from these tarballs
+      # (--offline: nothing from the registry). The command is the server package's.
       - name: npm install, starfold --version
         run: |
           set -euo pipefail
           mkdir app
           cd app
           npm init -y >/dev/null
-          npm install --no-audit --no-fund "../npm/starfold-$VERSION.tgz" "../npm/starfold-server-$PLATFORM-$VERSION.tgz"
+          npm install --offline --no-audit --no-fund "../npm/starfold-$VERSION.tgz" "../npm/starfold-server-$VERSION.tgz" "../npm/starfold-server-$PLATFORM-$VERSION.tgz"
+          npm ls --all
           out=$(npx --no-install starfold --version)
           echo "$out"
           case $out in "starfold $VERSION"|"starfold $VERSION "*) ;; *) echo "::error::npx starfold --version printed '$out', not starfold $VERSION"; exit 1 ;; esac
+      # The client alone: no command and nothing of the server's in the tree; Starfold imports.
+      - name: npm install of the client alone
+        run: |
+          set -euo pipefail
+          mkdir client-app
+          cd client-app
+          npm init -y >/dev/null
+          npm pkg set type=module
+          npm install --offline --no-audit --no-fund "../npm/starfold-$VERSION.tgz"
+          npm ls --all
+          [ ! -e node_modules/.bin/starfold ] && [ ! -e node_modules/.bin/starfold.cmd ] || { echo "::error::the client alone installed a starfold command"; exit 1; }
+          [ ! -e node_modules/@starfold ] || { echo "::error::the client alone installed $(ls node_modules/@starfold)"; exit 1; }
+          if npx --no-install starfold --version; then echo "::error::npx starfold ran with the client alone"; exit 1; fi
+          node --input-type=module -e "
+          import * as client from 'starfold';
+          import { Starfold } from 'starfold';
+          const s = new Starfold('http://127.0.0.1:9', { password: 'x' });
+          if (typeof s.screenshot !== 'function') process.exit(1);
+          for (const name of ['startServer', 'LocalServer', 'binaryPath']) if (name in client) { console.error('starfold exports', name); process.exit(1); }
+          console.log('starfold', '$VERSION', 'client only:', Object.keys(client).join(' '));
+          "
       - name: pip install, starfold --version
         run: |
           set -euo pipefail
@@ -877,7 +901,7 @@ jobs:
           export DISPLAY
           echo "DISPLAY=$DISPLAY"
           cat > app/smoke.mjs <<'EOF'
-          import { startServer } from 'starfold';
+          import { startServer } from '@starfold/server';
           const server = await startServer({ args: ['--audio-enabled=false'] });
           try {
             const shot = await server.client().screenshot();
@@ -1112,11 +1136,12 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.which.outputs.mode == 'bootstrap' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.auth.outputs.token }}
         run: .github/release/crates.sh publish
 
-  # npm gets six packages, all at the release version: the four @starfold/server-* (the default
-  # binary per platform), starfold (the TypeScript SDK, which pins those four as optional
-  # dependencies) and @starfold/web (the embeddable client).
+  # npm gets seven packages, all at the release version: the four @starfold/server-<platform> (the
+  # default binary per platform), starfold (the TypeScript client, no dependencies),
+  # @starfold/server (the command and startServer, which pins starfold and, as optional
+  # dependencies, the four) and @starfold/web (the embeddable client).
   npm:
-    name: npm dry run (starfold, @starfold/server-*, @starfold/web)
+    name: npm dry run (starfold, @starfold/server, @starfold/server-*, @starfold/web)
     needs: [version, embed, native, release]
     if: ${{ !cancelled() && needs.version.result == 'success' && needs.embed.result == 'success' && needs.native.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && (github.event_name != 'push' || github.ref_type != 'tag'))) }}
     runs-on: ubuntu-latest
@@ -1146,8 +1171,8 @@ jobs:
           set -euo pipefail
           (cd web && sha256sum -c -- *.sha256)
           (cd npm && sha256sum -c -- *.sha256)
-          tarballs=(npm/starfold-server-*-"$VERSION".tgz "npm/starfold-$VERSION.tgz" "web/starfold-web-embed-$VERSION.tgz")
-          [ ${#tarballs[@]} = 6 ] || { echo "::error::${#tarballs[@]} tarballs, not 6: ${tarballs[*]}"; exit 1; }
+          tarballs=(npm/starfold-server-*-"$VERSION".tgz "npm/starfold-$VERSION.tgz" "npm/starfold-server-$VERSION.tgz" "web/starfold-web-embed-$VERSION.tgz")
+          [ ${#tarballs[@]} = 7 ] || { echo "::error::${#tarballs[@]} tarballs, not 7: ${tarballs[*]}"; exit 1; }
           for t in "${tarballs[@]}"; do
             tar -xzOf "$t" package/package.json | python3 -I -c '
           import json, sys
@@ -1194,11 +1219,12 @@ jobs:
           node-version: '24.11.1'
       - run: npm install -g npm@11.6.2 && npm --version
       # A version npm lists already (a re-run) is skipped, one it doesn't is published; a registry
-      # that doesn't answer with the package's versions fails the job. The four server packages go
-      # first, and starfold only once npm lists all four at the version (an install of starfold
-      # resolves its platform's one then); @starfold/web last. No --tag: npm publish tags `latest`
-      # by default (`tag`, default "latest": https://docs.npmjs.com/cli/v11/commands/npm-publish),
-      # so `latest` moves from the 0.0.1 placeholders to this version.
+      # that doesn't answer with the package's versions fails the job. The four platform packages
+      # go first, then starfold, and @starfold/server only once npm lists all five at the version
+      # (an install of it resolves the client and its platform's binary then); @starfold/web last.
+      # No --tag: npm publish tags `latest` by default (`tag`, default "latest":
+      # https://docs.npmjs.com/cli/v11/commands/npm-publish), so `latest` moves to this version,
+      # from the 0.0.1 placeholders and from @starfold/server's 0.0.0-stage.
       - name: Publish
         working-directory: dist
         run: |
@@ -1218,17 +1244,22 @@ jobs:
           }
           servers=(npm/starfold-server-*-"$VERSION".tgz)
           [ ${#servers[@]} = 4 ] || { echo "::error::${#servers[@]} server packages, not 4"; exit 1; }
-          for t in "${servers[@]}"; do publish "$t"; done
-          for t in "${servers[@]}"; do
-            name=$(name_of "$t")
+          # listed <tarball> <what waits for it>: until npm lists the tarball's package at the version.
+          listed() {
+            local name
+            name=$(name_of "$1")
             for _ in $(seq 20); do
               [ "$(has "$name")" = present ] && break
               sleep 15
             done
-            [ "$(has "$name")" = present ] || { echo "::error::npm doesn't list $name@$VERSION; starfold is not published without it"; exit 1; }
+            [ "$(has "$name")" = present ] || { echo "::error::npm doesn't list $name@$VERSION; $2 is not published without it"; exit 1; }
             echo "$name@$VERSION is on npm"
-          done
+          }
+          for t in "${servers[@]}"; do publish "$t"; done
+          for t in "${servers[@]}"; do listed "$t" @starfold/server; done
           publish "npm/starfold-$VERSION.tgz"
+          listed "npm/starfold-$VERSION.tgz" @starfold/server
+          publish "npm/starfold-server-$VERSION.tgz"
           publish "web/starfold-web-embed-$VERSION.tgz"
 
   # PyPI gets the sdist, the pure wheel and the platform wheels (pip prefers a platform wheel

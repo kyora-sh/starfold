@@ -1,6 +1,6 @@
-// The SDK (the built dist/) against a real server on Xvfb, typing into an xterm, under any of
+// The client (the built dist/) against a real server on Xvfb, typing into an xterm, under any of
 // Node, Bun and Deno. Needs Linux with Xvfb and xterm, and STARFOLD_BIN pointing at a starfold
-// binary; skips without them:
+// binary; skips without them (startServer's own test is packages/server's):
 //
 //   STARFOLD_BIN=target/release/starfold node test/integration.mjs   (or bun, or deno run -A)
 import assert from 'node:assert/strict';
@@ -12,9 +12,8 @@ import {
 	mkdtempSync,
 	readFileSync,
 	readdirSync,
-	writeFileSync,
 } from 'node:fs';
-import { networkInterfaces, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,7 +43,7 @@ if (
 	process.exit(0);
 }
 
-const { AuthError, Starfold, startServer } = await import(dist);
+const { Starfold } = await import(dist);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const marker = randomBytes(8).toString('hex');
 const baseEnv = {
@@ -249,139 +248,6 @@ await check('files and recording', () =>
 		assert.ok(short.length >= 1);
 		assert.equal(new TextDecoder().decode(short[0].subarray(4, 8)), 'ftyp');
 	})
-);
-
-const serverEnv = { DISPLAY: display, STARFOLD_TEST_RUN: marker };
-const serverArgs = ['--audio-enabled=false'];
-
-/** The server process under a LocalServer: the guard's child that runs STARFOLD_BIN. */
-function serverPid() {
-	for (const pid of ours()) {
-		try {
-			const argv = readFileSync(`/proc/${pid}/cmdline`).toString().split('\0');
-			if (argv[0] === process.env.STARFOLD_BIN) return { pid, argv };
-		} catch {
-			// gone
-		}
-	}
-	return null;
-}
-
-await check('startServer binds to loopback by default', async () => {
-	const s = await startServer({ env: serverEnv, args: serverArgs });
-	try {
-		const u = new URL(s.url);
-		assert.equal(u.hostname, '127.0.0.1');
-		assert.ok(await healthy(s.url));
-		const { argv } = serverPid();
-		assert.ok(argv.includes('--addr=127.0.0.1'), argv.join(' '));
-		const outside = Object.values(networkInterfaces())
-			.flat()
-			.find((i) => i && i.family === 'IPv4' && !i.internal);
-		if (outside) {
-			assert.equal(
-				await healthy(`http://${outside.address}:${u.port}`),
-				false,
-				`answers on ${outside.address}`
-			);
-			console.log(`  not reachable on ${outside.address}:${u.port}`);
-		}
-	} finally {
-		await s.close();
-	}
-});
-
-await check('startServer generates a password the client holds', async () => {
-	const s = await startServer({ env: serverEnv, args: serverArgs });
-	try {
-		assert.match(s.password, /^[0-9a-f]{32}$/);
-		const shot = await s.client().screenshot();
-		assert.deepEqual(shot.size, [1280, 800]);
-		await assert.rejects(
-			new Starfold(s.url, { password: '' }).screenshot(),
-			AuthError
-		);
-		await assert.rejects(
-			new Starfold(s.url, { password: 'wrong' }).screenshot(),
-			AuthError
-		);
-		const { argv } = serverPid();
-		assert.ok(
-			!argv.join(' ').includes(s.password),
-			'the password is on the command line'
-		);
-		const other = await startServer({ env: serverEnv, args: serverArgs });
-		assert.notEqual(other.password, s.password);
-		await other.close();
-	} finally {
-		await s.close();
-	}
-	await until('the server outlived close()', 5000, () => serverPid() === null);
-});
-
-await check(
-	'startServer leaves no orphan after the parent is killed',
-	async () => {
-		const script = join(work, 'parent.mjs');
-		writeFileSync(
-			script,
-			`const { startServer } = await import(${JSON.stringify(dist)});
-const s = await startServer({ env: ${JSON.stringify(serverEnv)}, args: ${JSON.stringify(serverArgs)} });
-console.log(s.url);
-setInterval(() => {}, 1000);
-`
-		);
-		const cmd =
-			runtime === 'deno'
-				? [process.execPath, 'run', '-A', script]
-				: [process.execPath, script];
-		const parent = spawn(cmd[0], cmd.slice(1), {
-			env: baseEnv,
-			stdio: ['ignore', 'pipe', 'inherit'],
-		});
-		const url = await new Promise((ok, fail) => {
-			parent.stdout.once('data', (d) => ok(String(d).trim()));
-			parent.once('exit', (c) => fail(new Error(`parent exited with ${c}`)));
-		});
-		assert.ok(await healthy(url));
-		const server = serverPid();
-		assert.ok(server, 'no server process');
-		parent.kill('SIGKILL');
-		await until(
-			'the server survived its parent',
-			10_000,
-			async () => !(await healthy(url)) && serverPid() === null
-		);
-		const others = () =>
-			ours().flatMap((p) => {
-				try {
-					const line = readFileSync(`/proc/${p}/cmdline`)
-						.toString()
-						.replaceAll('\0', ' ')
-						.trim();
-					const state = /^State:\s+(\S)/m.exec(
-						readFileSync(`/proc/${p}/status`, 'utf8')
-					)?.[1];
-					return /^(\S*\/)?Xvfb /.test(line) || state === 'Z'
-						? []
-						: [`${p} ${state} ${line}`];
-				} catch {
-					return [];
-				}
-			});
-		try {
-			await until(
-				'processes outlived the parent',
-				5000,
-				() => others().length === 0
-			);
-		} catch (e) {
-			throw new Error(`${e.message}: ${others().join('; ')}`, { cause: e });
-		}
-		console.log(
-			`  server ${server.pid} gone after SIGKILL of parent ${parent.pid}`
-		);
-	}
 );
 
 for (const p of procs.toReversed()) {

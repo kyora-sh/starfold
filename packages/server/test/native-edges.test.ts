@@ -10,7 +10,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import * as starfold from '../src/index.ts';
+import { StarfoldError } from 'starfold';
+import * as native from '../src/index.ts';
 
 const here = import.meta.dir;
 const posix = process.platform !== 'win32';
@@ -40,7 +41,7 @@ async function caught(p: Promise<unknown>): Promise<Error> {
 }
 
 describe.if(posix)('startServer', () => {
-	let server: starfold.LocalServer | null = null;
+	let server: native.LocalServer | null = null;
 	afterEach(async () => {
 		await server?.close();
 		server = null;
@@ -49,7 +50,7 @@ describe.if(posix)('startServer', () => {
 	test('an address that makes no URL is named, not --base-path', async () => {
 		const dir = scratch();
 		const e = await caught(
-			starfold.startServer({
+			native.startServer({
 				binary: fakeBinary(dir),
 				addr: 'not an addr',
 				port: 4567,
@@ -63,7 +64,7 @@ describe.if(posix)('startServer', () => {
 
 	test('close() after the server exited ends the guard stdin', async () => {
 		const dir = scratch();
-		server = await starfold.startServer({
+		server = await native.startServer({
 			binary: fakeBinary(dir),
 			env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_EXIT_AFTER: '200' },
 		});
@@ -90,7 +91,7 @@ describe.if(posix)('startServer', () => {
 			chmodSync(bin, 0o755);
 			for (let i = 0; i < 30; i++) {
 				// oxlint-disable-next-line no-await-in-loop
-				await caught(starfold.startServer({ binary: bin, timeoutMs: 3000 }));
+				await caught(native.startServer({ binary: bin, timeoutMs: 3000 }));
 			}
 			const ids = readFileSync(groups, 'utf8').trim().split('\n');
 			expect(ids.length).toBe(30);
@@ -110,7 +111,7 @@ describe.if(posix)('startServer', () => {
 	for (const args of [['--base-path=/desk/'], ['--base-path', '/desk']]) {
 		test(`waits for the server under ${args.join(' ')}`, async () => {
 			const dir = scratch();
-			server = await starfold.startServer({
+			server = await native.startServer({
 				binary: fakeBinary(dir),
 				args,
 				timeoutMs: 3000,
@@ -125,7 +126,7 @@ describe.if(posix)('startServer', () => {
 		const dir = scratch();
 		const started = Date.now();
 		const e = await caught(
-			starfold.startServer({
+			native.startServer({
 				binary: fakeBinary(dir),
 				timeoutMs: 1500,
 				env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_STALL: '1' },
@@ -139,14 +140,14 @@ describe.if(posix)('startServer', () => {
 		const dir = scratch();
 		const rec = join(dir, 'rec.json');
 		const e = await caught(
-			starfold.startServer({
+			native.startServer({
 				binary: fakeBinary(dir),
 				args: ['--base-path=desktop'],
 				timeoutMs: 3000,
 				env: { FAKE_RECORD: rec },
 			})
 		);
-		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		expect(e).toBeInstanceOf(StarfoldError);
 		expect(e.name).toBe('ServerStartError');
 		expect(e.message).toContain('--base-path');
 		if (existsSync(rec)) {
@@ -167,7 +168,7 @@ describe.if(posix)('startServer', () => {
 
 	test('an empty password counts as none: one is generated', async () => {
 		const dir = scratch();
-		server = await starfold.startServer({
+		server = await native.startServer({
 			binary: fakeBinary(dir),
 			password: '',
 			env: { FAKE_RECORD: join(dir, 'rec.json') },
@@ -181,7 +182,7 @@ describe.if(posix)('startServer', () => {
 		const saved = process.env.HTTP_PROXY;
 		process.env.HTTP_PROXY = 'http://127.0.0.1:9';
 		try {
-			server = await starfold.startServer({
+			server = await native.startServer({
 				binary: fakeBinary(dir),
 				timeoutMs: 3000,
 				env: { FAKE_RECORD: join(dir, 'rec.json') },
@@ -197,7 +198,7 @@ describe.if(posix)('startServer', () => {
 		const dir = scratch();
 		const taken = join(dir, 'taken');
 		writeFileSync(taken, '');
-		server = await starfold.startServer({
+		server = await native.startServer({
 			binary: fakeBinary(dir),
 			env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_TAKEN: taken },
 		});
@@ -209,13 +210,13 @@ describe.if(posix)('startServer', () => {
 		const taken = join(dir, 'taken');
 		writeFileSync(taken, '');
 		const e = await caught(
-			starfold.startServer({
+			native.startServer({
 				binary: fakeBinary(dir),
 				port: 1,
 				env: { FAKE_RECORD: join(dir, 'rec.json'), FAKE_TAKEN: taken },
 			})
 		);
-		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		expect(e).toBeInstanceOf(StarfoldError);
 		expect(e.name).toBe('ServerStartError');
 		expect(e.message).toContain('Address already in use');
 	});
@@ -223,12 +224,12 @@ describe.if(posix)('startServer', () => {
 	test('a server that exits early is a ServerStartError with its output', async () => {
 		const dir = scratch();
 		const e = await caught(
-			starfold.startServer({
+			native.startServer({
 				binary: fakeBinary(dir),
 				env: { FAKE_EXIT: '3', FAKE_RECORD: join(dir, 'r') },
 			})
 		);
-		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		expect(e).toBeInstanceOf(StarfoldError);
 		expect(e.name).toBe('ServerStartError');
 		expect((e as Error & { output?: string }).output).toContain(
 			'fake: cannot open display'
@@ -247,25 +248,25 @@ describe('the errors of the native surface are StarfoldErrors', () => {
 		process.env.STARFOLD_BIN = '/nonexistent/starfold';
 		let e: Error | null = null;
 		try {
-			starfold.binaryPath();
+			native.binaryPath();
 		} catch (x) {
 			e = x as Error;
 		}
-		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		expect(e).toBeInstanceOf(StarfoldError);
 		expect(e?.name).toBe('BinaryNotFoundError');
 	});
 
 	test('a directory is not a binary', () => {
 		const dir = scratch();
 		process.env.STARFOLD_BIN = dir;
-		expect(() => starfold.binaryPath()).toThrow(
+		expect(() => native.binaryPath()).toThrow(
 			`STARFOLD_BIN is ${dir}, which isn't a file`
 		);
 	});
 
 	test('missing libraries: MissingLibrariesError', () => {
-		const e = new starfold.MissingLibrariesError(['libyuv.so.0']);
-		expect(e).toBeInstanceOf(starfold.StarfoldError);
+		const e = new native.MissingLibrariesError(['libyuv.so.0']);
+		expect(e).toBeInstanceOf(StarfoldError);
 		expect(e.name).toBe('MissingLibrariesError');
 	});
 });
@@ -290,9 +291,9 @@ describe.if(linux)('the Linux library check', () => {
 		);
 		chmodSync(join(bin, 'ldd'), 0o755);
 		process.env.PATH = `${bin}:${savedPath}`;
-		const missing = starfold.missingLibraries('/some/starfold');
+		const missing = native.missingLibraries('/some/starfold');
 		expect(missing).toEqual(['libyuv.so.0', 'GLIBC_2.39']);
-		const e = new starfold.MissingLibrariesError(missing);
+		const e = new native.MissingLibrariesError(missing);
 		expect(e.message).toContain('GLIBC_2.39');
 		expect(e.message).toContain('Ubuntu 24.04');
 	});

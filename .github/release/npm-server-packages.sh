@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # npm-server-packages.sh <version> <artifacts dir> <out dir>
-# The npm packages that carry the server binary, and the SDK that depends on them, packed into
-# <out dir> under the names `npm pack` gives them:
+# The npm packages that carry the server binary, the server package that depends on them and the
+# client, packed into <out dir> under the names `npm pack` gives them:
 #
 #   @starfold/server-linux-x64-gnu, -linux-arm64-gnu, -darwin-arm64, -win32-x64
 #     from the default flavour's archives <artifacts dir>/starfold-<v>-<target>/starfold-<v>-<target>.<ext>
@@ -10,9 +10,13 @@
 #     and the archive's LICENSE, THIRD_PARTY.md and licenses/; it has no bin entry and no scripts.
 #     Its "license" is the SPDX expression of what the binary carries on that platform, the same
 #     one its platform wheel states (python-platform-wheel.py licence <target>).
-#   starfold
-#     packages/starfold, built (its dependencies installed: bun install --frozen-lockfile), with
-#     optionalDependencies pinning the four at <version>; its package.json must say <version>.
+#   starfold (starfold-<version>.tgz)
+#     packages/starfold, the client, built (the workspace installed: bun install --frozen-lockfile);
+#     no dependencies, no bin, no optionalDependencies.
+#   @starfold/server (starfold-server-<version>.tgz, which starfold-server-*-<version>.tgz doesn't match)
+#     packages/server, built, with optionalDependencies pinning the four at <version>, the
+#     dependency starfold at exactly <version> and the bin starfold.
+# Both package.json files must say <version>.
 #
 # Every tarball gets a .sha256 beside it, and every binary is read back out of its packed tarball
 # and compared with the archive's.
@@ -24,11 +28,12 @@ out=$(cd "$3" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 fail() {
-	echo "::error::npm-server-packages.sh: $*"
+	echo "::error::npm-server-packages.sh: $*" >&2
 	exit 1
 }
 
 python3 -I "$here/versions.py" check package-json-file "$root/packages/starfold/package.json" "$version"
+python3 -I "$here/versions.py" check package-json-file "$root/packages/server/package.json" "$version"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -77,7 +82,7 @@ dir, name, version, os_, cpu, libc, license, target = sys.argv[1:]
 manifest = {
     "name": name,
     "version": version,
-    "description": f"The starfold server binary for {target}, used by the starfold package",
+    "description": f"The starfold server binary for {target}, used by the @starfold/server package",
     "license": license,
     "repository": {"type": "git", "url": "git+https://github.com/kyora-sh/starfold.git"},
     "os": [os_],
@@ -92,7 +97,7 @@ with open(f"{dir}/package.json", "w", encoding="utf-8") as f:
 with open(f"{dir}/README.md", "w", encoding="utf-8") as f:
     f.write(
         f"# {name}\n\nThe starfold server binary for {target} (`bin/`), installed by the\n"
-        "[starfold](https://www.npmjs.com/package/starfold) package as an optional dependency.\n"
+        "[@starfold/server](https://www.npmjs.com/package/@starfold/server) package as an optional dependency.\n"
         "THIRD_PARTY.md and licenses/ say what the binary carries.\n"
     )
 EOF
@@ -116,40 +121,89 @@ EOF
 done 3< <("$here/expected-files.sh" native "$version")
 [ ${#optional[@]} = 4 ] || fail "expected-files.sh native named ${#optional[@]} packages, not 4"
 
-# The SDK, built and staged with what its package.json "files" names, plus the pins.
-sdk=$root/packages/starfold
-cmp "$sdk/LICENSE" "$root/LICENSE" || fail "packages/starfold/LICENSE isn't the repository's LICENSE"
-[ -x "$sdk/node_modules/.bin/tsc" ] || [ -x "$root/node_modules/.bin/tsc" ] || fail "no tsc: run bun install --frozen-lockfile first"
-(cd "$sdk" && bun run build)
-stage=$work/sdk
-mkdir -p "$stage"
-cp -R "$sdk/package.json" "$sdk/README.md" "$sdk/LICENSE" "$sdk/dist" "$sdk/bin" "$stage/"
-python3 -I - "$stage/package.json" "$version" "${optional[@]}" <<'EOF'
+# stage <package dir> <what to copy...>: the built package staged with what its package.json "files"
+# names, without devDependencies; optionalDependencies, if given after --, pinned at <version>.
+stage() {
+	local src=$1 dir
+	shift
+	dir=$work/stage/$(basename "$src")
+	mkdir -p "$dir"
+	cmp "$src/LICENSE" "$root/LICENSE" || fail "${src#"$root/"}/LICENSE isn't the repository's LICENSE"
+	while [ $# -gt 0 ] && [ "$1" != -- ]; do
+		cp -R "$src/$1" "$dir/"
+		shift
+	done
+	[ $# -gt 0 ] && shift
+	python3 -I - "$dir/package.json" "$version" "$@" <<'EOF'
 import json, sys
 path, version, *packages = sys.argv[1:]
 with open(path, encoding="utf-8") as f:
     manifest = json.load(f)
 if "optionalDependencies" in manifest:
     sys.exit(f"{path} lists optionalDependencies already; the pack step writes them")
-manifest["optionalDependencies"] = {p: version for p in packages}
+if packages:
+    manifest["optionalDependencies"] = {p: version for p in packages}
 manifest.pop("devDependencies", None)
 with open(path, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2)
     f.write("\n")
 EOF
-tgz=$(pack "$stage" "starfold-$version.tgz")
-python3 -I "$here/versions.py" check package-json "$tgz" "$version"
-tar -xOzf "$tgz" package/package.json | python3 -I -c '
+	echo "$dir"
+}
+
+# manifest <tgz> <version> <bin JSON> <dependencies JSON> <optional package...>: the packed
+# package.json has exactly that bin, those dependencies and the optional packages at <version>
+# (null for none of each).
+manifest() {
+	tar -xOzf "$1" package/package.json | python3 -I -c '
 import json, sys
 m = json.load(sys.stdin)
-version, packages = sys.argv[1], sys.argv[2:]
-want = {p: version for p in packages}
-got = m.get("optionalDependencies")
-if got != want:
-    sys.exit(f"optionalDependencies are {got}, expected {want}")
-' "$version" "${optional[@]}"
-listing=$(tar -tzf "$tgz")
-for f in package/dist/index.js package/dist/index.d.ts package/dist/native.js package/bin/starfold.js package/LICENSE package/README.md; do
-	grep -q -x -F "$f" <<<"$listing" || fail "$tgz lacks $f"
+tgz, version, bin, deps, packages = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), json.loads(sys.argv[4]), sys.argv[5:]
+optional = {p: version for p in packages} or None
+for key, want in (("bin", bin), ("dependencies", deps), ("optionalDependencies", optional)):
+    if m.get(key) != want:
+        sys.exit(f"{tgz}: {key} is {m.get(key)}, expected {want}")
+for key in ("devDependencies", "peerDependencies", "bundleDependencies", "bundledDependencies"):
+    if key in m:
+        sys.exit(f"{tgz}: has {key}")
+' "$1" "$2" "$3" "$4" "${@:5}" || fail "$1: package.json isn't as expected"
+}
+
+# lists <tgz> <must> -- <must not>: files the tarball has, and has not.
+lists() {
+	local tgz=$1 listing f
+	shift
+	listing=$(tar -tzf "$tgz")
+	while [ $# -gt 0 ] && [ "$1" != -- ]; do
+		grep -q -x -F "package/$1" <<<"$listing" || fail "$tgz lacks $1"
+		shift
+	done
+	[ $# -gt 0 ] && shift
+	for f in "$@"; do
+		! grep -q -x -F "package/$f" <<<"$listing" || fail "$tgz has $f"
+	done
+}
+
+client=$root/packages/starfold
+server=$root/packages/server
+for p in "$client" "$server"; do
+	[ -x "$p/node_modules/.bin/tsc" ] || [ -x "$root/node_modules/.bin/tsc" ] || fail "no tsc for ${p#"$root/"}: run bun install --frozen-lockfile first"
 done
+(cd "$server" && bun run build)
+
+# The client: no dependencies, no command, no server package.
+dir=$(stage "$client" package.json README.md LICENSE dist)
+tgz=$(pack "$dir" "starfold-$version.tgz")
+python3 -I "$here/versions.py" check package-json "$tgz" "$version"
+manifest "$tgz" "$version" null null
+lists "$tgz" dist/index.js dist/index.d.ts LICENSE README.md -- dist/native.js bin/starfold.js
+echo "$(basename "$tgz") $(stat -c %s "$tgz") bytes"
+
+# The server: the command, the client at exactly this version and the four platform packages.
+dir=$(stage "$server" package.json README.md LICENSE dist bin -- "${optional[@]}")
+tgz=$(pack "$dir" "starfold-server-$version.tgz")
+case $(basename "$tgz") in "starfold-server-"*"-$version.tgz") fail "$tgz would be taken for a platform package" ;; esac
+python3 -I "$here/versions.py" check package-json "$tgz" "$version"
+manifest "$tgz" "$version" '{"starfold": "bin/starfold.js"}' "{\"starfold\": \"$version\"}" "${optional[@]}"
+lists "$tgz" dist/index.js dist/index.d.ts dist/native.js bin/starfold.js LICENSE README.md -- dist/client.js
 echo "$(basename "$tgz") $(stat -c %s "$tgz") bytes"

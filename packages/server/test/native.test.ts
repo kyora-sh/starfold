@@ -10,8 +10,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { AuthError, Starfold } from 'starfold';
 import {
-	AuthError,
 	LINUX_LIBRARIES_HINT,
 	MissingLibrariesError,
 	binaryPath,
@@ -172,7 +172,6 @@ describe.if(posix)('startServer', () => {
 		expect(await server.client().key('a')).toEqual({ seq: 1, events: 1 });
 		const stranger = server.client();
 		expect(stranger.url).toBe(server.url);
-		const { Starfold } = await import('../src/index.ts');
 		expect(
 			new Starfold(server.url, { password: 'wrong' }).key('a')
 		).rejects.toBeInstanceOf(AuthError);
