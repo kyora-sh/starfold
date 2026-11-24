@@ -10,7 +10,9 @@
 # A re-run (the tag's release exists already, say after an upload failed) creates nothing: each
 # expected file the release has is downloaded and compared with <dist dir>'s by sha256, a mismatch
 # fails, the missing ones are uploaded, and a release asset that isn't expected fails too. Either
-# way the release ends with exactly the expected asset names, which is read back and checked.
+# way the release ends with exactly the expected asset names, which is read back and checked, and
+# a draft (what an interrupted `gh release create` leaves) is then published. More than one
+# release or draft for the tag fails before anything changes.
 set -euo pipefail
 tag=${1:?usage: publish.sh <tag> <commit> <notes file> <dist dir> <flavour...>}
 commit=$2 notes=$3 dist=$4
@@ -19,7 +21,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 gh=${GH:-gh}
 v=${tag#v}
 fail() {
-	echo "::error::$*"
+	echo "::error::$*" >&2
 	exit 1
 }
 files=()
@@ -36,11 +38,27 @@ tag_check() {
 	now=$("$here/tag-commit.sh" "$tag")
 	[ "$now" = "$commit" ] || fail "$1 ($tag names $now on the remote, not $commit, the commit built)"
 }
-assets() { "$gh" release view "$tag" --json assets --jq '.assets[].name' | sort; }
+# The releases of the tag, drafts included ("<id> <draft>" each), from the REST list: `gh release
+# view <tag>` finds at most one, and a draft only through its pending tag name.
+releases() {
+	"$gh" api --paginate "repos/{owner}/{repo}/releases" --jq ".[] | select(.tag_name == \"$tag\") | \"\(.id) \(.draft)\""
+}
+# one: the single release of the tag, as "<id> <draft>"; none prints nothing; more than one fails.
+one() {
+	local found
+	found=$(releases) || fail "the releases of the repository couldn't be listed"
+	[ "$(grep -c . <<<"$found")" -le 1 ] ||
+		fail "$tag has $(grep -c . <<<"$found") releases or drafts ($(tr '\n' ' ' <<<"$found")); a maintainer has to keep one"
+	echo "$found"
+}
+assets() { "$gh" api "repos/{owner}/{repo}/releases/$id" --jq '.assets[].name' | sort; }
 sum() { sha256sum "$1" | cut -d' ' -f1; }
 
 tag_check "no release was created or changed"
-if "$gh" release view "$tag" --json tagName >/dev/null 2>&1; then
+found=$(one)
+if [ -n "$found" ]; then
+	read -r id draft <<<"$found"
+	echo "the release of $tag exists (id $id, draft $draft)"
 	have=$(assets)
 	extra=$(comm -13 <(cat <<<"$names") <(cat <<<"$have") | sed '/^$/d')
 	[ -z "$extra" ] || fail "the release of $tag has assets that aren't expected: $(tr '\n' ' ' <<<"$extra")"
@@ -70,10 +88,20 @@ else
 		args+=(--notes-start-tag "$prev")
 	fi
 	"$gh" release create "$tag" "${args[@]}" "${files[@]}"
+	found=$(one)
+	[ -n "$found" ] || fail "gh release create made no release of $tag"
+	read -r id draft <<<"$found"
 fi
 [ "$(assets)" = "$names" ] || {
 	diff <(cat <<<"$names") <(assets) || true
 	fail "the release of $tag doesn't hold exactly the expected assets (- expected, + released)"
 }
+# gh release create makes a draft, uploads and then publishes it: one it couldn't finish is a
+# draft, published here once it holds exactly the build's files.
+if [ "$draft" = true ]; then
+	"$gh" release edit "$tag" --draft=false
+	[ "$("$gh" api "repos/{owner}/{repo}/releases/$id" --jq '.draft')" = false ] || fail "the release of $tag is still a draft"
+	echo "published the draft release of $tag"
+fi
 tag_check "$tag moved while its release was made from $commit; the release holds $commit's files under a tag that names another commit, and needs a maintainer"
 echo "released $tag at $commit with ${#files[@]} files"

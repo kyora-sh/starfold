@@ -2,9 +2,10 @@
 # Usage: publish-test.sh
 #
 # Runs publish.sh against a scratch remote and a stand-in gh that keeps releases in a directory,
-# and checks the fresh release, a re-run after a failed upload, a re-run of a complete release,
-# and the cases that must fail: a released file that differs from the build, an asset that isn't
-# expected, and a tag that moved.
+# and checks the fresh release, a re-run after a failed upload (which leaves a draft), a re-run of
+# a complete release or a complete draft, and the cases that must fail: a released file that
+# differs from the build, an asset that isn't expected, two releases or drafts for the tag, and a
+# tag that moved.
 # The checks are strings eval runs, so shellcheck sees neither their expansions nor their uses.
 # shellcheck disable=SC2016,SC2034
 set -euo pipefail
@@ -24,47 +25,83 @@ check() {
 	fi
 }
 
-# The stand-in gh: $GH_STATE/<tag>/ is a release, its files the assets. FAIL_UPLOAD_AFTER=n makes
-# `release create` stop with an error after n assets, as a failed upload leaves a release.
+# The stand-in gh. A release is $GH_STATE/<id>/ with its tag, whether it is a draft, and its
+# assets. As the real one, `release create` makes a draft, uploads and then publishes it;
+# FAIL_UPLOAD_AFTER=n stops it with an error after n assets, leaving the draft. The commands that
+# take a tag act on the first release of that tag, as gh's lookup does.
 mkdir -p "$root/bin"
 cat >"$root/bin/gh" <<'GH'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "$1" = release ] || { echo "fake gh: $*" >&2; exit 2; }
-cmd=$2 tag=$3
-shift 3
-rel=$GH_STATE/$tag
-case $cmd in
-view)
-	[ -d "$rel" ] || { echo "release not found" >&2; exit 1; }
-	case "$*" in *assets*) ls -1 "$rel" ;; esac
+by_tag() {
+	local d
+	for d in "$GH_STATE"/*/; do
+		[ -f "$d/tag" ] && [ "$(cat "$d/tag")" = "$1" ] && { echo "${d%/}"; return; }
+	done
+	echo "release not found" >&2
+	exit 1
+}
+case "$1 $2" in
+"api --paginate")
+	tag=$(sed 's/.*tag_name == "\([^"]*\)".*/\1/' <<<"$5")
+	for d in "$GH_STATE"/*/; do
+		[ -f "$d/tag" ] && [ "$(cat "$d/tag")" = "$tag" ] && echo "$(basename "$d") $(cat "$d/draft")"
+	done
+	true
 	;;
-create)
-	mkdir "$rel"
-	n=0
+"api repos/{owner}/{repo}/releases/"*)
+	d=$GH_STATE/${2##*/}
+	case $4 in
+	'.assets[].name') ls -1 "$d/assets" ;;
+	'.draft') cat "$d/draft" ;;
+	*) exit 2 ;;
+	esac
+	;;
+"release create")
+	n=$(($(cat "$GH_STATE/next" 2>/dev/null || echo 0) + 1))
+	echo "$n" >"$GH_STATE/next"
+	d=$GH_STATE/$n
+	mkdir -p "$d/assets"
+	echo "$3" >"$d/tag"
+	echo true >"$d/draft"
+	shift 3
+	k=0
 	for a in "$@"; do
 		if [ -f "$a" ] && [ "${a#"$GH_DIST"/}" != "$a" ]; then
-			if [ -n "${FAIL_UPLOAD_AFTER:-}" ] && [ "$n" -ge "$FAIL_UPLOAD_AFTER" ]; then
+			if [ -n "${FAIL_UPLOAD_AFTER:-}" ] && [ "$k" -ge "$FAIL_UPLOAD_AFTER" ]; then
 				echo "upload failed" >&2
 				exit 1
 			fi
-			cp "$a" "$rel/"
-			n=$((n + 1))
+			cp "$a" "$d/assets/"
+			k=$((k + 1))
 		fi
 	done
+	echo false >"$d/draft"
 	;;
-upload)
+"release upload")
+	d=$(by_tag "$3")
+	shift 3
 	for a in "$@"; do
-		[ ! -e "$rel/$(basename "$a")" ] || { echo "asset exists: $a" >&2; exit 1; }
-		cp "$a" "$rel/"
+		[ ! -e "$d/assets/$(basename "$a")" ] || { echo "asset exists: $a" >&2; exit 1; }
+		cp "$a" "$d/assets/"
 	done
 	echo "uploaded $#" >>"$GH_STATE/uploads.log"
 	;;
-download)
-	[ "$1" = --pattern ] && [ "$3" = --dir ] || exit 2
-	cp "$rel/$2" "$4/"
+"release download")
+	d=$(by_tag "$3")
+	[ "$4" = --pattern ] && [ "$6" = --dir ] || exit 2
+	cp "$d/assets/$5" "$7/"
 	;;
-*) exit 2 ;;
+"release edit")
+	d=$(by_tag "$3")
+	[ "$4" = --draft=false ] || exit 2
+	echo false >"$d/draft"
+	echo "published" >>"$GH_STATE/edits.log"
+	;;
+*)
+	echo "fake gh: $*" >&2
+	exit 2
+	;;
 esac
 GH
 chmod +x "$root/bin/gh"
@@ -94,33 +131,51 @@ fresh() {
 	rm -rf "$GH_STATE"
 	mkdir -p "$GH_STATE"
 }
-released() { find "$GH_STATE/v0.0.1" -type f | wc -l | tr -d ' '; }
+rel() { find "$GH_STATE" -mindepth 1 -maxdepth 1 -type d | sort | head -1; }
+released() { find "$(rel)/assets" -type f | wc -l | tr -d ' '; }
+draft() { cat "$(rel)/draft"; }
+releases() { find "$GH_STATE" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' '; }
 
 fresh a
-check "a fresh release holds every expected file" 'run && [ "$(released)" = "$count" ]'
-check "a complete release re-runs without uploading" 'run && [ ! -e "$GH_STATE/uploads.log" ] && grep -q "0 missing" "$root/out"'
+check "a fresh release holds every expected file, published" 'run && [ "$(released)" = "$count" ] && [ "$(draft)" = false ]'
+check "a complete release re-runs without uploading or publishing" 'run && [ ! -e "$GH_STATE/uploads.log" ] && [ ! -e "$GH_STATE/edits.log" ] && grep -q "0 missing" "$root/out" && [ "$(releases)" = 1 ]'
 
 fresh b
-check "an upload that fails leaves a partial release and fails" '! FAIL_UPLOAD_AFTER=5 run && [ "$(released)" = 5 ]'
-check "the re-run uploads only what is missing" 'run && [ "$(released)" = "$count" ] && grep -q "uploaded $((count - 5))" "$GH_STATE/uploads.log"'
+check "an upload that fails leaves a draft with some assets and fails" '! FAIL_UPLOAD_AFTER=5 run && [ "$(released)" = 5 ] && [ "$(draft)" = true ]'
+check "the re-run uploads only what is missing and publishes the draft" 'run && [ "$(released)" = "$count" ] && grep -q "uploaded $((count - 5))" "$GH_STATE/uploads.log" && [ "$(draft)" = false ] && [ "$(releases)" = 1 ]'
 
 fresh c
 FAIL_UPLOAD_AFTER=5 run || true
-first=$(find "$GH_STATE/v0.0.1" -type f | sort | head -1)
-echo tampered >"$first"
-check "a released file that differs from the build fails the re-run" '! run && grep -q "isn.t the one built" "$root/out"'
-check "and nothing more is uploaded" '[ ! -e "$GH_STATE/uploads.log" ] && [ "$(released)" = 5 ]'
+cp "$dist"/*/* "$(rel)/assets/"
+check "a complete draft is published without uploading" 'run && [ ! -e "$GH_STATE/uploads.log" ] && [ "$(draft)" = false ] && grep -q published "$GH_STATE/edits.log"'
 
 fresh d
 FAIL_UPLOAD_AFTER=5 run || true
-echo stray >"$GH_STATE/v0.0.1/stray.bin"
-check "an asset that isn't expected fails the re-run" '! run && grep -q "stray.bin" "$root/out"'
+first=$(find "$(rel)/assets" -type f | sort | head -1)
+echo tampered >"$first"
+check "a released file that differs from the build fails the re-run" '! run && grep -q "isn.t the one built" "$root/out"'
+check "and nothing is uploaded or published" '[ ! -e "$GH_STATE/uploads.log" ] && [ "$(released)" = 5 ] && [ "$(draft)" = true ]'
 
 fresh e
+FAIL_UPLOAD_AFTER=5 run || true
+echo stray >"$(rel)/assets/stray.bin"
+check "an asset that isn't expected fails the re-run" '! run && grep -q "stray.bin" "$root/out" && [ "$(draft)" = true ]'
+
+fresh f
+FAIL_UPLOAD_AFTER=3 run || true
+FAIL_UPLOAD_AFTER=5 GH_STATE=$GH_STATE "$GH" release create v0.0.1 "$dist"/*/* 2>/dev/null || true
+check "two drafts for the tag fail, and nothing changes" '! run && grep -q "2 releases or drafts" "$root/out" && [ ! -e "$GH_STATE/uploads.log" ] && [ ! -e "$GH_STATE/edits.log" ]'
+
+fresh g
+run
+FAIL_UPLOAD_AFTER=1 GH_STATE=$GH_STATE "$GH" release create v0.0.1 "$dist"/*/* 2>/dev/null || true
+check "a release and a draft for the tag fail" '! run && grep -q "2 releases or drafts" "$root/out"'
+
+fresh h
 git commit -q --allow-empty -m two
 git tag -f v0.0.1 >/dev/null
 git push -q -f origin v0.0.1
-check "a tag that names another commit creates nothing" '! run && [ ! -e "$GH_STATE/v0.0.1" ] && grep -q "no release was created or changed" "$root/out"'
+check "a tag that names another commit creates nothing" '! run && [ "$(releases)" = 0 ] && grep -q "no release was created or changed" "$root/out"'
 
 [ "$failures" = 0 ] || {
 	echo "$failures failed"
