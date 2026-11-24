@@ -36,6 +36,17 @@ class MissingLibrariesError(StarfoldError):
     """The server binary's shared libraries don't all resolve on this Linux system."""
 
 
+class ServerStartError(StarfoldError):
+    """start_server() failed: the server exited, didn't answer in time, or its port was taken.
+
+    `output` holds the server's last lines of output.
+    """
+
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        self.output = output
+
+
 def _platform() -> str:
     return f"{platform.system() or sys.platform} {platform.machine() or 'unknown'}"
 
@@ -92,7 +103,7 @@ def check_libraries(path: str) -> None:
     if ldd is None:
         return
     try:
-        r = subprocess.run([ldd, path], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([ldd, "--", path], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return
     missing = _ldd_missing(r.stdout + "\n" + r.stderr)
@@ -113,20 +124,20 @@ def main() -> None:
     os.execv(path, [path, *sys.argv[1:]])
 
 
-_WATCHDOG = """
-import os, signal, sys, time
-pid = int(sys.argv[1])
-while sys.stdin.buffer.read(65536):
-    pass
-try:
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(100):
-        time.sleep(0.1)
-        os.kill(pid, 0)
-    os.kill(pid, signal.SIGKILL)
-except ProcessLookupError:
-    pass
+GUARD = """exec 3<&0 0</dev/null
+"$0" "$@" 3<&- &
+p=$!
+{ while read -r _ <&3; do :; done; kill "$p" 2>/dev/null; } &
+w=$!
+exec 3<&-
+wait "$p"
+rc=$?
+kill "$w" 2>/dev/null
+exit "$rc"
 """
+"""Runs the server with the guard's stdin, a pipe from this process, held by a watcher: when that
+pipe closes (this process ended, however it ended, or close() closed it) the watcher stops the
+server. The TypeScript SDK starts its server through the same script."""
 
 _live: weakref.WeakSet[LocalServer] = weakref.WeakSet()
 _jobs: list[int] = []
@@ -136,20 +147,6 @@ _jobs: list[int] = []
 def _close_all() -> None:
     for s in list(_live):
         s.close()
-
-
-def _pdeathsig(parent: int):
-    """A preexec_fn asking for SIGTERM when the parent dies, with prctl looked up before the fork."""
-    import ctypes
-
-    prctl = ctypes.CDLL(None, use_errno=True).prctl
-
-    def preexec() -> None:
-        prctl(1, signal.SIGTERM, 0, 0, 0)
-        if os.getppid() != parent:
-            os._exit(1)
-
-    return preexec
 
 
 def _free_port(addr: str) -> int:
@@ -165,12 +162,15 @@ def _url(addr: str, port: int) -> str:
 
 
 def _base_path(args: Sequence[str]) -> str:
-    """The --base-path among the server flags, if any, without a trailing slash."""
+    """The --base-path (or --base_path) among the server flags, if any, without a trailing slash."""
     found = ""
     for i, a in enumerate(args):
-        if a.startswith("--base-path="):
-            found = a.split("=", 1)[1]
-        elif a == "--base-path" and i + 1 < len(args):
+        name, eq, value = a.partition("=")
+        if name not in ("--base-path", "--base_path"):
+            continue
+        if eq:
+            found = value
+        elif i + 1 < len(args) and not args[i + 1].startswith("--"):
             found = args[i + 1]
     return found.rstrip("/")
 
@@ -179,22 +179,16 @@ class LocalServer:
     """A starfold server this process started: `url`, `password`, `process`, `client()`, `close()`.
 
     The server stops on `close()`, when the `with` block ends, at interpreter exit, and when this
-    process dies (on Linux through PR_SET_PDEATHSIG, elsewhere through a watchdog).
+    process ends however it ends: on Linux and macOS `process` is a small sh guard whose child is
+    the server and which stops it when this process's pipe to it closes; on Windows the server is
+    in a job object that ends with this process.
     """
 
-    def __init__(
-        self,
-        process: subprocess.Popen[bytes],
-        url: str,
-        password: str,
-        output: _Output,
-        watchdog: subprocess.Popen[bytes] | None,
-    ) -> None:
+    def __init__(self, process: subprocess.Popen[bytes], url: str, password: str, output: _Output) -> None:
         self.process = process
         self.url = url
         self.password = password
         self._output = output
-        self._watchdog = watchdog
         self._client: Starfold | None = None
         _live.add(self)
 
@@ -204,8 +198,10 @@ class LocalServer:
         return self._output.tail()
 
     def client(self, timeout: float = 30.0) -> Starfold:
-        """A Starfold client signed in to this server, closed with it."""
-        if self._client is None:
+        """A Starfold client signed in to this server, closed with it (a new one if `timeout` changed)."""
+        if self._client is None or self._client.timeout != timeout:
+            if self._client is not None:
+                self._client.close()
             self._client = Starfold(self.url, password=self.password, timeout=timeout)
         return self._client
 
@@ -214,22 +210,27 @@ class LocalServer:
         return AsyncStarfold(self.url, password=self.password, timeout=timeout)
 
     def close(self, timeout: float = 10.0) -> None:
-        """Stops the server: SIGTERM (on Windows, terminate), then SIGKILL after `timeout` seconds."""
+        """Stops the server: SIGTERM (on Windows, terminate), then SIGKILL after `timeout` seconds.
+
+        On Linux and macOS the guard sends the SIGTERM and reaps the server itself, so no signal
+        goes to a pid this process has already reaped.
+        """
         if self._client is not None:
             self._client.close()
             self._client = None
         p = self.process
-        if p.poll() is None:
+        if p.stdin is not None and not p.stdin.closed:
+            p.stdin.close()
+        elif p.poll() is None:
             p.terminate()
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if sys.platform == "win32":
                 p.kill()
-                p.wait()
-        if self._watchdog is not None:
-            self._watchdog.stdin.close()  # type: ignore[union-attr]
-            self._watchdog.wait()
-            self._watchdog = None
+            else:
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
         _live.discard(self)
 
     def __enter__(self) -> LocalServer:
@@ -258,35 +259,30 @@ class _Output:
 
 
 def _spawn(
-    path: str, args: list[str], env: dict[str, str], cwd: str | Path | None, watchdog: bool
-) -> tuple[subprocess.Popen[bytes], _Output, subprocess.Popen[bytes] | None]:
-    kw: dict = {}
+    path: str, args: list[str], env: dict[str, str], cwd: str | Path | None
+) -> tuple[subprocess.Popen[bytes], _Output]:
     if sys.platform == "win32":
-        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    elif sys.platform.startswith("linux") and not watchdog:
-        kw["preexec_fn"] = _pdeathsig(os.getpid())
-    p = subprocess.Popen(
-        [path, *args],
-        env=env,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        **kw,
-    )
-    out = _Output(p.stdout)
-    dog = None
-    if sys.platform == "win32":
+        p = subprocess.Popen(
+            [path, *args],
+            env=env,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
         _kill_on_close(p)
-    elif watchdog:
-        dog = subprocess.Popen(
-            [sys.executable, "-I", "-c", _WATCHDOG, str(p.pid)],
+    else:
+        p = subprocess.Popen(
+            ["/bin/sh", "-c", GUARD, path, *args],
+            env=env,
+            cwd=cwd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    return p, out, dog
+    return p, _Output(p.stdout)
 
 
 def _kill_on_close(p: subprocess.Popen[bytes]) -> None:
@@ -349,37 +345,37 @@ def start_server(
     cwd: str | Path | None = None,
     timeout: float = 30.0,
     binary: str | None = None,
-    _watchdog: bool | None = None,
 ) -> LocalServer:
     """Starts a starfold server on this machine and waits until it answers.
 
     It listens on `addr` (loopback unless you pass another address) and `port` (a free one by
-    default), with `password` (generated by default; the client from `client()` holds it). `args`
-    are further server flags (`starfold --help`), `env` replaces the environment it inherits.
-    On Linux it needs a display (DISPLAY, e.g. from Xvfb); it doesn't start one. Raises
-    StarfoldError with the server's last output if it exits or doesn't answer within `timeout`
-    seconds.
+    default), with `password` (generated by default, also when empty; the client from `client()`
+    holds it). `args` are further server flags (`starfold --help`); `env` is merged onto this
+    process's environment for the server; `binary` defaults to `binary_path()`. On Linux it needs
+    a display (DISPLAY, e.g. from Xvfb); it doesn't start one. Raises ServerStartError, with the
+    server's last output in `output`, if it exits, doesn't answer within `timeout` seconds or
+    can't have its port.
     """
     path = binary or binary_path()
     check_libraries(path)
     password = password or secrets.token_urlsafe(24)
-    child_env = dict(os.environ if env is None else env)
+    child_env = {**os.environ, **(env or {})}
     child_env["STARFOLD_PASSWORD"] = password
     child_env.pop("SELKIES_BASIC_AUTH_PASSWORD", None)
-    watchdog = _watchdog if _watchdog is not None else not sys.platform.startswith("linux")
     deadline = time.monotonic() + timeout
     for attempt in range(3):
         chosen = port if port is not None else _free_port(addr)
         flags = [f"--addr={addr}", f"--port={chosen}", *args]
-        p, out, dog = _spawn(path, flags, child_env, cwd, watchdog)
-        server = LocalServer(p, _url(addr, chosen) + _base_path(args), password, out, dog)
+        p, out = _spawn(path, flags, child_env, cwd)
+        server = LocalServer(p, _url(addr, chosen) + _base_path(args), password, out)
         try:
             _wait_ready(server, deadline)
             return server
         except _PortTaken:
             server.close()
             if port is not None or attempt == 2:
-                raise StarfoldError(f"port {chosen} is taken:\n{server.stderr_tail}") from None
+                tail = server.stderr_tail
+                raise ServerStartError(f"port {chosen} is taken:\n{tail}", tail) from None
         except BaseException:
             server.close()
             raise
@@ -397,12 +393,13 @@ def _wait_ready(server: LocalServer, deadline: float) -> None:
                 tail = server._output.tail(wait=2.0)
                 if "Address already in use" in tail or "address in use" in tail.lower():
                     raise _PortTaken()
-                raise StarfoldError(f"the starfold server exited with {server.process.returncode}:\n{tail}")
+                raise ServerStartError(f"the starfold server exited with {server.process.returncode}:\n{tail}", tail)
             try:
                 if http.get(f"{server.url}/healthz").status_code == 200:
                     return
             except httpx.TransportError:
                 pass
             if time.monotonic() > deadline:
-                raise StarfoldError(f"the starfold server didn't answer at {server.url} in time:\n{server.stderr_tail}")
+                tail = server.stderr_tail
+                raise ServerStartError(f"the starfold server didn't answer at {server.url} in time:\n{tail}", tail)
             time.sleep(0.1)

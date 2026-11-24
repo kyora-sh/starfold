@@ -112,7 +112,7 @@ def test_library_check_passes_and_is_linux_only(monkeypatch):
     assert calls == []
     monkeypatch.setattr(_native.sys, "platform", "linux")
     starfold.check_libraries("/x/starfold")
-    assert calls == [(["/usr/bin/ldd", "/x/starfold"],)]
+    assert calls == [(["/usr/bin/ldd", "--", "/x/starfold"],)]
 
 
 def test_console_script_is_declared():
@@ -153,8 +153,11 @@ def test_start_server_reports_an_early_exit_with_the_output(tmp_path):
     fake = tmp_path / "starfold"
     fake.write_text('#!/bin/sh\necho "bad flag: $*" >&2\nexit 2\n')
     fake.chmod(0o755)
-    with pytest.raises(StarfoldError, match=r"exited with 2:\nbad flag: --addr=127\.0\.0\.1 --port=\d+ --x"):
-        starfold.start_server(binary=str(fake), args=["--x"], timeout=10, env={"PATH": os.environ["PATH"]})
+    exited = r"exited with 2:\nbad flag: --addr=127\.0\.0\.1 --port=\d+ --x"
+    with pytest.raises(starfold.ServerStartError, match=exited) as e:
+        starfold.start_server(binary=str(fake), args=["--x"], timeout=10)
+    assert e.value.output.startswith("bad flag: --addr=127.0.0.1 --port=")
+    assert isinstance(e.value, StarfoldError)
 
 
 @posix_only
@@ -162,14 +165,28 @@ def test_start_server_times_out_with_the_output(tmp_path):
     fake = tmp_path / "starfold"
     fake.write_text('#!/bin/sh\necho "still starting"\nexec sleep 30\n')
     fake.chmod(0o755)
-    with pytest.raises(StarfoldError, match="didn't answer at http://127.0.0.1:\\d+ in time:\nstill starting"):
-        starfold.start_server(binary=str(fake), timeout=1, env={"PATH": os.environ["PATH"]})
+    late = "didn't answer at http://127.0.0.1:\\d+ in time:\nstill starting"
+    with pytest.raises(starfold.ServerStartError, match=late):
+        starfold.start_server(binary=str(fake), timeout=1)
+
+
+@posix_only
+def test_env_is_merged_onto_the_environment(tmp_path):
+    seen = tmp_path / "seen"
+    fake = tmp_path / "starfold"
+    fake.write_text(f'#!/bin/sh\nprintf "%s|%s" "$PATH" "$X" > {seen}\nexit 3\n')
+    fake.chmod(0o755)
+    with pytest.raises(StarfoldError):
+        starfold.start_server(binary=str(fake), env={"X": "1"}, timeout=10)
+    assert seen.read_text() == f"{os.environ['PATH']}|1", "env={'X': '1'} dropped the rest of the environment"
 
 
 def test_base_path_from_the_server_flags():
     assert _native._base_path([]) == ""
     assert _native._base_path(["--base-path=/desktop/"]) == "/desktop"
     assert _native._base_path(["--title", "x", "--base-path", "/a/b"]) == "/a/b"
+    assert _native._base_path(["--base_path=/u"]) == "/u"
+    assert _native._base_path(["--base-path", "--title", "x"]) == ""
 
 
 def test_url_for_wildcard_and_ipv6_addresses():

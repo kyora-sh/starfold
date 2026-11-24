@@ -36,8 +36,10 @@ with Starfold("http://localhost:6901", password="...") as sf:
 image if Pillow is installed (`starfold[pillow]`).
 
 Errors: `AuthError` (wrong or missing password), `ReadOnlyError` (the server runs with
-`--read-only`), `ForbiddenError`, `NotFoundError`, `StarfoldTimeoutError`,
-`StarfoldConnectionError`, all `StarfoldError`. `wait()` reports a timeout in its result
+`--read-only`), `RecordingOffError` (it runs without `--enable-recording`), `ForbiddenError`,
+`NotFoundError`, `StarfoldTimeoutError`, `StarfoldConnectionError`, and for the server on this
+machine (below) `BinaryNotFoundError`, `MissingLibrariesError` and `ServerStartError`, all
+`StarfoldError`. `wait()` reports a timeout in its result
 (`timed_out`) rather than raising.
 
 Keys for `key()` are a single character or a name (Enter, Tab, Escape, BackSpace, Delete,
@@ -59,12 +61,16 @@ with starfold.start_server() as server:  # loopback, a free port, a generated pa
     sf.screenshot().save("desktop.png")
 ```
 
-`start_server()` listens on 127.0.0.1 unless you pass `addr=`; `port=`, `password=`,
-`args=` (more server flags, `starfold --help`), `env=`, `cwd=` and `timeout=` (seconds until
-it answers, default 30) are optional. It returns a `LocalServer` with `url`, `password`,
-`process`, `client()`, `async_client()` and `close()`; the server stops on `close()`, at the
-end of the `with` block, at exit, and when your process is killed. On Linux it needs a display
-(`DISPLAY`, e.g. from Xvfb); it doesn't start one.
+`start_server()` listens on 127.0.0.1 unless you pass `addr=`; `port=`, `password=` (an
+empty one counts as none), `args=` (more server flags, `starfold --help`), `env=` (merged onto
+this process's environment), `cwd=`, `binary=` (default `binary_path()`) and `timeout=`
+(seconds until it answers, default 30) are optional. If the server exits, doesn't answer in
+time or can't have its port, it raises `ServerStartError` with the server's last output in
+`output`. It returns a `LocalServer` with `url`, `password`, `process`, `stderr_tail` (the
+server's last lines of output), `client()`, `async_client()` and `close()`; the server stops on
+`close()`, at the end of the `with` block, at exit, and when your process ends, however it
+ends. On Linux and macOS `process` is a small `sh` guard whose child is the server. On Linux it
+needs a display (`DISPLAY`, e.g. from Xvfb); it doesn't start one.
 
 `starfold.binary_path()` is the binary: `$STARFOLD_BIN` if set, else the wheel's. The
 `starfold` command runs it (`starfold --help`).

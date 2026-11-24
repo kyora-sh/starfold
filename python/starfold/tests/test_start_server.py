@@ -5,12 +5,14 @@ Needs Linux with Xvfb and STARFOLD_BIN pointing at a built `starfold` binary:
     STARFOLD_BIN=target/release/starfold uv run pytest -m integration
 """
 
+import contextlib
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -98,12 +100,20 @@ def _alive(pid: int) -> bool:
     return state != "Z"
 
 
-@pytest.mark.parametrize("watchdog", [False, True], ids=["pdeathsig", "watchdog"])
-def test_no_orphan_after_the_parent_is_killed(display, watchdog):
+def _tree(pid: int) -> list[int]:
+    """`pid` and its descendants (the server, and on Linux and macOS the guard above it)."""
+    found = [pid]
+    for p in found:
+        with contextlib.suppress(FileNotFoundError):
+            found += [int(c) for c in Path(f"/proc/{p}/task/{p}/children").read_text().split()]
+    return found
+
+
+def test_no_orphan_after_the_parent_is_killed(display):
     script = textwrap.dedent(
         f"""
         import sys, time, starfold
-        s = starfold.start_server(args={ARGS!r}, _watchdog={watchdog})
+        s = starfold.start_server(args={ARGS!r})
         print(s.process.pid, s.url, flush=True)
         time.sleep(600)
         """
@@ -113,12 +123,39 @@ def test_no_orphan_after_the_parent_is_killed(display, watchdog):
     assert line, "the parent didn't start a server"
     pid, url = int(line[0]), line[1]
     assert httpx.get(f"{url}/healthz").status_code == 200
-    assert _alive(pid)
+    pids = _tree(pid)
+    assert all(_alive(p) for p in pids)
     parent.send_signal(signal.SIGKILL)
     parent.wait()
     deadline = time.monotonic() + 15
-    while _alive(pid):
-        assert time.monotonic() < deadline, f"server {pid} outlived its parent"
+    while left := [p for p in pids if _alive(p)]:
+        assert time.monotonic() < deadline, f"{left} of {pids} outlived their parent"
         time.sleep(0.1)
     with pytest.raises(httpx.TransportError):
         httpx.get(f"{url}/healthz", timeout=2)
+
+
+def test_server_outlives_the_thread_that_started_it(display):
+    started: list[starfold.LocalServer] = []
+    t = threading.Thread(target=lambda: started.append(starfold.start_server(args=ARGS)))
+    t.start()
+    t.join()
+    (server,) = started
+    try:
+        time.sleep(2)
+        assert server.process.poll() is None, (
+            f"the server stopped when the thread that started it ended (exit {server.process.returncode}):\n"
+            f"{server.stderr_tail}"
+        )
+        assert server.client().screenshot().size == (1024, 768)
+    finally:
+        server.close()
+
+
+def test_close_stops_the_server_and_its_guard(display):
+    server = starfold.start_server(args=ARGS)
+    pids = _tree(server.process.pid)
+    server.close()
+    assert not [p for p in pids if _alive(p)]
+    with pytest.raises(httpx.TransportError):
+        httpx.get(f"{server.url}/healthz", timeout=2)
