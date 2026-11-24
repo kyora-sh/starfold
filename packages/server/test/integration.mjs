@@ -30,7 +30,11 @@ const runtime =
 			: 'node';
 const have = (cmd) => spawnSync('sh', ['-c', `command -v ${cmd}`]).status === 0;
 
-if (!process.env.STARFOLD_BIN || process.platform !== 'linux' || !have('Xvfb')) {
+if (
+	!process.env.STARFOLD_BIN ||
+	process.platform !== 'linux' ||
+	!have('Xvfb')
+) {
 	console.log('skip: set STARFOLD_BIN and install Xvfb to run (Linux)');
 	process.exit(0);
 }
@@ -177,7 +181,10 @@ await check('startServer generates a password the client holds', async () => {
 	try {
 		assert.match(s.password, /^[0-9a-f]{32}$/);
 		const client = s.client();
-		assert.ok(client instanceof Starfold, 'client() is not the starfold Starfold');
+		assert.ok(
+			client instanceof Starfold,
+			'client() is not the starfold Starfold'
+		);
 		const shot = await client.screenshot();
 		assert.deepEqual(shot.size, [1280, 800]);
 		await assert.rejects(

@@ -52,11 +52,11 @@ that line.
 
 Up to 0.3.2 the `starfold` package carried the server too. From 0.4.0:
 
-| 0.3.2                                     | 0.4.0                                                |
-| ----------------------------------------- | ---------------------------------------------------- |
-| `import { startServer } from 'starfold'`  | `import { startServer } from '@starfold/server'`     |
-| `npx starfold` / `npm i -g starfold`      | `npx @starfold/server` / `npm i -g @starfold/server` |
-| `Starfold`, `act`, the errors             | unchanged, from `starfold`                           |
+| 0.3.2                                    | 0.4.0                                                |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `import { startServer } from 'starfold'` | `import { startServer } from '@starfold/server'`     |
+| `npx starfold` / `npm i -g starfold`     | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `Starfold`, `act`, the errors            | unchanged, from `starfold`                           |
 
 ## Tests
 

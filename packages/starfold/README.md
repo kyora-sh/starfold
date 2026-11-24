@@ -58,11 +58,11 @@ punctuation key means the shifted key: `ctrl+shift+t`, `cmd+shift+4`.
 Up to 0.3.2 this package also carried the server: the `starfold` command and `startServer()`.
 From 0.4.0 they are in [@starfold/server](https://www.npmjs.com/package/@starfold/server), which depends on this package:
 
-| 0.3.2                                     | 0.4.0                                            |
-| ----------------------------------------- | ------------------------------------------------ |
-| `import { startServer } from 'starfold'`  | `import { startServer } from '@starfold/server'` |
-| `npx starfold` / `npm i -g starfold`      | `npx @starfold/server` / `npm i -g @starfold/server` |
-| `Starfold`, `act`, the errors             | unchanged, from `starfold`                       |
+| 0.3.2                                    | 0.4.0                                                |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `import { startServer } from 'starfold'` | `import { startServer } from '@starfold/server'`     |
+| `npx starfold` / `npm i -g starfold`     | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `Starfold`, `act`, the errors            | unchanged, from `starfold`                           |
 
 ## Tests
 
