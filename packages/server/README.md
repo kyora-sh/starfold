@@ -52,11 +52,11 @@ that line.
 
 Up to 0.3.2 the `starfold` package carried the server too. From 0.4.0:
 
-| 0.3.2                                    | 0.4.0                                                |
-| ---------------------------------------- | ---------------------------------------------------- |
-| `import { startServer } from 'starfold'` | `import { startServer } from '@starfold/server'`     |
-| `npx starfold` / `npm i -g starfold`     | `npx @starfold/server` / `npm i -g @starfold/server` |
-| `Starfold`, `act`, the errors            | unchanged, from `starfold`                           |
+| 0.3.2 | 0.4.0 |
+| --- | --- |
+| `import { startServer } from 'starfold'`, and likewise `LocalServer`, `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `'@starfold/server'` |
+| `npx starfold` / `npm i -g starfold` | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `Starfold`, `act`, `StarfoldError` and the client's other errors, the types | unchanged, from `starfold` |
 
 ## Tests
 

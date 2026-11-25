@@ -35,6 +35,7 @@ says() { [ "$(cat "$root/out")" = "$1" ]; }
 
 check "only 0.0.0-stage, as a bare string: absent" 'run 0 "\"0.0.0-stage\"" && says absent'
 check "only 0.0.0-stage, as a one-element list: absent" 'run 0 "[\"0.0.0-stage\"]" && says absent'
+check "the registry's list for @starfold/server before 0.4.0 (0.0.0-stage, 0.0.1): absent" 'run 0 "[\"0.0.0-stage\", \"0.0.1\"]" && says absent'
 check "0.0.0-stage and the release: present" 'run 0 "[\"0.0.0-stage\", \"0.4.0\"]" && says present'
 check "the release alone, as a bare string: present" 'run 0 "\"0.4.0\"" && says present'
 check "a prerelease of the release isn't the release: absent" 'run 0 "[\"0.4.0-rc.1\"]" && says absent'
@@ -44,8 +45,8 @@ check "an empty list: fails" '! run 0 "[]"'
 check "an object: fails" '! run 0 "{\"error\": \"x\"}"'
 check "not a version: fails" '! run 0 "[\"latest\"]"'
 
-publishes() { grep -E '^\s*(absent\) )?npm publish ' "$here/../workflows/release.yml" >"$root/out"; }
-check "release.yml publishes to npm" 'publishes'
+publishes() { grep -E '^[[:space:]]*absent\) npm publish ' "$here/../workflows/release.yml" >"$root/out"; }
+check "release.yml publishes to npm in exactly one place" 'publishes && [ "$(wc -l <"$root/out")" -eq 1 ] && ! grep -q -e --dry-run "$root/out"'
 check "release.yml's npm publish takes no --tag" 'publishes && ! grep -q -e --tag "$root/out"'
 
 [ "$failures" = 0 ] || {

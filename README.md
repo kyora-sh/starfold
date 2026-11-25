@@ -97,8 +97,9 @@ Both can start a server from code (`startServer()` from `@starfold/server` in Ty
 `start_server()` from `starfold_server` in Python) on loopback with a generated password, and give
 a client already signed in to it; see [packages/server](packages/server/README.md) and
 [python/starfold-server](python/starfold-server/README.md). On other platforms `@starfold/server`
-installs without a binary and PyPI has no `starfold-server` wheel; set `STARFOLD_BIN` to a
-starfold binary built for it, or use a client against a server running elsewhere. The client alone is npm's `starfold`
+installs without a binary, and `pip install starfold-server` finds no distribution: install its
+pure wheel from the GitHub release instead; with either, set `STARFOLD_BIN` to a starfold binary
+built for it, or use a client against a server running elsewhere. The client alone is npm's `starfold`
 ([packages/starfold](packages/starfold/README.md)), with no dependencies and no binary, and PyPI's
 `starfold` ([python/starfold](python/starfold/README.md)), with no binary and no `starfold` command.
 

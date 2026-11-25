@@ -67,7 +67,8 @@ env:
   # Symbols stay for backtraces; the line tables of `debug = 1` don't ship.
   CARGO_PROFILE_RELEASE_STRIP: debuginfo
   # 1 builds, checks, attaches and publishes the Linux platform wheels; 0 leaves them out everywhere
-  # (python-platform-wheels.sh and expected-files.sh read it), and pip on Linux takes the pure wheel.
+  # (python-platform-wheels.sh and expected-files.sh read it), and pip on Linux then finds no
+  # starfold-server (the client, starfold, is pure either way).
   LINUX_WHEELS: '1'
 
 jobs:
@@ -646,13 +647,14 @@ jobs:
           uv build --out-dir "$GITHUB_WORKSPACE/dist"
           (cd ../starfold-server && uv build --wheel --out-dir "$GITHUB_WORKSPACE/dist")
       # The versions, the pin and the MIT licence text, the repository's LICENSE, inside every
-      # distribution; the client's wheel carries no command and no server.
+      # distribution; the client's wheel carries no command and no server. uv build also writes a
+      # .gitignore into its output directory.
       - name: Check the versions and the licence
         working-directory: dist
         run: |
           ls -l
           wheel=starfold-$VERSION-py3-none-any.whl sdist=starfold-$VERSION.tar.gz server=starfold_server-$VERSION-py3-none-any.whl
-          [ "$(find . -mindepth 1 -printf '%f\n' | sort)" = "$(printf '%s\n' "$sdist" "$wheel" "$server" | sort)" ] || { echo "::error::not exactly $wheel, $sdist and $server"; exit 1; }
+          [ "$(find . -mindepth 1 ! -name .gitignore -printf '%f\n' | sort)" = "$(printf '%s\n' "$sdist" "$wheel" "$server" | sort)" ] || { echo "::error::not exactly $wheel, $sdist and $server"; exit 1; }
           versions() { python3 -I ../.github/release/versions.py "$@"; }
           versions check wheel "$wheel" "$VERSION"
           versions check sdist "$sdist" "$VERSION"
@@ -717,7 +719,7 @@ jobs:
           if-no-files-found: error
 
   # The SDKs with the server binary, from the default (MIT) build's four archives: the
-  # @starfold/server-* npm packages and the starfold SDK pinned to them, and starfold-server's
+  # @starfold/server-* npm packages, starfold and @starfold/server pinned to them, and starfold-server's
   # platform wheels (its pure wheel plus one platform's binary each). Built once, here; the install
   # jobs, the release and the registries take exactly these files.
   native:

@@ -64,6 +64,38 @@ def test_each_release_names_every_versioned_file():
         assert f"`{f}`" in steps, f"RELEASING.md's Each release doesn't name {f}"
 
 
+def test_third_party_describes_both_npm_packages():
+    text = DOC.read_text()
+    client = (
+        r"\*\*`starfold` on npm\*\*, MIT: the TypeScript client alone\."
+        r"\s+It carries no binary and depends on\s+nothing"
+    )
+    assert re.search(client, text), "THIRD_PARTY.md doesn't describe npm's starfold as the client alone"
+    assert "**`@starfold/server` on npm**" in text
+
+
+def _changelog_040() -> str:
+    text = (ROOT / "CHANGELOG.md").read_text()
+    return text.split("## 0.4.0", 1)[1].split("\n## ", 1)[0]
+
+
+def test_changelog_names_every_moved_python_name():
+    from starfold import MOVED_TO_SERVER
+
+    entry = _changelog_040()
+    missing = [n for n in sorted(MOVED_TO_SERVER) if f"`{n}`" not in entry]
+    assert not missing, f"CHANGELOG's 0.4.0 entry doesn't name {missing}"
+
+
+def test_changelog_names_every_moved_typescript_name():
+    index = (ROOT / "packages" / "server" / "src" / "index.ts").read_text()
+    names = set(re.findall(r"^\t(\w+),$", index, re.M)) | set(re.findall(r"export type \{ (\w+) \}", index))
+    assert {"startServer", "StartServerOptions", "LINUX_LIBRARIES_HINT"} <= names
+    entry = _changelog_040()
+    missing = [n for n in sorted(names) if f"`{n}`" not in entry]
+    assert not missing, f"CHANGELOG's 0.4.0 entry doesn't name {missing}"
+
+
 def test_third_party_doesnt_call_the_server_packages_mit():
     text = DOC.read_text()
     assert not re.search(r"`-win32-x64` on\s+npm\*\*, MIT", text), "THIRD_PARTY.md calls the server packages MIT"

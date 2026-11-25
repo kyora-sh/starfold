@@ -48,8 +48,11 @@
   its licence beside it.
 - **`@starfold/web` on npm**, `MIT AND BSD-2-Clause`: the embeddable client (MIT) with
   dav1d.wasm (as above).
-- **`starfold` on npm**, MIT: the TypeScript SDK. It carries no binary; it depends on the server
-  package for its platform.
+- **`starfold` on npm**, MIT: the TypeScript client alone. It carries no binary and depends on
+  nothing.
+- **`@starfold/server` on npm**, MIT: the `starfold` command and starting a server from code. It
+  carries no binary itself; it depends on `starfold` and installs the server package for its
+  platform (below).
 - **`starfold` on PyPI**: the sdist and the pure wheel (`py3-none-any`) are the Python client
   alone, MIT.
 - **The npm server packages and `starfold-server`'s platform wheels on PyPI**: each holds the default binary of one

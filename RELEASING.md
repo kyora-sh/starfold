@@ -132,8 +132,13 @@ package, this was done for `@starfold/server` (npm) and `starfold-server` (PyPI)
 
 3. **PyPI, the pending publisher.** pypi.org → Your account → Publishing → Add a new pending
    publisher → GitHub, the values above with environment `pypi` and the project name
-   `starfold-server`. The first tag's `pypi-server-publish` creates the project. As before, a
-   pending publisher reserves nothing.
+   `starfold-server`. With the same environment as `starfold`'s publisher, PyPI creates the
+   project at the first token exchange that matches it, which is `pypi-publish`'s (warehouse's
+   `mint_token` tries pending publishers first and attaches the new project to the existing
+   publisher), and from then on each job's token covers both projects. As before, a pending
+   publisher reserves nothing, and here more is at stake: if someone registers `starfold-server`
+   first, PyPI deletes the pending publisher and refuses that exchange, so `starfold` isn't
+   published either until the pending publisher is removed.
 4. **npm, after the release.** Deprecate the placeholder, so that it points at the release:
 
    ```sh

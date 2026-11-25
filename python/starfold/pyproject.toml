@@ -1,7 +1,7 @@
 [project]
 name = "starfold"
 version = "0.4.0"
-description = "Python SDK for starfold"
+description = "Python client for starfold: screenshots, waiting for the screen, mouse and keyboard"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

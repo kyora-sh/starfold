@@ -1,7 +1,7 @@
 # starfold-server (Python)
 
 The starfold server for Python: its binary, the `starfold` command, and `start_server()`, which
-starts a server on this machine and hands you a [`starfold`](../starfold/README.md) client
+starts a server on this machine and hands you a [`starfold`](https://pypi.org/project/starfold/) client
 signed in to it. Installing it installs the client too, at the same version.
 
 ```sh
@@ -10,9 +10,12 @@ starfold --version
 ```
 
 There are wheels for Linux x86_64 and aarch64 (glibc 2.39+), macOS arm64 and Windows x86_64,
-each with the default (MIT) build's binary of that platform's release archive. Elsewhere pip
-finds none; install `starfold` for the client alone, which works against a server running
-elsewhere.
+each with the default (MIT) build's binary of that platform's release archive. Elsewhere (musl,
+an older glibc, Intel macOS, Windows on Arm) pip finds no distribution of it: install its pure
+wheel, `starfold_server-<version>-py3-none-any.whl` from the
+[GitHub release](https://github.com/kyora-sh/starfold/releases), and set `STARFOLD_BIN` to a
+starfold binary built for the platform; or install `starfold`, the client alone, which works
+against a server running elsewhere.
 
 From a checkout: `uv add --editable path/to/starfold/python/starfold-server` (with `STARFOLD_BIN`
 set to a built binary, since a checkout carries none).
@@ -53,8 +56,13 @@ Without them, `start_server()` and `starfold` say which libraries are missing.
 
 Up to 0.3.2 all of this was in the `starfold` package: `pip install starfold` and
 `starfold.start_server(...)` become `pip install starfold-server` and
-`starfold_server.start_server(...)`. The client's imports (`Starfold`, `act`, the errors) stay
-in `starfold`. Staying on `starfold==0.3.2` changes nothing: it still carries the server.
+`starfold_server.start_server(...)`, and `LocalServer`, `binary_path`, `check_libraries`,
+`BinaryNotFoundError`, `MissingLibrariesError` and `ServerStartError` are imported from
+`starfold_server`. `pip install "starfold[pillow]"` with the server becomes
+`pip install starfold-server "starfold[pillow]"`, and `uvx starfold` / `pipx run starfold`
+become `uvx --from starfold-server starfold` / `pipx run --spec starfold-server starfold`. The
+client's imports (`Starfold`, `AsyncStarfold`, `act`, `StarfoldError` and the client's other
+errors) stay in `starfold`. Staying on `starfold==0.3.2` changes nothing: it still carries the server.
 
 ## Tests
 

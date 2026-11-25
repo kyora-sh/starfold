@@ -7,14 +7,23 @@ with no binary and no `starfold` command; the server, its command and starting o
 `@starfold/server` on npm and `starfold-server` on PyPI, which depend on the client at the same
 version. Staying on 0.3.2 changes nothing: starfold 0.3.2 on npm and on PyPI still carries the server. The crate on crates.io is still `starfold`, the server.
 
-| 0.3.2                                                  | 0.4.0                                                |
-| ------------------------------------------------------ | ---------------------------------------------------- |
-| `import { startServer } from 'starfold'`               | `import { startServer } from '@starfold/server'`     |
-| `npx starfold` / `npm i -g starfold` (the command)     | `npx @starfold/server` / `npm i -g @starfold/server` |
-| `starfold.start_server(...)`                           | `starfold_server.start_server(...)`                  |
-| `pip install starfold` (for the command, start_server) | `pip install starfold-server`                        |
-| client imports (`Starfold`, `act`, the errors)         | unchanged                                            |
-| `cargo install starfold`                               | unchanged                                            |
+| 0.3.2 | 0.4.0 |
+| --- | --- |
+| `import { startServer } from 'starfold'`, and likewise `LocalServer`, `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `'@starfold/server'` |
+| `npx starfold` / `npm i -g starfold` (the command) | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `from starfold import start_server`, and likewise `LocalServer`, `binary_path`, `check_libraries`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `starfold_server` |
+| `pip install starfold` (for the command or `start_server`) | `pip install starfold-server` |
+| `pip install "starfold[pillow]"` with the server | `pip install starfold-server "starfold[pillow]"` |
+| `uvx starfold` / `pipx run starfold` | `uvx --from starfold-server starfold` / `pipx run --spec starfold-server starfold` |
+| the client: `Starfold`, `AsyncStarfold`, `act`, `StarfoldError` and the client's other errors, the types | unchanged |
+| `cargo install starfold` | unchanged |
+
+`starfold-server` is on PyPI for the four platforms with a release binary (Linux x86_64 and aarch64
+with glibc 2.39+, macOS arm64, Windows x86_64). Elsewhere (musl, an older glibc, Intel macOS,
+Windows on Arm) `pip install starfold-server` finds no distribution: install its pure wheel,
+`starfold_server-0.4.0-py3-none-any.whl` from the GitHub release, and set `STARFOLD_BIN` to a
+starfold binary, or use the client against a server running elsewhere. On npm, `@starfold/server`
+installs there without a binary and takes `STARFOLD_BIN` likewise.
 
 ### npm
 
