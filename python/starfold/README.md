@@ -53,13 +53,13 @@ Up to 0.3.2 this package also carried the server: the `starfold` command, `start
 `LocalServer`, `binary_path()`, `check_libraries()` and their errors. From 0.4.0 they are in
 `starfold-server`:
 
-| 0.3.2 | 0.4.0 |
-| --- | --- |
-| `pip install starfold` (for the command or server) | `pip install starfold-server` |
-| `from starfold import start_server`, and likewise `LocalServer`, `binary_path`, `check_libraries`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `starfold_server` |
-| `pip install "starfold[pillow]"` with the server | `pip install starfold-server "starfold[pillow]"` |
-| `uvx starfold` / `pipx run starfold` | `uvx --from starfold-server starfold` / `pipx run --spec starfold-server starfold` |
-| `Starfold`, `AsyncStarfold`, `act`, `StarfoldError` and the client's other errors | unchanged |
+| 0.3.2                                                                                                                                                                 | 0.4.0                                                                              |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `pip install starfold` (for the command or server)                                                                                                                    | `pip install starfold-server`                                                      |
+| `from starfold import start_server`, and likewise `LocalServer`, `binary_path`, `check_libraries`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `starfold_server`                                              |
+| `pip install "starfold[pillow]"` with the server                                                                                                                      | `pip install starfold-server "starfold[pillow]"`                                   |
+| `uvx starfold` / `pipx run starfold`                                                                                                                                  | `uvx --from starfold-server starfold` / `pipx run --spec starfold-server starfold` |
+| `Starfold`, `AsyncStarfold`, `act`, `StarfoldError` and the client's other errors                                                                                     | unchanged                                                                          |
 
 `from starfold import start_server` (or any other moved name) raises an `ImportError` that says
 so. Staying on `starfold==0.3.2` changes nothing: it still carries the server.

@@ -102,7 +102,9 @@ describe('wait', () => {
 		const quick = new Starfold(server.url, { password: 'pw', timeoutMs: 100 });
 		server.delayMs = 250;
 		expect((await quick.wait({ timeoutMs: 300 })).seq).toBe(42);
-		await expect(quick.screenshot()).rejects.toBeInstanceOf(StarfoldTimeoutError);
+		await expect(quick.screenshot()).rejects.toBeInstanceOf(
+			StarfoldTimeoutError
+		);
 	});
 });
 
@@ -270,7 +272,9 @@ describe('recording', () => {
 		expect(stopped.endReason).toBe('stopped');
 		expect(server.last.params).toEqual({ id: RID, format: 'zip' });
 		expect([...(await sf.recordStop(RID))]).toEqual([text('mp4')]);
-		await expect(sf.recordStop('0'.repeat(32))).rejects.toBeInstanceOf(NotFoundError);
+		await expect(sf.recordStop('0'.repeat(32))).rejects.toBeInstanceOf(
+			NotFoundError
+		);
 	});
 
 	test('record gets its length on top of the timeout', async () => {
