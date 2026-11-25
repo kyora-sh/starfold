@@ -1,0 +1,46 @@
+---
+title: Encoders
+description: Which encoder starfold picks, the two builds, hardware encoders and threads.
+---
+
+## What `auto` picks
+
+`--encoder auto` (the default) takes each codec from its hardware encoder where there is one that isn't experimental, such as VideoToolbox on a Mac. The **base stream** (the one recordings and protocol 1 viewers get, and the fallback) comes from hardware H.264 if found, else from x264 if the binary includes it, else from libaom as AV1. The server and the browser negotiate HEVC or AV1 where both have them.
+
+| Build                                                       | Base stream without hardware H.264                                  | Licence          |
+| ----------------------------------------------------------- | ------------------------------------------------------------------- | ---------------- |
+| Default                                                     | AV1 from libaom, linked in statically                               | MIT              |
+| x264 (`--features x264`, or the `starfold-x264-*` archives) | H.264 from x264; browsers that decode AV1 still get AV1 from libaom | GPL-2.0-or-later |
+
+`starfold --version` names the software encoders a binary includes.
+
+## Protocol 1 viewers
+
+A protocol 1 viewer decodes only H.264. A build without an H.264 encoder (the default build, on a host without hardware H.264) closes such a viewer with WebSocket close code 4406 and a reason that names AV1 and the protocol 2 client. To keep protocol 1 viewers, use the x264 build or a host with a hardware H.264 encoder. starfold's own page is a protocol 2 client.
+
+## Pinning an encoder
+
+`--encoder` also takes `libaom`, `x264` (in the x264 build) or `videotoolbox` (macOS hardware). With `--encoder x264`, every viewer gets x264.
+
+The VA-API (Linux), NVENC (Linux, Windows), Media Foundation (Windows) and Intel Quick Sync (`qsv`, 64-bit Windows) encoders are experimental: start with `--experimental-hw-probes` and name one with `--encoder vaapi`, `nvenc`, `mediafoundation` or `qsv`. `auto` never picks them. `/stats` shows what the probe found.
+
+```sh
+starfold --experimental-hw-probes --encoder vaapi
+```
+
+On Linux the stream is encoded on the CPU by default.
+
+## Quality and bitrate
+
+- `--crf` (default 24) is x264's base quality, libaom's lowest quantizer, and a hardware encoder's constant QP when it runs one.
+- `--max-kbps` and `--min-kbps` (default 30000 and 2000) bound the adaptive bitrate.
+- `--paintover-crf`, `--paintover-burst` and `--paintover-delay-ms` (default 16, 3, 150) sharpen the picture once the screen goes still.
+- `--preset` is the preset or speed of the encoder `--encoder` names (under `auto`, of the software base one): libaom takes a speed, 9 by default; x264 a preset name, `ultrafast` by default. `starfold --help` lists what each encoder built into that binary takes.
+
+## Threads
+
+Unless `--encoder-threads` is given, libaom picks its own thread count from the picture size and the host's CPUs: 4 for a picture up to 1080p, 8 above it, at most the CPUs but never under 2 per encoder. Other software encoders take cores/4 threads, from 1 to 4.
+
+4K at 30 fps with libaom needs 8 or more CPUs. On fewer, the server sends fewer frames: it never queues captures behind a slow encode, skips the rest and carries what changed in them into the next frame.
+
+`--adaptive-threads` encodes on one thread and fans out only under sustained heavy motion.

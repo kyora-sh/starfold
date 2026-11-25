@@ -1,0 +1,97 @@
+---
+title: Flags
+description: Every flag the server takes, with its default.
+---
+
+Flags take `--name=value` or `--name value`; true/false flags also work on their own (`--read-only`). `starfold --help` prints this list for the binary you have, with the encoders that binary includes, and `starfold --version` its version. CI checks this page against the Linux release binary's `--help`.
+
+## Server
+
+| Flag                 | Default                                                      |                                                                                                                                     |
+| -------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `--addr`, `--port`   | `0.0.0.0` on Linux, `127.0.0.1` on macOS and Windows; `6901` | listen address and port                                                                                                             |
+| `--listen-tcp`       | `true`                                                       | listen on `--addr`/`--port`                                                                                                         |
+| `--listen-unix`      | none                                                         | also serve on a unix socket in this directory (Linux only); see [Auth and network](/server/auth-and-network#on-a-unix-socket-linux) |
+| `--listen-unix-mode` | `0600`                                                       | the socket's permissions                                                                                                            |
+| `--framed`           | `false`                                                      | every WebSocket message binary with a kind byte, for hops that carry binary only; the page then needs `?framed=1`                   |
+| `--title`            | `starfold`                                                   | the page's title: the browser tab, and the app's name if a viewer installs it                                                       |
+| `--favicon`          | starfold's icon                                              | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                                   |
+| `--allowed-hosts`    | none                                                         | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)                           |
+| `--allowed-origins`  | none                                                         | other sites whose pages may connect (`*` any)                                                                                       |
+| `--base-path`        | none                                                         | serve under this path prefix (such as `/desktop`), for a reverse proxy that forwards it unchanged                                   |
+
+`starfold attach DIR` is a command, not a flag: it relays stdin and stdout to the socket `--listen-unix DIR` serves (Linux only).
+
+## Login
+
+| Flag                    | Default                                                                                        |                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `--enable-basic-auth`   | `true`                                                                                         | ask for a password; `false` serves without one |
+| `--basic-auth-password` | `$STARFOLD_PASSWORD`, else `$SELKIES_BASIC_AUTH_PASSWORD`, else made up and printed at startup | the password                                   |
+| `--basic-auth-user`     | any                                                                                            | the user name a browser's sign-in has to give  |
+
+## Video
+
+| Flag                                                           | Default                                    |                                                                                                                                                |
+| -------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--framerate`                                                  | `60`                                       | max frames per second                                                                                                                          |
+| `--high-fps`                                                   | `false`                                    | hardware VideoToolbox streams take 120 frames per second (or `--framerate` if higher); other encoders take `--framerate` up to 60              |
+| `--crf`                                                        | `24`                                       | x264's base quality; libaom's lowest quantizer; a hardware encoder's constant QP when it runs one                                              |
+| `--max-kbps`, `--min-kbps`                                     | `30000`, `2000`                            | adaptive bitrate ceiling and floor; `--video-bitrate` is the same as `--max-kbps`                                                              |
+| `--encoder`                                                    | `auto`                                     | the base stream's encoder; see [Encoders](/server/encoders)                                                                                    |
+| `--encoder-probe`                                              | `true`                                     | probe the hardware encoders at startup (`/stats` lists what was found)                                                                         |
+| `--experimental-hw-probes`                                     | `false`                                    | also probe VA-API, NVENC, Media Foundation and Quick Sync, each in a child process; needed to name one with `--encoder`                        |
+| `--preset`                                                     | libaom: `9`; x264: `ultrafast`             | the preset or speed of the encoder `--encoder` names (under `auto`, of the software base one); `--help` lists what each built-in encoder takes |
+| `--encoder-threads`                                            | cores/4, from 1 to 4; libaom picks its own | sliced encoder threads; see [Encoders](/server/encoders#threads)                                                                               |
+| `--adaptive-threads`                                           | `false`                                    | encode on one thread, fanning out only under sustained heavy motion                                                                            |
+| `--stored-screens`                                             | `true`                                     | libaom keeps up to six settled screens and codes a return to one from it                                                                       |
+| `--paintover-crf`, `--paintover-burst`, `--paintover-delay-ms` | `16`, `3`, `150`                           | sharpening once the screen goes still                                                                                                          |
+| `--stripes`                                                    | `1`                                        | encode the screen as N independent streams (experimental)                                                                                      |
+| `--convert-threads`, `--coalesce-us`                           | `4`, `0`                                   | tuning                                                                                                                                         |
+
+## Desktop
+
+These differ by platform; [Platforms](/server/platforms) has each platform's own.
+
+| Flag                    | Default                                                                        |                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--display`             | Linux: `$DISPLAY`; macOS: the main display; Windows: the primary display       | Linux: the X display to stream when `DISPLAY` is unset; macOS and Windows: a display index (0 is the main one), or on macOS a display ID |
+| `--enable-clipboard`    | `true`                                                                         | `true`, `in`, `out` or `false`                                                                                                           |
+| `--audio-enabled`       | `true`                                                                         | desktop or system audio                                                                                                                  |
+| `--audio-device-name`   | Linux: `output.monitor`; Windows: the default output device                    | the PulseAudio source (Linux) or output device (Windows) to stream; not on macOS                                                         |
+| `--audio-bitrate`       | `128000`                                                                       | Opus bitrate                                                                                                                             |
+| `--microphone-enabled`  | `false`                                                                        | the browser's microphone into the desktop                                                                                                |
+| `--microphone-fifo`     | `/tmp/starfold-mic.fifo`                                                       | Linux: the FIFO a PulseAudio pipe source reads                                                                                           |
+| `--microphone-device`   | macOS: the first loopback device found; Windows: the first virtual cable found | output device (name or prefix) to play the microphone into                                                                               |
+| `--enable-resize`       | `false`                                                                        | the desktop follows the viewer's window                                                                                                  |
+| `--resize-scale`        | Linux: `1.5`; macOS: the capture scale; Windows: the display's scaling         | desktop pixels per CSS pixel                                                                                                             |
+| `--read-only`           | `false`                                                                        | viewers only watch                                                                                                                       |
+| `--scroll-px-per-notch` | `180`                                                                          | pixels one wheel notch scrolls                                                                                                           |
+| `--round-corners`       | `0`                                                                            | Linux: corner radius for top-level windows                                                                                               |
+| `--round-windows`       | none                                                                           | Linux: `title:radius,...` rounds windows with that title                                                                                 |
+| `--capture-scale`       | native, within the budget                                                      | macOS: streamed pixels per point                                                                                                         |
+| `--max-capture-pixels`  | `4096000`                                                                      | macOS: pixel budget for the automatic scale                                                                                              |
+| `--show-cursor`         | `true` with `--read-only`, else `false`                                        | macOS: include the host cursor in the video stream                                                                                       |
+
+On Linux, two environment variables choose how the screen is read: `STARFOLD_DIRECT_FB=1` reads Xvfb's `-shmem` framebuffer in place instead of with GetImage, and `STARFOLD_NO_DIRECT_FB` never does (it wins). See [Platforms](/server/platforms#reading-xvfbs-framebuffer-in-place).
+
+## Files and recordings
+
+| Flag                   | Default                                               |                                                                             |
+| ---------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| `--file-transfers`     | `upload,download`                                     | `upload`, `download`, `upload,download` or `none`                           |
+| `--files-root`         | none: no file transfer                                | folder the Files panel can see; symlinks in it are not followed             |
+| `--upload-dir`         | `Downloads`                                           | folder under the root that uploads go to                                    |
+| `--max-upload-mb`      | `0` (no limit)                                        | largest upload                                                              |
+| `--max-record-seconds` | `300`                                                 | longest recording, at most 600 with `--enable-recording`                    |
+| `--enable-recording`   | `false`                                               | allow `/record`; at most 2 recordings at once                               |
+| `--recording-dir`      | `/var/tmp` on Linux, else the system temporary folder | where recordings are written; not memory (tmpfs), not inside `--files-root` |
+
+With `--read-only`, uploads stay off whatever `--file-transfers` says, and files are listed and downloaded only when it names `download`.
+
+## Help and version
+
+| Flag              |                                                                             |
+| ----------------- | --------------------------------------------------------------------------- |
+| `-h`, `--help`    | print the flags and exit                                                    |
+| `-V`, `--version` | print the version, the software encoders built in and the licence, and exit |

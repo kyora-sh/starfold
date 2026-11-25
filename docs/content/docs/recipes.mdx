@@ -1,0 +1,136 @@
+---
+title: Recipes for agents
+description: 'Screenshot, act, wait: the loop an agent runs against a starfold desktop.'
+---
+
+An agent driving a desktop repeats three steps: look at the screen, act on it, and wait until the action has shown before looking again. starfold gives each step a route, and the change count `seq` ties them together, so the agent never sleeps for a guessed time.
+
+## The loop
+
+1. **Screenshot**: `GET /screenshot` gives the PNG for the model to look at.
+2. **Act**: `POST /input` sends the model's clicks and keys and answers with `seq`, the change count from before the first event.
+3. **Wait**: `GET /wait?change&since=<seq>` returns once the actions changed the screen, then `GET /wait` once it settled.
+
+<Tabs items={['Python', 'TypeScript', 'curl']}>
+<Tab value="Python">
+
+```python
+from starfold import Starfold, act
+
+with Starfold("http://localhost:6901") as sf:  # password from $STARFOLD_PASSWORD
+    shot = sf.screenshot()
+    shot.save("step-0.png")
+
+    r = sf.actions([act.click(400, 300), act.type_text("hello\n")])
+    changed = sf.wait(change=True, since=r.seq, timeout_ms=5000)
+    sf.wait(idle_ms=300)
+
+    sf.screenshot().save("step-1.png")
+```
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+import { Starfold, act } from 'starfold';
+
+const sf = new Starfold('http://localhost:6901'); // password from $STARFOLD_PASSWORD
+
+const shot = await sf.screenshot();
+await shot.save('step-0.png');
+
+const r = await sf.actions([act.click(400, 300), act.typeText('hello\n')]);
+const changed = await sf.wait({ change: true, since: r.seq, timeoutMs: 5000 });
+await sf.wait({ idleMs: 300 });
+
+await (await sf.screenshot()).save('step-1.png');
+```
+
+</Tab>
+<Tab value="curl">
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" -o step-0.png localhost:6901/screenshot
+seq=$(curl -u ":$STARFOLD_PASSWORD" -s -H 'Content-Type: application/json' localhost:6901/input \
+  -d '[{"type":"click","x":400,"y":300},{"type":"type","text":"hello\n"}]' | jq .seq)
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?change&since=$seq&timeout=5000"
+curl -u ":$STARFOLD_PASSWORD" localhost:6901/wait
+curl -u ":$STARFOLD_PASSWORD" -o step-1.png localhost:6901/screenshot
+```
+
+</Tab>
+</Tabs>
+
+If the action changed nothing, the first wait returns after its timeout with `changed` false (`timed_out` true); the agent can then look again or retry.
+
+## Waiting for one part of the screen
+
+A clock, a spinner or a blinking caret elsewhere on the screen keeps it from settling. Watch only the part that matters with `region` (`x,y,w,h`):
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?change&region=0,0,800,600"
+```
+
+A blinking text caret redraws about twice a second, so keep `idle` under 500 ms or leave the caret out of `region`.
+
+## A desktop of its own
+
+On Linux, start an Xvfb display and a server for the agent from code, with a client already signed in. The server connects to the display once, when it starts, so wait until Xvfb listens: with `-displayfd`, Xvfb picks a free display and writes its number once it is ready.
+
+<Tabs items={['Python', 'TypeScript']}>
+<Tab value="Python">
+
+```python
+import os
+import subprocess
+from starfold_server import start_server
+
+r, w = os.pipe()
+xvfb = subprocess.Popen(
+    ["Xvfb", "-displayfd", str(w), "-screen", "0", "1280x800x24"], pass_fds=[w]
+)
+os.close(w)
+with os.fdopen(r) as ready:
+    display = ":" + ready.readline().strip()
+
+with start_server(env={"DISPLAY": display}) as server:
+    sf = server.client()
+    sf.screenshot().save("desktop.png")
+xvfb.terminate()
+```
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { startServer } from '@starfold/server';
+
+const xvfb = spawn('Xvfb', ['-displayfd', '1', '-screen', '0', '1280x800x24'], {
+	stdio: ['ignore', 'pipe', 'inherit'],
+});
+const [n] = await once(createInterface({ input: xvfb.stdout }), 'line');
+{
+	await using server = await startServer({ env: { DISPLAY: `:${n}` } });
+	const sf = server.client();
+	await (await sf.screenshot()).save('desktop.png');
+}
+xvfb.kill();
+```
+
+</Tab>
+</Tabs>
+
+## Recording what the agent did
+
+Start the server with `--enable-recording`, then wrap the run in a recording:
+
+```python
+rec = sf.record_start()
+# ... the agent's steps ...
+clips = sf.record_stop(rec)
+```
+
+A recording is the stream itself, saved as MP4 without re-encoding; see [Recordings](/server/http-api#recordings).

@@ -1,0 +1,70 @@
+---
+title: Auth and network
+description: The password, TLS, host and origin checks, reverse proxies and the unix socket.
+---
+
+## The password
+
+starfold asks for a password before it shows the desktop or takes input, files or API calls. Give it one with `--basic-auth-password`, `STARFOLD_PASSWORD` or `SELKIES_BASIC_AUTH_PASSWORD`; otherwise it makes one up when it starts and prints a link that signs you in. There are three ways in:
+
+- **The link**: `http://host:6901/?token=<password>`. The page passes the password on to its own connections, so the link also works as an iframe's `src`.
+- **The browser's sign-in prompt**: any user name (unless `--basic-auth-user` names one) and the password.
+- **For programs**: `Authorization: Bearer <password>`, or `curl -u :<password>`.
+
+The page's scripts and `/healthz` load without it. Behind a proxy that signs people in itself, `--enable-basic-auth=false` turns starfold's login off.
+
+## TLS
+
+starfold serves plain HTTP. Browsers decode video only on HTTPS pages and on `localhost`, so to watch from another machine either forward the port over SSH and open `localhost`, or put starfold behind a TLS proxy and name its host with `--allowed-hosts`. starfold asks for a password by default but serves plain HTTP, so away from `localhost` put it behind TLS. The repository's `SECURITY.md` has the security policy.
+
+`--allowed-origins` takes origins (`scheme://host[:port]`), comma-separated; `--allowed-hosts` takes host names, comma-separated.
+
+## Hosts and origins
+
+starfold answers only requests for an IP address or `localhost`, and only from its own page. That keeps out other web pages, including pages whose domain is pointed at starfold's address (DNS rebinding).
+
+- To reach starfold under a host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-hosts`.
+- To let a page on another site connect, such as a page that embeds the [browser client](/browser-client), name that site with `--allowed-origins`.
+
+Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as usual. A refused request gets a 403 that names the flag to add.
+
+```sh
+starfold --allowed-hosts=desktop.example.com --allowed-origins=https://app.example.com
+```
+
+## Behind a reverse proxy, under a path
+
+A proxy that serves starfold under a path, such as `https://example.com/desktop/`, and forwards the path unchanged needs `--base-path=/desktop`. starfold then serves its pages under `/desktop/` only and prints its link with the prefix. Every request goes through the same host, origin and password checks.
+
+A proxy that strips the prefix before forwarding needs no flag, but has to redirect `/desktop` to `/desktop/` itself: the page's URLs are relative.
+
+`--base-path` is given once, as a prefix such as `/desktop` (letters, digits, `.`, `_`, `~` or `-` between single slashes). Given twice, empty, `/` or in any other shape, the server does not start: it exits with code 2 and says why.
+
+For hops that carry binary WebSocket messages only, `--framed` sends every message as binary with a kind byte; the page then needs `?framed=1`.
+
+## Read-only viewers
+
+With `--read-only`, a viewer cannot change the desktop, file contents or recordings: `POST /input` and the `/record` routes are refused with 403, and uploads are off. Every route and message is decided in one table, and anything not in it is refused.
+
+## On a unix socket (Linux)
+
+`--listen-unix DIR` serves the same routes, with the same login and host checks, on a unix socket: starfold makes `DIR` for its user alone (mode 0700) and listens on `DIR/s`. `--listen-tcp=false` turns TCP off.
+
+```sh
+starfold --listen-unix /run/sf/view --listen-tcp=false   # the server, once
+starfold attach /run/sf/view                             # per connection, same uid
+```
+
+Only a peer with starfold's own uid is let in (`SO_PEERCRED`); the same uid is not separated from starfold. With the default `--listen-unix-mode=0600`, no other uid can connect at all except root or a process with a capability that overrides file permissions. starfold refuses `--listen-unix` unless the user namespace's uid map is the identity map and every directory from `/` to `DIR` belongs to its user or root and lets no other user rename entries in it.
+
+`starfold attach DIR` connects to `DIR/s` and relays bytes between it and its stdin and stdout, one connection per run, after the same checks, and only if the listener has its own uid. It is for hosts that hand each connection to a process of their own, such as a pod exec stream. It does not authenticate what it relays: the server's login and host checks apply, so a host relaying a browser's requests sends `Host: localhost`.
+
+To send one request yourself, use curl on the socket, or keep `attach`'s stdin open until the reply is in: on 0.3.2, `attach` prints nothing when its stdin ends before the server has answered.
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" --unix-socket /run/sf/view/s http://localhost/stats
+{ printf 'GET /stats HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$STARFOLD_PASSWORD"; sleep 2; } |
+  starfold attach /run/sf/view
+```
+
+The repository README's section on the unix socket lists every check and what is not claimed.

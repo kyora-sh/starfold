@@ -1,0 +1,23 @@
+{
+	"title": "starfold",
+	"pages": [
+		"index",
+		"quickstart",
+		"---Install---",
+		"install/server",
+		"install/clients",
+		"---Server---",
+		"server/flags",
+		"server/encoders",
+		"server/auth-and-network",
+		"server/platforms",
+		"server/http-api",
+		"---Clients---",
+		"browser-client",
+		"sdk/typescript",
+		"sdk/python",
+		"---Guides---",
+		"recipes",
+		"releases"
+	]
+}

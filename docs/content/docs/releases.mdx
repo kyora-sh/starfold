@@ -1,0 +1,45 @@
+---
+title: Releases and licences
+description: Where releases are published, what each package carries, and the licence of each build.
+---
+
+## Where releases go
+
+Each release is a `v<version>` tag. It creates a [GitHub release](https://github.com/kyora-sh/starfold/releases) with the archives for every platform and publishes the default (MIT) build's packages:
+
+| Registry  | Package                     | What it is                                                                                      |
+| --------- | --------------------------- | ----------------------------------------------------------------------------------------------- |
+| crates.io | <Pkg path="server.crate" /> | the server, built from source                                                                   |
+| npm       | <Pkg path="server.npm" />   | the server: the `starfold` command and `startServer()`, with the binary from a platform package |
+| npm       | <Pkg path="client.npm" />   | the TypeScript client                                                                           |
+| npm       | <Pkg path="web.npm" />      | the embeddable browser client                                                                   |
+| PyPI      | <Pkg path="server.pypi" />  | the server: platform wheels with the binary, the `starfold` command and `start_server()`        |
+| PyPI      | <Pkg path="client.pypi" />  | the Python client                                                                               |
+
+The npm platform packages and the platform wheels carry the release archive's binary byte for byte. The x264 build is a GitHub release download only.
+
+<Callout>
+	Up to <Release previous />, the server shipped inside{' '}
+	<Pkg path="client.npm" /> on npm and PyPI. The
+	[TypeScript](/sdk/typescript#upgrading-from-032) and
+	[Python](/sdk/python#upgrading-from-032) pages list what moved.
+</Callout>
+
+The repository's `CHANGELOG.md` lists what changed in each release, including behaviour changes.
+
+## Licences
+
+The source code is MIT.
+
+| Build   | Licence          | Why                                                                                                                                                                       |
+| ------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Default | MIT              | links libaom (BSD-2-Clause, with the Alliance for Open Media Patent License 1.0) statically                                                                               |
+| x264    | GPL-2.0-or-later | links x264 (GPL-2.0-or-later); anything that bundles that binary is GPL-2.0-or-later as a combined work. Each release attaches the exact x264 source its x264 builds link |
+
+`starfold --version` names the encoders a binary includes and the licence it is distributed under.
+
+A binary built with GCC includes GCC's runtime code (on Linux its startup files; the prebuilt Windows binaries also its C++ runtime libraries) under GPL-3.0-or-later with the GCC Runtime Library Exception, which permits distributing the binary under MIT. A Linux binary also includes glibc's startup files, under LGPL-2.1-or-later with permission to link them into any program. The Linux and Windows archives carry these texts; the macOS ones need neither.
+
+Each archive holds `LICENSE`, `THIRD_PARTY.md` and `licenses/`: the licence texts of everything compiled or linked into its binary. The x264 archives add `COPYING` (GPL-2.0) and `X264-SOURCE.txt`.
+
+The <Pkg path="server.crate" /> crate on crates.io is `MIT AND BSD-2-Clause AND OFL-1.1`: besides starfold's code it ships the web client's `dav1d.wasm` (dav1d, BSD-2-Clause) and the Inter font (OFL-1.1). The repository's `THIRD_PARTY.md` lists every bundled component and what each published package carries.

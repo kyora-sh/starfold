@@ -1,0 +1,12 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "starfold-docs",
+	"main": ".open-next/worker.js",
+	"compatibility_date": "2025-05-05",
+	"compatibility_flags": ["nodejs_compat"],
+	"routes": [{ "pattern": "starfold.kyora.sh", "custom_domain": true }],
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS",
+	},
+}

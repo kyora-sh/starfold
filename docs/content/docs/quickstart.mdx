@@ -1,0 +1,78 @@
+---
+title: Quick start
+description: Stream a desktop to a browser tab, then drive it from a script.
+---
+
+## 1. Install the server
+
+<Install which="server" />
+
+An npm install puts the command behind `npx`: run `npx starfold` where these steps say `starfold`, or install globally with `npm install -g` <Pkg path="server.npm" />.
+
+On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc 2.39 or newer (Ubuntu 24.04 or newer). [Install the server](/install/server) has the release archives and the requirements of each platform.
+
+## 2. Start it
+
+<Tabs items={['Linux', 'macOS', 'Windows']}>
+<Tab value="Linux">
+
+starfold streams an X display. Without one, start Xvfb:
+
+```sh
+sudo apt install xvfb libyuv0 libopus0 libpulse0
+Xvfb :1 -screen 0 1920x1080x24 &
+DISPLAY=:1 starfold
+```
+
+</Tab>
+<Tab value="macOS">
+
+starfold streams this Mac's own screen, on `127.0.0.1` unless `--addr` says otherwise. macOS asks for the Screen Recording and Accessibility permissions.
+
+```sh
+starfold
+```
+
+</Tab>
+<Tab value="Windows">
+
+starfold streams the desktop of the session it runs in, on `127.0.0.1` unless `--addr` says otherwise. Start it in the user's session, not as a service.
+
+```powershell
+starfold
+```
+
+</Tab>
+</Tabs>
+
+With no password given, it makes one up and prints a link that signs you in:
+
+```
+open http://localhost:6901/?token=4f1c… to sign in (the password is 4f1c…; choose one with --basic-auth-password or STARFOLD_PASSWORD)
+```
+
+## 3. Open the link
+
+Open it in a browser on the same machine. Browsers decode video only on HTTPS pages and on `localhost`, so to watch from another machine forward the port over SSH and open `localhost`, or put starfold behind a TLS proxy (see [Auth and network](/server/auth-and-network)).
+
+Add `?stats` to the link for an FPS overlay.
+
+## 4. Drive it from a script
+
+Give the server a password of your own so a script can use it:
+
+```sh
+export STARFOLD_PASSWORD=change-me
+DISPLAY=:1 starfold
+```
+
+Then, from another shell with the same `STARFOLD_PASSWORD`:
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" -o shot.png localhost:6901/screenshot
+curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
+  -d '{"type":"type","text":"hello\n"}'
+curl -u ":$STARFOLD_PASSWORD" localhost:6901/wait
+```
+
+The [HTTP API](/server/http-api) has every route, and the [TypeScript](/sdk/typescript) and [Python](/sdk/python) clients wrap them.
