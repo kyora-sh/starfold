@@ -16,7 +16,7 @@ description: The starfold binary from npm, PyPI, crates.io or a release archive,
 </Callout>
 
 - **npm**: <Pkg path="server.npm" /> brings the binary from the platform package that matches the machine (below), the `starfold` command and `startServer()`. On other platforms set `STARFOLD_BIN` to a starfold binary built for it.
-- **PyPI**: <Pkg path="server.pypi" /> is a platform wheel with the binary, the `starfold` command and `start_server()`. Elsewhere pip finds no wheel; install the client alone, which works against a server running elsewhere.
+- **PyPI**: <Pkg path="server.pypi" /> is a platform wheel with the binary, the `starfold` command and `start_server()`. Elsewhere (musl, an older glibc, Intel macOS, Windows on Arm) pip finds no distribution of it: install its pure wheel, `starfold_server-<version>-py3-none-any.whl` from the [GitHub release](https://github.com/kyora-sh/starfold/releases), and set `STARFOLD_BIN` to a starfold binary built for the platform; or install the client alone, which works against a server running elsewhere.
 - **crates.io**: `cargo install` builds the server from source; it needs the build tools and libraries under [From source](#from-source).
 
 Both the npm and PyPI packages carry the default (MIT) build's binary, byte for byte the release archive's, with its `LICENSE`, `THIRD_PARTY.md` and `licenses/`.

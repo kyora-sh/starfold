@@ -5,7 +5,7 @@ export const release = '0.4.0';
 export const previousRelease = '0.3.2';
 
 /** The release whose Linux binary CI runs `--help` on to check the flags page. */
-export const checkedRelease = '0.3.2';
+export const checkedRelease = '0.4.0';
 
 export const repo = 'kyora-sh/starfold';
 

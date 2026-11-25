@@ -73,8 +73,10 @@ If the server exits, doesn't answer in time or finds its port taken, `startServe
 
 Up to <Release previous />, <Pkg path="client.npm" /> also carried the server. From <Release />:
 
-| <Release previous />                     | <Release />                                          |
-| ---------------------------------------- | ---------------------------------------------------- |
-| `import { startServer } from 'starfold'` | `import { startServer } from '@starfold/server'`     |
-| `npx starfold` / `npm i -g starfold`     | `npx @starfold/server` / `npm i -g @starfold/server` |
-| `Starfold`, `act`, the errors            | unchanged, from `starfold`                           |
+| <Release previous />                                                                                                                                                                                                                                                       | <Release />                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `import { startServer } from 'starfold'`, and likewise `LocalServer`, `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `'@starfold/server'`             |
+| `npx starfold` / `npm i -g starfold`                                                                                                                                                                                                                                       | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `Starfold`, `act`, `StarfoldError` and the client's other errors, the types                                                                                                                                                                                                | unchanged, from `starfold`                           |
+
+A named import of a moved name from `starfold` fails at link time and in `tsc`. Staying on `starfold@`<Release previous /> changes nothing: it still carries the server.
