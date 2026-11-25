@@ -107,8 +107,9 @@ jobs:
   # The release scripts against stand-ins: publish.sh with gh (a fresh release, a re-run that
   # completes a partial one, the mismatches that must fail), the install job's pip step with uv
   # (LINUX_WHEELS on and off), crates.sh's index check with curl (damaged answers stop it), and the
-  # release lookup with gh (an error is never taken for "no release"), and npm-has.sh with npm (a
-  # prerelease-only package hasn't the release).
+  # release lookup with gh (an error is never taken for "no release"), npm-has.sh with npm (a
+  # prerelease-only package hasn't the release), and npm-dry-run.sh with npm (a published version
+  # skips the dry run, a registry error fails it).
   release-scripts:
     name: Release scripts
     runs-on: kyora-2x4
@@ -120,6 +121,7 @@ jobs:
       - run: .github/release/crates-index-test.sh
       - run: .github/release/release-lookup-test.sh
       - run: .github/release/npm-has-test.sh
+      - run: .github/release/npm-dry-run-test.sh
 
   upstream-sync:
     name: Upstream sync script
