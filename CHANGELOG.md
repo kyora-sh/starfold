@@ -1,6 +1,50 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+The client and the server are separate packages on npm and PyPI. `starfold` is the client alone,
+with no binary and no `starfold` command; the server, its command and starting one from code are
+`@starfold/server` on npm and `starfold-server` on PyPI, which depend on the client at the same
+version. Staying on 0.3.2 changes nothing: starfold 0.3.2 on npm and on PyPI still carries the server. The crate on crates.io is still `starfold`, the server.
+
+| 0.3.2                                                                                                                                                                                                                                                                      | 0.4.0                                                                              |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `import { startServer } from 'starfold'`, and likewise `LocalServer`, `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `'@starfold/server'`                                           |
+| `npx starfold` / `npm i -g starfold` (the command)                                                                                                                                                                                                                         | `npx @starfold/server` / `npm i -g @starfold/server`                               |
+| `from starfold import start_server`, and likewise `LocalServer`, `binary_path`, `check_libraries`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError`                                                                                                      | the same names from `starfold_server`                                              |
+| `pip install starfold` (for the command or `start_server`)                                                                                                                                                                                                                 | `pip install starfold-server`                                                      |
+| `pip install "starfold[pillow]"` with the server                                                                                                                                                                                                                           | `pip install starfold-server "starfold[pillow]"`                                   |
+| `uvx starfold` / `pipx run starfold`                                                                                                                                                                                                                                       | `uvx --from starfold-server starfold` / `pipx run --spec starfold-server starfold` |
+| the client: `Starfold`, `AsyncStarfold`, `act`, `StarfoldError` and the client's other errors, the types                                                                                                                                                                   | unchanged                                                                          |
+| `cargo install starfold`                                                                                                                                                                                                                                                   | unchanged                                                                          |
+
+`starfold-server` is on PyPI for the four platforms with a release binary (Linux x86_64 and aarch64
+with glibc 2.39+, macOS arm64, Windows x86_64). Elsewhere (musl, an older glibc, Intel macOS,
+Windows on Arm) `pip install starfold-server` finds no distribution: install its pure wheel,
+`starfold_server-0.4.0-py3-none-any.whl` from the GitHub release, and set `STARFOLD_BIN` to a
+starfold binary, or use the client against a server running elsewhere. On npm, `@starfold/server`
+installs there without a binary and takes `STARFOLD_BIN` likewise.
+
+### npm
+
+- `starfold` is the TypeScript client only: no dependencies, no `bin`, no optional dependencies; its exports are `Starfold`, `act`, the errors and the types. `startServer` and the rest of the server's API are not in it, with no stand-ins (a named import of one fails at link time and in `tsc`)
+- New `@starfold/server`: the `starfold` command and `startServer`, `LocalServer` (whose `client()` is the `starfold` package's `Starfold`), `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError` and `ServerStartError` (still `StarfoldError`s, the client's), unchanged in behaviour; `STARFOLD_BIN` still works. It depends on `starfold` at exactly its own version and installs the binary from `@starfold/server-<platform>`, now its optional dependencies
+- The four `@starfold/server-<platform>` packages are unchanged but for the version, and `@starfold/web` likewise
+
+### PyPI
+
+- `starfold` is the Python client alone: `Starfold`, `AsyncStarfold`, `act` and the errors, an
+  sdist and a pure wheel, no binary and no `starfold` command.
+- `starfold-server` (new, import `starfold_server`) is the server: the `starfold` command,
+  `start_server()`, `LocalServer`, `binary_path()`, `check_libraries()`, `BinaryNotFoundError`,
+  `MissingLibrariesError` and `ServerStartError` (still `starfold.StarfoldError`s), unchanged in
+  behaviour; `LocalServer.client()` returns a `starfold.Starfold`. It requires exactly
+  `starfold==0.4.0` and comes as four platform wheels (Linux x86_64 and aarch64, macOS arm64,
+  Windows x86_64), each with that platform's binary; `STARFOLD_BIN` still names another one.
+- `from starfold import start_server` (or any other moved name) raises an `ImportError` that
+  names `starfold-server` and the new import.
+
+## 0.3.2
 
 The first release of kyora starfold. Prebuilt binaries for Linux (x86_64, aarch64), macOS (Apple
 silicon) and Windows (x86_64) are attached to each release, each as a default build with libaom

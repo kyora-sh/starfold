@@ -44,25 +44,56 @@ def test_third_party_states_the_declared_expression(target):
 
 
 def test_each_release_names_every_versioned_file():
-    """The release's `version` job checks each file `versions.py` reads; RELEASING.md's "Each release"
-    has to name them, and bun.lock, which records packages/starfold's version."""
+    """The release's `version` job checks each file `versions.py` reads, versions and exact pins;
+    RELEASING.md's "Each release" has to name them, bun.lock, which records the npm packages' versions,
+    and both Python projects' uv.lock."""
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-    checked = set(re.findall(r"versions\.py (?:cargo|check \S+) (\S+/\S+\.(?:toml|json))", workflow))
-    assert {"crates/starfold-server/Cargo.toml", "packages/starfold/package.json"} <= checked
+    checked = set(re.findall(r"versions\.py (?:cargo|check-pin \S+|check \S+) (\S+/\S+\.(?:toml|json))", workflow))
+    assert {
+        "crates/starfold-server/Cargo.toml",
+        "python/starfold/pyproject.toml",
+        "python/starfold-server/pyproject.toml",
+        "packages/starfold/package.json",
+        "packages/server/package.json",
+    } <= checked
+    pins = set(re.findall(r"versions\.py check-pin \S+ (\S+) starfold ", workflow))
+    assert pins == {"python/starfold-server/pyproject.toml", "packages/server/package.json"}
     releasing = (ROOT / "RELEASING.md").read_text()
     steps = releasing.split("## Each release", 1)[1]
-    for f in sorted(checked) + ["bun.lock"]:
+    for f in sorted(checked) + ["bun.lock", "python/starfold/uv.lock", "python/starfold-server/uv.lock"]:
         assert f"`{f}`" in steps, f"RELEASING.md's Each release doesn't name {f}"
 
 
-def test_both_sdks_run_the_same_guard():
-    """The TypeScript SDK starts its server through the same sh guard as this one, byte for byte."""
-    from starfold._native import GUARD
+def test_third_party_describes_both_npm_packages():
+    text = DOC.read_text()
+    client = (
+        r"\*\*`starfold` on npm\*\*, MIT: the TypeScript client alone\."
+        r"\s+It carries no binary and depends on\s+nothing"
+    )
+    assert re.search(client, text), "THIRD_PARTY.md doesn't describe npm's starfold as the client alone"
+    assert "**`@starfold/server` on npm**" in text
 
-    ts = (ROOT / "packages" / "starfold" / "src" / "native.ts").read_text()
-    m = re.search(r"^const GUARD = `(.*?)`;$", ts, re.S | re.M)
-    assert m, "native.ts has no GUARD"
-    assert m.group(1).strip("\n") == GUARD.strip("\n"), "native.ts's GUARD differs from _native.py's"
+
+def _changelog_040() -> str:
+    text = (ROOT / "CHANGELOG.md").read_text()
+    return text.split("## 0.4.0", 1)[1].split("\n## ", 1)[0]
+
+
+def test_changelog_names_every_moved_python_name():
+    from starfold import MOVED_TO_SERVER
+
+    entry = _changelog_040()
+    missing = [n for n in sorted(MOVED_TO_SERVER) if f"`{n}`" not in entry]
+    assert not missing, f"CHANGELOG's 0.4.0 entry doesn't name {missing}"
+
+
+def test_changelog_names_every_moved_typescript_name():
+    index = (ROOT / "packages" / "server" / "src" / "index.ts").read_text()
+    names = set(re.findall(r"^\t(\w+),$", index, re.M)) | set(re.findall(r"export type \{ (\w+) \}", index))
+    assert {"startServer", "StartServerOptions", "LINUX_LIBRARIES_HINT"} <= names
+    entry = _changelog_040()
+    missing = [n for n in sorted(names) if f"`{n}`" not in entry]
+    assert not missing, f"CHANGELOG's 0.4.0 entry doesn't name {missing}"
 
 
 def test_third_party_doesnt_call_the_server_packages_mit():

@@ -1,0 +1,45 @@
+{
+	"name": "@starfold/server",
+	"version": "0.4.0",
+	"description": "The starfold server for Node, Bun and Deno: the starfold command and startServer()",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kyora-sh/starfold.git",
+		"directory": "packages/server"
+	},
+	"bin": {
+		"starfold": "bin/starfold.js"
+	},
+	"files": [
+		"dist",
+		"bin",
+		"README.md",
+		"LICENSE"
+	],
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun run --cwd ../starfold build && tsc -p tsconfig.build.json",
+		"typecheck": "bun run --cwd ../starfold build && tsc -p .",
+		"test": "bun run build && bun test test/",
+		"test:integration": "node test/integration.mjs"
+	},
+	"dependencies": {
+		"starfold": "0.4.0"
+	},
+	"devDependencies": {
+		"@types/node": "20.19.9",
+		"typescript": "5.8.2"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}

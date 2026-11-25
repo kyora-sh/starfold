@@ -1,15 +1,12 @@
 [project]
 name = "starfold"
-version = "0.3.2"
-description = "Python SDK for starfold"
+version = "0.4.0"
+description = "Python client for starfold: screenshots, waiting for the screen, mouse and keyboard"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = ["httpx>=0.27"]
-
-[project.scripts]
-starfold = "starfold._native:main"
 
 [project.urls]
 Repository = "https://github.com/kyora-sh/starfold"
@@ -33,4 +30,3 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: starts the server on Xvfb (set STARFOLD_BIN to run)"]

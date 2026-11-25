@@ -9,12 +9,23 @@
         "oxlint": "1.80.0",
       },
     },
-    "packages/starfold": {
-      "name": "starfold",
-      "version": "0.3.2",
+    "packages/server": {
+      "name": "@starfold/server",
+      "version": "0.4.0",
       "bin": {
         "starfold": "bin/starfold.js",
       },
+      "dependencies": {
+        "starfold": "0.4.0",
+      },
+      "devDependencies": {
+        "@types/node": "20.19.9",
+        "typescript": "5.8.2",
+      },
+    },
+    "packages/starfold": {
+      "name": "starfold",
+      "version": "0.4.0",
       "devDependencies": {
         "@types/node": "20.19.9",
         "typescript": "5.8.2",
@@ -103,6 +114,8 @@
     "@oxlint/binding-win32-ia32-msvc": ["@oxlint/binding-win32-ia32-msvc@1.80.0", "", { "os": "win32", "cpu": "ia32" }, "sha512-xhRWBMpLxZvgKAH6+DJZmpP+W8Y8UdQOSU1JfxSWNXsaBaRGW77j+1hCuNHlzj7OH4SPN8fYd1q0o2qrDtoVyw=="],
 
     "@oxlint/binding-win32-x64-msvc": ["@oxlint/binding-win32-x64-msvc@1.80.0", "", { "os": "win32", "cpu": "x64" }, "sha512-yAnO7lwBYQnz2pcfBPIGQQZWIX5zd5R/1aAKIF3oE+TVj7IhoHcROjOkz3sRDngzqhfPKfFaXqug5j5rE5dn6Q=="],
+
+    "@starfold/server": ["@starfold/server@workspace:packages/server"],
 
     "@starfold/web": ["@starfold/web@workspace:packages/web"],
 
