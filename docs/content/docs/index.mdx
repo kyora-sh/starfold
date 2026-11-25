@@ -1,0 +1,44 @@
+---
+title: What starfold is
+description: Low-latency desktop streaming to a plain browser tab, with HTTP APIs for agents.
+---
+
+starfold streams a desktop to a browser tab over one WebSocket: an X11 display (Xvfb included), a Mac's screen or a Windows desktop. The browser decodes with WebCodecs, so there is nothing to install on the viewer's side.
+
+It carries the mouse, keyboard and touch, the clipboard, audio and the microphone, file transfer and dynamic resolution. Agents and scripts get HTTP APIs for screenshots, recordings, input and for waiting until the screen settles.
+
+## The parts
+
+| Part                              | What it is                                                                                                                                               |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The server                        | One binary, `starfold`: captures the screen, encodes it and serves the page, the WebSocket and the HTTP APIs. See [Install the server](/install/server). |
+| The browser client                | The page the server serves at `/`, and [`@starfold/web`](/browser-client) to mount the same client in a page of your own.                                |
+| The TypeScript and Python clients | Headless clients for agents and scripts: screenshots, waiting, input, recordings and files. See [TypeScript](/sdk/typescript) and [Python](/sdk/python). |
+
+## Video
+
+The default software encoder is AV1 from libaom, built into the binary. Where the host has a hardware H.264 encoder that isn't experimental (VideoToolbox on a Mac), starfold uses it, and the server and the browser negotiate HEVC or AV1 where both have them. A separate build adds x264 for software H.264. [Encoders](/server/encoders) has the details.
+
+## Why a WebSocket and not WebRTC
+
+One WebSocket goes wherever a web page does: through reverse proxies, tunnels and sandbox preview URLs, with no TURN servers or UDP ports to open. The browser decodes each frame the moment it arrives, without a jitter buffer, and starfold runs its own rate control, which keeps latency low on a clean link. The trade-off is TCP: on a link that drops packets, a lost packet holds up the frames behind it, where WebRTC can skip ahead.
+
+## Which browsers work
+
+Any browser with WebCodecs, on an HTTPS page or on `localhost`:
+
+| Browser                                                                | Works |
+| ---------------------------------------------------------------------- | ----- |
+| Chrome, Edge and other Chromium browsers 94+, desktop and Android      | Yes   |
+| Firefox 130+, desktop                                                  | Yes   |
+| Safari 16.4+ and any browser on iPhone or iPad (sound needs Safari 26) | Yes   |
+| Firefox for Android                                                    | No    |
+
+Where the stream is AV1, the viewer needs a protocol 2 client, such as starfold's own page. Where WebCodecs can't decode AV1, the page decodes it with dav1d compiled to WebAssembly, on the CPU. Phones and tablets get touch input and an on-screen keyboard.
+
+Wayland is not supported yet: on Linux, starfold streams X11 displays.
+
+## Next
+
+- [Quick start](/quickstart): a desktop in a browser tab in a few commands.
+- [Recipes for agents](/recipes): screenshot, act, wait.

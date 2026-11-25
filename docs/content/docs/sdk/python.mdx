@@ -1,0 +1,78 @@
+---
+title: Python
+description: The headless client, blocking and asyncio, and starting a server from Python.
+---
+
+<Pkg path="client.pypi" /> is a client for agents and scripts driving a starfold
+desktop: screenshots, waiting for the screen, mouse and keyboard, recordings and
+files. It is the client alone: no server binary and no `starfold` command.
+
+<Install which="client" />
+
+## Driving a desktop
+
+```python
+from starfold import Starfold, act
+
+# password defaults to $STARFOLD_PASSWORD
+with Starfold("http://localhost:6901", password="...") as sf:
+    shot = sf.screenshot()  # shot.png (bytes), shot.seq, shot.size
+    shot.save("before.png")
+
+    sf.click(400, 300)
+    r = sf.type_text("hello\n")
+    sf.wait(change=True, since=r.seq)  # once the typing changed the screen
+    sf.wait(idle_ms=300)  # and once it settled
+
+    sf.key("ctrl+shift+t")
+    sf.scroll(dy=3, x=400, y=300)
+    sf.drag(100, 100, 400, 100)
+    sf.actions([act.key("ctrl+l"), act.type_text("example.com"), act.key("Enter")])
+
+    clips = sf.record(5)  # a list of MP4s: one, or more if the encoder changed mid-recording
+    sf.files_upload("data.csv", "local/data.csv")
+    print([e.name for e in sf.files_list().entries])
+```
+
+`AsyncStarfold` has the same methods for asyncio. `Screenshot.image()` returns a Pillow image if Pillow is installed (`pip install "starfold[pillow]"`).
+
+Keys for `key()` follow the [input actions](/server/http-api#input).
+
+## Errors
+
+`AuthError` (wrong or missing password), `ReadOnlyError` (the server runs with `--read-only`), `RecordingOffError` (it runs without `--enable-recording`), `ForbiddenError`, `NotFoundError`, `StarfoldTimeoutError` and `StarfoldConnectionError` are all `StarfoldError`. `wait()` reports a timeout in its result (`timed_out`) rather than raising.
+
+## Starting a server from Python
+
+<Pkg path="server.pypi" /> has the server: its binary, the `starfold` command,
+and `start_server()`, which starts a server on this machine and hands you a
+client signed in to it. Installing it installs the client too, at the same
+version. There are wheels for Linux x86_64 and aarch64 (glibc 2.39+), macOS
+arm64 and Windows x86_64.
+
+<Install which="server" />
+
+```python
+from starfold_server import start_server
+
+with start_server() as server:  # loopback, a free port, a generated password
+    sf = server.client()  # a starfold.Starfold, signed in already
+    sf.screenshot().save("desktop.png")
+```
+
+`start_server()` listens on 127.0.0.1 unless you pass `addr=`. `port=`, `password=`, `args=` (more [server flags](/server/flags)), `env=`, `cwd=`, `binary=` and `timeout=` (seconds until it answers, default 30) are optional. It returns a `LocalServer` with `url`, `password`, `process`, `stderr_tail`, `client()`, `async_client()` and `close()`; the server stops on `close()`, at the end of the `with` block, at exit, and when your process ends.
+
+If the server exits, doesn't answer in time or can't have its port, it raises `ServerStartError` with the server's last output in `output`. On Linux it needs a display (`DISPLAY`, for example from Xvfb); it doesn't start one, and it needs the libraries under [Install the server](/install/server#what-each-platform-needs). `binary_path()` is the binary: `$STARFOLD_BIN` if set, else the wheel's.
+
+## Upgrading from 0.3.2
+
+Up to <Release previous />, <Pkg path="client.pypi" /> also carried the server. From <Release />:
+
+| <Release previous />                               | <Release />                                |
+| -------------------------------------------------- | ------------------------------------------ |
+| `pip install starfold` (for the command or server) | `pip install starfold-server`              |
+| `starfold.start_server(...)`                       | `starfold_server.start_server(...)`        |
+| `from starfold import start_server`                | `from starfold_server import start_server` |
+| `Starfold`, `AsyncStarfold`, `act`, the errors     | unchanged                                  |
+
+`from starfold import start_server` (or any other moved name) raises an `ImportError` that says so. Staying on `starfold==`<Release previous /> changes nothing: it still carries the server.

@@ -1,0 +1,101 @@
+---
+title: HTTP API
+description: Screenshots, waiting for the screen, mouse and keyboard input, and recordings over plain HTTP.
+---
+
+Every route takes the same password as the page: `curl -u ":$STARFOLD_PASSWORD"` or `Authorization: Bearer <password>`. The examples assume a server started with `STARFOLD_PASSWORD` set, on port 6901. The [TypeScript](/sdk/typescript) and [Python](/sdk/python) clients wrap all of this.
+
+| Route                                                         |                                                                       |
+| ------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `GET /screenshot`                                             | the screen as a PNG                                                   |
+| `GET /wait`                                                   | returns when the screen settles or changes                            |
+| `POST /input`                                                 | mouse and keyboard actions, as JSON                                   |
+| `GET /record`                                                 | an MP4 of the next N seconds (needs `--enable-recording`)             |
+| `POST /record/start`, `POST /record/stop`                     | a recording you stop yourself (needs `--enable-recording`)            |
+| `GET /files/list`, `GET /files/download`, `PUT /files/upload` | file transfer (needs `--files-root`)                                  |
+| `GET /stats`                                                  | what the server runs, including the hardware encoders the probe found |
+| `GET /healthz`                                                | `ok`, without a password                                              |
+
+## Screenshots
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" -o shot.png localhost:6901/screenshot
+```
+
+The answer's `X-Starfold-Seq` header is the screen's change count at the screenshot; pass it to `/wait?change&since=` to wait for anything after it.
+
+## Waiting for the screen
+
+`/wait` returns when the screen settles or changes, so an agent doesn't have to sleep after every action and hope it was long enough:
+
+```sh
+# once nothing changed for 300 ms
+curl -u ":$STARFOLD_PASSWORD" localhost:6901/wait
+# still for 1 s, giving up after 30 s
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?idle=1000&timeout=30000"
+# the first change in that rectangle
+curl -u ":$STARFOLD_PASSWORD" "localhost:6901/wait?change&region=0,0,800,600"
+# {"changed":true,"timed_out":false,"seq":812,"waited_ms":340}
+```
+
+| Parameter | Default          |                                                                                                      |
+| --------- | ---------------- | ---------------------------------------------------------------------------------------------------- |
+| `idle`    | `300`            | ms the screen has to stay still, counted from the request at the earliest                            |
+| `change`  |                  | return at the first change instead                                                                   |
+| `region`  | the whole screen | `x,y,w,h`: watch only that rectangle (to the 16-pixel block)                                         |
+| `timeout` | `10000`          | ms before it gives up; the answer then has `"timed_out":true`                                        |
+| `since`   |                  | a `seq` from an earlier `/wait`, `/input` or screenshot: return at once if anything changed after it |
+
+A blinking text caret redraws about twice a second, so keep `idle` under 500 ms or leave the caret out of `region`. starfold already knows which parts of the screen change (XDamage, ScreenCaptureKit and DXGI report them), so waiting takes no screenshots or polling.
+
+## Input
+
+`POST /input` takes one action or an array of them, applied in order, and answers once every event has reached the desktop:
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" -H 'Content-Type: application/json' localhost:6901/input \
+  -d '[{"type":"click","x":400,"y":300},{"type":"type","text":"hello\n"},{"type":"key","key":"ctrl+s"}]'
+# {"seq":812,"events":19}
+```
+
+`seq` is the screen's change count from before the first event, so `/wait?change&since=812` returns once the actions changed the screen.
+
+| Action                                                                 |                                                                                                                                                             |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"type":"move","x":10,"y":20}`                                        | move the pointer                                                                                                                                            |
+| `{"type":"click","x":10,"y":20,"button":"left","count":2}`             | click; `x`/`y` move first and are optional, `button` is `left` (default), `middle`, `right`, `back`, `forward` or an X button number, `count` defaults to 1 |
+| `{"type":"down","button":"left"}`, `{"type":"up"}`                     | press or release a button (optional `x`/`y`)                                                                                                                |
+| `{"type":"scroll","dx":0,"dy":3}`                                      | wheel notches, positive is down and right (optional `x`/`y`)                                                                                                |
+| `{"type":"key","key":"ctrl+shift+t"}`                                  | press keys together, then release them                                                                                                                      |
+| `{"type":"key_down","key":"shift"}`, `{"type":"key_up","key":"shift"}` | only press, or only release                                                                                                                                 |
+| `{"type":"type","text":"hello\n"}`                                     | type the text, newlines as Enter                                                                                                                            |
+| `{"type":"pause","ms":50}`                                             | wait before the next action                                                                                                                                 |
+
+Keys are a single character or a name (Enter, Tab, Escape, BackSpace, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right, Insert, Space, F1-F24, ctrl, shift, alt, altgr, super, ...), joined with `+`. After modifiers a letter's case follows Shift (`ctrl+T` is Ctrl+t), and with Shift a digit or punctuation key is its shifted symbol on a US layout (`cmd+shift+4` is Cmd+$).
+
+A request runs to the end even if its client goes away, so it never leaves a key or button pressed halfway. A `--read-only` server refuses input with 403.
+
+## Recordings
+
+Recording is off unless starfold runs with `--enable-recording`; without it the three `/record` routes answer 403. Under `--read-only` they are refused too.
+
+```sh
+# an MP4 of the next 10 s
+curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 "localhost:6901/record?seconds=10"
+# or start...
+id=$(curl -u ":$STARFOLD_PASSWORD" -s -X POST localhost:6901/record/start | jq -r .id)
+# ...and stop when done
+curl -u ":$STARFOLD_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
+```
+
+A recording is the stream starfold sends to viewers, saved as MP4 without re-encoding: H.264 from an H.264 encoder, AV1 from an AV1 one. It doesn't include the cursor, which viewers draw, except on macOS when the cursor is in the video. Only the holder of the id that start returned can stop a recording or get its clip: treat the id like a secret.
+
+- At most 2 recordings run at once; a third gets 429.
+- `--max-record-seconds` (default 300, at most 600) bounds the length.
+- If another encoder takes over mid-recording, the recording continues in a new MP4. Add `format=zip` to `/record` or `/record/stop` to get all of them with a `manifest.json`; without it you get the first. The `x-starfold-segments` and `x-starfold-record-end` headers say how many MP4s there were and why the recording ended.
+
+An AV1 MP4 plays in current Chrome, Edge and Firefox, in VLC and mpv, and with ffmpeg; Safari and QuickTime play it only where the hardware decodes AV1. To convert one: `ffmpeg -i clip.mp4 -c:v libx264 clip-h264.mp4`.
+
+## Files
+
+File transfer is off unless `--files-root` names a folder. Every path is resolved beneath that folder, and symlinks are never followed. Uploads go to `--upload-dir` (default `Downloads`, under the root) and never replace an existing file. The clients' `filesList`/`files_list`, `filesDownload`/`files_download` and `filesUpload`/`files_upload` wrap these routes.

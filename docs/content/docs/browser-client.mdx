@@ -1,0 +1,87 @@
+---
+title: Browser client
+description: The page the server serves, and mount() to show a starfold desktop inside a page of your own.
+---
+
+## The server's own page
+
+Every server serves its client at `/`: open the link it prints. The page takes these query parameters:
+
+| Parameter           |                                                                                                    |
+| ------------------- | -------------------------------------------------------------------------------------------------- |
+| `?token=<password>` | signs you in; the page passes it on to its own connections, so the link works as an iframe's `src` |
+| `?stats`            | an FPS overlay                                                                                     |
+| `?present=canvas`   | paint into a canvas instead of a `<video>`                                                         |
+| `?framed=1`         | for a server started with `--framed`                                                               |
+
+A page that embeds it in an iframe can wait for the `starfold:firstframe` event on `window` rather than `load`.
+
+## Embedding with mount()
+
+<Pkg path="web.npm" /> is the same client as an ES module, to mount in an
+element of another page. It keeps the picture, keyboard and pointer input,
+pasting into the desktop, the cursor, read-only display and (opt-in) audio; it
+has no toolbar, files, microphone or resizing.
+
+<Install which="web" />
+
+```ts
+import { mount } from '@starfold/web';
+
+const desktop = mount(document.getElementById('desktop')!, {
+	connect: {
+		url: 'wss://desktop.example.com/ws',
+		preamble: async () => await fetchTicket(),
+	},
+	reconnect: true,
+	onStatus: (status) => console.log(status),
+	onClose: (code, reason) => console.log(code, reason),
+});
+
+// later
+desktop.unmount();
+```
+
+`mount()` throws on a page that isn't a secure context (HTTPS or `localhost`) or in a browser without OffscreenCanvas. The server has to let the page's site connect: start it with `--allowed-origins` naming that site (see [Auth and network](/server/auth-and-network#hosts-and-origins)).
+
+### Options
+
+| Option                      |                                                                                                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `connect.url`               | the WebSocket URL, used exactly as given (no query string is added)                                                                                                |
+| `connect.protocols`         | WebSocket subprotocols                                                                                                                                             |
+| `connect.preamble`          | text message(s) sent first on every connection, before anything of starfold's, such as a ticket; called before every connect, never logged or passed to a callback |
+| `assetBase`                 | the directory with `worker.js`, `dav1d.js`, `dav1d.wasm` and `audio.js`; default: the module's own directory. It must be on the page's own origin                  |
+| `audio`                     | play the desktop's audio, after the first user gesture; default off                                                                                                |
+| `reconnect`                 | `true` for the defaults, or an object with limits (below); default off                                                                                             |
+| `onStatus(status, detail?)` | `connecting`, `open`, `closed`, `preamble-failed`, `connect-failed`, `reconnecting`, `gave-up`                                                                     |
+| `onClose(code, reason)`     | once per connection whose socket was asked for, with the close frame's code and reason                                                                             |
+| `onReconnect(event)`        | with `reconnect`: `reconnecting`, `reconnected` and `gave-up` events                                                                                               |
+
+`mount()` returns a handle with `connect()` (connect again; while waiting to reconnect, connect now) and `unmount()` (stop at once and remove everything `mount()` added).
+
+### Reconnecting
+
+With `reconnect`, a close worth another attempt calls the same `connect()` again, the preamble too, so a ticket is minted for each attempt. The delay before attempt n is a random time below min(`capMs`, `initialMs` × `factor`^(n-1)); a run gives up after `maxAttempts` attempts or `maxMs` since its first close, whichever comes first.
+
+| Limit                           | Default                             |
+| ------------------------------- | ----------------------------------- |
+| `initialMs`                     | `500`                               |
+| `factor`                        | `2`                                 |
+| `capMs`                         | `30000`                             |
+| `maxAttempts`                   | `10`                                |
+| `maxMs`                         | `300000` (5 min, on the wall clock) |
+| `shouldReconnect(code, reason)` | the table below                     |
+
+| Close code            | Sent by                                                                                | Reconnects                                                                |
+| --------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| 1006 (no close frame) | the browser: a network drop, a server that crashed or was killed, or a refused upgrade | yes; three in a row that never reached open give up                       |
+| 1001, 1012, 1013      | a server or proxy going away, restarting, or busy                                      | yes                                                                       |
+| 44xx (but 4406)       | the host's gateway or a server                                                         | yes; the same code twice in a row, each within 10 s of its open, gives up |
+| 4406                  | starfold: a protocol 1 viewer when the base stream is not H.264                        | no                                                                        |
+| 1000                  | a server or proxy closing on purpose                                                   | no                                                                        |
+| 1003, 1007, 1009      | starfold: a frame the client should not have sent                                      | no                                                                        |
+| 4000, 4001, 4002      | the client itself: a protocol error, no common codec, a failed worker                  | no                                                                        |
+| any other             |                                                                                        | no                                                                        |
+
+A connection that stays open for 10 s ends the run. A hidden tab waits to be visible again and an offline page for the network. A starfold server that shuts down sends 1012 to every viewer, so viewers with `reconnect` come back once it restarts.

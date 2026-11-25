@@ -1,0 +1,86 @@
+---
+title: Platforms
+description: What starfold streams on Linux, macOS and Windows, what each needs and its own flags.
+---
+
+|                                | Linux                                            | macOS                  | Windows                                            |
+| ------------------------------ | ------------------------------------------------ | ---------------------- | -------------------------------------------------- |
+| Streams                        | an X11 display (Xvfb included)                   | this Mac's screen      | the desktop of the session it runs in              |
+| Capture                        | MIT-SHM GetImage, or Xvfb's framebuffer in place | ScreenCaptureKit       | DXGI Desktop Duplication                           |
+| Default `--addr`               | `0.0.0.0`                                        | `127.0.0.1`            | `127.0.0.1`                                        |
+| Hardware encoders              | VA-API, NVENC (experimental)                     | VideoToolbox           | NVENC, Media Foundation, Quick Sync (experimental) |
+| Microphone                     | into a FIFO a PulseAudio pipe source reads       | into a loopback device | into a virtual audio cable                         |
+| Unix socket, `starfold attach` | yes                                              | no                     | no                                                 |
+| Prebuilt binaries              | x86_64, aarch64 (glibc 2.39+)                    | Apple silicon          | x86_64                                             |
+
+## Linux
+
+starfold streams an X11 display; Wayland is not supported yet. The release binaries are built on Ubuntu 24.04 and need glibc 2.39 or newer, libyuv, Opus and PulseAudio's client library:
+
+```sh
+sudo apt install libyuv0 libopus0 libpulse0
+DISPLAY=:1 starfold
+```
+
+starfold captures with MIT-SHM GetImage into a shared-memory segment of its own, which the X server has to attach. It can't over TCP (`DISPLAY=host:N`; use `DISPLAY=:N`), from another IPC namespace, or as another user: starfold then stops at start and names these causes.
+
+The repository's `xvfb.nix` builds a patched Xvfb for pixel-precise scroll input; stock Xvfb scrolls by wheel notches.
+
+### Reading Xvfb's framebuffer in place
+
+With `STARFOLD_DIRECT_FB=1` in its environment and Xvfb started with `-shmem`, starfold reads the screen in place from Xvfb's framebuffer instead of with GetImage. On one VM (4 vCPUs, a 1920x1080 full-screen animation at 60 fps) that saved about 1 ms per frame and about a tenth of a core. `STARFOLD_NO_DIRECT_FB` turns it off and wins. starfold reads a segment only if it can tie it to the X server it is connected to; otherwise it uses GetImage and logs why once.
+
+<Callout type="warn">
+	Xvfb creates its `-shmem` segments with mode 0777: every local user can read
+	that screen, whether starfold reads it or not. On a host with several users,
+	don't start Xvfb with `-shmem`.
+</Callout>
+
+Linux-only flags: `--audio-device-name` (a PulseAudio source, default `output.monitor`), `--microphone-fifo`, `--round-corners`, `--round-windows`, `--listen-unix`.
+
+## macOS
+
+starfold streams the Mac's own screen with ScreenCaptureKit, takes input with CGEvent, and carries the clipboard and system audio. macOS asks starfold (or the terminal that starts it) for the Screen Recording and Accessibility permissions. An archive's binary is not notarized, so clear its download quarantine first:
+
+```sh
+xattr -d com.apple.quarantine starfold
+./starfold --port=6901
+```
+
+For the microphone, install a loopback device (`brew install blackhole-2ch`) and pick it as the input in the apps that should hear you.
+
+| macOS flag             | Default                     |                                                                     |
+| ---------------------- | --------------------------- | ------------------------------------------------------------------- |
+| `--display`            | main display                | an index (0 is the main display) or a display ID; logged at startup |
+| `--capture-scale`      | native, within the budget   | streamed pixels per point                                           |
+| `--max-capture-pixels` | `4096000` (2560x1600)       | pixel budget for the automatic scale                                |
+| `--microphone-device`  | first loopback device found | output device (name or prefix) to play the browser microphone into  |
+| `--resize-scale`       | the capture scale           | so a viewer's window maps to the same number of points on the Mac   |
+| `--show-cursor`        | off; on with `--read-only`  | include the host cursor in the video stream                         |
+
+`--audio-device-name`, `--microphone-fifo` and the rounded-corner flags don't apply.
+
+## Windows
+
+starfold streams a Windows desktop (Windows 10 version 1703 or later) with DXGI Desktop Duplication, takes input with SendInput, and carries clipboard text and images and WASAPI system audio. It streams the desktop of the session it runs in, so start it in the user's session, not as a service; Windows hides the lock screen and UAC prompts from it unless it runs as SYSTEM.
+
+For the microphone, install a virtual audio cable such as VB-CABLE: starfold plays into "CABLE Input" and apps record from "CABLE Output".
+
+| Windows flag          | Default                   |                                                                    |
+| --------------------- | ------------------------- | ------------------------------------------------------------------ |
+| `--display`           | primary display           | by index (0 is the primary); logged at startup                     |
+| `--audio-device-name` | default output device     | output device (name or prefix) whose sound to stream               |
+| `--microphone-device` | first virtual cable found | output device (name or prefix) to play the browser microphone into |
+| `--resize-scale`      | the display's scaling     | so a viewer's window maps to the same size on the desktop          |
+
+Dynamic resolution picks the largest display mode that fits the viewer's window, and Windows restores the original mode when starfold exits. The experimental Quick Sync encoder (`--encoder qsv`, 64-bit only) needs Windows 10 1607 / Server 2016 or later.
+
+To build on Windows, use Rust, vcpkg, cmake, perl, nasm and esbuild:
+
+```powershell
+vcpkg install libyuv opus --triplet x64-windows-static-md
+$env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
+npm install -g esbuild
+cargo build --release
+.\target\release\starfold.exe --port=6901
+```

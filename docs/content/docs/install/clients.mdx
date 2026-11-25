@@ -1,0 +1,30 @@
+---
+title: Install the clients
+description: The headless TypeScript and Python clients, and the embeddable browser client.
+---
+
+## Headless clients
+
+For agents and scripts that drive a starfold desktop: screenshots, waiting for the screen, mouse and keyboard, recordings and files.
+
+<Install which="client" />
+
+- **TypeScript** (<Pkg path="client.npm" /> on npm): Node 20+, Bun and Deno; no dependencies. See [TypeScript](/sdk/typescript).
+- **Python** (<Pkg path="client.pypi" /> on PyPI): a blocking client and an asyncio one. See [Python](/sdk/python).
+
+The clients alone install no server binary and no `starfold` command. To run a server on the same machine, or start one from code, install <Pkg path="server.npm" /> or <Pkg path="server.pypi" /> instead: each brings the client with it, at the same version. See [Install the server](/install/server).
+
+<Callout>
+	Up to <Release previous />, <Pkg path="client.npm" /> and{' '}
+	<Pkg path="client.pypi" /> also carried the server. Staying on{' '}
+	<Release previous /> changes nothing; moving to <Release /> moves the server
+	imports (see each SDK's page).
+</Callout>
+
+## The browser client
+
+Every server serves its own page at `/`, so a viewer needs nothing but a browser. To show a starfold desktop inside a page of your own, install the embeddable client:
+
+<Install which="web" />
+
+See [Browser client](/browser-client).

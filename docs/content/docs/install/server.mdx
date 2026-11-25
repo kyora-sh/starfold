@@ -1,0 +1,76 @@
+---
+title: Install the server
+description: The starfold binary from npm, PyPI, crates.io or a release archive, and what each platform needs.
+---
+
+## With a package manager
+
+<Install which="server" />
+
+<Callout>
+	Up to <Release previous /> the server came inside the client packages (
+	<Pkg path="client.npm" /> on npm and <Pkg path="client.pypi" /> on PyPI). From{' '}
+	<Release /> it is <Pkg path="server.npm" /> on npm and{' '}
+	<Pkg path="server.pypi" /> on PyPI; the client packages carry the client
+	alone.
+</Callout>
+
+- **npm**: <Pkg path="server.npm" /> brings the binary from the platform package that matches the machine (below), the `starfold` command and `startServer()`. On other platforms set `STARFOLD_BIN` to a starfold binary built for it.
+- **PyPI**: <Pkg path="server.pypi" /> is a platform wheel with the binary, the `starfold` command and `start_server()`. Elsewhere pip finds no wheel; install the client alone, which works against a server running elsewhere.
+- **crates.io**: `cargo install` builds the server from source; it needs the build tools and libraries under [From source](#from-source).
+
+Both the npm and PyPI packages carry the default (MIT) build's binary, byte for byte the release archive's, with its `LICENSE`, `THIRD_PARTY.md` and `licenses/`.
+
+## Release archives
+
+Each [release](https://github.com/kyora-sh/starfold/releases) attaches two builds per platform, where `<version>` is the release's:
+
+<ServerPlatforms />
+
+- **Default**: where the host has no hardware H.264 encoder it streams AV1 from libaom, which is linked in statically. Viewers need a protocol 2 client that decodes AV1. Distributed under MIT.
+- **x264**: adds x264, so where the host has no hardware H.264 encoder the base stream (recordings, protocol 1 viewers, browsers without AV1) is H.264 from x264, while browsers that decode AV1 still get AV1. GPL-2.0-or-later; the release attaches x264's source beside it.
+
+Download an archive and its `.sha256`, check it and unpack it:
+
+```sh
+sha256sum -c starfold-<version>-x86_64-linux.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+tar -xzf starfold-<version>-x86_64-linux.tar.gz
+./starfold-<version>-x86_64-linux/starfold --version
+```
+
+`--version` names the version, the software encoders in the binary and its licence, for example `starfold <version> (encoders: libaom; licence: MIT)`.
+
+## What each platform needs
+
+- **Linux**: built on Ubuntu 24.04, so glibc 2.39 or newer. libyuv, Opus and PulseAudio's client library, plus x264 for the x264 build, and an X server to stream, such as Xvfb. On Ubuntu 24.04:
+
+  ```sh
+  sudo apt install libyuv0 libopus0 libpulse0   # plus libx264-164 for starfold-x264-*
+  ```
+
+- **macOS** (Apple silicon): nothing beyond the system. The binary is not notarized, so clear the download quarantine of an archive's binary first: `xattr -d com.apple.quarantine starfold`.
+- **Windows** x86_64 (Windows 10 version 1703 or later): nothing beyond the system; `starfold.exe` is self-contained.
+
+[Platforms](/server/platforms) covers what each platform streams and its own flags.
+
+## From source
+
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries. libaom is built from a git submodule and linked statically, which also needs git, cmake 3.16 or newer, perl and, on x86_64, nasm. On Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential clang libclang-dev pkg-config esbuild cmake perl nasm \
+  libyuv-dev libopus-dev libpulse-dev libxcb1-dev
+cargo install --locked starfold
+```
+
+That is the default build, with libaom and under MIT. For x264, add `--features x264` and install `libx264-dev`; that binary is GPL-2.0-or-later. On a Mac, `brew install opus pkgconf esbuild cmake nasm` (plus `x264` for `--features x264`) gives the libraries; Windows builds with vcpkg (see [Platforms](/server/platforms#windows)).
+
+From a clone, clone with the submodule (`git clone --recursive`): the build checks that the libaom submodule is at its pinned commit, so GitHub's source archives, which lack it, can't build libaom.
+
+```sh
+git clone --recursive https://github.com/kyora-sh/starfold
+cd starfold
+cargo build --release
+```
+
+The repository's `nix-shell --arg withRust true` provides every build dependency.

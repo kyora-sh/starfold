@@ -510,3 +510,61 @@ jobs:
       - name: Encoder bench
         if: inputs.encoder_bench
         run: bash bench/vs/mac-encoders.sh 5
+
+  # The documentation site (docs/, its own package and lockfile): only when docs/, the server's
+  # --help source or this file changed. The flags page is checked against the --help of the
+  # Linux release binary that docs/lib/packages.ts names (checkedRelease) and against help.rs.
+  docs:
+    name: Docs (types, build, flags)
+    runs-on: kyora-8x16
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Changed paths
+        id: paths
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null ||
+            git diff --name-only "$BASE" HEAD | grep -qE '^(docs/|crates/starfold-server/src/help\.rs$|\.github/workflows/ci\.yml$)'; then
+            echo run=true >>"$GITHUB_OUTPUT"
+          else
+            echo run=false >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.paths.outputs.run == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - if: steps.paths.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+      - if: steps.paths.outputs.run == 'true'
+        run: bun install --frozen-lockfile
+      - name: Type-check
+        if: steps.paths.outputs.run == 'true'
+        run: bun run check-types
+      - name: Build (the Worker bundle wrangler deploys)
+        if: steps.paths.outputs.run == 'true'
+        run: bunx opennextjs-cloudflare build
+      - name: Flags, packages and links against the server's --help
+        if: steps.paths.outputs.run == 'true'
+        run: |
+          v=$(sed -n "s/^export const checkedRelease = '\(.*\)';$/\1/p" lib/packages.ts)
+          test -n "$v"
+          a=starfold-$v-x86_64-linux.tar.gz
+          curl -fsSL --retry 3 -O "https://github.com/kyora-sh/starfold/releases/download/v$v/$a"
+          curl -fsSL --retry 3 -O "https://github.com/kyora-sh/starfold/releases/download/v$v/$a.sha256"
+          sha256sum -c "$a.sha256"
+          tar -xzf "$a"
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 update
+          sudo timeout -k 10 300 env DEBIAN_FRONTEND=noninteractive apt-get -q -o Acquire::Retries=3 install -y libyuv0 libopus0 libpulse0
+          "./starfold-$v-x86_64-linux/starfold" --help >"$RUNNER_TEMP/help.txt"
+          bun run check-flags "$RUNNER_TEMP/help.txt"
