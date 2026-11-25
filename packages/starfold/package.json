@@ -1,19 +1,15 @@
 {
 	"name": "starfold",
-	"version": "0.3.2",
-	"description": "TypeScript SDK for starfold: screenshots, waiting for the screen, mouse and keyboard, and a local server",
+	"version": "0.4.0",
+	"description": "TypeScript client for starfold: screenshots, waiting for the screen, mouse and keyboard",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/kyora-sh/starfold.git",
 		"directory": "packages/starfold"
 	},
-	"bin": {
-		"starfold": "bin/starfold.js"
-	},
 	"files": [
 		"dist",
-		"bin",
 		"README.md",
 		"LICENSE"
 	],

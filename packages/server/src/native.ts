@@ -11,9 +11,8 @@ import { Agent, request } from 'node:http';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join } from 'node:path';
-import { Starfold } from './client.js';
-import type { StarfoldOptions } from './client.js';
-import { StarfoldError } from './types.js';
+import { Starfold, StarfoldError } from 'starfold';
+import type { StarfoldOptions } from 'starfold';
 
 /** The apt line for the shared libraries the Linux binary links. */
 export const LINUX_LIBRARIES_HINT =
@@ -210,7 +209,7 @@ export interface StartServerOptions {
 	timeoutMs?: number;
 }
 
-// The Python SDK's guard, the same text: run as the leader of its own process group (detached),
+// The Python starfold-server's guard, the same text: run as the leader of its own process group (detached),
 // it starts the server and a watcher holding the guard's stdin, a pipe from this process. When
 // that pipe closes (this process ended, however it ended) the watcher sends TERM to the group,
 // which stops the server (the guard and the watcher ignore it); once the server is reaped the

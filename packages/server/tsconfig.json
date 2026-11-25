@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2022", "ESNext.Disposable", "DOM"],
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"types": ["node"],
+		"strict": true,
+		"noEmit": true,
+		"isolatedModules": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": true,
+		"skipLibCheck": true
+	},
+	"include": ["src"]
+}

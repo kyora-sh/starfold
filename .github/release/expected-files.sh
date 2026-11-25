@@ -3,12 +3,12 @@
 #
 #   expected-files.sh <version> <flavour...>
 #     every file, as <artifact directory>/<file>, one per line: each flavour's archive for each target
-#     and its .sha256 (directory: the archive's name), the Python SDK's wheel and sdist
-#     (starfold-python-<version>), the embeddable client's tarball (starfold-web-embed-<version>),
-#     the npm packages that carry the default binary and the SDK pinned to them (starfold-npm-<version>),
-#     the platform wheels (starfold-wheels-<version>; the Linux ones only with LINUX_WHEELS=1, the
-#     default) and x264's source (x264-source), each file with a .sha256. The release attaches exactly
-#     these.
+#     and its .sha256 (directory: the archive's name), the Python client's wheel and sdist and
+#     starfold-server's pure wheel, which its platform wheels are made from (starfold-python-<version>),
+#     the embeddable client's tarball (starfold-web-embed-<version>), the npm packages: the four that
+#     carry the default binary, the client and @starfold/server (starfold-npm-<version>), starfold-server's
+#     platform wheels (starfold-wheels-<version>; the Linux ones only with LINUX_WHEELS=1, the default)
+#     and x264's source (x264-source), each file with a .sha256. The release attaches exactly these.
 #   expected-files.sh archive <version> <flavour> <target>
 #     the archive file name of that flavour and target; fails for a target not listed here.
 #   expected-files.sh native <version>
@@ -55,7 +55,7 @@ native() {
 	for line in "${packages[@]}"; do
 		read -r target suffix tag <<<"$line"
 		name=$(archive "$1" starfold "$target")
-		wheel=starfold-wheels-$1/starfold-$1-py3-none-$tag.whl
+		wheel=starfold-wheels-$1/starfold_server-$1-py3-none-$tag.whl
 		case $target in *-linux) [ "${LINUX_WHEELS:-1}" = 1 ] || wheel=- ;; esac
 		echo "$target $suffix starfold-$1-$target/$name starfold-npm-$1/starfold-server-$suffix-$1.tgz $wheel"
 	done
@@ -83,7 +83,7 @@ x264-source)
 			echo "${name%."${t#*:}"}/$name.sha256"
 		done
 	done
-	for f in "starfold-$version-py3-none-any.whl" "starfold-$version.tar.gz"; do
+	for f in "starfold-$version-py3-none-any.whl" "starfold-$version.tar.gz" "starfold_server-$version-py3-none-any.whl"; do
 		echo "starfold-python-$version/$f"
 		echo "starfold-python-$version/$f.sha256"
 	done
@@ -97,8 +97,10 @@ x264-source)
 			echo "$wheel.sha256"
 		fi
 	done < <(native "$version")
-	echo "starfold-npm-$version/starfold-$version.tgz"
-	echo "starfold-npm-$version/starfold-$version.tgz.sha256"
+	for f in "starfold-$version.tgz" "starfold-server-$version.tgz"; do
+		echo "starfold-npm-$version/$f"
+		echo "starfold-npm-$version/$f.sha256"
+	done
 	for f in "${x264_source[@]}"; do
 		echo "x264-source/$f"
 		echo "x264-source/$f.sha256"

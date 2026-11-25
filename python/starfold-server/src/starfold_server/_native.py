@@ -1,4 +1,4 @@
-"""The starfold server binary the platform wheels carry, and starting it locally."""
+"""The starfold server binary this package's platform wheels carry, and starting it locally."""
 
 from __future__ import annotations
 
@@ -21,9 +21,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import httpx
-
-from ._client import AsyncStarfold, Starfold
-from ._types import StarfoldError
+from starfold import AsyncStarfold, Starfold, StarfoldError
 
 SUPPORTED = ("Linux x86_64 (glibc 2.39+)", "Linux aarch64 (glibc 2.39+)", "macOS arm64", "Windows x86_64")
 APT_LINE = "sudo apt install libyuv0 libopus0 libpulse0"
@@ -72,8 +70,8 @@ def binary_path() -> str:
     if bundled.is_file():
         return str(bundled)
     raise BinaryNotFoundError(
-        f"no starfold server binary for this platform ({_platform()}): the starfold wheels carry one for "
-        f"{', '.join(SUPPORTED)}, and this install has none. Set STARFOLD_BIN to a starfold binary to start "
+        f"no starfold server binary for this platform ({_platform()}): the starfold-server wheels carry one "
+        f"for {', '.join(SUPPORTED)}, and this install has none. Set STARFOLD_BIN to a starfold binary to start "
         "one here; the client (Starfold(url)) still works against a server running elsewhere."
     )
 

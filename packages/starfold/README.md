@@ -1,7 +1,9 @@
-# starfold (TypeScript)
+# starfold (TypeScript client)
 
 A client for agents and scripts driving a starfold desktop: screenshots, waiting for the
 screen, mouse and keyboard, recordings and files. Node 20+, Bun and Deno; no dependencies.
+The server, its `starfold` command and `startServer()` are
+[@starfold/server](https://www.npmjs.com/package/@starfold/server)'s.
 
 ```sh
 npm install starfold   # or: bun add starfold, pnpm add starfold, deno add npm:starfold
@@ -51,47 +53,16 @@ Home, End, PageUp, PageDown, Up, Down, Left, Right, F1-F24, ...), joined with `+
 modifiers (ctrl, shift, alt, altgr, super). With shift, a letter or a US-layout digit or
 punctuation key means the shifted key: `ctrl+shift+t`, `cmd+shift+4`.
 
-## The server, from the same install
+## The server
 
-On Linux x64 and arm64 (glibc), macOS arm64 and Windows x64, `npm install starfold` also
-installs the starfold server binary, from the optional dependency
-`@starfold/server-<platform>` that matches the machine. On other platforms it installs the
-client alone, which works against a server running elsewhere.
+Up to 0.3.2 this package also carried the server: the `starfold` command and `startServer()`.
+From 0.4.0 they are in [@starfold/server](https://www.npmjs.com/package/@starfold/server), which depends on this package:
 
-```ts
-import { startServer } from 'starfold';
-
-await using server = await startServer(); // loopback, a free port, a generated password
-const sf = server.client(); // signed in already
-await (await sf.screenshot()).save('desktop.png');
-```
-
-`startServer()` listens on 127.0.0.1 unless you pass `addr`; `port` (default: a free one,
-tried again if another process takes it first), `password` (default, and when empty: a
-generated one), `args` (more server flags, `starfold --help`; with `--base-path` the `url`
-includes it), `env` (added to this process's environment), `binary` and `timeoutMs` (until it
-answers, default 30000) are optional. It resolves to a `LocalServer` with `url`, `password`,
-`process`, `client()`, `output()` (the last of what the server printed) and `close()`; the
-server stops on `close()`, at the end of an `await using` block, when your process exits, and
-on Linux and macOS also when your process is killed. If the server exits, doesn't answer in
-time or finds its port taken, `startServer()` throws a `ServerStartError` whose `output` is
-what the server printed. On Linux it needs a display (`DISPLAY`, e.g. from Xvfb); it doesn't
-start one.
-
-`binaryPath()` is the binary: `$STARFOLD_BIN` if set, else the platform package's; without
-one it throws a `BinaryNotFoundError`. The `starfold` command runs it (`npx starfold --help`).
-These errors, and `MissingLibrariesError` below, are `StarfoldError`s too.
-
-On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc
-2.39 or newer (Ubuntu 24.04 or newer):
-
-```sh
-sudo apt install libyuv0 libopus0 libpulse0
-```
-
-Without them, or on an older glibc, `startServer()` (a `MissingLibrariesError`) and
-`starfold` name what is missing, the libraries or the glibc version (`GLIBC_2.39`), with
-that line.
+| 0.3.2                                                                                                                                                                                                                                                                      | 0.4.0                                                |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `import { startServer } from 'starfold'`, and likewise `LocalServer`, `StartServerOptions`, `binaryPath`, `checkLibraries`, `missingLibraries`, `platformKey`, `serverPackage`, `LINUX_LIBRARIES_HINT`, `BinaryNotFoundError`, `MissingLibrariesError`, `ServerStartError` | the same names from `'@starfold/server'`             |
+| `npx starfold` / `npm i -g starfold`                                                                                                                                                                                                                                       | `npx @starfold/server` / `npm i -g @starfold/server` |
+| `Starfold`, `act`, `StarfoldError` and the client's other errors, the types                                                                                                                                                                                                | unchanged, from `starfold`                           |
 
 ## Tests
 

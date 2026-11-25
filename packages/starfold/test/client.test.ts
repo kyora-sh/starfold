@@ -102,7 +102,9 @@ describe('wait', () => {
 		const quick = new Starfold(server.url, { password: 'pw', timeoutMs: 100 });
 		server.delayMs = 250;
 		expect((await quick.wait({ timeoutMs: 300 })).seq).toBe(42);
-		expect(quick.screenshot()).rejects.toBeInstanceOf(StarfoldTimeoutError);
+		await expect(quick.screenshot()).rejects.toBeInstanceOf(
+			StarfoldTimeoutError
+		);
 	});
 });
 
@@ -163,7 +165,7 @@ describe('input', () => {
 		expect(
 			(server.lastJson() as { type: string }[]).map((a) => a.type)
 		).toEqual(['key', 'pause', 'down', 'pause', 'move', 'up', 'type']);
-		expect(quick.key('a')).rejects.toBeInstanceOf(StarfoldTimeoutError);
+		await expect(quick.key('a')).rejects.toBeInstanceOf(StarfoldTimeoutError);
 	});
 
 	test('the other act builders', () => {
@@ -270,7 +272,9 @@ describe('recording', () => {
 		expect(stopped.endReason).toBe('stopped');
 		expect(server.last.params).toEqual({ id: RID, format: 'zip' });
 		expect([...(await sf.recordStop(RID))]).toEqual([text('mp4')]);
-		expect(sf.recordStop('0'.repeat(32))).rejects.toBeInstanceOf(NotFoundError);
+		await expect(sf.recordStop('0'.repeat(32))).rejects.toBeInstanceOf(
+			NotFoundError
+		);
 	});
 
 	test('record gets its length on top of the timeout', async () => {
@@ -424,7 +428,7 @@ describe('errors', () => {
 			);
 		const c = new Starfold(`${server.url}/desk/`);
 		expect(c.url).toBe(`${server.url}/desk`);
-		expect(c.key('a')).rejects.toBeInstanceOf(ReadOnlyError);
+		await expect(c.key('a')).rejects.toBeInstanceOf(ReadOnlyError);
 		await Bun.sleep(50);
 		expect(server.last.path).toBe('/desk/input');
 	});
