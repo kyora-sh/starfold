@@ -24,6 +24,7 @@ const otherTools = new Set([
 	'release',
 	'tag',
 	'triplet',
+	'unix-socket',
 ]);
 
 const flagsIn = (text: string) =>

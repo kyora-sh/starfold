@@ -59,4 +59,12 @@ Only a peer with starfold's own uid is let in (`SO_PEERCRED`); the same uid is n
 
 `starfold attach DIR` connects to `DIR/s` and relays bytes between it and its stdin and stdout, one connection per run, after the same checks, and only if the listener has its own uid. It is for hosts that hand each connection to a process of their own, such as a pod exec stream. It does not authenticate what it relays: the server's login and host checks apply, so a host relaying a browser's requests sends `Host: localhost`.
 
+To send one request yourself, use curl on the socket, or keep `attach`'s stdin open until the reply is in: on 0.3.2, `attach` prints nothing when its stdin ends before the server has answered.
+
+```sh
+curl -u ":$STARFOLD_PASSWORD" --unix-socket /run/sf/view/s http://localhost/stats
+{ printf 'GET /stats HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$STARFOLD_PASSWORD"; sleep 2; } |
+  starfold attach /run/sf/view
+```
+
 The repository README's section on the unix socket lists every check and what is not claimed.

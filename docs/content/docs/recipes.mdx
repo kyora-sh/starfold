@@ -75,17 +75,25 @@ A blinking text caret redraws about twice a second, so keep `idle` under 500 ms 
 
 ## A desktop of its own
 
-On Linux, start an Xvfb display and a server for the agent from code, with a client already signed in:
+On Linux, start an Xvfb display and a server for the agent from code, with a client already signed in. The server connects to the display once, when it starts, so wait until Xvfb listens: with `-displayfd`, Xvfb picks a free display and writes its number once it is ready.
 
 <Tabs items={['Python', 'TypeScript']}>
 <Tab value="Python">
 
 ```python
+import os
 import subprocess
 from starfold_server import start_server
 
-xvfb = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1280x800x24"])
-with start_server(env={"DISPLAY": ":1"}) as server:
+r, w = os.pipe()
+xvfb = subprocess.Popen(
+    ["Xvfb", "-displayfd", str(w), "-screen", "0", "1280x800x24"], pass_fds=[w]
+)
+os.close(w)
+with os.fdopen(r) as ready:
+    display = ":" + ready.readline().strip()
+
+with start_server(env={"DISPLAY": display}) as server:
     sf = server.client()
     sf.screenshot().save("desktop.png")
 xvfb.terminate()
@@ -96,11 +104,16 @@ xvfb.terminate()
 
 ```ts
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import { startServer } from '@starfold/server';
 
-const xvfb = spawn('Xvfb', [':1', '-screen', '0', '1280x800x24']);
+const xvfb = spawn('Xvfb', ['-displayfd', '1', '-screen', '0', '1280x800x24'], {
+	stdio: ['ignore', 'pipe', 'inherit'],
+});
+const [n] = await once(createInterface({ input: xvfb.stdout }), 'line');
 {
-	await using server = await startServer({ env: { DISPLAY: ':1' } });
+	await using server = await startServer({ env: { DISPLAY: `:${n}` } });
 	const sf = server.client();
 	await (await sf.screenshot()).save('desktop.png');
 }

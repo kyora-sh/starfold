@@ -55,7 +55,7 @@ tar -xzf starfold-<version>-x86_64-linux.tar.gz
 
 ## From source
 
-Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config, esbuild and the native libraries. libaom is built from a git submodule and linked statically, which also needs git, cmake 3.16 or newer, perl and, on x86_64, nasm. On Ubuntu 24.04:
+Rust (CI builds with 1.93), a C++ compiler, clang, pkg-config and the native libraries. libaom is built from source and linked statically, which also needs cmake 3.16 or newer, perl and, on x86_64, nasm. On Ubuntu 24.04:
 
 ```sh
 sudo apt install build-essential clang libclang-dev pkg-config esbuild cmake perl nasm \
@@ -65,7 +65,7 @@ cargo install --locked starfold
 
 That is the default build, with libaom and under MIT. For x264, add `--features x264` and install `libx264-dev`; that binary is GPL-2.0-or-later. On a Mac, `brew install opus pkgconf esbuild cmake nasm` (plus `x264` for `--features x264`) gives the libraries; Windows builds with vcpkg (see [Platforms](/server/platforms#windows)).
 
-From a clone, clone with the submodule (`git clone --recursive`): the build checks that the libaom submodule is at its pinned commit, so GitHub's source archives, which lack it, can't build libaom.
+The crate from crates.io carries libaom's source and the built web client. A build from a clone also needs git and esbuild, and the libaom submodule (`git clone --recursive`): the build checks that the submodule is at its pinned commit, so GitHub's source archives, which lack it, can't build libaom.
 
 ```sh
 git clone --recursive https://github.com/kyora-sh/starfold

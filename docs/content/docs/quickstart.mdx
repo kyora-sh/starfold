@@ -7,6 +7,8 @@ description: Stream a desktop to a browser tab, then drive it from a script.
 
 <Install which="server" />
 
+An npm install puts the command behind `npx`: run `npx starfold` where these steps say `starfold`, or install globally with `npm install -g` <Pkg path="server.npm" />.
+
 On Linux the server uses the system's libyuv, Opus and PulseAudio libraries and needs glibc 2.39 or newer (Ubuntu 24.04 or newer). [Install the server](/install/server) has the release archives and the requirements of each platform.
 
 ## 2. Start it
@@ -43,10 +45,10 @@ starfold
 </Tab>
 </Tabs>
 
-It prints a link that signs you in:
+With no password given, it makes one up and prints a link that signs you in:
 
 ```
-open http://localhost:6901/?token=4f1c… to sign in
+open http://localhost:6901/?token=4f1c… to sign in (the password is 4f1c…; choose one with --basic-auth-password or STARFOLD_PASSWORD)
 ```
 
 ## 3. Open the link
